@@ -12,10 +12,11 @@ implementation.
 |---|---|---|
 | `camelmailer-config` | `lib/postal/config_schema.rb`, `lib/postal/config.rb` | ✅ complete (all defaults, YAML loading, `$config-file-root` substitution, legacy `postal:` group alias, `POSTAL_CONFIG_FILE_PATH` fallback) + new `postgres` group |
 | `camelmailer-core` | `app/models` (domain model), `app/lib/received_header.rb`, `Postal::Helpers`, token generation | ✅ domain model + storage traits (`Store` for SMTP, async `AdminStore` for the API, `MessageSink`) with in-memory implementations |
-| `camelmailer-db` | `lib/postal/message_db/` + the ActiveRecord persistence | ✅ PostgreSQL with row-level security (see below); embedded migrations; implements all storage traits |
-| `camelmailer-smtp` | `app/lib/smtp_server/client.rb` + `server.rb`, `script/smtp_server.rb` | ✅ full protocol state machine (see below), tokio TCP server; ⚠️ STARTTLS termination not yet implemented |
-| `camelmailer-api` | `app/controllers/admin_api/` | 🚧 conventions complete (auth incl. DB-backed keys, envelope, pagination, errors); organizations + servers resources ported, remaining resources pending |
-| `camelmailer` (bin) | `bin/postal` | ✅ CLI dispatcher: `smtp-server`, `web-server`, `initialize` (migrations), `make-admin-api-key`, `version` |
+| `camelmailer-db` | `lib/postal/message_db/` + the ActiveRecord persistence | ✅ PostgreSQL with row-level security (see below); embedded migrations; message metadata parity (status, spam, deliveries, links/clicks, loads/opens); delivery queue |
+| `camelmailer-smtp` | `app/lib/smtp_server/client.rb` + `server.rb`, `script/smtp_server.rb` | ✅ full protocol state machine (see below), tokio TCP server, STARTTLS termination via rustls |
+| `camelmailer-worker` | `script/worker.rb`, `app/lib/message_dequeuer`, `app/senders` | ✅ queue dequeuer (SKIP LOCKED), SMTP sending (relays/MX), suppression holds, HTTP endpoint delivery for incoming routes, webhooks, delivery recording |
+| `camelmailer-api` | `app/controllers/admin_api/` | ✅ auth (incl. DB-backed keys), envelope, pagination, errors; organizations, servers, domains, credentials, routes, webhooks, suppressions, users, IP pools |
+| `camelmailer` (bin) | `bin/postal` | ✅ CLI dispatcher: `smtp-server`, `web-server`, `worker`, `initialize` (migrations), `make-admin-api-key`, `version` |
 
 ## Storage: single PostgreSQL database with row-level security
 
@@ -88,24 +89,29 @@ group is accepted as an alias for `camelmailer:`, and
 - **Rebranding.** The SMTP banner reads `ESMTP CamelMailer/<trace-id>`.
   Response texts and status codes are otherwise kept byte-identical to the
   Ruby implementation so existing clients and tests keep matching.
-- **Honest capability surface.** The Rust SMTP server refuses to start with
-  `smtp_server.tls_enabled: true` instead of advertising STARTTLS it cannot
-  complete; terminate TLS in front of it until native TLS lands.
+- **STARTTLS termination.** With `smtp_server.tls_enabled: true` the server
+  loads the configured certificate/key, advertises STARTTLS (and withholds
+  AUTH) on plaintext sessions, upgrades the socket via rustls on request and
+  continues the same session encrypted. Messages received after the upgrade
+  are marked `received_with_ssl`.
+- **Delivery pipeline.** Accepted messages are enqueued in the same
+  transaction that stores them. The worker dequeues with
+  `FOR UPDATE SKIP LOCKED`, enters the owning tenant's RLS context per
+  message (no BYPASSRLS role needed), checks the suppression list, sends via
+  configured relays or MX lookup, retries soft failures with exponential
+  backoff, records every attempt in `deliveries`, and fires webhooks
+  (MessageSent/MessageDelayed/MessageDeliveryFailed/MessageHeld). Incoming
+  route mail is POSTed to the route's HTTP endpoint (`routes.endpoint_url`,
+  a deliberate simplification of Postal's polymorphic endpoints).
 
-## Not yet ported (next phases)
+## Not yet ported
 
-1. **Remaining Admin API resources** — domains, credentials, routes,
-   webhooks, suppressions, IP pools, users (the conventions layer they sit on
-   is done; storage for domains/routes/credentials already exists in
-   `camelmailer-db`).
-2. **Worker & delivery pipeline** — queued message dequeuer, SMTP sending,
-   bounce handling, webhooks (`app/lib/message_dequeuer`, `app/senders`).
-   The cross-tenant queue worker gets a dedicated `BYPASSRLS` role.
-3. **Message metadata parity** — the full `messages` schema of
-   `lib/postal/message_db/` (spam status, delivery attempts, clicks/opens)
-   on the RLS-protected table.
-4. **STARTTLS termination** for the SMTP server.
-5. **Web UI** — the management interface remains the Rails app for now.
+1. **Web UI** — the management interface remains the Rails app (explicitly
+   out of scope for the Rust port).
+2. Smaller follow-ups: webhook request recording/retrying and payload
+   signing, DKIM signing on outbound mail, rspamd/clamav integration,
+   tracking HTTP endpoints serving the recorded links/loads, outbound
+   STARTTLS in the SMTP client, IP-pool-aware source addresses.
 
 The Ruby application remains fully functional and authoritative while these
 phases land; the two run side by side (strangler-fig migration).

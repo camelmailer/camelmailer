@@ -1,17 +1,100 @@
 //! The TCP acceptor loop — the port of `app/lib/smtp_server/server.rb` and
 //! `script/smtp_server.rb`, on tokio instead of a thread-per-connection
-//! model.
-//!
-//! TLS termination (STARTTLS upgrade) is not yet implemented in the Rust
-//! port; the server refuses to start with `smtp_server.tls_enabled: true`
-//! rather than advertising a capability it cannot honour.
+//! model, including STARTTLS termination via rustls.
 
 use crate::session::{Reply, Session, SessionConfig};
 use camelmailer_core::{MessageSink, Store};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+
+/// A line-oriented reader/writer over any stream, kept upgradeable: unlike
+/// a `BufReader` split, the inner stream can be taken back out for the TLS
+/// handshake after STARTTLS.
+struct LineStream<S> {
+    stream: S,
+    buffer: Vec<u8>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> LineStream<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream,
+            buffer: Vec::new(),
+        }
+    }
+
+    fn into_inner(self) -> S {
+        self.stream
+    }
+
+    /// Read one line (without the trailing `\n`). `None` on EOF.
+    async fn read_line(&mut self) -> std::io::Result<Option<String>> {
+        loop {
+            if let Some(position) = self.buffer.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = self.buffer.drain(..=position).collect();
+                line.pop(); // the \n
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            let mut chunk = [0u8; 4096];
+            let read = self.stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Ok(None);
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    async fn write_reply(&mut self, reply: &Reply) -> std::io::Result<()> {
+        match reply {
+            Reply::None => Ok(()),
+            Reply::Line(text) => {
+                self.stream
+                    .write_all(format!("{text}\r\n").as_bytes())
+                    .await
+            }
+            Reply::Lines(lines) => {
+                let mut out = String::new();
+                for text in lines {
+                    out.push_str(text);
+                    out.push_str("\r\n");
+                }
+                self.stream.write_all(out.as_bytes()).await
+            }
+        }
+    }
+
+    async fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        self.stream
+            .write_all(format!("{line}\r\n").as_bytes())
+            .await
+    }
+}
+
+fn load_tls_acceptor(
+    certificate_path: &str,
+    private_key_path: &str,
+) -> std::io::Result<TlsAcceptor> {
+    // rustls needs a process-wide crypto provider; installing twice is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let certificates = rustls_pemfile::certs(&mut std::io::BufReader::new(
+        std::fs::File::open(certificate_path)?,
+    ))
+    .collect::<Result<Vec<_>, _>>()?;
+    let private_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        std::fs::File::open(private_key_path)?,
+    ))?
+    .ok_or_else(|| std::io::Error::other("no private key found in the TLS key file"))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(std::io::Error::other)?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
 
 pub struct SmtpServer {
     config: camelmailer_config::Config,
@@ -33,13 +116,6 @@ impl SmtpServer {
     }
 
     pub async fn run(self) -> std::io::Result<()> {
-        if self.config.smtp_server.tls_enabled {
-            return Err(std::io::Error::other(
-                "smtp_server.tls_enabled is not yet supported by the Rust SMTP server; \
-                 terminate TLS in front of it or disable the option",
-            ));
-        }
-
         let port = std::env::var("PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
@@ -49,13 +125,28 @@ impl SmtpServer {
 
         let listener = TcpListener::bind((bind_address.as_str(), port)).await?;
         tracing::info!(%bind_address, port, "camelmailer SMTP server listening");
+        self.serve(listener).await
+    }
+
+    /// Accept connections on an existing listener (used by tests to bind an
+    /// ephemeral port).
+    pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
+        let tls_acceptor = if self.config.smtp_server.tls_enabled {
+            Some(load_tls_acceptor(
+                &self.config.smtp_server.tls_certificate_path,
+                &self.config.smtp_server.tls_private_key_path,
+            )?)
+        } else {
+            None
+        };
 
         let this = Arc::new(self);
         loop {
             let (stream, peer) = listener.accept().await?;
             let this = this.clone();
+            let tls_acceptor = tls_acceptor.clone();
             tokio::spawn(async move {
-                if let Err(error) = this.handle_connection(stream, peer).await {
+                if let Err(error) = this.handle_connection(stream, peer, tls_acceptor).await {
                     tracing::debug!(%peer, %error, "connection ended with error");
                 }
             });
@@ -66,6 +157,7 @@ impl SmtpServer {
         &self,
         stream: TcpStream,
         peer: SocketAddr,
+        tls_acceptor: Option<TlsAcceptor>,
     ) -> std::io::Result<()> {
         let session_config = SessionConfig::from(&self.config);
         // With proxy_protocol enabled the client IP comes from the PROXY
@@ -84,53 +176,54 @@ impl SmtpServer {
             ip_address,
         );
 
-        let (read_half, mut write_half) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-
+        let mut lines = LineStream::new(stream);
         if send_banner {
-            write_half
-                .write_all(format!("{}\r\n", session.banner()).as_bytes())
-                .await?;
+            lines.write_line(&session.banner()).await?;
         }
 
-        let mut buffer = Vec::new();
-        loop {
-            buffer.clear();
-            let read = reader.read_until(b'\n', &mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            if buffer.last() == Some(&b'\n') {
-                buffer.pop();
-            }
-            let line = String::from_utf8_lossy(&buffer).into_owned();
-            let reply = session.handle(&line);
-            match reply {
-                Reply::None => {}
-                Reply::Line(text) => {
-                    write_half
-                        .write_all(format!("{text}\r\n").as_bytes())
-                        .await?;
-                }
-                Reply::Lines(lines) => {
-                    let mut out = String::new();
-                    for text in lines {
-                        out.push_str(&text);
-                        out.push_str("\r\n");
-                    }
-                    write_half.write_all(out.as_bytes()).await?;
-                }
-            }
-            if session.take_start_tls() {
-                // Unreachable while tls_enabled is rejected in run(), kept as
-                // a guard for when TLS support lands.
-                break;
-            }
-            if session.finished() {
-                break;
-            }
+        // Plaintext phase: run until the connection ends or STARTTLS asks
+        // for an upgrade.
+        let upgrade = drive_session(&mut session, &mut lines).await?;
+        if !upgrade {
+            return Ok(());
         }
-        write_half.shutdown().await.ok();
+
+        let Some(tls_acceptor) = tls_acceptor else {
+            // The session only offers STARTTLS when tls_enabled, and serve()
+            // builds an acceptor whenever it is — this is unreachable, kept
+            // as a defensive close.
+            return Ok(());
+        };
+
+        // TLS phase: handshake on the raw socket, then continue the same
+        // session over the encrypted stream.
+        let tls_stream = tls_acceptor.accept(lines.into_inner()).await?;
+        session.set_tls(true);
+        let mut tls_lines = LineStream::new(tls_stream);
+        drive_session(&mut session, &mut tls_lines).await?;
+        tls_lines.stream.shutdown().await.ok();
         Ok(())
+    }
+}
+
+/// Pump lines through the session until the client disconnects, the session
+/// finishes, or (in the plaintext phase) STARTTLS requests an upgrade.
+/// Returns `true` when a TLS upgrade is requested.
+async fn drive_session<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut Session,
+    lines: &mut LineStream<S>,
+) -> std::io::Result<bool> {
+    loop {
+        let Some(line) = lines.read_line().await? else {
+            return Ok(false);
+        };
+        let reply = session.handle(&line);
+        lines.write_reply(&reply).await?;
+        if session.take_start_tls() {
+            return Ok(true);
+        }
+        if session.finished() {
+            return Ok(false);
+        }
     }
 }

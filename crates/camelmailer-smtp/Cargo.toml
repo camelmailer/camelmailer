@@ -11,7 +11,10 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 hmac = { workspace = true }
 md-5 = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -19,3 +22,4 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 hmac = { workspace = true }
 md-5 = { workspace = true }
+rcgen = { workspace = true }
