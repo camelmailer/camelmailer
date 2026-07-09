@@ -97,6 +97,16 @@ impl Worker {
             .await?
         {
             self.queue.complete(queued.id).await?;
+            self.sink
+                .record_delivery(
+                    message.server_id,
+                    message.id,
+                    "Held",
+                    "recipient is on the suppression list",
+                    "",
+                    false,
+                )
+                .await?;
             self.send_webhooks(
                 message.server_id,
                 "MessageHeld",
@@ -119,6 +129,16 @@ impl Worker {
         match outcome {
             SendOutcome::Sent { response } => {
                 self.queue.complete(queued.id).await?;
+                self.sink
+                    .record_delivery(
+                        message.server_id,
+                        message.id,
+                        "Sent",
+                        "message accepted by the remote server",
+                        &response,
+                        false,
+                    )
+                    .await?;
                 self.send_webhooks(
                     message.server_id,
                     "MessageSent",
@@ -130,6 +150,16 @@ impl Worker {
             SendOutcome::SoftFail { response } => {
                 if queued.attempts + 1 >= self.max_attempts {
                     self.queue.complete(queued.id).await?;
+                    self.sink
+                        .record_delivery(
+                            message.server_id,
+                            message.id,
+                            "HardFail",
+                            "delivery attempts exhausted",
+                            &response,
+                            false,
+                        )
+                        .await?;
                     self.send_webhooks(
                         message.server_id,
                         "MessageDeliveryFailed",
@@ -139,6 +169,16 @@ impl Worker {
                     Ok(ProcessOutcome::Failed { response })
                 } else {
                     self.queue.retry(queued.id, queued.attempts).await?;
+                    self.sink
+                        .record_delivery(
+                            message.server_id,
+                            message.id,
+                            "SoftFail",
+                            "temporary delivery failure",
+                            &response,
+                            false,
+                        )
+                        .await?;
                     self.send_webhooks(
                         message.server_id,
                         "MessageDelayed",
@@ -150,6 +190,16 @@ impl Worker {
             }
             SendOutcome::HardFail { response } => {
                 self.queue.complete(queued.id).await?;
+                self.sink
+                    .record_delivery(
+                        message.server_id,
+                        message.id,
+                        "HardFail",
+                        "message rejected by the remote server",
+                        &response,
+                        false,
+                    )
+                    .await?;
                 self.send_webhooks(
                     message.server_id,
                     "MessageDeliveryFailed",

@@ -1245,7 +1245,7 @@ impl Store for PgStore {
 // ----------------------------------------------------------- message sink
 
 /// A message stored in the shared, RLS-protected `messages` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredMessage {
     pub id: i64,
     pub server_id: Id,
@@ -1259,6 +1259,13 @@ pub struct StoredMessage {
     pub credential_id: Option<Id>,
     pub route_id: Option<Id>,
     pub raw_message: Vec<u8>,
+    pub status: String,
+    pub subject: Option<String>,
+    pub message_id_header: Option<String>,
+    pub spam_status: String,
+    pub spam_score: f64,
+    pub held: bool,
+    pub size: i64,
 }
 
 fn stored_message_from_row(row: &PgRow) -> StoredMessage {
@@ -1277,6 +1284,35 @@ fn stored_message_from_row(row: &PgRow) -> StoredMessage {
             .map(|id| id as Id),
         route_id: row.get::<Option<i64>, _>("route_id").map(|id| id as Id),
         raw_message: row.get("raw_message"),
+        status: row.get("status"),
+        subject: row.get("subject"),
+        message_id_header: row.get("message_id_header"),
+        spam_status: row.get("spam_status"),
+        spam_score: row.get("spam_score"),
+        held: row.get("held"),
+        size: row.get("size"),
+    }
+}
+
+/// A delivery attempt record (port of the message DB `deliveries` table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub id: i64,
+    pub message_id: i64,
+    pub status: String,
+    pub details: Option<String>,
+    pub output: Option<String>,
+    pub sent_with_ssl: bool,
+}
+
+fn delivery_from_row(row: &PgRow) -> Delivery {
+    Delivery {
+        id: row.get("id"),
+        message_id: row.get("message_id"),
+        status: row.get("status"),
+        details: row.get("details"),
+        output: row.get("output"),
+        sent_with_ssl: row.get("sent_with_ssl"),
     }
 }
 
@@ -1294,13 +1330,20 @@ impl PgMessageSink {
     }
 
     pub async fn insert_message(&self, message: &QueuedMessage) -> Result<i64, sqlx::Error> {
+        // index the interesting headers at insert time, like the Ruby
+        // message DB does on save
+        let subject = camelmailer_core::message::header_value(&message.raw_message, "subject");
+        let message_id_header =
+            camelmailer_core::message::header_value(&message.raw_message, "message-id");
+
         let mut tx = self.store.pool.begin().await?;
         set_tenant_context(&mut tx, message.server_id).await?;
         let row = sqlx::query(
             "INSERT INTO messages
                  (server_id, token, scope, rcpt_to, mail_from, bounce,
-                  received_with_ssl, domain_id, credential_id, route_id, raw_message)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                  received_with_ssl, domain_id, credential_id, route_id, raw_message,
+                  subject, message_id_header, size)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
              RETURNING id",
         )
         .bind(message.server_id as i64)
@@ -1317,6 +1360,9 @@ impl PgMessageSink {
         .bind(message.credential_id.map(|id| id as i64))
         .bind(message.route_id.map(|id| id as i64))
         .bind(&message.raw_message)
+        .bind(&subject)
+        .bind(&message_id_header)
+        .bind(message.raw_message.len() as i64)
         .fetch_one(&mut *tx)
         .await?;
         let message_id: i64 = row.get("id");
@@ -1355,6 +1401,178 @@ impl PgMessageSink {
             .await?;
         tx.commit().await?;
         Ok(row.as_ref().map(stored_message_from_row))
+    }
+
+    /// Record a delivery attempt and update the message's status,
+    /// `last_delivery_attempt` and `held` flag (port of
+    /// `Postal::MessageDB::Message#create_delivery`).
+    pub async fn record_delivery(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        status: &str,
+        details: &str,
+        output: &str,
+        sent_with_ssl: bool,
+    ) -> Result<i64, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO deliveries (server_id, message_id, status, details, output, sent_with_ssl)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(server_id as i64)
+        .bind(message_id)
+        .bind(status)
+        .bind(details)
+        .bind(output)
+        .bind(sent_with_ssl)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE messages
+             SET status = $2, held = ($2 = 'Held'), last_delivery_attempt = now()
+             WHERE id = $1",
+        )
+        .bind(message_id)
+        .bind(status)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.get("id"))
+    }
+
+    pub async fn deliveries_for_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Vec<Delivery>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let rows = sqlx::query("SELECT * FROM deliveries WHERE message_id = $1 ORDER BY id")
+            .bind(message_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(delivery_from_row).collect())
+    }
+
+    /// Store a spam-check result (port of `update_spam` on the message).
+    pub async fn set_spam_result(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        spam_status: &str,
+        spam_score: f64,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        sqlx::query("UPDATE messages SET spam_status = $2, spam_score = $3 WHERE id = $1")
+            .bind(message_id)
+            .bind(spam_status)
+            .bind(spam_score)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Register a trackable link in a message; returns (link id, token).
+    pub async fn create_link(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        url: &str,
+    ) -> Result<(i64, String), sqlx::Error> {
+        let link_token = token::generate_token(16);
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let row = sqlx::query(
+            "INSERT INTO links (server_id, message_id, token, url)
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(server_id as i64)
+        .bind(message_id)
+        .bind(&link_token)
+        .bind(url)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((row.get("id"), link_token))
+    }
+
+    /// Record a click on a tracked link.
+    pub async fn record_link_click(
+        &self,
+        server_id: Id,
+        link_id: i64,
+        ip_address: &str,
+        user_agent: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        sqlx::query(
+            "INSERT INTO link_clicks (server_id, link_id, ip_address, user_agent)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(server_id as i64)
+        .bind(link_id)
+        .bind(ip_address)
+        .bind(user_agent)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record an open (tracking-pixel load).
+    pub async fn record_load(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        ip_address: &str,
+        user_agent: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        sqlx::query(
+            "INSERT INTO loads (server_id, message_id, ip_address, user_agent)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(server_id as i64)
+        .bind(message_id)
+        .bind(ip_address)
+        .bind(user_agent)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Clicks (per link) and opens for a message: (clicks, opens).
+    pub async fn activity_counts(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<(i64, i64), sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let clicks: i64 = sqlx::query(
+            "SELECT count(*) AS c FROM link_clicks lc
+             JOIN links l ON l.id = lc.link_id
+             WHERE l.message_id = $1",
+        )
+        .bind(message_id)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("c");
+        let opens: i64 = sqlx::query("SELECT count(*) AS c FROM loads WHERE message_id = $1")
+            .bind(message_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .get("c");
+        tx.commit().await?;
+        Ok((clicks, opens))
     }
 
     /// Is this address on the tenant's suppression list?

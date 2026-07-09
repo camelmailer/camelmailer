@@ -597,3 +597,171 @@ async fn suppressions_are_tenant_isolated_by_rls() {
         .await
         .unwrap());
 }
+
+// ------------------------------------------- message metadata (phase 3)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messages_index_subject_and_message_id_at_insert() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    let mut message = message_for(f.server.id, "user@example.net");
+    message.raw_message =
+        b"Subject: Quarterly Report\r\nMessage-ID: <q1@org.example>\r\n\r\nBody\r\n".to_vec();
+    let id = sink.insert_message(&message).await.unwrap();
+
+    let stored = sink
+        .message_by_id(f.server.id, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.subject.as_deref(), Some("Quarterly Report"));
+    assert_eq!(
+        stored.message_id_header.as_deref(),
+        Some("<q1@org.example>")
+    );
+    assert_eq!(stored.status, "Pending");
+    assert_eq!(stored.spam_status, "NotChecked");
+    assert_eq!(stored.size, message.raw_message.len() as i64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deliveries_update_message_status_and_are_listed() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let id = sink
+        .insert_message(&message_for(f.server.id, "user@example.net"))
+        .await
+        .unwrap();
+
+    sink.record_delivery(f.server.id, id, "SoftFail", "greylisted", "451 try later", false)
+        .await
+        .unwrap();
+    sink.record_delivery(f.server.id, id, "Sent", "accepted", "250 OK", true)
+        .await
+        .unwrap();
+
+    let message = sink.message_by_id(f.server.id, id).await.unwrap().unwrap();
+    assert_eq!(message.status, "Sent");
+    assert!(!message.held);
+
+    let deliveries = sink.deliveries_for_message(f.server.id, id).await.unwrap();
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(deliveries[0].status, "SoftFail");
+    assert_eq!(deliveries[1].status, "Sent");
+    assert_eq!(deliveries[1].output.as_deref(), Some("250 OK"));
+
+    // Held marks the message held
+    sink.record_delivery(f.server.id, id, "Held", "suppressed", "", false)
+        .await
+        .unwrap();
+    let message = sink.message_by_id(f.server.id, id).await.unwrap().unwrap();
+    assert_eq!(message.status, "Held");
+    assert!(message.held);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spam_results_are_stored() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let id = sink
+        .insert_message(&message_for(f.server.id, "user@example.net"))
+        .await
+        .unwrap();
+    sink.set_spam_result(f.server.id, id, "Spam", 7.5)
+        .await
+        .unwrap();
+    let message = sink.message_by_id(f.server.id, id).await.unwrap().unwrap();
+    assert_eq!(message.spam_status, "Spam");
+    assert!((message.spam_score - 7.5).abs() < f64::EPSILON);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clicks_and_opens_are_recorded_per_message() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let id = sink
+        .insert_message(&message_for(f.server.id, "user@example.net"))
+        .await
+        .unwrap();
+
+    let (link_id, link_token) = sink
+        .create_link(f.server.id, id, "https://example.com/offer")
+        .await
+        .unwrap();
+    assert_eq!(link_token.len(), 16);
+
+    sink.record_link_click(f.server.id, link_id, "1.2.3.4", "TestUA/1.0")
+        .await
+        .unwrap();
+    sink.record_link_click(f.server.id, link_id, "1.2.3.5", "TestUA/1.0")
+        .await
+        .unwrap();
+    sink.record_load(f.server.id, id, "1.2.3.4", "TestUA/1.0")
+        .await
+        .unwrap();
+
+    let (clicks, opens) = sink.activity_counts(f.server.id, id).await.unwrap();
+    assert_eq!(clicks, 2);
+    assert_eq!(opens, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_tables_are_rls_protected() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let id = sink
+        .insert_message(&message_for(f.server.id, "user@example.net"))
+        .await
+        .unwrap();
+    sink.record_delivery(f.server.id, id, "Sent", "ok", "250 OK", false)
+        .await
+        .unwrap();
+    let (link_id, _) = sink
+        .create_link(f.server.id, id, "https://example.com")
+        .await
+        .unwrap();
+    sink.record_link_click(f.server.id, link_id, "1.1.1.1", "UA")
+        .await
+        .unwrap();
+    sink.record_load(f.server.id, id, "1.1.1.1", "UA")
+        .await
+        .unwrap();
+
+    // without a tenant context every activity table appears empty
+    for table in ["deliveries", "links", "link_clicks", "loads"] {
+        let count: i64 = sqlx::query(&format!("SELECT count(*) AS c FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("c");
+        assert_eq!(count, 0, "{table} must be invisible without tenant context");
+    }
+
+    // a foreign tenant context sees nothing either
+    let other_server = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let deliveries = sink
+        .deliveries_for_message(other_server.id, id)
+        .await
+        .unwrap();
+    assert!(deliveries.is_empty());
+}

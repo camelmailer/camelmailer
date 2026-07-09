@@ -455,3 +455,41 @@ async fn incoming_messages_without_an_endpoint_are_completed_silently() {
     assert_eq!(outcome, ProcessOutcome::NothingToDo);
     assert_eq!(s.queue.queue_size().await.unwrap(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deliveries_and_status_are_recorded_by_the_worker() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    let message_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+
+    let message = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.status, "Sent");
+
+    let deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, message_id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, "Sent");
+    assert!(deliveries[0]
+        .output
+        .as_deref()
+        .unwrap_or_default()
+        .contains("250 Accepted"));
+}
