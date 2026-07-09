@@ -7,9 +7,10 @@
 
 use async_trait::async_trait;
 use camelmailer_core::{
-    store, token, AdminStore, Credential, CredentialType, Domain, DomainOwner, Id, MessageScope,
-    MessageSink, NewOrganization, NewServer, Organization, QueuedMessage, ResolvedRoute, Route,
-    RouteMode, Server, ServerMode, Store, StoreError,
+    store, token, AdminStore, Credential, CredentialType, Domain, DomainOwner, Id, IpAddress,
+    IpPool, MessageScope, MessageSink, NewCredential, NewIpAddress, NewOrganization, NewRoute,
+    NewServer, NewSuppression, NewUser, NewWebhook, Organization, QueuedMessage, ResolvedRoute,
+    Route, RouteMode, Server, ServerMode, Store, StoreError, Suppression, User, Webhook,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -47,7 +48,19 @@ impl PgStore {
     fn sqlx_error(error: sqlx::Error) -> StoreError {
         if let sqlx::Error::Database(db_error) = &error {
             if db_error.code().as_deref() == Some("23505") {
-                return StoreError::Conflict("Permalink has already been taken".into());
+                let message = match db_error.constraint() {
+                    Some(constraint) if constraint.starts_with("domains") => {
+                        "Name has already been taken"
+                    }
+                    Some(constraint) if constraint.starts_with("suppressions") => {
+                        "Address is already suppressed"
+                    }
+                    Some(constraint) if constraint.starts_with("users") => {
+                        "Email address has already been taken"
+                    }
+                    _ => "Permalink has already been taken",
+                };
+                return StoreError::Conflict(message.into());
             }
         }
         StoreError::Other(error.to_string())
@@ -137,6 +150,88 @@ fn credential_type_to_str(credential_type: CredentialType) -> &'static str {
         CredentialType::Api => "API",
         CredentialType::SmtpIp => "SMTP-IP",
     }
+}
+
+fn domain_from_row(row: &PgRow) -> Domain {
+    let owner_id = row.get::<i64, _>("owner_id") as Id;
+    Domain {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        owner: match row.get::<String, _>("owner_type").as_str() {
+            "Organization" => DomainOwner::Organization(owner_id),
+            _ => DomainOwner::Server(owner_id),
+        },
+        name: row.get("name"),
+        verified: row.get("verified"),
+    }
+}
+
+fn webhook_from_row(row: &PgRow) -> Webhook {
+    Webhook {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        name: row.get("name"),
+        url: row.get("url"),
+        all_events: row.get("all_events"),
+        enabled: row.get("enabled"),
+        sign: row.get("sign"),
+    }
+}
+
+fn suppression_from_row(row: &PgRow) -> Suppression {
+    Suppression {
+        id: row.get::<i64, _>("id") as Id,
+        server_id: row.get::<i64, _>("server_id") as Id,
+        suppression_type: row.get("type"),
+        address: row.get("address"),
+        reason: row.get("reason"),
+    }
+}
+
+fn user_from_row(row: &PgRow) -> User {
+    User {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        email_address: row.get("email_address"),
+        first_name: row.get("first_name"),
+        last_name: row.get("last_name"),
+        admin: row.get("admin"),
+    }
+}
+
+fn ip_pool_from_row(row: &PgRow) -> IpPool {
+    IpPool {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        name: row.get("name"),
+        default: row.get("default"),
+    }
+}
+
+fn ip_address_from_row(row: &PgRow) -> IpAddress {
+    IpAddress {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        ip_pool_id: row.get::<i64, _>("ip_pool_id") as Id,
+        ipv4: row.get("ipv4"),
+        ipv6: row.get("ipv6"),
+        hostname: row.get("hostname"),
+        priority: row.get("priority"),
+    }
+}
+
+/// Establish the tenant context on a transaction (`SET LOCAL`), scoping all
+/// RLS-protected tables (messages, suppressions) to one mail server.
+pub(crate) async fn set_tenant_context(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    server_id: Id,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+        .bind(server_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 const ROUTE_WITH_SERVER: &str = r#"
@@ -456,6 +551,489 @@ impl AdminStore for PgStore {
             .map(|_| ())
             .map_err(Self::sqlx_error)
     }
+
+    async fn list_domains(&self, server_id: Id) -> Result<Vec<Domain>, StoreError> {
+        sqlx::query(
+            "SELECT * FROM domains WHERE owner_type = 'Server' AND owner_id = $1 ORDER BY id",
+        )
+        .bind(server_id as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.iter().map(domain_from_row).collect())
+        .map_err(Self::sqlx_error)
+    }
+
+    async fn domain_by_name(
+        &self,
+        server_id: Id,
+        name: &str,
+    ) -> Result<Option<Domain>, StoreError> {
+        sqlx::query(
+            "SELECT * FROM domains WHERE owner_type = 'Server' AND owner_id = $1 AND name = $2",
+        )
+        .bind(server_id as i64)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.as_ref().map(domain_from_row))
+        .map_err(Self::sqlx_error)
+    }
+
+    async fn create_server_domain(
+        &self,
+        server_id: Id,
+        name: &str,
+    ) -> Result<Domain, StoreError> {
+        self.create_domain(DomainOwner::Server(server_id), name, false)
+            .await
+    }
+
+    async fn set_domain_verified(&self, domain_id: Id, verified: bool) -> Result<(), StoreError> {
+        sqlx::query("UPDATE domains SET verified = $2 WHERE id = $1")
+            .bind(domain_id as i64)
+            .bind(verified)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn delete_domain(&self, domain_id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM domains WHERE id = $1")
+            .bind(domain_id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn list_credentials(&self, server_id: Id) -> Result<Vec<Credential>, StoreError> {
+        sqlx::query("SELECT * FROM credentials WHERE server_id = $1 ORDER BY id")
+            .bind(server_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(credential_from_row).collect())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn credential_by_id(
+        &self,
+        server_id: Id,
+        id: Id,
+    ) -> Result<Option<Credential>, StoreError> {
+        sqlx::query("SELECT * FROM credentials WHERE server_id = $1 AND id = $2")
+            .bind(server_id as i64)
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.as_ref().map(credential_from_row))
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn create_credential_record(
+        &self,
+        new: NewCredential,
+    ) -> Result<Credential, StoreError> {
+        let key = new.key.unwrap_or_else(token::generate_key);
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO credentials (uuid, server_id, type, name, key)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(new.server_id as i64)
+        .bind(credential_type_to_str(new.credential_type))
+        .bind(&new.name)
+        .bind(&key)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(Credential {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            server_id: new.server_id,
+            credential_type: new.credential_type,
+            name: new.name,
+            key,
+            hold: false,
+        })
+    }
+
+    async fn update_credential(&self, credential: Credential) -> Result<Credential, StoreError> {
+        sqlx::query("UPDATE credentials SET name = $2, hold = $3 WHERE id = $1")
+            .bind(credential.id as i64)
+            .bind(&credential.name)
+            .bind(credential.hold)
+            .execute(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(credential)
+    }
+
+    async fn delete_credential(&self, id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM credentials WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn list_routes(&self, server_id: Id) -> Result<Vec<Route>, StoreError> {
+        sqlx::query("SELECT * FROM routes WHERE server_id = $1 ORDER BY id")
+            .bind(server_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(route_from_row).collect())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn route_by_id(&self, server_id: Id, id: Id) -> Result<Option<Route>, StoreError> {
+        sqlx::query("SELECT * FROM routes WHERE server_id = $1 AND id = $2")
+            .bind(server_id as i64)
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.as_ref().map(route_from_row))
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn create_route_record(&self, new: NewRoute) -> Result<Route, StoreError> {
+        self.create_route(new.server_id, new.domain_id, &new.name, new.mode)
+            .await
+    }
+
+    async fn update_route(&self, route: Route) -> Result<Route, StoreError> {
+        sqlx::query("UPDATE routes SET name = $2, domain_id = $3, mode = $4 WHERE id = $1")
+            .bind(route.id as i64)
+            .bind(&route.name)
+            .bind(route.domain_id.map(|id| id as i64))
+            .bind(route_mode_to_str(route.mode))
+            .execute(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(route)
+    }
+
+    async fn delete_route(&self, id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM routes WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn list_webhooks(&self, server_id: Id) -> Result<Vec<Webhook>, StoreError> {
+        sqlx::query("SELECT * FROM webhooks WHERE server_id = $1 ORDER BY id")
+            .bind(server_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(webhook_from_row).collect())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn webhook_by_id(&self, server_id: Id, id: Id) -> Result<Option<Webhook>, StoreError> {
+        sqlx::query("SELECT * FROM webhooks WHERE server_id = $1 AND id = $2")
+            .bind(server_id as i64)
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.as_ref().map(webhook_from_row))
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn create_webhook(&self, new: NewWebhook) -> Result<Webhook, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO webhooks (uuid, server_id, name, url, all_events, sign)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(new.server_id as i64)
+        .bind(&new.name)
+        .bind(&new.url)
+        .bind(new.all_events)
+        .bind(new.sign)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(Webhook {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            server_id: new.server_id,
+            name: new.name,
+            url: new.url,
+            all_events: new.all_events,
+            enabled: true,
+            sign: new.sign,
+        })
+    }
+
+    async fn update_webhook(&self, webhook: Webhook) -> Result<Webhook, StoreError> {
+        sqlx::query(
+            "UPDATE webhooks SET name = $2, url = $3, all_events = $4, enabled = $5, sign = $6
+             WHERE id = $1",
+        )
+        .bind(webhook.id as i64)
+        .bind(&webhook.name)
+        .bind(&webhook.url)
+        .bind(webhook.all_events)
+        .bind(webhook.enabled)
+        .bind(webhook.sign)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(webhook)
+    }
+
+    async fn delete_webhook(&self, id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM webhooks WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn list_suppressions(&self, server_id: Id) -> Result<Vec<Suppression>, StoreError> {
+        // Tenant-scoped table: enter the tenant context; the SELECT itself
+        // carries no WHERE server_id — RLS scopes it.
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let rows = sqlx::query("SELECT * FROM suppressions ORDER BY id")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(suppression_from_row).collect())
+    }
+
+    async fn create_suppression(&self, new: NewSuppression) -> Result<Suppression, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, new.server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let row = sqlx::query(
+            "INSERT INTO suppressions (server_id, type, address, reason)
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(new.server_id as i64)
+        .bind(&new.suppression_type)
+        .bind(&new.address)
+        .bind(&new.reason)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(Suppression {
+            id: row.get::<i64, _>("id") as Id,
+            server_id: new.server_id,
+            suppression_type: new.suppression_type,
+            address: new.address,
+            reason: new.reason,
+        })
+    }
+
+    async fn delete_suppression(
+        &self,
+        server_id: Id,
+        address: &str,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let result = sqlx::query("DELETE FROM suppressions WHERE address = $1")
+            .bind(address)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn list_users(&self) -> Result<Vec<User>, StoreError> {
+        sqlx::query("SELECT * FROM users ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(user_from_row).collect())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn user_by_id(&self, id: Id) -> Result<Option<User>, StoreError> {
+        sqlx::query("SELECT * FROM users WHERE id = $1")
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.as_ref().map(user_from_row))
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn create_user(&self, new: NewUser) -> Result<User, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO users (uuid, email_address, first_name, last_name, admin)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(&new.email_address)
+        .bind(&new.first_name)
+        .bind(&new.last_name)
+        .bind(new.admin)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(User {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            email_address: new.email_address,
+            first_name: new.first_name,
+            last_name: new.last_name,
+            admin: new.admin,
+        })
+    }
+
+    async fn update_user(&self, user: User) -> Result<User, StoreError> {
+        sqlx::query(
+            "UPDATE users SET email_address = $2, first_name = $3, last_name = $4, admin = $5
+             WHERE id = $1",
+        )
+        .bind(user.id as i64)
+        .bind(&user.email_address)
+        .bind(&user.first_name)
+        .bind(&user.last_name)
+        .bind(user.admin)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(user)
+    }
+
+    async fn delete_user(&self, id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn list_ip_pools(&self) -> Result<Vec<IpPool>, StoreError> {
+        sqlx::query("SELECT * FROM ip_pools ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(ip_pool_from_row).collect())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn ip_pool_by_id(&self, id: Id) -> Result<Option<IpPool>, StoreError> {
+        sqlx::query("SELECT * FROM ip_pools WHERE id = $1")
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.as_ref().map(ip_pool_from_row))
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn create_ip_pool(&self, name: &str, default: bool) -> Result<IpPool, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO ip_pools (uuid, name, \"default\") VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(name)
+        .bind(default)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(IpPool {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            name: name.into(),
+            default,
+        })
+    }
+
+    async fn update_ip_pool(&self, pool: IpPool) -> Result<IpPool, StoreError> {
+        sqlx::query("UPDATE ip_pools SET name = $2, \"default\" = $3 WHERE id = $1")
+            .bind(pool.id as i64)
+            .bind(&pool.name)
+            .bind(pool.default)
+            .execute(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(pool)
+    }
+
+    async fn delete_ip_pool(&self, id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM ip_pools WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn list_ip_addresses(&self, ip_pool_id: Id) -> Result<Vec<IpAddress>, StoreError> {
+        sqlx::query("SELECT * FROM ip_addresses WHERE ip_pool_id = $1 ORDER BY id")
+            .bind(ip_pool_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(ip_address_from_row).collect())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn ip_address_by_id(
+        &self,
+        ip_pool_id: Id,
+        id: Id,
+    ) -> Result<Option<IpAddress>, StoreError> {
+        sqlx::query("SELECT * FROM ip_addresses WHERE ip_pool_id = $1 AND id = $2")
+            .bind(ip_pool_id as i64)
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.as_ref().map(ip_address_from_row))
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn create_ip_address(&self, new: NewIpAddress) -> Result<IpAddress, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO ip_addresses (uuid, ip_pool_id, ipv4, ipv6, hostname, priority)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(new.ip_pool_id as i64)
+        .bind(&new.ipv4)
+        .bind(&new.ipv6)
+        .bind(&new.hostname)
+        .bind(new.priority)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(IpAddress {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            ip_pool_id: new.ip_pool_id,
+            ipv4: new.ipv4,
+            ipv6: new.ipv6,
+            hostname: new.hostname,
+            priority: new.priority,
+        })
+    }
+
+    async fn delete_ip_address(&self, id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM ip_addresses WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
 }
 
 // ----------------------------------------------------- Store (SMTP, sync)
@@ -690,21 +1268,9 @@ impl PgMessageSink {
         Self { store }
     }
 
-    /// Establish the tenant context on a transaction (`SET LOCAL`).
-    async fn set_tenant(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        server_id: Id,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
-            .bind(server_id.to_string())
-            .execute(&mut **tx)
-            .await?;
-        Ok(())
-    }
-
     pub async fn insert_message(&self, message: &QueuedMessage) -> Result<i64, sqlx::Error> {
         let mut tx = self.store.pool.begin().await?;
-        Self::set_tenant(&mut tx, message.server_id).await?;
+        set_tenant_context(&mut tx, message.server_id).await?;
         let row = sqlx::query(
             "INSERT INTO messages
                  (server_id, token, scope, rcpt_to, mail_from, bounce,
@@ -739,7 +1305,7 @@ impl PgMessageSink {
         server_id: Id,
     ) -> Result<Vec<StoredMessage>, sqlx::Error> {
         let mut tx = self.store.pool.begin().await?;
-        Self::set_tenant(&mut tx, server_id).await?;
+        set_tenant_context(&mut tx, server_id).await?;
         let rows = sqlx::query("SELECT * FROM messages ORDER BY id")
             .fetch_all(&mut *tx)
             .await?;

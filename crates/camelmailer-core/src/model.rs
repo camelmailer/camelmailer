@@ -113,3 +113,56 @@ pub struct ResolvedRoute {
     /// The name of the route's domain (`route.domain.name` in Ruby)
     pub domain_name: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct User {
+    pub id: Id,
+    pub uuid: String,
+    pub email_address: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub admin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IpPool {
+    pub id: Id,
+    pub uuid: String,
+    pub name: String,
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IpAddress {
+    pub id: Id,
+    pub uuid: String,
+    pub ip_pool_id: Id,
+    pub ipv4: String,
+    pub ipv6: Option<String>,
+    pub hostname: String,
+    pub priority: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Webhook {
+    pub id: Id,
+    pub uuid: String,
+    pub server_id: Id,
+    pub name: String,
+    pub url: String,
+    pub all_events: bool,
+    pub enabled: bool,
+    pub sign: bool,
+}
+
+/// A suppression-list entry. Tenant-scoped: lives under RLS in Postgres
+/// (in the Ruby app this was a table in the per-server message database).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Suppression {
+    pub id: Id,
+    pub server_id: Id,
+    #[serde(rename = "type")]
+    pub suppression_type: String,
+    pub address: String,
+    pub reason: Option<String>,
+}

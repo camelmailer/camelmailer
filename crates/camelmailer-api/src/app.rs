@@ -26,6 +26,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 
+use crate::resources;
+
 pub struct ApiState {
     /// Storage — in-memory for tests, PostgreSQL in production.
     pub store: Arc<dyn AdminStore>,
@@ -58,18 +60,18 @@ impl ApiState {
 
 /// Per-request timer, injected before auth so even 401s carry `time`.
 #[derive(Clone, Copy)]
-struct RequestStart(Instant);
+pub(crate) struct RequestStart(pub(crate) Instant);
 
-fn elapsed(request_start: Option<&RequestStart>) -> f64 {
+pub(crate) fn elapsed(request_start: Option<&RequestStart>) -> f64 {
     let seconds = request_start
         .map(|start| start.0.elapsed().as_secs_f64())
         .unwrap_or(0.0);
     (seconds * 1000.0).round() / 1000.0
 }
 
-struct ApiResponse {
-    status: StatusCode,
-    body: Value,
+pub(crate) struct ApiResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) body: Value,
 }
 
 impl IntoResponse for ApiResponse {
@@ -78,7 +80,7 @@ impl IntoResponse for ApiResponse {
     }
 }
 
-fn render_success(start: Option<&RequestStart>, status: StatusCode, data: Value) -> ApiResponse {
+pub(crate) fn render_success(start: Option<&RequestStart>, status: StatusCode, data: Value) -> ApiResponse {
     ApiResponse {
         status,
         body: json!({
@@ -89,7 +91,7 @@ fn render_success(start: Option<&RequestStart>, status: StatusCode, data: Value)
     }
 }
 
-fn render_error(
+pub(crate) fn render_error(
     start: Option<&RequestStart>,
     status: StatusCode,
     code: &str,
@@ -105,11 +107,11 @@ fn render_error(
     }
 }
 
-fn render_deleted(start: Option<&RequestStart>) -> ApiResponse {
+pub(crate) fn render_deleted(start: Option<&RequestStart>) -> ApiResponse {
     render_success(start, StatusCode::OK, json!({ "deleted": true }))
 }
 
-fn render_not_found(start: Option<&RequestStart>) -> ApiResponse {
+pub(crate) fn render_not_found(start: Option<&RequestStart>) -> ApiResponse {
     render_error(
         start,
         StatusCode::NOT_FOUND,
@@ -118,7 +120,7 @@ fn render_not_found(start: Option<&RequestStart>) -> ApiResponse {
     )
 }
 
-fn render_validation_error(start: Option<&RequestStart>, message: &str) -> ApiResponse {
+pub(crate) fn render_validation_error(start: Option<&RequestStart>, message: &str) -> ApiResponse {
     render_error(
         start,
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -127,11 +129,11 @@ fn render_validation_error(start: Option<&RequestStart>, message: &str) -> ApiRe
     )
 }
 
-fn render_parameter_missing(start: Option<&RequestStart>, message: &str) -> ApiResponse {
+pub(crate) fn render_parameter_missing(start: Option<&RequestStart>, message: &str) -> ApiResponse {
     render_error(start, StatusCode::BAD_REQUEST, "ParameterMissing", message)
 }
 
-fn render_store_error(start: Option<&RequestStart>, error: StoreError) -> ApiResponse {
+pub(crate) fn render_store_error(start: Option<&RequestStart>, error: StoreError) -> ApiResponse {
     match error {
         StoreError::Conflict(message) => render_validation_error(start, &message),
         StoreError::Other(message) => {
@@ -188,17 +190,17 @@ async fn auth_middleware(
 // ------------------------------------------------------------- pagination
 
 #[derive(Debug, Deserialize, Default)]
-struct PaginationParams {
-    page: Option<u64>,
-    per_page: Option<u64>,
+pub(crate) struct PaginationParams {
+    pub(crate) page: Option<u64>,
+    pub(crate) per_page: Option<u64>,
 }
 
-struct Paginated<T> {
-    items: Vec<T>,
-    pagination: Value,
+pub(crate) struct Paginated<T> {
+    pub(crate) items: Vec<T>,
+    pub(crate) pagination: Value,
 }
 
-fn paginate<T: Clone>(collection: &[T], params: &PaginationParams) -> Paginated<T> {
+pub(crate) fn paginate<T: Clone>(collection: &[T], params: &PaginationParams) -> Paginated<T> {
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(25).clamp(1, 100);
     let total = collection.len() as u64;
@@ -301,7 +303,7 @@ async fn organizations_create(
     }
 }
 
-async fn find_organization(
+pub(crate) async fn find_organization(
     state: &ApiState,
     permalink: &str,
 ) -> Result<Option<Organization>, StoreError> {
@@ -422,7 +424,7 @@ async fn servers_create(
     }
 }
 
-async fn find_server(
+pub(crate) async fn find_server(
     state: &ApiState,
     org_permalink: &str,
     permalink: &str,
@@ -521,7 +523,7 @@ async fn servers_unsuspend(
     }
 }
 
-fn permalink_from(name: &str) -> String {
+pub(crate) fn permalink_from(name: &str) -> String {
     name.to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -558,6 +560,85 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/unsuspend",
             axum::routing::post(servers_unsuspend),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/domains",
+            get(resources::domains_index).post(resources::domains_create),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/domains/{name}",
+            get(resources::domains_show).delete(resources::domains_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/domains/{name}/verify",
+            axum::routing::post(resources::domains_verify),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/credentials",
+            get(resources::credentials_index).post(resources::credentials_create),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/credentials/{id}",
+            get(resources::credentials_show)
+                .patch(resources::credentials_update)
+                .delete(resources::credentials_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/routes",
+            get(resources::routes_index).post(resources::routes_create),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/routes/{id}",
+            get(resources::routes_show)
+                .patch(resources::routes_update)
+                .delete(resources::routes_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/webhooks",
+            get(resources::webhooks_index).post(resources::webhooks_create),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/webhooks/{id}",
+            get(resources::webhooks_show).delete(resources::webhooks_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/webhooks/{id}/enable",
+            axum::routing::post(resources::webhooks_enable),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/webhooks/{id}/disable",
+            axum::routing::post(resources::webhooks_disable),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/suppressions",
+            get(resources::suppressions_index).post(resources::suppressions_create),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/suppressions/{address}",
+            axum::routing::delete(resources::suppressions_destroy),
+        )
+        .route("/users", get(resources::users_index).post(resources::users_create))
+        .route(
+            "/users/{id}",
+            get(resources::users_show)
+                .patch(resources::users_update)
+                .delete(resources::users_destroy),
+        )
+        .route(
+            "/ip_pools",
+            get(resources::ip_pools_index).post(resources::ip_pools_create),
+        )
+        .route(
+            "/ip_pools/{id}",
+            get(resources::ip_pools_show).delete(resources::ip_pools_destroy),
+        )
+        .route(
+            "/ip_pools/{pool_id}/ip_addresses",
+            get(resources::ip_addresses_index).post(resources::ip_addresses_create),
+        )
+        .route(
+            "/ip_pools/{pool_id}/ip_addresses/{id}",
+            get(resources::ip_addresses_show).delete(resources::ip_addresses_destroy),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

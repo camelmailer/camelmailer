@@ -395,3 +395,437 @@ async fn servers_in_a_missing_organization_render_not_found() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ------------------------------------------------- server-scoped resources
+
+async fn build_app_with_server() -> Router {
+    let (app, _) = build_app().await;
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Acme", "permalink": "acme" })),
+    )
+    .await;
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations/acme/servers",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Mail", "permalink": "mail" })),
+    )
+    .await;
+    app
+}
+
+const BASE: &str = "/api/v2/admin/organizations/acme/servers/mail";
+
+#[tokio::test]
+async fn domains_crud_and_verify() {
+    let app = build_app_with_server().await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "acme.example" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["domain"]["name"], "acme.example");
+    assert_eq!(body["data"]["domain"]["verified"], false);
+
+    // duplicate name conflicts
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "acme.example" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains/acme.example/verify"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["domain"]["verified"], true);
+
+    let (_, body) = request(&app, "GET", &format!("{BASE}/domains"), Some(GLOBAL_KEY), None).await;
+    assert_eq!(body["data"]["domains"].as_array().unwrap().len(), 1);
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/domains/acme.example"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/domains/acme.example"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn credentials_crud_generates_keys_and_holds() {
+    let app = build_app_with_server().await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/credentials"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "App", "type": "SMTP" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let credential = &body["data"]["credential"];
+    assert_eq!(credential["type"], "SMTP");
+    assert!(credential["key"].as_str().unwrap().len() >= 24);
+    let id = credential["id"].as_u64().unwrap();
+
+    // SMTP-IP requires an explicit CIDR key
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/credentials"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Relay", "type": "SMTP-IP" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &format!("{BASE}/credentials/{id}"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "hold": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["credential"]["hold"], true);
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/credentials/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn routes_crud_resolves_domains() {
+    let app = build_app_with_server().await;
+    request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "acme.example" })),
+    )
+    .await;
+
+    // unknown domain is a validation error
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/routes"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "info", "domain": "nope.example" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/routes"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "info", "domain": "acme.example", "mode": "Accept" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let route = &body["data"]["route"];
+    assert_eq!(route["mode"], "Accept");
+    assert!(route["token"].as_str().unwrap().len() >= 8);
+    let id = route["id"].as_u64().unwrap();
+
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &format!("{BASE}/routes/{id}"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "mode": "Reject" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["route"]["mode"], "Reject");
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/routes/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn webhooks_crud_enable_disable() {
+    let app = build_app_with_server().await;
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/webhooks"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Hook", "url": "not-a-url" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/webhooks"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Hook", "url": "https://hooks.example/cb" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let webhook = &body["data"]["webhook"];
+    assert_eq!(webhook["enabled"], true);
+    let id = webhook["id"].as_u64().unwrap();
+
+    let (_, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/webhooks/{id}/disable"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(body["data"]["webhook"]["enabled"], false);
+
+    let (_, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/webhooks/{id}/enable"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(body["data"]["webhook"]["enabled"], true);
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/webhooks/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn suppressions_create_list_delete_and_conflict() {
+    let app = build_app_with_server().await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/suppressions"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "address": "bounce@example.net", "reason": "hard bounce" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["suppression"]["type"], "recipient");
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/suppressions"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "address": "bounce@example.net" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (_, body) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/suppressions"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(body["data"]["suppressions"].as_array().unwrap().len(), 1);
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/suppressions/bounce@example.net"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/suppressions/bounce@example.net"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn users_crud_with_unique_email() {
+    let (app, _) = build_app().await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/users",
+        Some(GLOBAL_KEY),
+        Some(json!({ "email_address": "admin@example.com", "first_name": "Ada", "last_name": "Admin", "admin": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = body["data"]["user"]["id"].as_u64().unwrap();
+    assert_eq!(body["data"]["user"]["admin"], true);
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/users",
+        Some(GLOBAL_KEY),
+        Some(json!({ "email_address": "admin@example.com" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/users",
+        Some(GLOBAL_KEY),
+        Some(json!({ "email_address": "no-at-sign" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (_, body) = request(
+        &app,
+        "PATCH",
+        &format!("/api/v2/admin/users/{id}"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "admin": false })),
+    )
+    .await;
+    assert_eq!(body["data"]["user"]["admin"], false);
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("/api/v2/admin/users/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn ip_pools_and_nested_addresses() {
+    let (app, _) = build_app().await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/ip_pools",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Pool 1", "default": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let pool_id = body["data"]["ip_pool"]["id"].as_u64().unwrap();
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("/api/v2/admin/ip_pools/{pool_id}/ip_addresses"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "ipv4": "not-an-ip", "hostname": "mx.example" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("/api/v2/admin/ip_pools/{pool_id}/ip_addresses"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "ipv4": "192.0.2.10", "hostname": "mx.example" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let address_id = body["data"]["ip_address"]["id"].as_u64().unwrap();
+    assert_eq!(body["data"]["ip_address"]["priority"], 100);
+
+    let (_, body) = request(
+        &app,
+        "GET",
+        &format!("/api/v2/admin/ip_pools/{pool_id}/ip_addresses"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(body["data"]["ip_addresses"].as_array().unwrap().len(), 1);
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("/api/v2/admin/ip_pools/{pool_id}/ip_addresses/{address_id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("/api/v2/admin/ip_pools/{pool_id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}

@@ -100,20 +100,25 @@ pub fn match_ip_credential(credentials: Vec<Credential>, ip: IpAddr) -> Option<C
 }
 
 #[derive(Default)]
-struct MemoryStoreInner {
-    organizations: HashMap<Id, Organization>,
-    servers: HashMap<Id, Server>,
-    domains: HashMap<Id, Domain>,
-    routes: HashMap<Id, Route>,
-    credentials: HashMap<Id, Credential>,
-    credential_uses: HashMap<Id, u64>,
-    admin_api_keys: std::collections::HashSet<String>,
+pub(crate) struct MemoryStoreInner {
+    pub(crate) organizations: HashMap<Id, Organization>,
+    pub(crate) servers: HashMap<Id, Server>,
+    pub(crate) domains: HashMap<Id, Domain>,
+    pub(crate) routes: HashMap<Id, Route>,
+    pub(crate) credentials: HashMap<Id, Credential>,
+    pub(crate) credential_uses: HashMap<Id, u64>,
+    pub(crate) admin_api_keys: std::collections::HashSet<String>,
+    pub(crate) users: HashMap<Id, User>,
+    pub(crate) ip_pools: HashMap<Id, IpPool>,
+    pub(crate) ip_addresses: HashMap<Id, IpAddress>,
+    pub(crate) webhooks: HashMap<Id, Webhook>,
+    pub(crate) suppressions: HashMap<Id, Suppression>,
 }
 
 /// A thread-safe in-memory [`Store`].
 #[derive(Default)]
 pub struct MemoryStore {
-    inner: RwLock<MemoryStoreInner>,
+    pub(crate) inner: RwLock<MemoryStoreInner>,
     next_id: AtomicU64,
 }
 

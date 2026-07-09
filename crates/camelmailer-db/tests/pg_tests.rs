@@ -517,3 +517,83 @@ async fn a_full_smtp_session_stores_the_message_in_postgres() {
     assert_eq!(messages[0].credential_id, Some(credential.id));
     assert!(String::from_utf8_lossy(&messages[0].raw_message).contains("Subject: E2E"));
 }
+
+// ------------------------------------------------- suppressions (RLS)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suppressions_are_tenant_isolated_by_rls() {
+    use camelmailer_core::NewSuppression;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other_server = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+
+    f.store
+        .create_suppression(NewSuppression {
+            server_id: f.server.id,
+            suppression_type: "recipient".into(),
+            address: "a@tenant-a.example".into(),
+            reason: None,
+        })
+        .await
+        .unwrap();
+    f.store
+        .create_suppression(NewSuppression {
+            server_id: other_server.id,
+            suppression_type: "recipient".into(),
+            address: "b@tenant-b.example".into(),
+            reason: None,
+        })
+        .await
+        .unwrap();
+
+    // duplicate within the tenant conflicts
+    let error = f
+        .store
+        .create_suppression(NewSuppression {
+            server_id: f.server.id,
+            suppression_type: "recipient".into(),
+            address: "a@tenant-a.example".into(),
+            reason: None,
+        })
+        .await
+        .expect_err("duplicate suppression must conflict");
+    assert!(matches!(error, camelmailer_core::StoreError::Conflict(_)));
+
+    // each tenant sees only its own entries
+    let tenant_a = f.store.list_suppressions(f.server.id).await.unwrap();
+    assert_eq!(tenant_a.len(), 1);
+    assert_eq!(tenant_a[0].address, "a@tenant-a.example");
+    let tenant_b = f.store.list_suppressions(other_server.id).await.unwrap();
+    assert_eq!(tenant_b.len(), 1);
+
+    // without a tenant context the table appears empty (FORCE RLS)
+    let count: i64 = sqlx::query("SELECT count(*) AS c FROM suppressions")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("c");
+    assert_eq!(count, 0);
+
+    // deleting from tenant A cannot touch tenant B's entry
+    assert!(!f
+        .store
+        .delete_suppression(f.server.id, "b@tenant-b.example")
+        .await
+        .unwrap());
+    assert!(f
+        .store
+        .delete_suppression(f.server.id, "a@tenant-a.example")
+        .await
+        .unwrap());
+}

@@ -12,7 +12,10 @@ pub mod store;
 pub mod testing;
 pub mod token;
 
-pub use admin_store::{AdminStore, NewOrganization, NewServer, StoreError};
+pub use admin_store::{
+    AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewServer,
+    NewSuppression, NewUser, NewWebhook, StoreError,
+};
 pub use message::{MemorySink, MessageScope, MessageSink, QueuedMessage};
 pub use model::*;
 pub use store::{MemoryStore, Store};
