@@ -121,6 +121,7 @@ fn route_from_row(row: &PgRow) -> Route {
         name: row.get("name"),
         token: row.get("token"),
         mode: route_mode_from_str(&row.get::<String, _>("mode")),
+        endpoint_url: row.get("endpoint_url"),
     }
 }
 
@@ -235,7 +236,7 @@ pub(crate) async fn set_tenant_context(
 }
 
 const ROUTE_WITH_SERVER: &str = r#"
-    SELECT r.id, r.uuid, r.server_id, r.domain_id, r.name, r.token, r.mode,
+    SELECT r.id, r.uuid, r.server_id, r.domain_id, r.name, r.token, r.mode, r.endpoint_url,
            COALESCE(d.name, '') AS domain_name,
            s.id AS s_id, s.uuid AS s_uuid, s.organization_id, s.name AS s_name,
            s.permalink, s.token AS s_token, s.mode AS s_mode, s.suspended,
@@ -329,11 +330,23 @@ impl PgStore {
         name: &str,
         mode: RouteMode,
     ) -> Result<Route, StoreError> {
+        self.create_route_with_endpoint(server_id, domain_id, name, mode, None)
+            .await
+    }
+
+    pub async fn create_route_with_endpoint(
+        &self,
+        server_id: Id,
+        domain_id: Option<Id>,
+        name: &str,
+        mode: RouteMode,
+        endpoint_url: Option<String>,
+    ) -> Result<Route, StoreError> {
         let uuid = token::generate_uuid();
         let route_token = token::generate_token(8);
         let row = sqlx::query(
-            "INSERT INTO routes (uuid, server_id, domain_id, name, token, mode)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            "INSERT INTO routes (uuid, server_id, domain_id, name, token, mode, endpoint_url)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
         )
         .bind(&uuid)
         .bind(server_id as i64)
@@ -341,6 +354,7 @@ impl PgStore {
         .bind(name)
         .bind(&route_token)
         .bind(route_mode_to_str(mode))
+        .bind(&endpoint_url)
         .fetch_one(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -352,6 +366,7 @@ impl PgStore {
             name: name.into(),
             token: route_token,
             mode,
+            endpoint_url,
         })
     }
 
@@ -699,16 +714,26 @@ impl AdminStore for PgStore {
     }
 
     async fn create_route_record(&self, new: NewRoute) -> Result<Route, StoreError> {
-        self.create_route(new.server_id, new.domain_id, &new.name, new.mode)
-            .await
+        self.create_route_with_endpoint(
+            new.server_id,
+            new.domain_id,
+            &new.name,
+            new.mode,
+            new.endpoint_url,
+        )
+        .await
     }
 
     async fn update_route(&self, route: Route) -> Result<Route, StoreError> {
-        sqlx::query("UPDATE routes SET name = $2, domain_id = $3, mode = $4 WHERE id = $1")
+        sqlx::query(
+            "UPDATE routes SET name = $2, domain_id = $3, mode = $4, endpoint_url = $5
+             WHERE id = $1",
+        )
             .bind(route.id as i64)
             .bind(&route.name)
             .bind(route.domain_id.map(|id| id as i64))
             .bind(route_mode_to_str(route.mode))
+            .bind(&route.endpoint_url)
             .execute(&self.pool)
             .await
             .map_err(Self::sqlx_error)?;
@@ -1294,8 +1319,58 @@ impl PgMessageSink {
         .bind(&message.raw_message)
         .fetch_one(&mut *tx)
         .await?;
+        let message_id: i64 = row.get("id");
+
+        // Queue for delivery in the same transaction (the queue table is
+        // cross-tenant and not RLS-protected — see migrations/0004_queue.sql).
+        let destination_domain = message
+            .rcpt_to
+            .rsplit_once('@')
+            .map(|(_, domain)| domain)
+            .unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO queued_messages (message_id, server_id, domain) VALUES ($1, $2, $3)",
+        )
+        .bind(message_id)
+        .bind(message.server_id as i64)
+        .bind(destination_domain)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
-        Ok(row.get("id"))
+        Ok(message_id)
+    }
+
+    /// Load one message within its tenant's RLS context.
+    pub async fn message_by_id(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<StoredMessage>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let row = sqlx::query("SELECT * FROM messages WHERE id = $1")
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row.as_ref().map(stored_message_from_row))
+    }
+
+    /// Is this address on the tenant's suppression list?
+    pub async fn address_suppressed(
+        &self,
+        server_id: Id,
+        address: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let row = sqlx::query("SELECT count(*) AS c FROM suppressions WHERE address = $1")
+            .bind(address)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row.get::<i64, _>("c") > 0)
     }
 
     /// List a tenant's messages. The query carries no `WHERE server_id`

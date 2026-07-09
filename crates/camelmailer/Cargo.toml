@@ -15,6 +15,7 @@ camelmailer-config = { workspace = true }
 camelmailer-core = { workspace = true }
 camelmailer-db = { workspace = true }
 camelmailer-smtp = { workspace = true }
+camelmailer-worker = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

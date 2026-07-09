@@ -13,8 +13,10 @@
 //! table owner subject to the policy.
 
 mod pg_store;
+mod queue;
 
 pub use pg_store::{PgMessageSink, PgStore, StoredMessage};
+pub use queue::{PgQueue, QueuedMessageRow};
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;

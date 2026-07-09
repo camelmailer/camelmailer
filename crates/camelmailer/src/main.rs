@@ -5,6 +5,7 @@ use camelmailer_api::{build_router, ApiState};
 use camelmailer_core::{AdminStore, MemorySink, MemoryStore, MessageSink, Store};
 use camelmailer_db::{PgMessageSink, PgStore};
 use camelmailer_smtp::SmtpServer;
+use camelmailer_worker::Worker;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("web-server") => run_async(web_server()),
         Some("smtp-server") => run_async(smtp_server()),
+        Some("worker") => run_async(worker()),
         Some("initialize") | Some("update") | Some("upgrade") => run_async(initialize()),
         Some("make-admin-api-key") => {
             let name = args.get(2).cloned().unwrap_or_else(|| "cli".to_string());
@@ -122,6 +124,20 @@ async fn web_server() -> std::io::Result<()> {
     axum::serve(listener, router).await
 }
 
+async fn worker() -> std::io::Result<()> {
+    let config = load_config();
+    if !postgres_enabled(&config) {
+        return Err(std::io::Error::other(
+            "the worker requires PostgreSQL (postgres.enabled: true or DATABASE_URL)",
+        ));
+    }
+    let store = connect_pg(&config).await?;
+    Worker::new(&config, store)
+        .run()
+        .await
+        .map_err(std::io::Error::other)
+}
+
 async fn smtp_server() -> std::io::Result<()> {
     let config = load_config();
     let (store, sink): (Arc<dyn Store>, Arc<dyn MessageSink>) = if postgres_enabled(&config) {
@@ -144,6 +160,7 @@ fn print_usage() {
     println!();
     println!(" * web-server - run the web server (Admin API)");
     println!(" * smtp-server - run the SMTP server");
+    println!(" * worker - run the delivery worker");
     println!();
     println!("Setup/upgrade tools:");
     println!();

@@ -348,6 +348,7 @@ fn route_json(route: &Route) -> Value {
         "name": route.name,
         "token": route.token,
         "domain_id": route.domain_id,
+        "endpoint_url": route.endpoint_url,
         "mode": match route.mode {
             RouteMode::Endpoint => "Endpoint",
             RouteMode::Accept => "Accept",
@@ -396,6 +397,7 @@ pub(crate) struct CreateRoute {
     name: Option<String>,
     domain: Option<String>,
     mode: Option<String>,
+    endpoint_url: Option<String>,
 }
 
 pub(crate) async fn routes_create(
@@ -437,6 +439,7 @@ pub(crate) async fn routes_create(
                 domain_id,
                 name,
                 mode,
+                endpoint_url: body.endpoint_url,
             })
             .await,
         |route| created(&start, json!({ "route": route_json(&route) })),

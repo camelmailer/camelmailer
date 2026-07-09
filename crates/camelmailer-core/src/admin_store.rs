@@ -43,6 +43,7 @@ pub struct NewRoute {
     pub domain_id: Option<Id>,
     pub name: String,
     pub mode: RouteMode,
+    pub endpoint_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -418,6 +419,7 @@ impl AdminStore for crate::store::MemoryStore {
             name: new.name,
             token: crate::token::generate_token(8),
             mode: new.mode,
+            endpoint_url: new.endpoint_url,
         }))
     }
 

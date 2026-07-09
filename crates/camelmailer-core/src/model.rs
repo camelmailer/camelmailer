@@ -70,6 +70,9 @@ pub struct Route {
     pub name: String,
     pub token: String,
     pub mode: RouteMode,
+    /// HTTP delivery target for incoming mail (simplification of Postal's
+    /// polymorphic endpoints).
+    pub endpoint_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

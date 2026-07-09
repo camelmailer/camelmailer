@@ -121,6 +121,25 @@ impl Fixtures {
             name: name.into(),
             token: token::generate_token(8),
             mode,
+            endpoint_url: None,
+        })
+    }
+
+    pub fn route_with_endpoint(
+        &self,
+        name: &str,
+        domain_id: Option<Id>,
+        endpoint_url: &str,
+    ) -> Route {
+        self.store.insert_route(Route {
+            id: self.store.next_id(),
+            uuid: token::generate_uuid(),
+            server_id: self.server.id,
+            domain_id,
+            name: name.into(),
+            token: token::generate_token(8),
+            mode: RouteMode::Endpoint,
+            endpoint_url: Some(endpoint_url.into()),
         })
     }
 }

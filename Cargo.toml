@@ -6,6 +6,7 @@ members = [
     "crates/camelmailer-smtp",
     "crates/camelmailer-api",
     "crates/camelmailer-db",
+    "crates/camelmailer-worker",
     "crates/camelmailer",
 ]
 
@@ -21,8 +22,11 @@ camelmailer-core = { path = "crates/camelmailer-core" }
 camelmailer-smtp = { path = "crates/camelmailer-smtp" }
 camelmailer-api = { path = "crates/camelmailer-api" }
 camelmailer-db = { path = "crates/camelmailer-db" }
+camelmailer-worker = { path = "crates/camelmailer-worker" }
 
 async-trait = "0.1"
+hickory-resolver = "0.24"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros", "chrono"] }
 
 serde = { version = "1", features = ["derive"] }
