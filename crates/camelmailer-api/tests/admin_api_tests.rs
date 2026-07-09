@@ -14,10 +14,14 @@ use tower::ServiceExt;
 const GLOBAL_KEY: &str = "global-admin-key";
 const DB_KEY: &str = "db-backed-key";
 
-fn build_app() -> (Router, Arc<ApiState>) {
+async fn build_app() -> (Router, Arc<ApiState>) {
     let store = Arc::new(MemoryStore::new());
     let state = ApiState::new(store, Some(GLOBAL_KEY.to_string()));
-    state.add_admin_api_key(DB_KEY);
+    state
+        .store
+        .create_admin_api_key("test", DB_KEY)
+        .await
+        .unwrap();
     (build_router(state.clone()), state)
 }
 
@@ -54,7 +58,7 @@ async fn request(
 
 #[tokio::test]
 async fn requests_without_a_key_are_unauthorized() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     let (status, body) = request(&app, "GET", "/api/v2/admin/organizations", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["status"], "error");
@@ -65,7 +69,7 @@ async fn requests_without_a_key_are_unauthorized() {
 
 #[tokio::test]
 async fn requests_with_an_invalid_key_are_unauthorized() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     let (status, body) = request(
         &app,
         "GET",
@@ -80,7 +84,7 @@ async fn requests_with_an_invalid_key_are_unauthorized() {
 
 #[tokio::test]
 async fn the_global_config_key_authenticates() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     let (status, body) = request(
         &app,
         "GET",
@@ -95,7 +99,7 @@ async fn the_global_config_key_authenticates() {
 
 #[tokio::test]
 async fn database_backed_keys_authenticate() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     let (status, body) = request(
         &app,
         "GET",
@@ -112,7 +116,7 @@ async fn database_backed_keys_authenticate() {
 
 #[tokio::test]
 async fn success_responses_carry_the_standard_envelope() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     let (_, body) = request(
         &app,
         "GET",
@@ -130,7 +134,7 @@ async fn success_responses_carry_the_standard_envelope() {
 
 #[tokio::test]
 async fn organizations_can_be_created_shown_listed_and_deleted() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
 
     let (status, body) = request(
         &app,
@@ -192,7 +196,7 @@ async fn organizations_can_be_created_shown_listed_and_deleted() {
 
 #[tokio::test]
 async fn creating_an_organization_without_a_name_is_a_parameter_error() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     let (status, body) = request(
         &app,
         "POST",
@@ -207,7 +211,7 @@ async fn creating_an_organization_without_a_name_is_a_parameter_error() {
 
 #[tokio::test]
 async fn duplicate_permalinks_are_a_validation_error() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     let payload = json!({ "name": "Test Org", "permalink": "test-org" });
     request(
         &app,
@@ -231,7 +235,7 @@ async fn duplicate_permalinks_are_a_validation_error() {
 
 #[tokio::test]
 async fn missing_resources_render_not_found() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     let (status, body) = request(
         &app,
         "GET",
@@ -249,7 +253,7 @@ async fn missing_resources_render_not_found() {
 
 #[tokio::test]
 async fn list_endpoints_paginate_and_cap_per_page_at_100() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     for index in 0..30 {
         request(
             &app,
@@ -300,7 +304,7 @@ async fn list_endpoints_paginate_and_cap_per_page_at_100() {
 
 #[tokio::test]
 async fn servers_are_nested_under_organizations() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     request(
         &app,
         "POST",
@@ -380,7 +384,7 @@ async fn servers_are_nested_under_organizations() {
 
 #[tokio::test]
 async fn servers_in_a_missing_organization_render_not_found() {
-    let (app, _) = build_app();
+    let (app, _) = build_app().await;
     let (status, _) = request(
         &app,
         "GET",

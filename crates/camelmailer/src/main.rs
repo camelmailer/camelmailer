@@ -2,7 +2,8 @@
 //! process roles from a single binary.
 
 use camelmailer_api::{build_router, ApiState};
-use camelmailer_core::{MemorySink, MemoryStore};
+use camelmailer_core::{AdminStore, MemorySink, MemoryStore, MessageSink, Store};
+use camelmailer_db::{PgMessageSink, PgStore};
 use camelmailer_smtp::SmtpServer;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -21,6 +22,11 @@ fn main() -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("web-server") => run_async(web_server()),
         Some("smtp-server") => run_async(smtp_server()),
+        Some("initialize") | Some("update") | Some("upgrade") => run_async(initialize()),
+        Some("make-admin-api-key") => {
+            let name = args.get(2).cloned().unwrap_or_else(|| "cli".to_string());
+            run_async(make_admin_api_key(name))
+        }
         Some("version") => {
             println!("CamelMailer v{VERSION}");
             ExitCode::SUCCESS
@@ -53,9 +59,54 @@ fn load_config() -> camelmailer_config::Config {
     }
 }
 
+fn postgres_enabled(config: &camelmailer_config::Config) -> bool {
+    config.postgres.enabled || std::env::var("DATABASE_URL").is_ok()
+}
+
+async fn connect_pg(config: &camelmailer_config::Config) -> std::io::Result<PgStore> {
+    let url = config.postgres.url();
+    let pool = camelmailer_db::connect(&url, config.postgres.pool_size)
+        .await
+        .map_err(std::io::Error::other)?;
+    Ok(PgStore::new(pool))
+}
+
+async fn initialize() -> std::io::Result<()> {
+    let config = load_config();
+    let store = connect_pg(&config).await?;
+    camelmailer_db::migrate(store.pool())
+        .await
+        .map_err(std::io::Error::other)?;
+    println!("Database is up to date.");
+    Ok(())
+}
+
+async fn make_admin_api_key(name: String) -> std::io::Result<()> {
+    let config = load_config();
+    if !postgres_enabled(&config) {
+        return Err(std::io::Error::other(
+            "make-admin-api-key requires PostgreSQL (postgres.enabled: true or DATABASE_URL)",
+        ));
+    }
+    let store = connect_pg(&config).await?;
+    let key = camelmailer_core::token::generate_key();
+    store
+        .create_admin_api_key(&name, &key)
+        .await
+        .map_err(std::io::Error::other)?;
+    println!("Admin API key '{name}' created:");
+    println!("{key}");
+    Ok(())
+}
+
 async fn web_server() -> std::io::Result<()> {
     let config = load_config();
-    let store = Arc::new(MemoryStore::new());
+    let store: Arc<dyn AdminStore> = if postgres_enabled(&config) {
+        Arc::new(connect_pg(&config).await?)
+    } else {
+        tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
+        Arc::new(MemoryStore::new())
+    };
     let state = ApiState::new(store, config.camelmailer.admin_api_key.clone());
     let router = build_router(state);
 
@@ -73,8 +124,16 @@ async fn web_server() -> std::io::Result<()> {
 
 async fn smtp_server() -> std::io::Result<()> {
     let config = load_config();
-    let store = Arc::new(MemoryStore::new());
-    let sink = Arc::new(MemorySink::new());
+    let (store, sink): (Arc<dyn Store>, Arc<dyn MessageSink>) = if postgres_enabled(&config) {
+        let store = connect_pg(&config).await?;
+        (
+            Arc::new(store.clone()),
+            Arc::new(PgMessageSink::new(store)),
+        )
+    } else {
+        tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
+        (Arc::new(MemoryStore::new()), Arc::new(MemorySink::new()))
+    };
     SmtpServer::new(config, store, sink).run().await
 }
 
@@ -85,6 +144,11 @@ fn print_usage() {
     println!();
     println!(" * web-server - run the web server (Admin API)");
     println!(" * smtp-server - run the SMTP server");
+    println!();
+    println!("Setup/upgrade tools:");
+    println!();
+    println!(" * initialize - create/upgrade the PostgreSQL schema");
+    println!(" * make-admin-api-key [name] - create an Admin API key");
     println!();
     println!("Other tools:");
     println!();

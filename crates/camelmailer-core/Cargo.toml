@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 chrono = { workspace = true }
 ipnet = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }

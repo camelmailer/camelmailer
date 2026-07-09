@@ -16,39 +16,37 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use camelmailer_core::{token, MemoryStore, Organization, Server, ServerMode};
+use camelmailer_core::{
+    AdminStore, NewOrganization as CoreNewOrganization, NewServer as CoreNewServer, Organization,
+    Server, ServerMode, StoreError,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 
 pub struct ApiState {
-    pub store: Arc<MemoryStore>,
-    /// Database-backed admin API keys (`AdminAPIKey` records).
-    pub admin_api_keys: RwLock<HashSet<String>>,
+    /// Storage — in-memory for tests, PostgreSQL in production.
+    pub store: Arc<dyn AdminStore>,
     /// `camelmailer.admin_api_key` — the global fallback key.
     pub global_admin_api_key: Option<String>,
 }
 
 impl ApiState {
-    pub fn new(store: Arc<MemoryStore>, global_admin_api_key: Option<String>) -> Arc<Self> {
+    pub fn new(store: Arc<dyn AdminStore>, global_admin_api_key: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             store,
-            admin_api_keys: RwLock::new(HashSet::new()),
             global_admin_api_key,
         })
     }
 
-    pub fn add_admin_api_key(&self, key: impl Into<String>) {
-        self.admin_api_keys.write().unwrap().insert(key.into());
-    }
-
-    fn key_is_valid(&self, key: &str) -> bool {
-        if self.admin_api_keys.read().unwrap().contains(key) {
+    async fn key_is_valid(&self, key: &str) -> bool {
+        // 1. database-backed admin API keys (records their use)
+        if self.store.admin_api_key_valid(key).await.unwrap_or(false) {
             return true;
         }
+        // 2. the configured global key, compared in constant time
         match &self.global_admin_api_key {
             Some(configured) if !configured.is_empty() => {
                 configured.as_bytes().ct_eq(key.as_bytes()).into()
@@ -133,6 +131,21 @@ fn render_parameter_missing(start: Option<&RequestStart>, message: &str) -> ApiR
     render_error(start, StatusCode::BAD_REQUEST, "ParameterMissing", message)
 }
 
+fn render_store_error(start: Option<&RequestStart>, error: StoreError) -> ApiResponse {
+    match error {
+        StoreError::Conflict(message) => render_validation_error(start, &message),
+        StoreError::Other(message) => {
+            tracing::error!(%message, "storage error");
+            render_error(
+                start,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "An internal error occurred",
+            )
+        }
+    }
+}
+
 async fn timing_middleware(mut request: Request, next: Next) -> Response {
     request.extensions_mut().insert(RequestStart(Instant::now()));
     next.run(request).await
@@ -159,7 +172,8 @@ async fn auth_middleware(
         )
         .into_response();
     }
-    if !state.key_is_valid(key) {
+    let key = key.to_string();
+    if !state.key_is_valid(&key).await {
         return render_error(
             start.as_ref(),
             StatusCode::UNAUTHORIZED,
@@ -238,7 +252,10 @@ async fn organizations_index(
     start: axum::Extension<RequestStart>,
     Query(params): Query<PaginationParams>,
 ) -> ApiResponse {
-    let mut organizations = state.store.organizations();
+    let mut organizations = match state.store.list_organizations().await {
+        Ok(organizations) => organizations,
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
     organizations.sort_by(|a, b| a.name.cmp(&b.name));
     let result = paginate(&organizations, &params);
     render_success(
@@ -270,34 +287,25 @@ async fn organizations_create(
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| permalink_from(&name));
 
-    if state
+    match state
         .store
-        .organizations()
-        .iter()
-        .any(|o| o.permalink == permalink)
+        .create_organization(CoreNewOrganization { name, permalink })
+        .await
     {
-        return render_validation_error(Some(&start.0), "Permalink has already been taken");
+        Ok(organization) => render_success(
+            Some(&start.0),
+            StatusCode::CREATED,
+            json!({ "organization": organization_json(&organization) }),
+        ),
+        Err(error) => render_store_error(Some(&start.0), error),
     }
-
-    let organization = state.store.insert_organization(Organization {
-        id: state.store.next_id(),
-        uuid: token::generate_uuid(),
-        name,
-        permalink,
-    });
-    render_success(
-        Some(&start.0),
-        StatusCode::CREATED,
-        json!({ "organization": organization_json(&organization) }),
-    )
 }
 
-fn find_organization(state: &ApiState, permalink: &str) -> Option<Organization> {
-    state
-        .store
-        .organizations()
-        .into_iter()
-        .find(|o| o.permalink == permalink)
+async fn find_organization(
+    state: &ApiState,
+    permalink: &str,
+) -> Result<Option<Organization>, StoreError> {
+    state.store.organization_by_permalink(permalink).await
 }
 
 async fn organizations_show(
@@ -305,13 +313,14 @@ async fn organizations_show(
     start: axum::Extension<RequestStart>,
     Path(permalink): Path<String>,
 ) -> ApiResponse {
-    match find_organization(&state, &permalink) {
-        Some(organization) => render_success(
+    match find_organization(&state, &permalink).await {
+        Ok(Some(organization)) => render_success(
             Some(&start.0),
             StatusCode::OK,
             json!({ "organization": organization_json(&organization) }),
         ),
-        None => render_not_found(Some(&start.0)),
+        Ok(None) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
     }
 }
 
@@ -320,12 +329,13 @@ async fn organizations_destroy(
     start: axum::Extension<RequestStart>,
     Path(permalink): Path<String>,
 ) -> ApiResponse {
-    match find_organization(&state, &permalink) {
-        Some(organization) => {
-            state.store.delete_organization(organization.id);
-            render_deleted(Some(&start.0))
-        }
-        None => render_not_found(Some(&start.0)),
+    match find_organization(&state, &permalink).await {
+        Ok(Some(organization)) => match state.store.delete_organization(organization.id).await {
+            Ok(_) => render_deleted(Some(&start.0)),
+            Err(error) => render_store_error(Some(&start.0), error),
+        },
+        Ok(None) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
     }
 }
 
@@ -337,15 +347,15 @@ async fn servers_index(
     Path(org_permalink): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> ApiResponse {
-    let Some(organization) = find_organization(&state, &org_permalink) else {
-        return render_not_found(Some(&start.0));
+    let organization = match find_organization(&state, &org_permalink).await {
+        Ok(Some(organization)) => organization,
+        Ok(None) => return render_not_found(Some(&start.0)),
+        Err(error) => return render_store_error(Some(&start.0), error),
     };
-    let servers: Vec<Server> = state
-        .store
-        .servers()
-        .into_iter()
-        .filter(|s| s.organization_id == organization.id)
-        .collect();
+    let servers: Vec<Server> = match state.store.servers_for_organization(organization.id).await {
+        Ok(servers) => servers,
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
     let result = paginate(&servers, &params);
     render_success(
         Some(&start.0),
@@ -370,8 +380,10 @@ async fn servers_create(
     Path(org_permalink): Path<String>,
     Json(body): Json<CreateServer>,
 ) -> ApiResponse {
-    let Some(organization) = find_organization(&state, &org_permalink) else {
-        return render_not_found(Some(&start.0));
+    let organization = match find_organization(&state, &org_permalink).await {
+        Ok(Some(organization)) => organization,
+        Ok(None) => return render_not_found(Some(&start.0)),
+        Err(error) => return render_store_error(Some(&start.0), error),
     };
     let Some(name) = body.name.filter(|n| !n.is_empty()) else {
         return render_parameter_missing(Some(&start.0), "param is missing or the value is empty: name");
@@ -391,43 +403,37 @@ async fn servers_create(
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| permalink_from(&name));
 
-    if state
+    match state
         .store
-        .servers()
-        .iter()
-        .any(|s| s.organization_id == organization.id && s.permalink == permalink)
+        .create_server(CoreNewServer {
+            organization_id: organization.id,
+            name,
+            permalink,
+            mode,
+        })
+        .await
     {
-        return render_validation_error(Some(&start.0), "Permalink has already been taken");
+        Ok(server) => render_success(
+            Some(&start.0),
+            StatusCode::CREATED,
+            json!({ "server": server_json(&server) }),
+        ),
+        Err(error) => render_store_error(Some(&start.0), error),
     }
-
-    let server = state.store.insert_server(Server {
-        id: state.store.next_id(),
-        uuid: token::generate_uuid(),
-        organization_id: organization.id,
-        name,
-        permalink,
-        token: token::generate_token(6),
-        mode,
-        suspended: false,
-        suspension_reason: None,
-        privacy_mode: false,
-        log_smtp_data: false,
-        allow_sender: false,
-    });
-    render_success(
-        Some(&start.0),
-        StatusCode::CREATED,
-        json!({ "server": server_json(&server) }),
-    )
 }
 
-fn find_server(state: &ApiState, org_permalink: &str, permalink: &str) -> Option<Server> {
-    let organization = find_organization(state, org_permalink)?;
+async fn find_server(
+    state: &ApiState,
+    org_permalink: &str,
+    permalink: &str,
+) -> Result<Option<Server>, StoreError> {
+    let Some(organization) = find_organization(state, org_permalink).await? else {
+        return Ok(None);
+    };
     state
         .store
-        .servers()
-        .into_iter()
-        .find(|s| s.organization_id == organization.id && s.permalink == permalink)
+        .server_by_permalink(organization.id, permalink)
+        .await
 }
 
 async fn servers_show(
@@ -435,13 +441,14 @@ async fn servers_show(
     start: axum::Extension<RequestStart>,
     Path((org_permalink, permalink)): Path<(String, String)>,
 ) -> ApiResponse {
-    match find_server(&state, &org_permalink, &permalink) {
-        Some(server) => render_success(
+    match find_server(&state, &org_permalink, &permalink).await {
+        Ok(Some(server)) => render_success(
             Some(&start.0),
             StatusCode::OK,
             json!({ "server": server_json(&server) }),
         ),
-        None => render_not_found(Some(&start.0)),
+        Ok(None) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
     }
 }
 
@@ -450,12 +457,13 @@ async fn servers_destroy(
     start: axum::Extension<RequestStart>,
     Path((org_permalink, permalink)): Path<(String, String)>,
 ) -> ApiResponse {
-    match find_server(&state, &org_permalink, &permalink) {
-        Some(server) => {
-            state.store.delete_server(server.id);
-            render_deleted(Some(&start.0))
-        }
-        None => render_not_found(Some(&start.0)),
+    match find_server(&state, &org_permalink, &permalink).await {
+        Ok(Some(server)) => match state.store.delete_server(server.id).await {
+            Ok(_) => render_deleted(Some(&start.0)),
+            Err(error) => render_store_error(Some(&start.0), error),
+        },
+        Ok(None) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
     }
 }
 
@@ -470,20 +478,23 @@ async fn servers_suspend(
     Path((org_permalink, permalink)): Path<(String, String)>,
     body: Option<Json<SuspendBody>>,
 ) -> ApiResponse {
-    match find_server(&state, &org_permalink, &permalink) {
-        Some(mut server) => {
+    match find_server(&state, &org_permalink, &permalink).await {
+        Ok(Some(mut server)) => {
             server.suspended = true;
             server.suspension_reason = body
                 .and_then(|Json(b)| b.reason)
                 .or(Some("Suspended via Admin API".into()));
-            let server = state.store.insert_server(server);
-            render_success(
-                Some(&start.0),
-                StatusCode::OK,
-                json!({ "server": server_json(&server) }),
-            )
+            match state.store.update_server(server).await {
+                Ok(server) => render_success(
+                    Some(&start.0),
+                    StatusCode::OK,
+                    json!({ "server": server_json(&server) }),
+                ),
+                Err(error) => render_store_error(Some(&start.0), error),
+            }
         }
-        None => render_not_found(Some(&start.0)),
+        Ok(None) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
     }
 }
 
@@ -492,18 +503,21 @@ async fn servers_unsuspend(
     start: axum::Extension<RequestStart>,
     Path((org_permalink, permalink)): Path<(String, String)>,
 ) -> ApiResponse {
-    match find_server(&state, &org_permalink, &permalink) {
-        Some(mut server) => {
+    match find_server(&state, &org_permalink, &permalink).await {
+        Ok(Some(mut server)) => {
             server.suspended = false;
             server.suspension_reason = None;
-            let server = state.store.insert_server(server);
-            render_success(
-                Some(&start.0),
-                StatusCode::OK,
-                json!({ "server": server_json(&server) }),
-            )
+            match state.store.update_server(server).await {
+                Ok(server) => render_success(
+                    Some(&start.0),
+                    StatusCode::OK,
+                    json!({ "server": server_json(&server) }),
+                ),
+                Err(error) => render_store_error(Some(&start.0), error),
+            }
         }
-        None => render_not_found(Some(&start.0)),
+        Ok(None) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
     }
 }
 

@@ -64,6 +64,41 @@ pub fn strip_name_from_address(value: &str) -> &str {
     value.trim()
 }
 
+/// Longest-prefix matching of SMTP-IP credentials against a client address
+/// (IPv4-mapped IPv6 clients match IPv4 CIDRs). Shared by the in-memory and
+/// Postgres stores.
+pub fn match_ip_credential(credentials: Vec<Credential>, ip: IpAddr) -> Option<Credential> {
+    let mut candidates: Vec<(ipnet::IpNet, Credential)> = credentials
+        .into_iter()
+        .filter(|c| c.credential_type == CredentialType::SmtpIp)
+        .filter_map(|c| {
+            let net = c
+                .key
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| c.key.parse::<IpAddr>().map(ipnet::IpNet::from))
+                .ok()?;
+            Some((net, c))
+        })
+        .collect();
+    // Longest prefix first, mirroring `sort_by { |c| c.ipaddr&.prefix }.reverse`
+    candidates.sort_by(|a, b| b.0.prefix_len().cmp(&a.0.prefix_len()));
+    candidates
+        .into_iter()
+        .find(|(net, _)| {
+            if net.contains(&ip) {
+                return true;
+            }
+            // an IPv4 CIDR should match the IPv4-mapped form of an IPv6 client
+            if let (ipnet::IpNet::V4(net4), IpAddr::V6(ip6)) = (net, ip) {
+                if let Some(mapped) = ip6.to_ipv4_mapped() {
+                    return net4.contains(&mapped);
+                }
+            }
+            false
+        })
+        .map(|(_, c)| c)
+}
+
 #[derive(Default)]
 struct MemoryStoreInner {
     organizations: HashMap<Id, Organization>,
@@ -72,6 +107,7 @@ struct MemoryStoreInner {
     routes: HashMap<Id, Route>,
     credentials: HashMap<Id, Credential>,
     credential_uses: HashMap<Id, u64>,
+    admin_api_keys: std::collections::HashSet<String>,
 }
 
 /// A thread-safe in-memory [`Store`].
@@ -185,6 +221,18 @@ impl MemoryStore {
         self.inner.read().unwrap().domains.get(&id).cloned()
     }
 
+    pub fn insert_admin_api_key(&self, key: &str) {
+        self.inner
+            .write()
+            .unwrap()
+            .admin_api_keys
+            .insert(key.to_string());
+    }
+
+    pub fn admin_api_key_exists(&self, key: &str) -> bool {
+        self.inner.read().unwrap().admin_api_keys.contains(key)
+    }
+
     pub fn credential_use_count(&self, credential_id: Id) -> u64 {
         self.inner
             .read()
@@ -251,37 +299,11 @@ impl Store for MemoryStore {
     }
 
     fn find_ip_credential(&self, ip: IpAddr) -> Option<Credential> {
-        let inner = self.inner.read().unwrap();
-        let mut candidates: Vec<(ipnet::IpNet, &Credential)> = inner
-            .credentials
-            .values()
-            .filter(|c| c.credential_type == CredentialType::SmtpIp)
-            .filter_map(|c| {
-                let net = c
-                    .key
-                    .parse::<ipnet::IpNet>()
-                    .or_else(|_| c.key.parse::<IpAddr>().map(ipnet::IpNet::from))
-                    .ok()?;
-                Some((net, c))
-            })
-            .collect();
-        // Longest prefix first, mirroring `sort_by { |c| c.ipaddr&.prefix }.reverse`
-        candidates.sort_by(|a, b| b.0.prefix_len().cmp(&a.0.prefix_len()));
-        candidates
-            .into_iter()
-            .find(|(net, _)| {
-                if net.contains(&ip) {
-                    return true;
-                }
-                // an IPv4 CIDR should match the IPv4-mapped form of an IPv6 client
-                if let (ipnet::IpNet::V4(net4), IpAddr::V6(ip6)) = (net, ip) {
-                    if let Some(mapped) = ip6.to_ipv4_mapped() {
-                        return net4.contains(&mapped);
-                    }
-                }
-                false
-            })
-            .map(|(_, c)| c.clone())
+        let credentials: Vec<Credential> = {
+            let inner = self.inner.read().unwrap();
+            inner.credentials.values().cloned().collect()
+        };
+        match_ip_credential(credentials, ip)
     }
 
     fn smtp_credentials_for_server(&self, server_id: Id) -> Vec<Credential> {

@@ -340,6 +340,54 @@ impl Default for SmtpClient {
     }
 }
 
+/// PostgreSQL — the single multi-tenant database (replaces MariaDB's
+/// `main_db` + database-per-server `message_db` layout; tenant isolation is
+/// enforced with row-level security).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Postgres {
+    /// Use PostgreSQL persistence (in-memory storage is used when disabled)
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: Option<String>,
+    pub database: String,
+    pub pool_size: u32,
+}
+
+impl Default for Postgres {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "localhost".into(),
+            port: 5432,
+            username: "camelmailer".into(),
+            password: None,
+            database: "camelmailer".into(),
+            pool_size: 10,
+        }
+    }
+}
+
+impl Postgres {
+    /// A `postgres://` connection URL. The `DATABASE_URL` environment
+    /// variable, when set, takes precedence over the configured values.
+    pub fn url(&self) -> String {
+        if let Ok(url) = std::env::var("DATABASE_URL") {
+            return url;
+        }
+        let auth = match &self.password {
+            Some(password) => format!("{}:{}", self.username, password),
+            None => self.username.clone(),
+        };
+        format!(
+            "postgres://{}@{}:{}/{}",
+            auth, self.host, self.port, self.database
+        )
+    }
+}
+
 /// The complete CamelMailer configuration.
 ///
 /// Unknown top-level groups (e.g. `rails`, `rspamd`, `oidc` from a legacy
@@ -353,7 +401,10 @@ pub struct Config {
     pub camelmailer: CamelMailer,
     pub web_server: WebServer,
     pub worker: Worker,
+    pub postgres: Postgres,
+    /// Legacy MariaDB settings, accepted for config-file compatibility only.
     pub main_db: MainDb,
+    /// Legacy MariaDB settings, accepted for config-file compatibility only.
     pub message_db: MessageDb,
     pub logging: Logging,
     pub smtp_server: SmtpServer,
@@ -490,6 +541,33 @@ mod tests {
         assert_eq!(config.smtp.port, 25);
         assert_eq!(config.smtp.authentication_type, "login");
         assert!(config.smtp.enable_starttls_auto);
+    }
+
+    #[test]
+    fn postgres_defaults_and_url() {
+        let config = Config::default();
+        assert!(!config.postgres.enabled);
+        assert_eq!(config.postgres.port, 5432);
+        assert_eq!(config.postgres.database, "camelmailer");
+        assert_eq!(
+            config.postgres.url(),
+            "postgres://camelmailer@localhost:5432/camelmailer"
+        );
+
+        let config = Config::from_yaml(
+            r#"
+postgres:
+  enabled: true
+  host: db.internal
+  port: 5433
+  username: app
+  password: s3cret
+  database: mail
+"#,
+        )
+        .unwrap();
+        assert!(config.postgres.enabled);
+        assert_eq!(config.postgres.url(), "postgres://app:s3cret@db.internal:5433/mail");
     }
 
     #[test]

@@ -13,6 +13,7 @@ axum = { workspace = true }
 camelmailer-api = { workspace = true }
 camelmailer-config = { workspace = true }
 camelmailer-core = { workspace = true }
+camelmailer-db = { workspace = true }
 camelmailer-smtp = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
