@@ -1,0 +1,19 @@
+[package]
+name = "camelmailer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "camelmailer"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+camelmailer-api = { workspace = true }
+camelmailer-config = { workspace = true }
+camelmailer-core = { workspace = true }
+camelmailer-smtp = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

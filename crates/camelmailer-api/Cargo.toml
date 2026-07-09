@@ -1,0 +1,19 @@
+[package]
+name = "camelmailer-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+camelmailer-config = { workspace = true }
+camelmailer-core = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+http-body-util = { workspace = true }
+tower = { workspace = true }

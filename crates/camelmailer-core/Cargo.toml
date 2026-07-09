@@ -1,0 +1,11 @@
+[package]
+name = "camelmailer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+ipnet = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
