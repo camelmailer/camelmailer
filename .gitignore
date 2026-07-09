@@ -1,1 +1,5 @@
 /target
+
+# The repo-wide .gitignore excludes *.sql (MariaDB dumps); the embedded
+# sqlx migrations are source code and must be tracked.
+!crates/camelmailer-db/migrations/*.sql
