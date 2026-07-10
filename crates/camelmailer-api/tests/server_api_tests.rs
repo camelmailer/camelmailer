@@ -884,6 +884,121 @@ async fn inbound_is_tenant_scoped() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+// ------------------------------------------- P7: templates + rendering
+
+#[tokio::test]
+async fn template_crud_render_and_scoping() {
+    let (app, token_a, token_b, _) = build_two_with_domains().await;
+
+    // create
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/templates",
+        &token_a,
+        json!({
+            "name": "Welcome",
+            "subject": "Hi {{ name }}",
+            "html_body": "<p>Hi {{ name }}</p>",
+            "text_body": "Hi {{ name }}"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["template"]["permalink"], "welcome");
+
+    // list + show
+    let (_, body) = request(&app, "/api/v2/server/templates", Some(&token_a)).await;
+    assert_eq!(body["data"]["templates"].as_array().unwrap().len(), 1);
+    let (status, _) = request(&app, "/api/v2/server/templates/welcome", Some(&token_a)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // dry-run render escapes by default
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/templates/welcome/render",
+        &token_a,
+        json!({ "template_model": { "name": "<b>Ada</b>" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["rendered"]["subject"], "Hi &lt;b&gt;Ada&lt;/b&gt;");
+
+    // update + archive
+    let (status, body) = patch_json(
+        &app,
+        "/api/v2/server/templates/welcome",
+        &token_a,
+        json!({ "subject": "Hello {{ name }}" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["template"]["subject"], "Hello {{ name }}");
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/templates/welcome/archive",
+        &token_a,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["template"]["archived"], true);
+
+    // tenant B cannot see or read A's template
+    let (_, body) = request(&app, "/api/v2/server/templates", Some(&token_b)).await;
+    assert_eq!(body["data"]["templates"].as_array().unwrap().len(), 0);
+    let (status, _) = request(&app, "/api/v2/server/templates/welcome", Some(&token_b)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn send_with_template_renders_and_enqueues() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    post_json(
+        &app,
+        "/api/v2/server/templates",
+        &token,
+        json!({
+            "name": "Receipt",
+            "subject": "Order {{ order.id }}",
+            "text_body": "Thanks {{ name }}"
+        }),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/messages/with_template",
+        &token,
+        json!({
+            "from": "news@alpha.example",
+            "to": ["buyer@dest.example"],
+            "template": "receipt",
+            "template_model": { "name": "Ada", "order": { "id": 42 } }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["data"]["message_id"].is_number());
+
+    // the enqueued MIME carries the rendered subject + body
+    let server_id = store.server_for_api_token(&token).await.unwrap().unwrap().id;
+    let stored = store.messages_for(server_id);
+    assert_eq!(stored.len(), 1);
+    let raw = String::from_utf8_lossy(&stored[0].raw_message);
+    assert!(raw.contains("Subject: Order 42"), "subject not rendered: {raw}");
+    assert!(raw.contains("Thanks Ada"));
+
+    // unknown template → 422
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/messages/with_template",
+        &token,
+        json!({ "from": "news@alpha.example", "to": ["x@dest.example"], "template": "ghost" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 #[tokio::test]
 async fn streams_are_tenant_scoped() {
     let (app, token_a, token_b, _) = build_two_with_domains().await;

@@ -1506,6 +1506,85 @@ impl camelmailer_core::ServerStore for PgStore {
             .await
             .map_err(|e| StoreError::Other(e.to_string()))
     }
+
+    async fn list_templates(
+        &self,
+        server_id: Id,
+    ) -> Result<Vec<camelmailer_core::Template>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM templates WHERE server_id = $1 ORDER BY id")
+            .bind(server_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(template_from_row).collect())
+    }
+
+    async fn template_by_permalink(
+        &self,
+        server_id: Id,
+        permalink: &str,
+    ) -> Result<Option<camelmailer_core::Template>, StoreError> {
+        let row = sqlx::query("SELECT * FROM templates WHERE server_id = $1 AND permalink = $2")
+            .bind(server_id as i64)
+            .bind(permalink)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(row.as_ref().map(template_from_row))
+    }
+
+    async fn create_template(
+        &self,
+        new: camelmailer_core::NewTemplate,
+    ) -> Result<camelmailer_core::Template, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO templates (uuid, server_id, name, permalink, subject, html_body, text_body)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(new.server_id as i64)
+        .bind(&new.name)
+        .bind(&new.permalink)
+        .bind(&new.subject)
+        .bind(&new.html_body)
+        .bind(&new.text_body)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(camelmailer_core::Template {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            server_id: new.server_id,
+            name: new.name,
+            permalink: new.permalink,
+            subject: new.subject,
+            html_body: new.html_body,
+            text_body: new.text_body,
+            archived: false,
+        })
+    }
+
+    async fn update_template(
+        &self,
+        template: camelmailer_core::Template,
+    ) -> Result<camelmailer_core::Template, StoreError> {
+        sqlx::query(
+            "UPDATE templates
+             SET name = $2, subject = $3, html_body = $4, text_body = $5, archived = $6
+             WHERE id = $1",
+        )
+        .bind(template.id as i64)
+        .bind(&template.name)
+        .bind(&template.subject)
+        .bind(&template.html_body)
+        .bind(&template.text_body)
+        .bind(template.archived)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(template)
+    }
 }
 
 impl Store for PgStore {
@@ -2414,6 +2493,20 @@ fn message_stream_from_row(row: &PgRow) -> camelmailer_core::MessageStream {
         name: row.get("name"),
         permalink: row.get("permalink"),
         stream_type: row.get("stream_type"),
+        archived: row.get("archived"),
+    }
+}
+
+fn template_from_row(row: &PgRow) -> camelmailer_core::Template {
+    camelmailer_core::Template {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        name: row.get("name"),
+        permalink: row.get("permalink"),
+        subject: row.get("subject"),
+        html_body: row.get("html_body"),
+        text_body: row.get("text_body"),
         archived: row.get("archived"),
     }
 }

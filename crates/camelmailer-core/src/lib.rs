@@ -11,6 +11,7 @@ pub mod model;
 pub mod received_header;
 pub mod server_store;
 pub mod store;
+pub mod template;
 pub mod testing;
 pub mod token;
 
@@ -20,8 +21,9 @@ pub use admin_store::{
 };
 pub use server_store::{
     ActivityEvent, DeliveryRecord, DeliveryStats, MessageFilter, MessageStats, NewStream,
-    QueuedDomain, ServerContext, ServerStore, StatsFilter,
+    NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter,
 };
+pub use template::{render as render_template, RenderError};
 pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,
 };

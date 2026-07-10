@@ -199,6 +199,22 @@ pub struct MessageStream {
     pub archived: bool,
 }
 
+/// A message template — named subject/html/text bodies rendered with a
+/// per-send model. A config record, filtered by `server_id`; not
+/// RLS-protected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Template {
+    pub id: Id,
+    pub uuid: String,
+    pub server_id: Id,
+    pub name: String,
+    pub permalink: String,
+    pub subject: Option<String>,
+    pub html_body: Option<String>,
+    pub text_body: Option<String>,
+    pub archived: bool,
+}
+
 /// A suppression-list entry. Tenant-scoped: lives under RLS in Postgres
 /// (in the Ruby app this was a table in the per-server message database).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

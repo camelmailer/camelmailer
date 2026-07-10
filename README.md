@@ -15,7 +15,7 @@ implementation.
 | `camelmailer-db` | `lib/postal/message_db/` + the ActiveRecord persistence | ✅ PostgreSQL with row-level security (see below); embedded migrations; message metadata parity (status, spam, deliveries, links/clicks, loads/opens); delivery queue |
 | `camelmailer-smtp` | `app/lib/smtp_server/client.rb` + `server.rb`, `script/smtp_server.rb` | ✅ full protocol state machine (see below), tokio TCP server, STARTTLS termination via rustls |
 | `camelmailer-worker` | `script/worker.rb`, `app/lib/message_dequeuer`, `app/senders`, `app/lib/postal/message_inspectors`, `dkim_header.rb`, `signer.rb` | ✅ queue dequeuer (SKIP LOCKED), SMTP sending (relays/MX) with opportunistic outbound STARTTLS and IP-pool source addresses, suppression holds, rspamd/ClamAV inspection, DKIM signing, open/click tracking rewrite, HTTP endpoint delivery, webhook queue with retries + RSA signing, delivery recording |
-| `camelmailer-api` | `app/controllers/admin_api/` | ✅ auth (incl. DB-backed keys), envelope, pagination, errors; organizations, servers, domains, credentials, routes, webhooks, suppressions, users, IP pools; public click/open tracking endpoints |
+| `camelmailer-api` | `app/controllers/admin_api/` + a native Server API | ✅ **Account API** (`/api/v2/admin`, `X-Admin-API-Key`): auth (incl. DB-backed keys), envelope, pagination, errors; organizations, servers (full config + IP-pool + admin-key management), domains, credentials, routes, webhooks, suppressions, users, IP pools. ✅ **Server API** (`/api/v2/server`, `X-Server-API-Key`): HTTP send, message/delivery/open/click reads, stats + bounces + queue stats, message streams, inbound search/bypass/retry, templates + rendering. ✅ public click/open tracking endpoints |
 | `camelmailer` (bin) | `bin/postal` | ✅ CLI dispatcher: `smtp-server`, `web-server`, `worker`, `initialize` (migrations), `make-admin-api-key`, `version` |
 
 ## Storage: single PostgreSQL database with row-level security
@@ -126,11 +126,56 @@ group is accepted as an alias for `camelmailer:`, and
   backoff, optionally RSA-signed (`X-CamelMailer-Signature`), and every
   attempt is written to a tenant-scoped audit log.
 
+## Headless API: Account + Server scopes
+
+CamelMailer is API-first — the whole platform is drivable over HTTP so a
+frontend (e.g. React) can be built on top. There are two token scopes, both
+returning the native `{ status, time, data | error }` envelope with
+snake_case fields and `{ page, per_page, total, total_pages }` pagination:
+
+- **Account API** — `X-Admin-API-Key` → `/api/v2/admin/...`. Org/server
+  management: organizations, servers (create/update/suspend, full config —
+  open/click tracking, spam thresholds, hook URLs, inbound domain, colour,
+  IP pool, default stream), domains, credentials, routes, webhooks,
+  suppressions, users, IP pools, and admin-API-key management.
+- **Server API** — `X-Server-API-Key` → `/api/v2/server/...`. A per-server
+  token (a `credentials` record of type `API`) implies exactly one server;
+  every request is scoped to it and message-data queries enter that server's
+  RLS tenant context. It is a sibling router — **not** under admin auth.
+
+Server API surface:
+
+| Area | Endpoints |
+|---|---|
+| Self / probe | `GET /`, `GET /ping` |
+| Send | `POST /messages`, `POST /messages/batch` — builds MIME, authorises the From-domain, fans out one stored message per recipient; DKIM + tracking are applied by the worker at delivery time |
+| Send with template | `POST /messages/with_template`, `POST /messages/with_template/batch` |
+| Messages | `GET /messages` (filter: `scope/status/tag/stream/query`, paged), `GET /messages/{id}` (+ deliveries), `/deliveries`, `/opens`, `/clicks`, `/raw` (base64; 404 in privacy mode) |
+| Statistics | `GET /stats` (status + open/click counters, `?from/&to`), `GET /stats/deliveries` (outbound queue depth) |
+| Bounces | `GET /bounces`, `GET /bounces/{id}` |
+| Message streams | `GET/POST /streams`, `GET/PATCH /streams/{permalink}`, `POST /streams/{permalink}/archive` |
+| Inbound | `GET /inbound`, `GET /inbound/{id}`, `POST /inbound/{id}/bypass`, `POST /inbound/{id}/retry` |
+| Templates | `GET/POST /templates`, `GET/PATCH /templates/{permalink}`, `POST /templates/{permalink}/archive`, `POST /templates/{permalink}/render` (dry-run) |
+
+Templates render with a small **Mustache subset** (`camelmailer-core::template`):
+`{{ var }}` (HTML-escaped), `{{{ var }}}`/`{{& var }}` (raw), `{{# s }}`/`{{^ s }}`
+sections over arrays/objects, dotted paths and `.`. No partials, lambdas, or
+IO; output size and section-nesting depth are capped because the model is
+untrusted end-user data. Tenant isolation is enforced everywhere — a token
+for server A can never read or mutate server B's data — and is covered by
+both router tests and Postgres RLS tests.
+
 ## Not yet ported
 
 **Web UI** — the management interface remains the Rails app, explicitly out
 of scope for the Rust port. Everything else Postal does at the MTA and API
 layer is covered here.
+
+**Deferred API capabilities** (documented so a frontend knows they are not
+yet available): per-domain DKIM key generation + DNS records and Return-Path
+domains (DKIM currently uses one installation key + `dns.dkim_identifier`),
+per-address sender signatures, real DNS-based domain verification, webhook
+trigger granularity / HTTP auth headers, and template *push* between servers.
 
 The Ruby application remains fully functional and authoritative while these
 phases land; the two run side by side (strangler-fig migration).

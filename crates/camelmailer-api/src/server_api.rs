@@ -21,11 +21,16 @@ use base64::Engine;
 use camelmailer_core::mime::{self, Address, Attachment, BuildParams};
 use camelmailer_core::{
     ActivityEvent, DeliveryRecord, MessageFilter, MessageRecord, MessageScope, MessageStream,
-    NewStream, QueuedMessage, Server, ServerContext,
+    NewStream, NewTemplate, QueuedMessage, Server, ServerContext, Template,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// A rendered error: HTTP status, native error code, and message.
+type ApiError = (StatusCode, String, String);
+/// Rendered (subject, html_body, text_body) fields of a template.
+type RenderedFields = (Option<String>, Option<String>, Option<String>);
 
 /// Resolve the `X-Server-API-Key` header to a server, reject suspended
 /// servers, and inject the resolved `Server` (+ `ServerContext`) as request
@@ -1162,6 +1167,369 @@ async fn stream_archive(
     }
 }
 
+// ------------------------------------------------------------ templates
+
+fn template_json(template: &Template) -> Value {
+    json!({
+        "id": template.id,
+        "uuid": template.uuid,
+        "name": template.name,
+        "permalink": template.permalink,
+        "subject": template.subject,
+        "html_body": template.html_body,
+        "text_body": template.text_body,
+        "archived": template.archived,
+    })
+}
+
+/// `GET /api/v2/server/templates`.
+async fn templates_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.list_templates(server.0.id).await {
+        Ok(templates) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "templates": templates.iter().map(template_json).collect::<Vec<_>>() }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTemplate {
+    name: Option<String>,
+    permalink: Option<String>,
+    subject: Option<String>,
+    html_body: Option<String>,
+    text_body: Option<String>,
+}
+
+/// `POST /api/v2/server/templates`.
+async fn templates_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Json(body): Json<CreateTemplate>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let Some(name) = body.name.filter(|n| !n.is_empty()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::BAD_REQUEST,
+            "ParameterMissing",
+            "param is missing or the value is empty: name",
+        )
+        .into_response();
+    };
+    let permalink = body
+        .permalink
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| permalink_from(&name));
+
+    match store
+        .create_template(NewTemplate {
+            server_id: server.0.id,
+            name,
+            permalink,
+            subject: body.subject,
+            html_body: body.html_body,
+            text_body: body.text_body,
+        })
+        .await
+    {
+        Ok(template) => render_success(
+            Some(&start.0),
+            StatusCode::CREATED,
+            json!({ "template": template_json(&template) }),
+        )
+        .into_response(),
+        Err(camelmailer_core::StoreError::Conflict(message)) => render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            &message,
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `GET /api/v2/server/templates/{permalink}`.
+async fn template_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.template_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(template)) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "template": template_json(&template) }),
+        )
+        .into_response(),
+        Ok(None) => not_found(&start.0),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UpdateTemplate {
+    name: Option<String>,
+    subject: Option<String>,
+    html_body: Option<String>,
+    text_body: Option<String>,
+    archived: Option<bool>,
+}
+
+/// `PATCH /api/v2/server/templates/{permalink}`.
+async fn template_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+    Json(body): Json<UpdateTemplate>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let mut template = match store.template_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(template)) => template,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    if let Some(name) = body.name.filter(|n| !n.is_empty()) {
+        template.name = name;
+    }
+    if body.subject.is_some() {
+        template.subject = body.subject;
+    }
+    if body.html_body.is_some() {
+        template.html_body = body.html_body;
+    }
+    if body.text_body.is_some() {
+        template.text_body = body.text_body;
+    }
+    if let Some(archived) = body.archived {
+        template.archived = archived;
+    }
+    match store.update_template(template).await {
+        Ok(template) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "template": template_json(&template) }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `POST /api/v2/server/templates/{permalink}/archive`.
+async fn template_archive(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let mut template = match store.template_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(template)) => template,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    template.archived = true;
+    match store.update_template(template).await {
+        Ok(template) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "template": template_json(&template) }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RenderBody {
+    template_model: Option<Value>,
+}
+
+/// Render a template's subject/html/text against a model, or a rendered
+/// error tuple (native shape).
+fn render_template_fields(
+    template: &Template,
+    model: &Value,
+) -> Result<RenderedFields, ApiError> {
+    let render_field = |field: &Option<String>| -> Result<Option<String>, ApiError> {
+        match field {
+            Some(source) => camelmailer_core::render_template(source, model)
+                .map(Some)
+                .map_err(|error| {
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "ValidationError".to_string(),
+                        format!("template render failed: {error}"),
+                    )
+                }),
+            None => Ok(None),
+        }
+    };
+    Ok((
+        render_field(&template.subject)?,
+        render_field(&template.html_body)?,
+        render_field(&template.text_body)?,
+    ))
+}
+
+/// `POST /api/v2/server/templates/{permalink}/render` — dry-run preview.
+async fn template_render(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+    Json(body): Json<RenderBody>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let template = match store.template_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(template)) => template,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let model = body.template_model.unwrap_or_else(|| json!({}));
+    match render_template_fields(&template, &model) {
+        Ok((subject, html_body, text_body)) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({
+                "rendered": {
+                    "subject": subject,
+                    "html_body": html_body,
+                    "text_body": text_body,
+                }
+            }),
+        )
+        .into_response(),
+        Err((status, code, message)) => {
+            render_error(Some(&start.0), status, &code, &message).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SendWithTemplate {
+    #[serde(flatten)]
+    message: SendMessage,
+    template: Option<String>,
+    template_model: Option<Value>,
+}
+
+/// Load the named template, render it against the model, and fold the result
+/// into a [`SendMessage`] ready for [`enqueue_send`].
+async fn build_templated_message(
+    state: &ApiState,
+    server: &Server,
+    body: SendWithTemplate,
+) -> Result<SendMessage, (StatusCode, String, String)> {
+    let store = server_store(state).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError".into(),
+        "message storage is not configured".into(),
+    ))?;
+    let permalink = body.template.filter(|t| !t.is_empty()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "ParameterMissing".into(),
+        "param is missing or the value is empty: template".into(),
+    ))?;
+    let template = store
+        .template_by_permalink(server.id, &permalink)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError".into(),
+                error.to_string(),
+            )
+        })?
+        .ok_or((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError".into(),
+            format!("Message template {permalink:?} does not exist"),
+        ))?;
+    let model = body.template_model.unwrap_or_else(|| json!({}));
+    let (subject, html_body, text_body) = render_template_fields(&template, &model)?;
+    let mut message = body.message;
+    message.subject = subject.or(message.subject);
+    message.html_body = html_body.or(message.html_body);
+    message.text_body = text_body.or(message.text_body);
+    Ok(message)
+}
+
+/// `POST /api/v2/server/messages/with_template`.
+async fn messages_send_with_template(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Json(body): Json<SendWithTemplate>,
+) -> Response {
+    let message = match build_templated_message(&state, &server.0, body).await {
+        Ok(message) => message,
+        Err((status, code, message)) => {
+            return render_error(Some(&start.0), status, &code, &message).into_response()
+        }
+    };
+    match enqueue_send(&state, &server.0, message).await {
+        Ok(data) => render_success(Some(&start.0), StatusCode::CREATED, data).into_response(),
+        Err((status, code, message)) => {
+            render_error(Some(&start.0), status, &code, &message).into_response()
+        }
+    }
+}
+
+/// `POST /api/v2/server/messages/with_template/batch`.
+async fn messages_send_with_template_batch(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Json(messages): Json<Vec<SendWithTemplate>>,
+) -> Response {
+    let mut results = Vec::with_capacity(messages.len());
+    for body in messages {
+        let outcome = match build_templated_message(&state, &server.0, body).await {
+            Ok(message) => enqueue_send(&state, &server.0, message).await,
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(data) => results.push(json!({ "status": "success", "data": data })),
+            Err((_, code, message)) => results
+                .push(json!({ "status": "error", "error": { "code": code, "message": message } })),
+        }
+    }
+    render_success(Some(&start.0), StatusCode::OK, json!({ "messages": results }))
+        .into_response()
+}
+
 /// Build the `/api/v2/server` router (server-token authenticated).
 pub fn build_server_router(state: Arc<ApiState>) -> Router {
     let server = Router::new()
@@ -1169,6 +1537,11 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/ping", get(ping))
         .route("/messages", get(messages_index).post(messages_send))
         .route("/messages/batch", post(messages_send_batch))
+        .route("/messages/with_template", post(messages_send_with_template))
+        .route(
+            "/messages/with_template/batch",
+            post(messages_send_with_template_batch),
+        )
         .route("/messages/{id}", get(message_show))
         .route("/messages/{id}/deliveries", get(message_deliveries))
         .route("/messages/{id}/opens", get(message_opens))
@@ -1185,6 +1558,13 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/inbound/{id}", get(inbound_show))
         .route("/inbound/{id}/bypass", post(inbound_bypass))
         .route("/inbound/{id}/retry", post(inbound_retry))
+        .route("/templates", get(templates_index).post(templates_create))
+        .route(
+            "/templates/{permalink}",
+            get(template_show).patch(template_update),
+        )
+        .route("/templates/{permalink}/archive", post(template_archive))
+        .route("/templates/{permalink}/render", post(template_render))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             server_auth_middleware,

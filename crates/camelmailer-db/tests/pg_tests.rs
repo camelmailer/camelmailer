@@ -1160,3 +1160,79 @@ async fn inbound_bypass_retry_requeue_and_scope() {
         .get("c");
     assert_eq!(queued, 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn templates_crud_and_scoping() {
+    use camelmailer_core::{NewTemplate, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+
+    let template = f
+        .store
+        .create_template(NewTemplate {
+            server_id: f.server.id,
+            name: "Welcome".into(),
+            permalink: "welcome".into(),
+            subject: Some("Hi {{ name }}".into()),
+            html_body: Some("<p>{{ name }}</p>".into()),
+            text_body: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(template.permalink, "welcome");
+
+    // duplicate permalink rejected
+    assert!(f
+        .store
+        .create_template(NewTemplate {
+            server_id: f.server.id,
+            name: "Dup".into(),
+            permalink: "welcome".into(),
+            subject: None,
+            html_body: None,
+            text_body: None,
+        })
+        .await
+        .is_err());
+
+    // update (archive + change subject)
+    let updated = f
+        .store
+        .update_template(camelmailer_core::Template {
+            subject: Some("Hello {{ name }}".into()),
+            archived: true,
+            ..template.clone()
+        })
+        .await
+        .unwrap();
+    assert!(updated.archived);
+    let reloaded = f
+        .store
+        .template_by_permalink(f.server.id, "welcome")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reloaded.subject.as_deref(), Some("Hello {{ name }}"));
+    assert!(reloaded.archived);
+
+    // the other tenant sees nothing
+    assert!(f.store.list_templates(other.id).await.unwrap().is_empty());
+    assert!(f
+        .store
+        .template_by_permalink(other.id, "welcome")
+        .await
+        .unwrap()
+        .is_none());
+}

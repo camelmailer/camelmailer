@@ -9,7 +9,7 @@
 
 use crate::admin_store::StoreError;
 use crate::message::{MessageRecord, QueuedMessage, SentMessage};
-use crate::model::{Id, MessageStream};
+use crate::model::{Id, MessageStream, Template};
 use async_trait::async_trait;
 
 /// The server a per-server API request is scoped to, injected as a request
@@ -38,6 +38,17 @@ pub struct NewStream {
     pub name: String,
     pub permalink: String,
     pub stream_type: String,
+}
+
+/// Fields for creating a message template.
+#[derive(Debug, Clone)]
+pub struct NewTemplate {
+    pub server_id: Id,
+    pub name: String,
+    pub permalink: String,
+    pub subject: Option<String>,
+    pub html_body: Option<String>,
+    pub text_body: Option<String>,
 }
 
 /// A recorded open (pixel load) or click.
@@ -221,6 +232,16 @@ pub trait ServerStore: Send + Sync {
         server_id: Id,
         message_id: i64,
     ) -> Result<Option<MessageRecord>, StoreError>;
+
+    // templates (config; server-scoped)
+    async fn list_templates(&self, server_id: Id) -> Result<Vec<Template>, StoreError>;
+    async fn template_by_permalink(
+        &self,
+        server_id: Id,
+        permalink: &str,
+    ) -> Result<Option<Template>, StoreError>;
+    async fn create_template(&self, new: NewTemplate) -> Result<Template, StoreError>;
+    async fn update_template(&self, template: Template) -> Result<Template, StoreError>;
 }
 
 #[async_trait]
@@ -372,5 +393,40 @@ impl ServerStore for crate::store::MemoryStore {
         message_id: i64,
     ) -> Result<Option<MessageRecord>, StoreError> {
         Ok(self.requeue_inbound(server_id, message_id, false))
+    }
+
+    async fn list_templates(&self, server_id: Id) -> Result<Vec<Template>, StoreError> {
+        Ok(self.templates_for(server_id))
+    }
+
+    async fn template_by_permalink(
+        &self,
+        server_id: Id,
+        permalink: &str,
+    ) -> Result<Option<Template>, StoreError> {
+        Ok(self.find_template(server_id, permalink))
+    }
+
+    async fn create_template(&self, new: NewTemplate) -> Result<Template, StoreError> {
+        if self.find_template(new.server_id, &new.permalink).is_some() {
+            return Err(StoreError::Conflict(
+                "Permalink has already been taken".into(),
+            ));
+        }
+        Ok(self.insert_template(Template {
+            id: self.next_id(),
+            uuid: crate::token::generate_uuid(),
+            server_id: new.server_id,
+            name: new.name,
+            permalink: new.permalink,
+            subject: new.subject,
+            html_body: new.html_body,
+            text_body: new.text_body,
+            archived: false,
+        }))
+    }
+
+    async fn update_template(&self, template: Template) -> Result<Template, StoreError> {
+        Ok(self.insert_template(template))
     }
 }

@@ -125,6 +125,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) message_clicks: Vec<(i64, crate::server_store::ActivityEvent)>,
     /// Message streams (config; server-scoped).
     pub(crate) message_streams: HashMap<Id, MessageStream>,
+    /// Message templates (config; server-scoped).
+    pub(crate) templates: HashMap<Id, Template>,
 }
 
 /// A thread-safe in-memory [`Store`].
@@ -611,6 +613,42 @@ impl MemoryStore {
             .message_streams
             .values()
             .find(|s| s.server_id == server_id && s.permalink == permalink)
+            .cloned()
+    }
+
+    /// Insert or replace a message template.
+    pub fn insert_template(&self, template: Template) -> Template {
+        self.inner
+            .write()
+            .unwrap()
+            .templates
+            .insert(template.id, template.clone());
+        template
+    }
+
+    /// A server's message templates, ordered by id.
+    pub fn templates_for(&self, server_id: Id) -> Vec<Template> {
+        let mut templates: Vec<Template> = self
+            .inner
+            .read()
+            .unwrap()
+            .templates
+            .values()
+            .filter(|t| t.server_id == server_id)
+            .cloned()
+            .collect();
+        templates.sort_by_key(|t| t.id);
+        templates
+    }
+
+    /// One of a server's templates by permalink.
+    pub fn find_template(&self, server_id: Id, permalink: &str) -> Option<Template> {
+        self.inner
+            .read()
+            .unwrap()
+            .templates
+            .values()
+            .find(|t| t.server_id == server_id && t.permalink == permalink)
             .cloned()
     }
 
