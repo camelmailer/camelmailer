@@ -12,6 +12,7 @@
 //! writes outside that context. `FORCE ROW LEVEL SECURITY` keeps even the
 //! table owner subject to the policy.
 
+mod auth_pg;
 mod pg_store;
 mod queue;
 mod tracking;

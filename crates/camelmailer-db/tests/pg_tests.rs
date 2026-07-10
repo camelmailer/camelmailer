@@ -1380,3 +1380,328 @@ async fn templates_crud_and_scoping() {
         .unwrap()
         .is_none());
 }
+
+// ------------------------------------------------------------------- auth
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_auth_account_state_round_trips() {
+    use camelmailer_core::{AuthStore, NewUser};
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+    let user = f
+        .store
+        .create_user(NewUser {
+            email_address: "Ada@Example.com".into(),
+            first_name: "Ada".into(),
+            last_name: "L".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+
+    // case-insensitive email lookup
+    let found = f.store.user_by_email("ada@example.COM").await.unwrap();
+    assert_eq!(found.unwrap().id, user.id);
+    assert!(f.store.user_by_email("nobody@x").await.unwrap().is_none());
+
+    // defaults exist without a user_auth row
+    let auth = f.store.user_auth(user.id).await.unwrap().unwrap();
+    assert_eq!(auth.password_digest, None);
+    assert!(!auth.totp_enabled);
+    assert!(f.store.user_auth(999_999).await.unwrap().is_none());
+
+    f.store
+        .set_password_digest(user.id, "$argon2id$test")
+        .await
+        .unwrap();
+    f.store.set_totp(user.id, Some("SECRET32"), true).await.unwrap();
+    let locked = chrono::Utc::now() + chrono::Duration::minutes(15);
+    f.store
+        .set_login_state(user.id, 3, Some(locked), None)
+        .await
+        .unwrap();
+    let auth = f.store.user_auth(user.id).await.unwrap().unwrap();
+    assert_eq!(auth.password_digest.as_deref(), Some("$argon2id$test"));
+    assert_eq!(auth.totp_secret.as_deref(), Some("SECRET32"));
+    assert!(auth.totp_enabled);
+    assert_eq!(auth.failed_login_attempts, 3);
+    assert!(auth.locked_until.is_some());
+    // last_login_at survives a state write that passes None
+    f.store
+        .set_login_state(user.id, 0, None, Some(chrono::Utc::now()))
+        .await
+        .unwrap();
+    f.store.set_login_state(user.id, 1, None, None).await.unwrap();
+    let auth = f.store.user_auth(user.id).await.unwrap().unwrap();
+    assert!(auth.last_login_at.is_some());
+    assert_eq!(auth.failed_login_attempts, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_auth_sessions_lifecycle() {
+    use camelmailer_core::{AuthStore, NewAuthSession, NewUser};
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+    let user = f
+        .store
+        .create_user(NewUser {
+            email_address: "s@example.com".into(),
+            first_name: "S".into(),
+            last_name: "U".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+
+    let expires = chrono::Utc::now() + chrono::Duration::days(14);
+    let session = f
+        .store
+        .create_session(NewAuthSession {
+            user_id: user.id,
+            token_hash: "hash-1".into(),
+            expires_at: expires,
+            ip_address: Some("10.1.2.3".into()),
+            user_agent: Some("tests".into()),
+        })
+        .await
+        .unwrap();
+
+    let (found, found_user) = f
+        .store
+        .session_with_user("hash-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, session.id);
+    assert_eq!(found_user.id, user.id);
+    assert!(f.store.session_with_user("nope").await.unwrap().is_none());
+
+    let new_expiry = expires + chrono::Duration::days(1);
+    f.store
+        .touch_session(session.id, chrono::Utc::now(), new_expiry)
+        .await
+        .unwrap();
+    let (touched, _) = f
+        .store
+        .session_with_user("hash-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!((touched.expires_at - new_expiry).num_seconds().abs() < 2);
+
+    assert!(f.store.delete_session("hash-1").await.unwrap());
+    assert!(!f.store.delete_session("hash-1").await.unwrap());
+
+    for n in 0..2 {
+        f.store
+            .create_session(NewAuthSession {
+                user_id: user.id,
+                token_hash: format!("bulk-{n}"),
+                expires_at: expires,
+                ip_address: None,
+                user_agent: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(f.store.delete_sessions_for_user(user.id).await.unwrap(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_auth_memberships_and_invitations() {
+    use camelmailer_core::{AuthStore, NewInvitation, NewUser, Role, StoreError};
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+    let user = f
+        .store
+        .create_user(NewUser {
+            email_address: "m@example.com".into(),
+            first_name: "M".into(),
+            last_name: "U".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+
+    let membership = f
+        .store
+        .upsert_membership(f.organization.id, user.id, Role::Member)
+        .await
+        .unwrap();
+    assert_eq!(membership.role, Role::Member);
+    let updated = f
+        .store
+        .upsert_membership(f.organization.id, user.id, Role::Owner)
+        .await
+        .unwrap();
+    assert_eq!(updated.id, membership.id);
+    assert_eq!(updated.role, Role::Owner);
+
+    let mine = f.store.memberships_for_user(user.id).await.unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].1.id, f.organization.id);
+    let members = f
+        .store
+        .memberships_for_organization(f.organization.id)
+        .await
+        .unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].1.id, user.id);
+    assert!(f
+        .store
+        .membership(f.organization.id, user.id)
+        .await
+        .unwrap()
+        .is_some());
+
+    // invitations: pending duplicates conflict (case-insensitive)
+    let new_invite = |email: &str, hash: &str| NewInvitation {
+        organization_id: f.organization.id,
+        email_address: email.to_string(),
+        role: Role::Member,
+        token_hash: hash.to_string(),
+        invited_by_user_id: user.id,
+        expires_at: chrono::Utc::now() + chrono::Duration::days(7),
+    };
+    let invitation = f
+        .store
+        .create_invitation(new_invite("new@example.com", "inv-1"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.store
+            .create_invitation(new_invite("NEW@example.com", "inv-2"))
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let found = f
+        .store
+        .invitation_by_token_hash("inv-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, invitation.id);
+    f.store.mark_invitation_accepted(invitation.id).await.unwrap();
+    f.store
+        .create_invitation(new_invite("new@example.com", "inv-3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store.list_invitations(f.organization.id).await.unwrap().len(),
+        2
+    );
+    assert!(!f.store.delete_invitation(999_999, invitation.id).await.unwrap());
+    assert!(f
+        .store
+        .delete_invitation(f.organization.id, invitation.id)
+        .await
+        .unwrap());
+
+    assert!(f
+        .store
+        .delete_membership(f.organization.id, user.id)
+        .await
+        .unwrap());
+    assert!(!f
+        .store
+        .delete_membership(f.organization.id, user.id)
+        .await
+        .unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_auth_resets_oidc_and_audit() {
+    use camelmailer_core::{AuthStore, NewAuthEvent, NewUser};
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+    let user = f
+        .store
+        .create_user(NewUser {
+            email_address: "r@example.com".into(),
+            first_name: "R".into(),
+            last_name: "U".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+
+    // password resets are single-use and expire
+    f.store
+        .create_password_reset(user.id, "reset-1", chrono::Utc::now() + chrono::Duration::hours(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .consume_password_reset("reset-1", chrono::Utc::now())
+            .await
+            .unwrap(),
+        Some(user.id)
+    );
+    assert_eq!(
+        f.store
+            .consume_password_reset("reset-1", chrono::Utc::now())
+            .await
+            .unwrap(),
+        None
+    );
+    f.store
+        .create_password_reset(user.id, "reset-2", chrono::Utc::now() - chrono::Duration::hours(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .consume_password_reset("reset-2", chrono::Utc::now())
+            .await
+            .unwrap(),
+        None
+    );
+
+    // oidc sub linking + one-shot states
+    assert!(f.store.user_by_oidc_sub("sub-1").await.unwrap().is_none());
+    f.store.set_oidc_sub(user.id, "sub-1").await.unwrap();
+    assert_eq!(
+        f.store.user_by_oidc_sub("sub-1").await.unwrap().unwrap().id,
+        user.id
+    );
+    f.store
+        .create_oidc_state(
+            "state-1",
+            "verifier",
+            "nonce",
+            chrono::Utc::now() + chrono::Duration::minutes(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .consume_oidc_state("state-1", chrono::Utc::now())
+            .await
+            .unwrap(),
+        Some(("verifier".into(), "nonce".into()))
+    );
+    assert_eq!(
+        f.store
+            .consume_oidc_state("state-1", chrono::Utc::now())
+            .await
+            .unwrap(),
+        None
+    );
+
+    // audit log, newest first
+    for event in ["login.success", "logout"] {
+        f.store
+            .record_auth_event(NewAuthEvent {
+                user_id: Some(user.id),
+                email_address: Some("r@example.com".into()),
+                event: event.into(),
+                ip_address: Some("10.0.0.9".into()),
+                user_agent: None,
+            })
+            .await
+            .unwrap();
+    }
+    let events = f.store.list_auth_events(10).await.unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event, "logout");
+    assert_eq!(events[1].event, "login.success");
+}
