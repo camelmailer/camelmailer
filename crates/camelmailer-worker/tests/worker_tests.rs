@@ -45,7 +45,7 @@ async fn test_pool(base: &str) -> PgPool {
         .unwrap();
     admin_pool.close().await;
     let position = base.rfind('/').unwrap();
-    let pool = camelmailer_db::connect(&format!("{}/{}", &base[..position], db_name), 5)
+    let pool = camelmailer_db::connect(&format!("{}/{}", &base[..position], db_name), 2)
         .await
         .unwrap();
     camelmailer_db::migrate(&pool).await.unwrap();
@@ -246,6 +246,7 @@ async fn outgoing_messages_are_delivered_via_the_relay_and_webhooked() {
     let outcome = worker.process_next().await.unwrap().unwrap();
     assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
     assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    worker.drain_webhooks().await.unwrap();
 
     // the mock SMTP saw the right envelope and body
     let seen = smtp.received.lock().unwrap().clone();
@@ -289,6 +290,7 @@ async fn soft_failures_are_requeued_with_backoff_and_delayed_webhook() {
     let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
     let outcome = worker.process_next().await.unwrap().unwrap();
     assert!(matches!(outcome, ProcessOutcome::Delayed { .. }));
+    worker.drain_webhooks().await.unwrap();
 
     // still queued, with attempts bumped and a retry_after in the future
     assert_eq!(s.queue.queue_size().await.unwrap(), 1);
@@ -337,6 +339,7 @@ async fn hard_failures_leave_the_queue_and_fire_failure_webhook() {
     let outcome = worker.process_next().await.unwrap().unwrap();
     assert!(matches!(outcome, ProcessOutcome::Failed { .. }));
     assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    worker.drain_webhooks().await.unwrap();
     let hooks = hook.requests.lock().unwrap().clone();
     assert_eq!(hooks[0]["event"], "MessageDeliveryFailed");
 }
@@ -492,4 +495,160 @@ async fn deliveries_and_status_are_recorded_by_the_worker() {
         .as_deref()
         .unwrap_or_default()
         .contains("250 Accepted"));
+}
+
+// ------------------------------------------------- webhook queue (commit A)
+
+/// A mock HTTP server capturing headers and raw bodies.
+struct MockHttpFull {
+    url: String,
+    requests: Arc<Mutex<Vec<(serde_json::Value, String)>>>, // (headers, body)
+}
+
+async fn mock_http_full(status: axum::http::StatusCode) -> MockHttpFull {
+    use axum::extract::State;
+    let requests: Arc<Mutex<Vec<(serde_json::Value, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = axum::Router::new()
+        .route(
+            "/hook",
+            axum::routing::post(
+                move |State(captured): State<Arc<Mutex<Vec<(serde_json::Value, String)>>>>,
+                      headers: axum::http::HeaderMap,
+                      body: String| async move {
+                    let header_map: serde_json::Value = headers
+                        .iter()
+                        .map(|(k, v)| {
+                            (k.as_str().to_string(),
+                             serde_json::Value::String(v.to_str().unwrap_or("").to_string()))
+                        })
+                        .collect::<serde_json::Map<_, _>>()
+                        .into();
+                    captured.lock().unwrap().push((header_map, body));
+                    status
+                },
+            ),
+        )
+        .with_state(requests.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    MockHttpFull {
+        url: format!("http://127.0.0.1:{port}/hook"),
+        requests,
+    }
+}
+
+fn signing_key_path() -> String {
+    format!(
+        "{}/tests/fixtures/test_signing_key.pem",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_payloads_are_signed_and_verifiable() {
+    use rsa::signature::Verifier;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let hook = mock_http_full(axum::http::StatusCode::OK).await;
+
+    s.store
+        .create_webhook(NewWebhook {
+            server_id: s.server.id,
+            name: "signed".into(),
+            url: hook.url.clone(),
+            all_events: true,
+            sign: true,
+        })
+        .await
+        .unwrap();
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.signing_key_path = signing_key_path();
+    let worker = Worker::new(&config, s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+    assert_eq!(worker.drain_webhooks().await.unwrap(), 1);
+
+    let requests = hook.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    let (headers, body) = &requests[0];
+    assert_eq!(headers["x-camelmailer-event"], "MessageSent");
+    assert!(headers["x-camelmailer-uuid"].is_string());
+
+    // verify the RSA-SHA256 signature against the signing key's public half
+    use base64::Engine;
+    let signature_b64 = headers["x-camelmailer-signature"].as_str().unwrap();
+    let signature_bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
+        .unwrap();
+    let pem = std::fs::read_to_string(signing_key_path()).unwrap();
+    let signer = camelmailer_worker::Signer::from_pem(&pem).unwrap();
+    let verifying_key = rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(signer.public_key());
+    let signature = rsa::pkcs1v15::Signature::try_from(signature_bytes.as_slice()).unwrap();
+    verifying_key.verify(body.as_bytes(), &signature).unwrap();
+
+    // the audit log recorded the successful attempt
+    let queue = camelmailer_db::PgWebhookQueue::new(s.store.pool().clone());
+    let log = queue.log_for_server(s.server.id).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert!(log[0].success);
+    assert_eq!(log[0].status_code, Some(200));
+    assert_eq!(log[0].attempt, 1);
+    assert_eq!(queue.queue_size().await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failing_webhooks_are_retried_with_backoff_and_logged() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let hook = mock_http(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+
+    s.store
+        .create_webhook(NewWebhook {
+            server_id: s.server.id,
+            name: "flaky".into(),
+            url: hook.url.clone(),
+            all_events: true,
+            sign: false,
+        })
+        .await
+        .unwrap();
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+
+    let outcome = worker.process_next_webhook().await.unwrap().unwrap();
+    assert_eq!(outcome, camelmailer_worker::WebhookOutcome::Retrying);
+
+    let queue = camelmailer_db::PgWebhookQueue::new(s.store.pool().clone());
+    // still queued but deferred: nothing ready right now
+    assert_eq!(queue.queue_size().await.unwrap(), 1);
+    assert!(worker.process_next_webhook().await.unwrap().is_none());
+
+    // second attempt after clearing the backoff
+    queue.clear_backoff().await.unwrap();
+    let outcome = worker.process_next_webhook().await.unwrap().unwrap();
+    assert_eq!(outcome, camelmailer_worker::WebhookOutcome::Retrying);
+
+    let log = queue.log_for_server(s.server.id).await.unwrap();
+    assert_eq!(log.len(), 2);
+    assert!(!log[0].success);
+    assert_eq!(log[0].status_code, Some(500));
+    assert_eq!(log[0].attempt, 1);
+    assert_eq!(log[1].attempt, 2);
 }

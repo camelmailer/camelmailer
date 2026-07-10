@@ -6,12 +6,17 @@
 //! content, so tenant isolation never depends on worker code being careful.
 
 use crate::sender::SmtpSender;
+use crate::signer::Signer;
 use crate::smtp_client::SendOutcome;
 use base64::Engine;
 use camelmailer_core::{AdminStore, Id, RouteMode};
-use camelmailer_db::{PgMessageSink, PgQueue, PgStore, StoredMessage};
+use camelmailer_db::{PgMessageSink, PgQueue, PgStore, PgWebhookQueue, StoredMessage};
 use serde_json::json;
 use std::time::Duration;
+
+/// Webhook deliveries are retried this many times before giving up
+/// (mirrors Postal's webhook retry schedule length).
+const WEBHOOK_MAX_ATTEMPTS: i32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOutcome {
@@ -31,11 +36,20 @@ pub enum ProcessOutcome {
     MessageMissing,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebhookOutcome {
+    Delivered,
+    Retrying,
+    GivenUp,
+}
+
 pub struct Worker {
     store: PgStore,
     sink: PgMessageSink,
     queue: PgQueue,
+    webhook_queue: PgWebhookQueue,
     sender: SmtpSender,
+    signer: Option<Signer>,
     http: reqwest::Client,
     max_attempts: i32,
     worker_id: String,
@@ -50,10 +64,18 @@ impl Worker {
             .timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client");
+        let signer = Signer::from_pem_file(&config.camelmailer.signing_key_path)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not load signing key; webhook signing disabled");
+                None
+            });
+        let webhook_queue = PgWebhookQueue::new(store.pool().clone());
         Self {
             store,
             sink,
             queue,
+            webhook_queue,
+            signer,
             sender,
             http,
             max_attempts: config.camelmailer.default_maximum_delivery_attempts as i32,
@@ -281,8 +303,9 @@ impl Worker {
         })
     }
 
-    /// POST an event to every enabled webhook of the server. Failures are
-    /// logged, not retried (webhook request retrying is a later phase).
+    /// Enqueue an event for every enabled webhook of the server. Delivery,
+    /// signing, retrying and audit logging happen in
+    /// [`Worker::process_next_webhook`].
     async fn send_webhooks(&self, server_id: Id, event: &str, payload: serde_json::Value) {
         let webhooks = match self.store.list_webhooks(server_id).await {
             Ok(webhooks) => webhooks,
@@ -292,44 +315,115 @@ impl Worker {
             }
         };
         for webhook in webhooks.into_iter().filter(|w| w.enabled) {
+            let uuid = camelmailer_core::token::generate_uuid();
             let body = json!({
                 "event": event,
                 "timestamp": chrono::Utc::now().timestamp(),
-                "uuid": camelmailer_core::token::generate_uuid(),
+                "uuid": uuid,
                 "payload": payload,
             });
-            let result = self
-                .http
-                .post(&webhook.url)
-                .header("X-CamelMailer-Event", event)
-                .json(&body)
-                .send()
-                .await;
-            match result {
-                Ok(response) if response.status().is_success() => {}
-                Ok(response) => {
-                    tracing::warn!(webhook = %webhook.url, status = %response.status(), "webhook rejected");
-                }
-                Err(error) => {
-                    tracing::warn!(webhook = %webhook.url, %error, "webhook delivery failed");
-                }
+            if let Err(error) = self
+                .webhook_queue
+                .enqueue(
+                    server_id,
+                    webhook.id,
+                    &uuid,
+                    event,
+                    &webhook.url,
+                    &body.to_string(),
+                    webhook.sign,
+                )
+                .await
+            {
+                tracing::warn!(%error, webhook = %webhook.url, "could not enqueue webhook");
             }
         }
+    }
+
+    /// Deliver one queued webhook request, if any is ready. Signs the body
+    /// with the installation signing key when the webhook asks for it,
+    /// records every attempt in the tenant-scoped audit log, and retries
+    /// failures with backoff.
+    pub async fn process_next_webhook(&self) -> Result<Option<WebhookOutcome>, sqlx::Error> {
+        let Some(request) = self.webhook_queue.dequeue(&self.worker_id).await? else {
+            return Ok(None);
+        };
+
+        let mut http_request = self
+            .http
+            .post(&request.url)
+            .header("content-type", "application/json")
+            .header("X-CamelMailer-Event", &request.event)
+            .header("X-CamelMailer-UUID", &request.uuid);
+        if request.sign {
+            if let Some(signer) = &self.signer {
+                let signature = signer.sign_sha256(request.payload.as_bytes());
+                http_request = http_request.header(
+                    "X-CamelMailer-Signature",
+                    base64::engine::general_purpose::STANDARD.encode(signature),
+                );
+            }
+        }
+
+        let attempt = request.attempts + 1;
+        let result = http_request.body(request.payload.clone()).send().await;
+        let (status_code, success, response_body) = match result {
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                (Some(status.as_u16() as i32), status.is_success(), body)
+            }
+            Err(error) => (None, false, error.to_string()),
+        };
+        self.webhook_queue
+            .log_attempt(&request, attempt, status_code, success, &response_body)
+            .await?;
+
+        if success {
+            self.webhook_queue.complete(request.id).await?;
+            Ok(Some(WebhookOutcome::Delivered))
+        } else if attempt >= WEBHOOK_MAX_ATTEMPTS {
+            self.webhook_queue.complete(request.id).await?;
+            tracing::warn!(url = %request.url, "webhook given up after {WEBHOOK_MAX_ATTEMPTS} attempts");
+            Ok(Some(WebhookOutcome::GivenUp))
+        } else {
+            self.webhook_queue.retry(request.id, request.attempts).await?;
+            Ok(Some(WebhookOutcome::Retrying))
+        }
+    }
+
+    /// Test/ops helper: deliver every ready webhook request.
+    pub async fn drain_webhooks(&self) -> Result<usize, sqlx::Error> {
+        let mut processed = 0;
+        while self.process_next_webhook().await?.is_some() {
+            processed += 1;
+        }
+        Ok(processed)
     }
 
     /// The long-running worker loop: drain the queue, then poll.
     pub async fn run(&self) -> Result<(), sqlx::Error> {
         tracing::info!(worker_id = %self.worker_id, "camelmailer worker started");
         loop {
+            let mut idle = true;
             match self.process_next().await {
                 Ok(Some(outcome)) => {
+                    idle = false;
                     tracing::debug!(?outcome, "processed queued message");
                 }
-                Ok(None) => tokio::time::sleep(Duration::from_secs(5)).await,
-                Err(error) => {
-                    tracing::error!(%error, "queue processing error");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(None) => {}
+                Err(error) => tracing::error!(%error, "queue processing error"),
+            }
+            match self.process_next_webhook().await {
+                Ok(Some(outcome)) => {
+                    idle = false;
+                    tracing::debug!(?outcome, "processed webhook request");
                 }
+                Ok(None) => {}
+                Err(error) => tracing::error!(%error, "webhook processing error"),
+            }
+            if idle {
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
     }

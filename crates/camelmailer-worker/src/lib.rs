@@ -2,9 +2,11 @@
 //! `app/lib/message_dequeuer` and `app/senders`.
 
 pub mod sender;
+pub mod signer;
 pub mod smtp_client;
 pub mod worker;
 
 pub use sender::SmtpSender;
+pub use signer::Signer;
 pub use smtp_client::SendOutcome;
-pub use worker::{ProcessOutcome, Worker};
+pub use worker::{ProcessOutcome, WebhookOutcome, Worker};

@@ -14,9 +14,11 @@
 
 mod pg_store;
 mod queue;
+mod webhook_queue;
 
 pub use pg_store::{Delivery, PgMessageSink, PgStore, StoredMessage};
 pub use queue::{PgQueue, QueuedMessageRow};
+pub use webhook_queue::{PgWebhookQueue, WebhookLogEntry, WebhookRequestRow};
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;

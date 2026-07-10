@@ -51,7 +51,7 @@ async fn test_pool(base: &str) -> PgPool {
         let position = base.rfind('/').unwrap();
         format!("{}/{}", &base[..position], db_name)
     };
-    let pool = camelmailer_db::connect(&db_url, 5).await.unwrap();
+    let pool = camelmailer_db::connect(&db_url, 2).await.unwrap();
     camelmailer_db::migrate(&pool).await.unwrap();
     pool
 }

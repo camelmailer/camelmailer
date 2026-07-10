@@ -12,7 +12,9 @@ camelmailer-db = { workspace = true }
 chrono = { workspace = true }
 hickory-resolver = { workspace = true }
 reqwest = { workspace = true }
+rsa = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
