@@ -500,21 +500,23 @@ async fn deliveries_and_status_are_recorded_by_the_worker() {
 // ------------------------------------------------- webhook queue (commit A)
 
 /// A mock HTTP server capturing headers and raw bodies.
+type CapturedRequests = Arc<Mutex<Vec<(serde_json::Value, String)>>>; // (headers, body)
+
 struct MockHttpFull {
     url: String,
-    requests: Arc<Mutex<Vec<(serde_json::Value, String)>>>, // (headers, body)
+    requests: CapturedRequests,
 }
 
 async fn mock_http_full(status: axum::http::StatusCode) -> MockHttpFull {
     use axum::extract::State;
-    let requests: Arc<Mutex<Vec<(serde_json::Value, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let requests: CapturedRequests = Arc::new(Mutex::new(Vec::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = axum::Router::new()
         .route(
             "/hook",
             axum::routing::post(
-                move |State(captured): State<Arc<Mutex<Vec<(serde_json::Value, String)>>>>,
+                move |State(captured): State<CapturedRequests>,
                       headers: axum::http::HeaderMap,
                       body: String| async move {
                     let header_map: serde_json::Value = headers
