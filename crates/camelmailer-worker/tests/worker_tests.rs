@@ -654,3 +654,73 @@ async fn failing_webhooks_are_retried_with_backoff_and_logged() {
     assert_eq!(log[0].attempt, 1);
     assert_eq!(log[1].attempt, 2);
 }
+
+// --------------------------------------------------------- DKIM (commit B)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outgoing_mail_with_an_authenticated_domain_is_dkim_signed() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    let domain = s
+        .store
+        .create_domain(
+            camelmailer_core::DomainOwner::Server(s.server.id),
+            "org.example",
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut message = outgoing_message(s.server.id, "user@dest.example");
+    message.domain_id = Some(domain.id);
+    s.sink.insert_message(&message).await.unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.signing_key_path = signing_key_path();
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
+
+    let seen = smtp.received.lock().unwrap().clone();
+    let dkim_line = seen
+        .iter()
+        .find(|l| l.starts_with("DKIM-Signature: "))
+        .expect("mock SMTP must have received a DKIM-Signature header");
+    assert!(dkim_line.contains("d=org.example;"));
+    assert!(dkim_line.contains("s=postal;"));
+    assert!(dkim_line.contains("a=rsa-sha256;"));
+    // the original message follows unmodified
+    assert!(seen.iter().any(|l| l == "Subject: Pipeline"));
+
+    // the stored message stays unsigned
+    let stored = s
+        .sink
+        .messages_for_server(s.server.id)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&stored[0].raw_message).contains("DKIM-Signature"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outgoing_mail_without_a_domain_is_not_dkim_signed() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.signing_key_path = signing_key_path();
+    let worker = Worker::new(&config, s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+
+    let seen = smtp.received.lock().unwrap().clone();
+    assert!(!seen.iter().any(|l| l.starts_with("DKIM-Signature:")));
+}

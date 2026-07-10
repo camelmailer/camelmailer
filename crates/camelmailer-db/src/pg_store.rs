@@ -282,6 +282,15 @@ impl PgStore {
             .map_err(Self::sqlx_error)
     }
 
+    pub async fn domain_by_id(&self, id: Id) -> Result<Option<Domain>, StoreError> {
+        sqlx::query("SELECT * FROM domains WHERE id = $1")
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.as_ref().map(domain_from_row))
+            .map_err(Self::sqlx_error)
+    }
+
     pub async fn server_async(&self, id: Id) -> Result<Option<Server>, StoreError> {
         sqlx::query("SELECT * FROM servers WHERE id = $1")
             .bind(id as i64)

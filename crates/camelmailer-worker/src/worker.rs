@@ -5,6 +5,7 @@
 //! context (via the RLS-aware accessors on `camelmailer-db`) to read
 //! content, so tenant isolation never depends on worker code being careful.
 
+use crate::dkim;
 use crate::sender::SmtpSender;
 use crate::signer::Signer;
 use crate::smtp_client::SendOutcome;
@@ -50,6 +51,7 @@ pub struct Worker {
     webhook_queue: PgWebhookQueue,
     sender: SmtpSender,
     signer: Option<Signer>,
+    dkim_selector: String,
     http: reqwest::Client,
     max_attempts: i32,
     worker_id: String,
@@ -76,6 +78,7 @@ impl Worker {
             queue,
             webhook_queue,
             signer,
+            dkim_selector: config.dns.dkim_identifier.clone(),
             sender,
             http,
             max_attempts: config.camelmailer.default_maximum_delivery_attempts as i32,
@@ -138,13 +141,32 @@ impl Worker {
             return Ok(ProcessOutcome::Held);
         }
 
+        // DKIM-sign at delivery time when the message carries an
+        // authenticated domain and a signing key is configured. The stored
+        // message stays unsigned, matching the Ruby behaviour.
+        let raw_message = match (&self.signer, message.domain_id) {
+            (Some(signer), Some(domain_id)) => {
+                match self.store.domain_by_id(domain_id).await {
+                    Ok(Some(domain)) => dkim::sign_and_prepend(
+                        &message.raw_message,
+                        &domain.name,
+                        &self.dkim_selector,
+                        signer,
+                        chrono::Utc::now().timestamp(),
+                    ),
+                    _ => message.raw_message.clone(),
+                }
+            }
+            _ => message.raw_message.clone(),
+        };
+
         let outcome = self
             .sender
             .send(
                 &queued.domain,
                 &message.mail_from,
                 &message.rcpt_to,
-                &message.raw_message,
+                &raw_message,
             )
             .await;
 
