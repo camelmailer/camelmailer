@@ -205,8 +205,13 @@ dependencies = [
  "camelmailer-core",
  "chrono",
  "http-body-util",
+ "jsonwebtoken",
+ "rand 0.8.6",
+ "reqwest",
+ "rsa",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tokio",
  "tower",
@@ -1077,6 +1082,19 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64",
+ "js-sys",
+ "ring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
