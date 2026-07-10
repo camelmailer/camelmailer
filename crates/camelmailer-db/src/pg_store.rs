@@ -1224,6 +1224,8 @@ impl AdminStore for PgStore {
 
 // ----------------------------------------------------- Store (SMTP, sync)
 
+impl camelmailer_core::ServerStore for PgStore {}
+
 impl Store for PgStore {
     fn organization(&self, id: Id) -> Option<Organization> {
         self.wait(self.organization_async(id)).ok().flatten()

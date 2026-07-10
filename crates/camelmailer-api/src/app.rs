@@ -31,6 +31,8 @@ use crate::resources;
 pub struct ApiState {
     /// Storage — in-memory for tests, PostgreSQL in production.
     pub store: Arc<dyn AdminStore>,
+    /// Tenant-scoped storage for the per-server API (`/api/v2/server`).
+    pub server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
     /// `camelmailer.admin_api_key` — the global fallback key.
     pub global_admin_api_key: Option<String>,
 }
@@ -39,6 +41,20 @@ impl ApiState {
     pub fn new(store: Arc<dyn AdminStore>, global_admin_api_key: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             store,
+            server_store: None,
+            global_admin_api_key,
+        })
+    }
+
+    /// Construct with tenant-scoped storage for the per-server API.
+    pub fn with_server_store(
+        store: Arc<dyn AdminStore>,
+        server_store: Arc<dyn camelmailer_core::ServerStore>,
+        global_admin_api_key: Option<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            server_store: Some(server_store),
             global_admin_api_key,
         })
     }
@@ -148,7 +164,7 @@ pub(crate) fn render_store_error(start: Option<&RequestStart>, error: StoreError
     }
 }
 
-async fn timing_middleware(mut request: Request, next: Next) -> Response {
+pub(crate) async fn timing_middleware(mut request: Request, next: Next) -> Response {
     request.extensions_mut().insert(RequestStart(Instant::now()));
     next.run(request).await
 }

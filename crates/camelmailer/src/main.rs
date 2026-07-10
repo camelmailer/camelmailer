@@ -1,7 +1,7 @@
 //! The `camelmailer` CLI — the Rust port of `bin/postal`, dispatching the
 //! process roles from a single binary.
 
-use camelmailer_api::{build_router, tracking_router, ApiState, TrackingState};
+use camelmailer_api::{build_router, build_server_router, tracking_router, ApiState, TrackingState};
 use camelmailer_core::{AdminStore, MemorySink, MemoryStore, MessageSink, Store, TrackingStore};
 use camelmailer_db::{PgMessageSink, PgStore};
 use camelmailer_smtp::SmtpServer;
@@ -103,19 +103,23 @@ async fn make_admin_api_key(name: String) -> std::io::Result<()> {
 
 async fn web_server() -> std::io::Result<()> {
     let config = load_config();
-    let store: Arc<dyn AdminStore> = if postgres_enabled(&config) {
-        Arc::new(connect_pg(&config).await?)
+    let global_key = config.camelmailer.admin_api_key.clone();
+
+    let (state, tracking) = if postgres_enabled(&config) {
+        // One Postgres store, shared as the admin store, the tenant-scoped
+        // server store, and the tracking store.
+        let pg = Arc::new(connect_pg(&config).await?);
+        let state = ApiState::with_server_store(pg.clone(), pg.clone(), global_key);
+        let tracking: Arc<dyn TrackingStore> = pg;
+        (state, Some(tracking))
     } else {
         tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
-        Arc::new(MemoryStore::new())
+        let memory = Arc::new(MemoryStore::new());
+        let state = ApiState::with_server_store(memory.clone(), memory, global_key);
+        (state, None)
     };
-    let tracking: Option<std::sync::Arc<dyn TrackingStore>> = if postgres_enabled(&config) {
-        Some(std::sync::Arc::new(connect_pg(&config).await?))
-    } else {
-        None
-    };
-    let state = ApiState::new(store, config.camelmailer.admin_api_key.clone());
-    let mut router = build_router(state);
+
+    let mut router = build_router(state.clone()).merge(build_server_router(state));
     if let Some(tracking) = tracking {
         router = router.merge(tracking_router(std::sync::Arc::new(TrackingState {
             store: tracking,

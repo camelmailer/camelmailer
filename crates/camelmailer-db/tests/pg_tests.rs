@@ -765,3 +765,49 @@ async fn activity_tables_are_rls_protected() {
         .unwrap();
     assert!(deliveries.is_empty());
 }
+
+// ------------------------------------------- server API tokens (P1)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_for_api_token_resolves_and_records_use() {
+    use camelmailer_core::{CredentialType, NewCredential};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+
+    let token = "server-api-token-abc123";
+    f.store
+        .create_credential_record(NewCredential {
+            server_id: f.server.id,
+            credential_type: CredentialType::Api,
+            name: "api".into(),
+            key: Some(token.into()),
+        })
+        .await
+        .unwrap();
+
+    // resolves to the owning server
+    let resolved = f.store.server_for_api_token(token).await.unwrap().unwrap();
+    assert_eq!(resolved.id, f.server.id);
+    assert!(f.store.server_for_api_token("wrong").await.unwrap().is_none());
+
+    // last_used_at was stamped
+    use sqlx::Row;
+    let last_used: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query("SELECT last_used_at FROM credentials WHERE key = $1")
+            .bind(token)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("last_used_at");
+    assert!(last_used.is_some());
+
+    // held credentials do not resolve
+    sqlx::query("UPDATE credentials SET hold = true WHERE key = $1")
+        .bind(token)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(f.store.server_for_api_token(token).await.unwrap().is_none());
+}
