@@ -29,6 +29,9 @@ camelmailer:
   default_spam_failure_threshold: 20
 
 web_server:
+  # Browser origins allowed to call the APIs (CORS). Empty = no CORS.
+  # cors_origins:
+  #   - https://mail-admin.example.com
   default_port: 5000
   default_bind_address: 127.0.0.1   # containers override via BIND_ADDRESS
 
@@ -73,3 +76,34 @@ clamav:
   enabled: false
   host: 127.0.0.1
   port: 2000
+
+# ---------------------------------------------------------------- accounts
+
+# User accounts, sessions and RBAC (see docs/authentication.md).
+# Bootstrap the first account with: camelmailer make-user <email> --admin
+auth:
+  session_timeout_days: 14
+  max_login_attempts: 5
+  lockout_minutes: 15
+  minimum_password_length: 8
+  # Any signed-in user may create an organization (becoming its owner);
+  # set to false to restrict creation to global admins.
+  allow_organization_creation: true
+  invitation_expiry_days: 7
+  password_reset_expiry_hours: 2
+  # Base URL of your web frontend — used for invitation/reset links and
+  # the OIDC post-login redirect.
+  # frontend_url: https://mail-admin.example.com
+
+# OpenID Connect single sign-on (Okta, Entra ID, Google, Keycloak, …).
+# Register the redirect URI:
+#   {web_protocol}://{web_hostname}/api/v2/auth/oidc/callback
+oidc:
+  enabled: false
+  # name: Okta
+  # issuer: https://acme.okta.com
+  # identifier: client-id
+  # secret: client-secret
+  # scopes: [openid, email, profile]
+  # auto_provision: true
+  # allowed_email_domains: [acme.com]

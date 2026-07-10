@@ -118,6 +118,21 @@ curl -s "$API/api/v2/server/messages/1" -H "X-Server-API-Key: $SERVER_KEY"
 curl -s "$API/api/v2/server/stats" -H "X-Server-API-Key: $SERVER_KEY"
 ```
 
+## Optional: user accounts for your team
+
+The admin API key above is a machine credential. For humans (and for a
+web frontend) create user accounts — with roles, 2FA and SSO:
+
+```bash
+docker compose exec web camelmailer make-user you@example.com Ada Lovelace --admin
+curl -X POST http://localhost:5000/api/v2/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email_address": "you@example.com", "password": "…"}'
+```
+
+See **[authentication.md](authentication.md)** for roles, invitations,
+OIDC single sign-on and CORS.
+
 ## Where to go next
 
 - **[configuration.md](configuration.md)** — config file, DKIM signing key,

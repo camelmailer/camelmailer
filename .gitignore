@@ -1,5 +1,9 @@
 /target
 
+# Proxy-CA shim some sandboxed CI environments inject into the build
+# context for TLS interception; never commit one.
+._verify-ca.crt
+
 # Local environment + real configuration (keep the examples).
 .env
 config/*

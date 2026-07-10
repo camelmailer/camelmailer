@@ -2,7 +2,8 @@
 //! process roles from a single binary.
 
 use camelmailer_api::{
-    build_router, build_server_router, tracking_router, ApiState, TrackingState,
+    build_auth_router, build_oidc_router, build_router, build_server_router, cors_layer,
+    tracking_router, ApiState, TrackingState,
 };
 use camelmailer_core::{AdminStore, MemorySink, MemoryStore, MessageSink, Store, TrackingStore};
 use camelmailer_db::{PgMessageSink, PgStore};
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
             let name = args.get(2).cloned().unwrap_or_else(|| "cli".to_string());
             run_async(make_admin_api_key(name))
         }
+        Some("make-user") => run_async(make_user(args[2..].to_vec())),
         Some("version") => {
             println!("CamelMailer v{VERSION}");
             ExitCode::SUCCESS
@@ -103,29 +105,108 @@ async fn make_admin_api_key(name: String) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `make-user <email> <first-name> <last-name> [--admin]` — create a user
+/// account. The password comes from `CAMELMAILER_USER_PASSWORD` or is
+/// generated and printed.
+async fn make_user(args: Vec<String>) -> std::io::Result<()> {
+    let config = load_config();
+    if !postgres_enabled(&config) {
+        return Err(std::io::Error::other(
+            "make-user requires PostgreSQL (postgres.enabled: true or DATABASE_URL)",
+        ));
+    }
+    let admin = args.iter().any(|a| a == "--admin");
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let Some(email) = positional.first().filter(|e| e.contains('@')) else {
+        return Err(std::io::Error::other(
+            "usage: camelmailer make-user <email> [first-name] [last-name] [--admin]",
+        ));
+    };
+    let first_name = positional.get(1).cloned().cloned().unwrap_or_default();
+    let last_name = positional.get(2).cloned().cloned().unwrap_or_default();
+
+    let (password, generated) = match std::env::var("CAMELMAILER_USER_PASSWORD") {
+        Ok(password) if !password.is_empty() => (password, false),
+        _ => (camelmailer_core::token::generate_key(), true),
+    };
+    if (password.len() as u32) < config.auth.minimum_password_length {
+        return Err(std::io::Error::other(format!(
+            "password must be at least {} characters",
+            config.auth.minimum_password_length
+        )));
+    }
+    let digest = camelmailer_core::auth::hash_password(&password).map_err(std::io::Error::other)?;
+
+    let store = connect_pg(&config).await?;
+    use camelmailer_core::{AdminStore, AuthStore};
+    let user = store
+        .create_user(camelmailer_core::NewUser {
+            email_address: email.to_string(),
+            first_name,
+            last_name,
+            admin,
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+    store
+        .set_password_digest(user.id, &digest)
+        .await
+        .map_err(std::io::Error::other)?;
+
+    println!(
+        "User '{}' created{}.",
+        user.email_address,
+        if admin { " (global admin)" } else { "" }
+    );
+    if generated {
+        println!("Generated password: {password}");
+        println!("(set CAMELMAILER_USER_PASSWORD to choose one; change it after first login)");
+    }
+    Ok(())
+}
+
 async fn web_server() -> std::io::Result<()> {
     let config = load_config();
     let global_key = config.camelmailer.admin_api_key.clone();
 
     let (state, tracking) = if postgres_enabled(&config) {
         // One Postgres store, shared as the admin store, the tenant-scoped
-        // server store, and the tracking store.
+        // server store, the account store, and the tracking store.
         let pg = Arc::new(connect_pg(&config).await?);
-        let state = ApiState::with_server_store(pg.clone(), pg.clone(), global_key);
+        let state = ApiState::full(
+            pg.clone(),
+            Some(pg.clone()),
+            Some(pg.clone()),
+            global_key,
+            config.clone(),
+        );
         let tracking: Arc<dyn TrackingStore> = pg;
         (state, Some(tracking))
     } else {
         tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
         let memory = Arc::new(MemoryStore::new());
-        let state = ApiState::with_server_store(memory.clone(), memory, global_key);
+        let state = ApiState::full(
+            memory.clone(),
+            Some(memory.clone()),
+            Some(memory),
+            global_key,
+            config.clone(),
+        );
         (state, None)
     };
 
-    let mut router = build_router(state.clone()).merge(build_server_router(state));
+    let mut router = build_router(state.clone())
+        .merge(build_server_router(state.clone()))
+        .merge(build_auth_router(state.clone()))
+        .merge(build_oidc_router(state));
     if let Some(tracking) = tracking {
         router = router.merge(tracking_router(std::sync::Arc::new(TrackingState {
             store: tracking,
         })));
+    }
+    if let Some(cors) = cors_layer(&config.web_server.cors_origins) {
+        tracing::info!(origins = ?config.web_server.cors_origins, "CORS enabled");
+        router = router.layer(cors);
     }
 
     let port = std::env::var("PORT")
@@ -179,6 +260,7 @@ fn print_usage() {
     println!();
     println!(" * initialize - create/upgrade the PostgreSQL schema");
     println!(" * make-admin-api-key [name] - create an Admin API key");
+    println!(" * make-user <email> [first] [last] [--admin] - create a user account");
     println!();
     println!("Other tools:");
     println!();

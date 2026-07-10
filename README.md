@@ -3,9 +3,11 @@
 **A headless, API-first mail delivery platform in Rust.** SMTP in and out,
 HTTP APIs for everything — sending, templates, message streams, statistics,
 bounces, inbound routing, webhooks, tracking — backed by a single PostgreSQL
-database with row-level-security tenant isolation. One small binary runs
-every process role. MIT licensed; born as a full Rust rewrite of
-[Postal](https://github.com/postalserver/postal).
+database with row-level-security tenant isolation. User accounts with
+2FA, organization-level RBAC, invitations, OIDC single sign-on, an auth
+audit log and CORS make it frontend- and enterprise-ready out of the box.
+One small binary runs every process role. MIT licensed; born as a full
+Rust rewrite of [Postal](https://github.com/postalserver/postal).
 
 ## Quickstart
 
@@ -21,7 +23,8 @@ That's PostgreSQL + migrations + the HTTP API (`:5000`) + SMTP (`:25`) +
 the delivery worker. Follow **[docs/quickstart.md](docs/quickstart.md)** for
 the five-minute zero-to-first-mail walkthrough, and
 **[docs/configuration.md](docs/configuration.md)** for DKIM, DNS records,
-TLS, and the production checklist.
+TLS, and the production checklist. Accounts, roles and SSO are covered in
+**[docs/authentication.md](docs/authentication.md)**.
 
 ## How it's built
 
@@ -38,8 +41,8 @@ the corresponding RSpec suite before/alongside the implementation.
 | `camelmailer-db` | `lib/postal/message_db/` + the ActiveRecord persistence | ✅ PostgreSQL with row-level security (see below); embedded migrations; message metadata parity (status, spam, deliveries, links/clicks, loads/opens); delivery queue |
 | `camelmailer-smtp` | `app/lib/smtp_server/client.rb` + `server.rb`, `script/smtp_server.rb` | ✅ full protocol state machine (see below), tokio TCP server, STARTTLS termination via rustls |
 | `camelmailer-worker` | `script/worker.rb`, `app/lib/message_dequeuer`, `app/senders`, `app/lib/postal/message_inspectors`, `dkim_header.rb`, `signer.rb` | ✅ queue dequeuer (SKIP LOCKED), SMTP sending (relays/MX) with opportunistic outbound STARTTLS and IP-pool source addresses, suppression holds, rspamd/ClamAV inspection, DKIM signing, open/click tracking rewrite, HTTP endpoint delivery, webhook queue with retries + RSA signing, delivery recording |
-| `camelmailer-api` | `app/controllers/admin_api/` + a native Server API | ✅ **Account API** (`/api/v2/admin`, `X-Admin-API-Key`): auth (incl. DB-backed keys), envelope, pagination, errors; organizations, servers (full config + IP-pool + admin-key management), domains, credentials, routes, webhooks, suppressions, users, IP pools. ✅ **Server API** (`/api/v2/server`, `X-Server-API-Key`): HTTP send, message/delivery/open/click reads, stats + bounces + queue stats, message streams, inbound search/bypass/retry, templates + rendering. ✅ public click/open tracking endpoints |
-| `camelmailer` (bin) | `bin/postal` | ✅ CLI dispatcher: `smtp-server`, `web-server`, `worker`, `initialize` (migrations), `make-admin-api-key`, `version` |
+| `camelmailer-api` | `app/controllers/admin_api/` + a native Server API | ✅ **Account API** (`/api/v2/admin`, `X-Admin-API-Key`): auth (incl. DB-backed keys), envelope, pagination, errors; organizations, servers (full config + IP-pool + admin-key management), domains, credentials, routes, webhooks, suppressions, users, IP pools. ✅ **Server API** (`/api/v2/server`, `X-Server-API-Key`): HTTP send, message/delivery/open/click reads, stats + bounces + queue stats, message streams, inbound search/bypass/retry, templates + rendering. ✅ public click/open tracking endpoints. ✅ **Auth API** (`/api/v2/auth`, Bearer sessions): login with lockout + TOTP 2FA, password change/reset, profile, invitations accept, OIDC SSO (code flow + PKCE); RBAC (viewer/member/admin/owner + global admins) enforced across the admin API; members + invitations management; auth audit log; CORS |
+| `camelmailer` (bin) | `bin/postal` | ✅ CLI dispatcher: `smtp-server`, `web-server`, `worker`, `initialize` (migrations), `make-admin-api-key`, `make-user` (accounts bootstrap), `version` |
 
 ## Storage: single PostgreSQL database with row-level security
 
