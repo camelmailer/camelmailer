@@ -8,8 +8,8 @@
 //! admin auth middleware.
 
 use crate::app::{
-    paginate, render_error, render_success, server_json, timing_middleware, ApiState,
-    PaginationParams, RequestStart,
+    paginate, permalink_from, render_error, render_success, server_json, timing_middleware,
+    ApiState, PaginationParams, RequestStart,
 };
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -20,8 +20,8 @@ use axum::{Json, Router};
 use base64::Engine;
 use camelmailer_core::mime::{self, Address, Attachment, BuildParams};
 use camelmailer_core::{
-    ActivityEvent, DeliveryRecord, MessageFilter, MessageRecord, MessageScope, QueuedMessage,
-    Server, ServerContext,
+    ActivityEvent, DeliveryRecord, MessageFilter, MessageRecord, MessageScope, MessageStream,
+    NewStream, QueuedMessage, Server, ServerContext,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -176,6 +176,8 @@ struct SendMessage {
     attachments: Vec<AttachmentInput>,
     tag: Option<String>,
     metadata: Option<Value>,
+    /// Message-stream permalink; defaults to the server's default stream.
+    stream: Option<String>,
 }
 
 /// The From-address' domain, or an error message.
@@ -241,6 +243,36 @@ async fn enqueue_send(
             format!("From domain {from_domain:?} is not a verified sender for this server"),
         ))?;
 
+    // Resolve the target stream: an explicit permalink (must exist and not be
+    // archived) or the server's default stream.
+    let stream_id = match &body.stream {
+        Some(permalink) => match server_store.stream_by_permalink(server.id, permalink).await {
+            Ok(Some(stream)) if !stream.archived => Some(stream.id),
+            Ok(Some(_)) => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationError".into(),
+                    format!("Message stream {permalink:?} is archived"),
+                ))
+            }
+            Ok(None) => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationError".into(),
+                    format!("Message stream {permalink:?} does not exist"),
+                ))
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError".into(),
+                    "An internal error occurred".into(),
+                ))
+            }
+        },
+        None => server.default_stream_id,
+    };
+
     let attachments: Vec<Attachment> = body
         .attachments
         .into_iter()
@@ -295,6 +327,7 @@ async fn enqueue_send(
             route_id: None,
             tag: body.tag.clone(),
             metadata: body.metadata.clone(),
+            stream_id,
         };
         match server_store.store_outgoing(queued).await {
             Ok(sent) => {
@@ -377,6 +410,7 @@ fn message_json(message: &MessageRecord) -> Value {
         "threat": message.threat,
         "size": message.size,
         "metadata": message.metadata,
+        "stream_id": message.stream_id,
         "created_at": message.created_at.to_rfc3339(),
     })
 }
@@ -410,6 +444,26 @@ struct MessageListParams {
     status: Option<String>,
     tag: Option<String>,
     query: Option<String>,
+    /// Restrict to one message stream (by permalink).
+    stream: Option<String>,
+}
+
+/// Resolve an optional `?stream=` permalink to a stream id. `Ok(None)` means
+/// "no stream filter"; `Err` is a rendered 404 for an unknown stream.
+async fn resolve_stream_filter(
+    store: &Arc<dyn camelmailer_core::ServerStore>,
+    server_id: camelmailer_core::Id,
+    permalink: &Option<String>,
+    start: &RequestStart,
+) -> Result<Option<camelmailer_core::Id>, Response> {
+    match permalink.as_deref().filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(permalink) => match store.stream_by_permalink(server_id, permalink).await {
+            Ok(Some(stream)) => Ok(Some(stream.id)),
+            Ok(None) => Err(not_found(start)),
+            Err(error) => Err(internal_error(start, &error.to_string())),
+        },
+    }
 }
 
 /// The configured tenant-scoped store, if the API was built with one.
@@ -438,11 +492,17 @@ async fn messages_index(
         Some(store) => store,
         None => return storage_unconfigured(&start.0),
     };
+    let stream_id =
+        match resolve_stream_filter(store, server.0.id, &params.stream, &start.0).await {
+            Ok(stream_id) => stream_id,
+            Err(response) => return response,
+        };
     let filter = MessageFilter {
         scope: params.scope.filter(|s| !s.is_empty()),
         status: params.status.filter(|s| !s.is_empty()),
         tag: params.tag.filter(|s| !s.is_empty()),
         query: params.query.filter(|s| !s.is_empty()),
+        stream_id,
     };
     let messages = match store.messages(server.0.id, &filter).await {
         Ok(messages) => messages,
@@ -715,6 +775,7 @@ async fn bounces_index(
         status: params.status.filter(|s| !s.is_empty()),
         tag: params.tag.filter(|s| !s.is_empty()),
         query: params.query.filter(|s| !s.is_empty()),
+        stream_id: None,
     };
     let bounces = match store.bounces(server.0.id, &filter).await {
         Ok(bounces) => bounces,
@@ -774,6 +835,216 @@ fn internal_error(start: &RequestStart, message: &str) -> Response {
     .into_response()
 }
 
+// ------------------------------------------------------- message streams
+
+fn stream_json(stream: &MessageStream) -> Value {
+    json!({
+        "id": stream.id,
+        "uuid": stream.uuid,
+        "name": stream.name,
+        "permalink": stream.permalink,
+        "stream_type": stream.stream_type,
+        "archived": stream.archived,
+    })
+}
+
+fn valid_stream_type(stream_type: &str) -> bool {
+    matches!(stream_type, "transactional" | "broadcast" | "inbound")
+}
+
+/// `GET /api/v2/server/streams`.
+async fn streams_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.list_streams(server.0.id).await {
+        Ok(streams) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "streams": streams.iter().map(stream_json).collect::<Vec<_>>() }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateStream {
+    name: Option<String>,
+    permalink: Option<String>,
+    stream_type: Option<String>,
+}
+
+/// `POST /api/v2/server/streams`.
+async fn streams_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Json(body): Json<CreateStream>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let Some(name) = body.name.filter(|n| !n.is_empty()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::BAD_REQUEST,
+            "ParameterMissing",
+            "param is missing or the value is empty: name",
+        )
+        .into_response();
+    };
+    let stream_type = body.stream_type.unwrap_or_else(|| "transactional".into());
+    if !valid_stream_type(&stream_type) {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            &format!("Stream type {stream_type:?} is not valid"),
+        )
+        .into_response();
+    }
+    let permalink = body
+        .permalink
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| permalink_from(&name));
+
+    match store
+        .create_stream(NewStream {
+            server_id: server.0.id,
+            name,
+            permalink,
+            stream_type,
+        })
+        .await
+    {
+        Ok(stream) => render_success(
+            Some(&start.0),
+            StatusCode::CREATED,
+            json!({ "stream": stream_json(&stream) }),
+        )
+        .into_response(),
+        Err(camelmailer_core::StoreError::Conflict(message)) => render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            &message,
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `GET /api/v2/server/streams/{permalink}`.
+async fn stream_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.stream_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(stream)) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "stream": stream_json(&stream) }),
+        )
+        .into_response(),
+        Ok(None) => not_found(&start.0),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UpdateStream {
+    name: Option<String>,
+    stream_type: Option<String>,
+    archived: Option<bool>,
+}
+
+/// `PATCH /api/v2/server/streams/{permalink}`.
+async fn stream_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+    Json(body): Json<UpdateStream>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let mut stream = match store.stream_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(stream)) => stream,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    if let Some(name) = body.name.filter(|n| !n.is_empty()) {
+        stream.name = name;
+    }
+    if let Some(stream_type) = body.stream_type {
+        if !valid_stream_type(&stream_type) {
+            return render_error(
+                Some(&start.0),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationError",
+                &format!("Stream type {stream_type:?} is not valid"),
+            )
+            .into_response();
+        }
+        stream.stream_type = stream_type;
+    }
+    if let Some(archived) = body.archived {
+        stream.archived = archived;
+    }
+    match store.update_stream(stream).await {
+        Ok(stream) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "stream": stream_json(&stream) }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `POST /api/v2/server/streams/{permalink}/archive`.
+async fn stream_archive(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let mut stream = match store.stream_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(stream)) => stream,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    stream.archived = true;
+    match store.update_stream(stream).await {
+        Ok(stream) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "stream": stream_json(&stream) }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
 /// Build the `/api/v2/server` router (server-token authenticated).
 pub fn build_server_router(state: Arc<ApiState>) -> Router {
     let server = Router::new()
@@ -790,6 +1061,9 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/stats/deliveries", get(delivery_stats_show))
         .route("/bounces", get(bounces_index))
         .route("/bounces/{id}", get(bounce_show))
+        .route("/streams", get(streams_index).post(streams_create))
+        .route("/streams/{permalink}", get(stream_show).patch(stream_update))
+        .route("/streams/{permalink}/archive", post(stream_archive))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             server_auth_middleware,

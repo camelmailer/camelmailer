@@ -252,11 +252,25 @@ async fn build_with_verified_domain() -> (Router, String, Arc<MS>, u64) {
 }
 
 async fn post_json(app: &Router, path: &str, token: &str, body: Value) -> (StatusCode, Value) {
+    json_request(app, "POST", path, token, body).await
+}
+
+async fn patch_json(app: &Router, path: &str, token: &str, body: Value) -> (StatusCode, Value) {
+    json_request(app, "PATCH", path, token, body).await
+}
+
+async fn json_request(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
     let response = app
         .clone()
         .oneshot(
             Request::builder()
-                .method("POST")
+                .method(method)
                 .uri(path)
                 .header("X-Server-API-Key", token)
                 .header("content-type", "application/json")
@@ -641,5 +655,169 @@ async fn stats_and_bounces_are_tenant_scoped() {
     let (_, body) = request(&app, "/api/v2/server/bounces", Some(&token_b)).await;
     assert_eq!(body["data"]["bounces"].as_array().unwrap().len(), 0);
     let (status, _) = request(&app, &format!("/api/v2/server/bounces/{id}"), Some(&token_b)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ------------------------------------------- P5: message streams
+
+#[tokio::test]
+async fn every_server_has_a_default_stream() {
+    let (app, token, _, _) = build_two_with_domains().await;
+    let (status, body) = request(&app, "/api/v2/server/streams", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let streams = body["data"]["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0]["permalink"], "outbound");
+    assert_eq!(streams[0]["stream_type"], "transactional");
+
+    // the server exposes its default_stream_id
+    let (_, body) = request(&app, "/api/v2/server", Some(&token)).await;
+    assert_eq!(body["data"]["server"]["default_stream_id"], streams[0]["id"]);
+}
+
+#[tokio::test]
+async fn stream_crud_and_archive() {
+    let (app, token, _, _) = build_two_with_domains().await;
+
+    // create
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token,
+        json!({ "name": "Broadcasts", "stream_type": "broadcast" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["stream"]["permalink"], "broadcasts");
+    assert_eq!(body["data"]["stream"]["stream_type"], "broadcast");
+
+    // duplicate permalink → 422
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token,
+        json!({ "name": "Broadcasts" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // invalid type → 422
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token,
+        json!({ "name": "X", "stream_type": "nonsense" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // show
+    let (status, body) = request(&app, "/api/v2/server/streams/broadcasts", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["stream"]["name"], "Broadcasts");
+
+    // update (rename)
+    let (status, body) = patch_json(
+        &app,
+        "/api/v2/server/streams/broadcasts",
+        &token,
+        json!({ "name": "Newsletters" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["stream"]["name"], "Newsletters");
+
+    // archive
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/streams/broadcasts/archive",
+        &token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["stream"]["archived"], true);
+}
+
+#[tokio::test]
+async fn send_targets_a_stream_and_list_filters_by_it() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    // a second stream to route to
+    post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token,
+        json!({ "name": "Broadcasts", "stream_type": "broadcast" }),
+    )
+    .await;
+
+    // send explicitly to the broadcasts stream
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@alpha.example",
+            "to": ["a@dest.example"],
+            "subject": "Promo",
+            "text_body": "x",
+            "stream": "broadcasts"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let broadcast_id = body["data"]["message_id"].as_i64().unwrap();
+
+    // send to the default stream (no stream param)
+    send_one(&app, &token, "news@alpha.example", "b@dest.example", "Receipt", "t").await;
+
+    // the broadcast message carries the broadcasts stream id
+    let streams_id = {
+        let (_, body) = request(&app, "/api/v2/server/streams/broadcasts", Some(&token)).await;
+        body["data"]["stream"]["id"].as_i64().unwrap()
+    };
+    let stored = store.message_for(
+        store.server_for_api_token(&token).await.unwrap().unwrap().id,
+        broadcast_id,
+    );
+    assert_eq!(stored.unwrap().stream_id, Some(streams_id as u64));
+
+    // ?stream= filters the message list
+    let (_, body) = request(&app, "/api/v2/server/messages?stream=broadcasts", Some(&token)).await;
+    let messages = body["data"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["subject"], "Promo");
+
+    // sending to an unknown stream is a 422
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({ "from": "news@alpha.example", "to": ["c@dest.example"], "subject": "x", "text_body": "y", "stream": "ghost" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn streams_are_tenant_scoped() {
+    let (app, token_a, token_b, _) = build_two_with_domains().await;
+    post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token_a,
+        json!({ "name": "Secret" }),
+    )
+    .await;
+    // token B never sees server A's stream
+    let (_, body) = request(&app, "/api/v2/server/streams", Some(&token_b)).await;
+    let permalinks: Vec<&str> = body["data"]["streams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["permalink"].as_str().unwrap())
+        .collect();
+    assert!(!permalinks.contains(&"secret"));
+    let (status, _) = request(&app, "/api/v2/server/streams/secret", Some(&token_b)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }

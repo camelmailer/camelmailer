@@ -185,6 +185,20 @@ pub struct Webhook {
     pub sign: bool,
 }
 
+/// A message stream — a flat label grouping mail for a server
+/// (transactional / broadcast / inbound). A config record, filtered by
+/// `server_id`; not RLS-protected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageStream {
+    pub id: Id,
+    pub uuid: String,
+    pub server_id: Id,
+    pub name: String,
+    pub permalink: String,
+    pub stream_type: String,
+    pub archived: bool,
+}
+
 /// A suppression-list entry. Tenant-scoped: lives under RLS in Postgres
 /// (in the Ruby app this was a table in the per-server message database).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

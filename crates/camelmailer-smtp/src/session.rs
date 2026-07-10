@@ -808,6 +808,7 @@ impl Session {
                         route_id: None,
             tag: None,
             metadata: None,
+            stream_id: None,
                     });
                 }
                 RecipientKind::Bounce => {
@@ -827,6 +828,7 @@ impl Session {
                                 route_id: Some(rp_route.route.id),
             tag: None,
             metadata: None,
+            stream_id: None,
                             });
                         }
                         None => {
@@ -845,6 +847,7 @@ impl Session {
                                 route_id: None,
             tag: None,
             metadata: None,
+            stream_id: None,
                             });
                         }
                     }
@@ -864,6 +867,7 @@ impl Session {
                         route_id: Some(route.route.id),
             tag: None,
             metadata: None,
+            stream_id: None,
                     });
                 }
             }

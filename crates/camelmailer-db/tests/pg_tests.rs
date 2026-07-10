@@ -101,6 +101,7 @@ fn message_for(server_id: camelmailer_core::Id, rcpt_to: &str) -> QueuedMessage 
         route_id: None,
             tag: None,
             metadata: None,
+            stream_id: None,
     }
 }
 
@@ -991,4 +992,96 @@ async fn server_store_stats_and_bounces_are_tenant_scoped() {
     assert!(f.store.bounces(other.id, &MessageFilter::default()).await.unwrap().is_empty());
     assert!(f.store.bounce(other.id, bounced_id).await.unwrap().is_none());
     assert_eq!(f.store.delivery_stats(other.id).await.unwrap().queued, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_streams_default_crud_and_scoping() {
+    use camelmailer_core::{MessageFilter, NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+
+    // create_server backfilled a default transactional stream + pointer
+    let streams = f.store.list_streams(f.server.id).await.unwrap();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].permalink, "outbound");
+    assert_eq!(f.server.default_stream_id, Some(streams[0].id));
+
+    // create a second stream, duplicate permalink rejected
+    let broadcast = f
+        .store
+        .create_stream(NewStream {
+            server_id: f.server.id,
+            name: "Broadcasts".into(),
+            permalink: "broadcasts".into(),
+            stream_type: "broadcast".into(),
+        })
+        .await
+        .unwrap();
+    assert!(f
+        .store
+        .create_stream(NewStream {
+            server_id: f.server.id,
+            name: "Dup".into(),
+            permalink: "broadcasts".into(),
+            stream_type: "broadcast".into(),
+        })
+        .await
+        .is_err());
+
+    // send a message into the broadcast stream and filter by it
+    let mut msg = message_for(f.server.id, "a@dest.example");
+    msg.scope = MessageScope::Outgoing;
+    msg.stream_id = Some(broadcast.id);
+    let (msg_id, _) = f.store.store_outgoing(msg).await.map(|m| (m.id, m.token)).unwrap();
+
+    let in_stream = f
+        .store
+        .messages(
+            f.server.id,
+            &MessageFilter { stream_id: Some(broadcast.id), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    assert_eq!(in_stream.len(), 1);
+    assert_eq!(in_stream[0].id, msg_id);
+    assert_eq!(in_stream[0].stream_id, Some(broadcast.id));
+
+    // archive via update_stream
+    let archived = f
+        .store
+        .update_stream(camelmailer_core::MessageStream { archived: true, ..broadcast.clone() })
+        .await
+        .unwrap();
+    assert!(archived.archived);
+    assert!(
+        f.store
+            .stream_by_permalink(f.server.id, "broadcasts")
+            .await
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+
+    // the other tenant sees only its own (default) stream
+    let their_streams = f.store.list_streams(other.id).await.unwrap();
+    assert_eq!(their_streams.len(), 1);
+    assert_eq!(their_streams[0].permalink, "outbound");
+    assert!(f
+        .store
+        .stream_by_permalink(other.id, "broadcasts")
+        .await
+        .unwrap()
+        .is_none());
 }

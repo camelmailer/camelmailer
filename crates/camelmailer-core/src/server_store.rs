@@ -9,7 +9,7 @@
 
 use crate::admin_store::StoreError;
 use crate::message::{MessageRecord, QueuedMessage, SentMessage};
-use crate::model::Id;
+use crate::model::{Id, MessageStream};
 use async_trait::async_trait;
 
 /// The server a per-server API request is scoped to, injected as a request
@@ -27,6 +27,17 @@ pub struct MessageFilter {
     pub tag: Option<String>,
     /// Case-insensitive substring match against subject or recipient.
     pub query: Option<String>,
+    /// Restrict to one message stream (resolved id).
+    pub stream_id: Option<Id>,
+}
+
+/// Fields for creating a message stream.
+#[derive(Debug, Clone)]
+pub struct NewStream {
+    pub server_id: Id,
+    pub name: String,
+    pub permalink: String,
+    pub stream_type: String,
 }
 
 /// A recorded open (pixel load) or click.
@@ -166,6 +177,16 @@ pub trait ServerStore: Send + Sync {
         server_id: Id,
         message_id: i64,
     ) -> Result<Option<MessageRecord>, StoreError>;
+
+    // message streams (config; server-scoped)
+    async fn list_streams(&self, server_id: Id) -> Result<Vec<MessageStream>, StoreError>;
+    async fn stream_by_permalink(
+        &self,
+        server_id: Id,
+        permalink: &str,
+    ) -> Result<Option<MessageStream>, StoreError>;
+    async fn create_stream(&self, new: NewStream) -> Result<MessageStream, StoreError>;
+    async fn update_stream(&self, stream: MessageStream) -> Result<MessageStream, StoreError>;
 }
 
 #[async_trait]
@@ -246,5 +267,38 @@ impl ServerStore for crate::store::MemoryStore {
         Ok(self
             .message_for(server_id, message_id)
             .filter(|m| m.bounce || m.status == "Bounced"))
+    }
+
+    async fn list_streams(&self, server_id: Id) -> Result<Vec<MessageStream>, StoreError> {
+        Ok(self.streams_for(server_id))
+    }
+
+    async fn stream_by_permalink(
+        &self,
+        server_id: Id,
+        permalink: &str,
+    ) -> Result<Option<MessageStream>, StoreError> {
+        Ok(self.find_stream(server_id, permalink))
+    }
+
+    async fn create_stream(&self, new: NewStream) -> Result<MessageStream, StoreError> {
+        if self.find_stream(new.server_id, &new.permalink).is_some() {
+            return Err(StoreError::Conflict(
+                "Permalink has already been taken".into(),
+            ));
+        }
+        Ok(self.insert_stream(MessageStream {
+            id: self.next_id(),
+            uuid: crate::token::generate_uuid(),
+            server_id: new.server_id,
+            name: new.name,
+            permalink: new.permalink,
+            stream_type: new.stream_type,
+            archived: false,
+        }))
+    }
+
+    async fn update_stream(&self, stream: MessageStream) -> Result<MessageStream, StoreError> {
+        Ok(self.insert_stream(stream))
     }
 }

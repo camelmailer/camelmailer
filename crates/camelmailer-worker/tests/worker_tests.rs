@@ -205,6 +205,7 @@ fn outgoing_message(server_id: camelmailer_core::Id, rcpt_to: &str) -> QueuedMes
         route_id: None,
             tag: None,
             metadata: None,
+            stream_id: None,
     }
 }
 
@@ -1286,6 +1287,7 @@ async fn http_sent_message_is_delivered_by_the_worker() {
         route_id: None,
         tag: Some("api".into()),
         metadata: None,
+        stream_id: None,
     };
     let sent = s.store.store_outgoing(queued).await.unwrap();
     assert_eq!(s.queue.queue_size().await.unwrap(), 1);

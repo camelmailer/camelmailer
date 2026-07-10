@@ -19,8 +19,8 @@ pub use admin_store::{
     NewSuppression, NewUser, NewWebhook, StoreError, TrackingStore, TrackingTarget,
 };
 pub use server_store::{
-    ActivityEvent, DeliveryRecord, DeliveryStats, MessageFilter, MessageStats, QueuedDomain,
-    ServerContext, ServerStore, StatsFilter,
+    ActivityEvent, DeliveryRecord, DeliveryStats, MessageFilter, MessageStats, NewStream,
+    QueuedDomain, ServerContext, ServerStore, StatsFilter,
 };
 pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,

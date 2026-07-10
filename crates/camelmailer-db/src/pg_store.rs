@@ -557,8 +557,30 @@ impl AdminStore for PgStore {
         .fetch_one(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
+        let server_id = row.get::<i64, _>("id") as Id;
+
+        // Give every new server a built-in transactional stream (parity with
+        // the 0012 migration's backfill) and point default_stream_id at it.
+        let default_stream_id = sqlx::query(
+            "INSERT INTO message_streams (uuid, server_id, name, permalink, stream_type)
+             VALUES ($1, $2, 'Default Transactional Stream', 'outbound', 'transactional')
+             RETURNING id",
+        )
+        .bind(token::generate_uuid())
+        .bind(server_id as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?
+        .get::<i64, _>("id") as Id;
+        sqlx::query("UPDATE servers SET default_stream_id = $2 WHERE id = $1")
+            .bind(server_id as i64)
+            .bind(default_stream_id as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+
         Ok(Server {
-            id: row.get::<i64, _>("id") as Id,
+            id: server_id,
             uuid,
             organization_id: new.organization_id,
             name: new.name,
@@ -579,7 +601,7 @@ impl AdminStore for PgStore {
             delivery_hook_url: None,
             inbound_domain: None,
             color: None,
-            default_stream_id: None,
+            default_stream_id: Some(default_stream_id),
         })
     }
 
@@ -1361,6 +1383,80 @@ impl camelmailer_core::ServerStore for PgStore {
             .map_err(|e| StoreError::Other(e.to_string()))?
             .filter(|m| m.bounce || m.status == "Bounced"))
     }
+
+    async fn list_streams(
+        &self,
+        server_id: Id,
+    ) -> Result<Vec<camelmailer_core::MessageStream>, StoreError> {
+        let rows =
+            sqlx::query("SELECT * FROM message_streams WHERE server_id = $1 ORDER BY id")
+                .bind(server_id as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(message_stream_from_row).collect())
+    }
+
+    async fn stream_by_permalink(
+        &self,
+        server_id: Id,
+        permalink: &str,
+    ) -> Result<Option<camelmailer_core::MessageStream>, StoreError> {
+        let row = sqlx::query(
+            "SELECT * FROM message_streams WHERE server_id = $1 AND permalink = $2",
+        )
+        .bind(server_id as i64)
+        .bind(permalink)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(row.as_ref().map(message_stream_from_row))
+    }
+
+    async fn create_stream(
+        &self,
+        new: camelmailer_core::NewStream,
+    ) -> Result<camelmailer_core::MessageStream, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO message_streams (uuid, server_id, name, permalink, stream_type)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(new.server_id as i64)
+        .bind(&new.name)
+        .bind(&new.permalink)
+        .bind(&new.stream_type)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(camelmailer_core::MessageStream {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            server_id: new.server_id,
+            name: new.name,
+            permalink: new.permalink,
+            stream_type: new.stream_type,
+            archived: false,
+        })
+    }
+
+    async fn update_stream(
+        &self,
+        stream: camelmailer_core::MessageStream,
+    ) -> Result<camelmailer_core::MessageStream, StoreError> {
+        sqlx::query(
+            "UPDATE message_streams SET name = $2, stream_type = $3, archived = $4 WHERE id = $1",
+        )
+        .bind(stream.id as i64)
+        .bind(&stream.name)
+        .bind(&stream.stream_type)
+        .bind(stream.archived)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(stream)
+    }
 }
 
 impl Store for PgStore {
@@ -1663,8 +1759,8 @@ impl PgMessageSink {
             "INSERT INTO messages
                  (server_id, token, scope, rcpt_to, mail_from, bounce,
                   received_with_ssl, domain_id, credential_id, route_id, raw_message,
-                  subject, message_id_header, size, tag, metadata)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                  subject, message_id_header, size, tag, metadata, stream_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
              RETURNING id",
         )
         .bind(message.server_id as i64)
@@ -1686,6 +1782,7 @@ impl PgMessageSink {
         .bind(message.raw_message.len() as i64)
         .bind(&message.tag)
         .bind(&message.metadata)
+        .bind(message.stream_id.map(|id| id as i64))
         .fetch_one(&mut *tx)
         .await?;
         let message_id: i64 = row.get("id");
@@ -2002,6 +2099,9 @@ impl PgMessageSink {
         if let Some(tag) = &filter.tag {
             qb.push(" AND tag = ").push_bind(tag.clone());
         }
+        if let Some(stream_id) = filter.stream_id {
+            qb.push(" AND stream_id = ").push_bind(stream_id as i64);
+        }
         if let Some(query) = &filter.query {
             let like = format!("%{query}%");
             qb.push(" AND (subject ILIKE ")
@@ -2205,8 +2305,21 @@ fn message_record_from_row(row: &PgRow) -> MessageRecord {
         threat: row.get("threat"),
         size: row.get("size"),
         metadata: row.get("metadata"),
+        stream_id: row.get::<Option<i64>, _>("stream_id").map(|id| id as Id),
         created_at: row.get("created_at"),
         raw_message: row.get("raw_message"),
+    }
+}
+
+fn message_stream_from_row(row: &PgRow) -> camelmailer_core::MessageStream {
+    camelmailer_core::MessageStream {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        name: row.get("name"),
+        permalink: row.get("permalink"),
+        stream_type: row.get("stream_type"),
+        archived: row.get("archived"),
     }
 }
 

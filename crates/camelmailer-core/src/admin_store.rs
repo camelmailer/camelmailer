@@ -302,7 +302,7 @@ impl AdminStore for crate::store::MemoryStore {
                 "Permalink has already been taken".into(),
             ));
         }
-        Ok(self.insert_server(Server {
+        let server = self.insert_server(Server {
             id: self.next_id(),
             uuid: crate::token::generate_uuid(),
             organization_id: new.organization_id,
@@ -325,6 +325,21 @@ impl AdminStore for crate::store::MemoryStore {
             inbound_domain: None,
             color: None,
             default_stream_id: None,
+        });
+        // Give every server a built-in transactional stream (parity with the
+        // migration's backfill), and point default_stream_id at it.
+        let stream = self.insert_stream(MessageStream {
+            id: self.next_id(),
+            uuid: crate::token::generate_uuid(),
+            server_id: server.id,
+            name: "Default Transactional Stream".into(),
+            permalink: "outbound".into(),
+            stream_type: "transactional".into(),
+            archived: false,
+        });
+        Ok(self.insert_server(Server {
+            default_stream_id: Some(stream.id),
+            ..server
         }))
     }
 

@@ -123,6 +123,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) message_opens: Vec<(i64, crate::server_store::ActivityEvent)>,
     /// Clicks keyed by message id.
     pub(crate) message_clicks: Vec<(i64, crate::server_store::ActivityEvent)>,
+    /// Message streams (config; server-scoped).
+    pub(crate) message_streams: HashMap<Id, MessageStream>,
 }
 
 /// A thread-safe in-memory [`Store`].
@@ -288,6 +290,7 @@ impl MemoryStore {
             threat: false,
             size: message.raw_message.len() as i64,
             metadata: message.metadata,
+            stream_id: message.stream_id,
             created_at: chrono::Utc::now(),
             raw_message: message.raw_message,
         };
@@ -344,6 +347,7 @@ impl MemoryStore {
                     .as_deref()
                     .is_none_or(|t| m.tag.as_deref() == Some(t))
             })
+            .filter(|m| filter.stream_id.is_none_or(|s| m.stream_id == Some(s)))
             .filter(|m| {
                 query.as_deref().is_none_or(|q| {
                     m.subject
@@ -551,6 +555,42 @@ impl MemoryStore {
             .map(|(domain, count)| crate::server_store::QueuedDomain { domain, count })
             .collect();
         crate::server_store::DeliveryStats { queued, domains }
+    }
+
+    /// Insert or replace a message stream.
+    pub fn insert_stream(&self, stream: MessageStream) -> MessageStream {
+        self.inner
+            .write()
+            .unwrap()
+            .message_streams
+            .insert(stream.id, stream.clone());
+        stream
+    }
+
+    /// A server's message streams, ordered by id.
+    pub fn streams_for(&self, server_id: Id) -> Vec<MessageStream> {
+        let mut streams: Vec<MessageStream> = self
+            .inner
+            .read()
+            .unwrap()
+            .message_streams
+            .values()
+            .filter(|s| s.server_id == server_id)
+            .cloned()
+            .collect();
+        streams.sort_by_key(|s| s.id);
+        streams
+    }
+
+    /// One of a server's streams by permalink.
+    pub fn find_stream(&self, server_id: Id, permalink: &str) -> Option<MessageStream> {
+        self.inner
+            .read()
+            .unwrap()
+            .message_streams
+            .values()
+            .find(|s| s.server_id == server_id && s.permalink == permalink)
+            .cloned()
     }
 
     pub fn list_admin_api_keys(&self) -> Vec<AdminApiKey> {

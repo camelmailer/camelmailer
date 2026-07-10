@@ -72,6 +72,8 @@ pub struct QueuedMessage {
     pub tag: Option<String>,
     /// Optional per-message metadata (HTTP send).
     pub metadata: Option<serde_json::Value>,
+    /// The message stream this message belongs to (HTTP send).
+    pub stream_id: Option<Id>,
 }
 
 /// The public identity of a message accepted via the HTTP send API.
@@ -103,6 +105,7 @@ pub struct MessageRecord {
     pub threat: bool,
     pub size: i64,
     pub metadata: Option<serde_json::Value>,
+    pub stream_id: Option<Id>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub raw_message: Vec<u8>,
 }
