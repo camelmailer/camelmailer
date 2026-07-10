@@ -459,7 +459,14 @@ async fn domains_crud_and_verify() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["domain"]["verified"], true);
 
-    let (_, body) = request(&app, "GET", &format!("{BASE}/domains"), Some(GLOBAL_KEY), None).await;
+    let (_, body) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/domains"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
     assert_eq!(body["data"]["domains"].as_array().unwrap().len(), 1);
 
     let (status, _) = request(
@@ -904,7 +911,14 @@ async fn admin_api_keys_create_list_delete() {
     assert_eq!(status, StatusCode::OK);
 
     // list shows only the prefix, never the secret (build_app pre-seeds one key)
-    let (_, body) = request(&app, "GET", "/api/v2/admin/admin_api_keys", Some(GLOBAL_KEY), None).await;
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/admin_api_keys",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
     let keys = body["data"]["admin_api_keys"].as_array().unwrap();
     let ci = keys.iter().find(|k| k["name"] == "ci-key").unwrap();
     assert_eq!(ci["key_prefix"], &full_key[..6]);
@@ -920,7 +934,14 @@ async fn admin_api_keys_create_list_delete() {
     .await;
     assert_eq!(status, StatusCode::OK);
     // deleted key no longer authenticates
-    let (status, _) = request(&app, "GET", "/api/v2/admin/organizations", Some(&full_key), None).await;
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations",
+        Some(&full_key),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -947,4 +968,14 @@ async fn server_ip_pool_assignment() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["server"]["ip_pool_id"], pool_id);
+}
+
+#[tokio::test]
+async fn health_is_public_and_reports_the_version() {
+    let (app, _) = build_app().await;
+    // no API key required — this is the container/LB liveness probe
+    let (status, body) = request(&app, "GET", "/health", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert!(body["version"].is_string());
 }

@@ -203,9 +203,9 @@ fn outgoing_message(server_id: camelmailer_core::Id, rcpt_to: &str) -> QueuedMes
         domain_id: None,
         credential_id: None,
         route_id: None,
-            tag: None,
-            metadata: None,
-            stream_id: None,
+        tag: None,
+        metadata: None,
+        stream_id: None,
     }
 }
 
@@ -525,8 +525,10 @@ async fn mock_http_full(status: axum::http::StatusCode) -> MockHttpFull {
                     let header_map: serde_json::Value = headers
                         .iter()
                         .map(|(k, v)| {
-                            (k.as_str().to_string(),
-                             serde_json::Value::String(v.to_str().unwrap_or("").to_string()))
+                            (
+                                k.as_str().to_string(),
+                                serde_json::Value::String(v.to_str().unwrap_or("").to_string()),
+                            )
                         })
                         .collect::<serde_json::Map<_, _>>()
                         .into();
@@ -699,11 +701,7 @@ async fn outgoing_mail_with_an_authenticated_domain_is_dkim_signed() {
     assert!(seen.iter().any(|l| l == "Subject: Pipeline"));
 
     // the stored message stays unsigned
-    let stored = s
-        .sink
-        .messages_for_server(s.server.id)
-        .await
-        .unwrap();
+    let stored = s.sink.messages_for_server(s.server.id).await.unwrap();
     assert!(!String::from_utf8_lossy(&stored[0].raw_message).contains("DKIM-Signature"));
 }
 
@@ -770,10 +768,7 @@ async fn mock_clamd(reply: &'static str) -> u16 {
                         Err(_) => return,
                     }
                 }
-                stream
-                    .write_all(format!("{reply}\0").as_bytes())
-                    .await
-                    .ok();
+                stream.write_all(format!("{reply}\0").as_bytes()).await.ok();
                 stream.shutdown().await.ok();
             });
         }
@@ -805,7 +800,10 @@ async fn incoming_route_setup(s: &Setup) -> (camelmailer_core::Domain, camelmail
     (domain, route)
 }
 
-fn incoming_message(server_id: camelmailer_core::Id, route_id: camelmailer_core::Id) -> QueuedMessage {
+fn incoming_message(
+    server_id: camelmailer_core::Id,
+    route_id: camelmailer_core::Id,
+) -> QueuedMessage {
     let mut message = outgoing_message(server_id, "info@org.example");
     message.scope = MessageScope::Incoming;
     message.route_id = Some(route_id);
@@ -837,7 +835,12 @@ async fn clean_incoming_mail_is_inspected_and_scored_not_spam() {
     let outcome = worker.process_next().await.unwrap().unwrap();
     assert_eq!(outcome, ProcessOutcome::NothingToDo);
 
-    let message = s.sink.message_by_id(s.server.id, message_id).await.unwrap().unwrap();
+    let message = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(message.inspected);
     assert_eq!(message.spam_status, "NotSpam");
     assert!((message.spam_score - 0.5).abs() < 1e-9);
@@ -869,9 +872,18 @@ async fn spam_failure_mail_is_held() {
     let outcome = worker.process_next().await.unwrap().unwrap();
     assert_eq!(outcome, ProcessOutcome::Held);
 
-    let message = s.sink.message_by_id(s.server.id, message_id).await.unwrap().unwrap();
+    let message = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(message.spam_status, "SpamFailure");
-    let deliveries = s.sink.deliveries_for_message(s.server.id, message_id).await.unwrap();
+    let deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, message_id)
+        .await
+        .unwrap();
     assert_eq!(deliveries[0].status, "Held");
 }
 
@@ -898,9 +910,17 @@ async fn virus_mail_is_held_with_the_signature_recorded() {
     let outcome = worker.process_next().await.unwrap().unwrap();
     assert_eq!(outcome, ProcessOutcome::Held);
 
-    let message = s.sink.message_by_id(s.server.id, message_id).await.unwrap().unwrap();
+    let message = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(message.threat);
-    assert_eq!(message.threat_details.as_deref(), Some("Eicar-Test-Signature"));
+    assert_eq!(
+        message.threat_details.as_deref(),
+        Some("Eicar-Test-Signature")
+    );
     assert!(message.inspected);
 }
 
@@ -927,7 +947,12 @@ async fn clean_virus_scan_passes() {
     let outcome = worker.process_next().await.unwrap().unwrap();
     assert_eq!(outcome, ProcessOutcome::NothingToDo);
 
-    let message = s.sink.message_by_id(s.server.id, message_id).await.unwrap().unwrap();
+    let message = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!message.threat);
     assert!(message.inspected);
 }
@@ -997,9 +1022,10 @@ async fn html_outgoing_mail_gets_click_links_rewritten_and_an_open_pixel() {
     // drive the public tracking endpoints against the resolved store
     let tracking: std::sync::Arc<dyn camelmailer_core::TrackingStore> =
         std::sync::Arc::new(s.store.clone());
-    let router = camelmailer_api::tracking_router(std::sync::Arc::new(
-        camelmailer_api::TrackingState { store: tracking },
-    ));
+    let router =
+        camelmailer_api::tracking_router(std::sync::Arc::new(camelmailer_api::TrackingState {
+            store: tracking,
+        }));
 
     // click → 302 redirect to the original URL, click recorded
     let response = router
@@ -1036,7 +1062,11 @@ async fn html_outgoing_mail_gets_click_links_rewritten_and_an_open_pixel() {
     assert_eq!(&bytes[0..6], b"GIF89a");
 
     // the activity counts reflect one click and one open
-    let (clicks, opens) = s.sink.activity_counts(s.server.id, message_id).await.unwrap();
+    let (clicks, opens) = s
+        .sink
+        .activity_counts(s.server.id, message_id)
+        .await
+        .unwrap();
     assert_eq!(clicks, 1);
     assert_eq!(opens, 1);
 }
@@ -1053,9 +1083,10 @@ async fn unknown_tracking_tokens_do_not_leak_validity() {
 
     let tracking: std::sync::Arc<dyn camelmailer_core::TrackingStore> =
         std::sync::Arc::new(s.store.clone());
-    let router = camelmailer_api::tracking_router(std::sync::Arc::new(
-        camelmailer_api::TrackingState { store: tracking },
-    ));
+    let router =
+        camelmailer_api::tracking_router(std::sync::Arc::new(camelmailer_api::TrackingState {
+            store: tracking,
+        }));
 
     // unknown click → 404
     let response = router
@@ -1096,13 +1127,10 @@ struct MockTlsSmtp {
 async fn mock_starttls_smtp() -> MockTlsSmtp {
     use tokio_rustls::TlsAcceptor;
 
-    let certified =
-        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
-    let key = rustls::pki_types::PrivateKeyDer::try_from(
-        certified.key_pair.serialize_der(),
-    )
-    .unwrap();
+    let key =
+        rustls::pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -1130,14 +1158,20 @@ async fn mock_starttls_smtp() -> MockTlsSmtp {
                 // read EHLO
                 let mut line = String::new();
                 reader.read_line(&mut line).await.ok();
-                write_half.write_all(b"250-mock\r\n250 STARTTLS\r\n").await.ok();
+                write_half
+                    .write_all(b"250-mock\r\n250 STARTTLS\r\n")
+                    .await
+                    .ok();
                 // expect STARTTLS
                 line.clear();
                 reader.read_line(&mut line).await.ok();
                 if !line.to_uppercase().starts_with("STARTTLS") {
                     return;
                 }
-                write_half.write_all(b"220 Ready to start TLS\r\n").await.ok();
+                write_half
+                    .write_all(b"220 Ready to start TLS\r\n")
+                    .await
+                    .ok();
                 // upgrade
                 let raw = reader.into_inner().reunite(write_half).unwrap();
                 let Ok(tls_stream) = acceptor.accept(raw).await else {
@@ -1206,9 +1240,16 @@ async fn outbound_delivery_upgrades_to_starttls_and_records_ssl() {
     assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
     assert!(*smtp.used_tls.lock().unwrap(), "delivery must use STARTTLS");
 
-    let deliveries = s.sink.deliveries_for_message(s.server.id, message_id).await.unwrap();
+    let deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, message_id)
+        .await
+        .unwrap();
     assert_eq!(deliveries[0].status, "Sent");
-    assert!(deliveries[0].sent_with_ssl, "sent_with_ssl must be recorded");
+    assert!(
+        deliveries[0].sent_with_ssl,
+        "sent_with_ssl must be recorded"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1278,7 +1319,8 @@ async fn http_sent_message_is_delivered_by_the_worker() {
         server_id: s.server.id,
         rcpt_to: "user@dest.example".into(),
         mail_from: "news@org.example".into(),
-        raw_message: b"From: news@org.example\r\nSubject: API send\r\n\r\nHello via HTTP.\r\n".to_vec(),
+        raw_message: b"From: news@org.example\r\nSubject: API send\r\n\r\nHello via HTTP.\r\n"
+            .to_vec(),
         received_with_ssl: false,
         scope: MessageScope::Outgoing,
         bounce: false,

@@ -73,16 +73,20 @@ pub(crate) async fn domains_index(
         Ok(server) => server,
         Err(response) => return response,
     };
-    from_result(&start, state.store.list_domains(server.id).await, |domains| {
-        let result = paginate(&domains, &params);
-        ok(
-            &start,
-            json!({
-                "domains": result.items.iter().map(domain_json).collect::<Vec<_>>(),
-                "pagination": result.pagination,
-            }),
-        )
-    })
+    from_result(
+        &start,
+        state.store.list_domains(server.id).await,
+        |domains| {
+            let result = paginate(&domains, &params);
+            ok(
+                &start,
+                json!({
+                    "domains": result.items.iter().map(domain_json).collect::<Vec<_>>(),
+                    "pagination": result.pagination,
+                }),
+            )
+        },
+    )
 }
 
 #[derive(Deserialize)]
@@ -264,7 +268,12 @@ pub(crate) async fn credentials_create(
                 key: body.key,
             })
             .await,
-        |credential| created(&start, json!({ "credential": credential_json(&credential) })),
+        |credential| {
+            created(
+                &start,
+                json!({ "credential": credential_json(&credential) }),
+            )
+        },
     )
 }
 
@@ -289,7 +298,10 @@ pub(crate) async fn credentials_show(
     Path((org, server, id)): Path<(String, String, u64)>,
 ) -> ApiResponse {
     match require_credential(&state, &start, &org, &server, id).await {
-        Ok(credential) => ok(&start, json!({ "credential": credential_json(&credential) })),
+        Ok(credential) => ok(
+            &start,
+            json!({ "credential": credential_json(&credential) }),
+        ),
         Err(response) => response,
     }
 }
@@ -317,7 +329,12 @@ pub(crate) async fn credentials_update(
             from_result(
                 &start,
                 state.store.update_credential(credential).await,
-                |credential| ok(&start, json!({ "credential": credential_json(&credential) })),
+                |credential| {
+                    ok(
+                        &start,
+                        json!({ "credential": credential_json(&credential) }),
+                    )
+                },
             )
         }
         Err(response) => response,
@@ -655,9 +672,11 @@ async fn set_webhook_enabled(
     match require_webhook(&state, &start, &org, &server, id).await {
         Ok(mut webhook) => {
             webhook.enabled = enabled;
-            from_result(&start, state.store.update_webhook(webhook).await, |webhook| {
-                ok(&start, json!({ "webhook": webhook_json(&webhook) }))
-            })
+            from_result(
+                &start,
+                state.store.update_webhook(webhook).await,
+                |webhook| ok(&start, json!({ "webhook": webhook_json(&webhook) })),
+            )
         }
         Err(response) => response,
     }
@@ -751,7 +770,12 @@ pub(crate) async fn suppressions_create(
                 reason: body.reason,
             })
             .await,
-        |suppression| created(&start, json!({ "suppression": suppression_json(&suppression) })),
+        |suppression| {
+            created(
+                &start,
+                json!({ "suppression": suppression_json(&suppression) }),
+            )
+        },
     )
 }
 

@@ -150,11 +150,8 @@ pub trait ServerStore: Send + Sync {
     ) -> Result<Vec<DeliveryRecord>, StoreError>;
 
     /// Recorded opens (pixel loads) for the message.
-    async fn opens(
-        &self,
-        server_id: Id,
-        message_id: i64,
-    ) -> Result<Vec<ActivityEvent>, StoreError>;
+    async fn opens(&self, server_id: Id, message_id: i64)
+        -> Result<Vec<ActivityEvent>, StoreError>;
 
     /// Recorded link clicks for the message.
     async fn clicks(

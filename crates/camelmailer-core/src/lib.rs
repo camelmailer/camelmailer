@@ -16,16 +16,16 @@ pub mod testing;
 pub mod token;
 
 pub use admin_store::{
-    AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewServer,
-    NewSuppression, NewUser, NewWebhook, StoreError, TrackingStore, TrackingTarget,
+    AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewServer, NewSuppression,
+    NewUser, NewWebhook, StoreError, TrackingStore, TrackingTarget,
 };
-pub use server_store::{
-    ActivityEvent, DeliveryRecord, DeliveryStats, MessageFilter, MessageStats, NewStream,
-    NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter,
-};
-pub use template::{render as render_template, RenderError};
 pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,
 };
 pub use model::*;
+pub use server_store::{
+    ActivityEvent, DeliveryRecord, DeliveryStats, MessageFilter, MessageStats, NewStream,
+    NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter,
+};
 pub use store::{MemoryStore, Store};
+pub use template::{render as render_template, RenderError};

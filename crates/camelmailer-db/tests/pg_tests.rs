@@ -99,9 +99,9 @@ fn message_for(server_id: camelmailer_core::Id, rcpt_to: &str) -> QueuedMessage 
         domain_id: None,
         credential_id: None,
         route_id: None,
-            tag: None,
-            metadata: None,
-            stream_id: None,
+        tag: None,
+        metadata: None,
+        stream_id: None,
     }
 }
 
@@ -257,7 +257,10 @@ async fn rls_confines_bulk_updates_and_deletes_to_the_tenant() {
     tx.commit().await.unwrap();
     assert_eq!(deleted, 1);
     assert_eq!(
-        sink.messages_for_server(other_server.id).await.unwrap().len(),
+        sink.messages_for_server(other_server.id)
+            .await
+            .unwrap()
+            .len(),
         1
     );
 }
@@ -333,11 +336,20 @@ async fn store_matches_ip_credentials_by_longest_prefix() {
         .await
         .unwrap();
 
-    let found = f.store.find_ip_credential("1.2.3.4".parse().unwrap()).unwrap();
+    let found = f
+        .store
+        .find_ip_credential("1.2.3.4".parse().unwrap())
+        .unwrap();
     assert_eq!(found.id, narrow.id);
-    let found = f.store.find_ip_credential("1.9.9.9".parse().unwrap()).unwrap();
+    let found = f
+        .store
+        .find_ip_credential("1.9.9.9".parse().unwrap())
+        .unwrap();
     assert_eq!(found.id, wide.id);
-    assert!(f.store.find_ip_credential("9.9.9.9".parse().unwrap()).is_none());
+    assert!(f
+        .store
+        .find_ip_credential("9.9.9.9".parse().unwrap())
+        .is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -357,7 +369,11 @@ async fn store_authenticates_from_domains_only_when_verified() {
         .unwrap();
     let org_domain = f
         .store
-        .create_domain(DomainOwner::Organization(f.organization.id), "org.example", true)
+        .create_domain(
+            DomainOwner::Organization(f.organization.id),
+            "org.example",
+            true,
+        )
         .await
         .unwrap();
 
@@ -428,7 +444,11 @@ async fn admin_store_crud_and_conflicts() {
     assert_eq!(reloaded.suspension_reason.as_deref(), Some("abuse"));
 
     // deleting the organization cascades to servers
-    assert!(f.store.delete_organization(f.organization.id).await.unwrap());
+    assert!(f
+        .store
+        .delete_organization(f.organization.id)
+        .await
+        .unwrap());
     assert!(f
         .store
         .server_by_permalink(f.organization.id, "example-server")
@@ -615,11 +635,7 @@ async fn messages_index_subject_and_message_id_at_insert() {
         b"Subject: Quarterly Report\r\nMessage-ID: <q1@org.example>\r\n\r\nBody\r\n".to_vec();
     let id = sink.insert_message(&message).await.unwrap();
 
-    let stored = sink
-        .message_by_id(f.server.id, id)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = sink.message_by_id(f.server.id, id).await.unwrap().unwrap();
     assert_eq!(stored.subject.as_deref(), Some("Quarterly Report"));
     assert_eq!(
         stored.message_id_header.as_deref(),
@@ -641,9 +657,16 @@ async fn deliveries_update_message_status_and_are_listed() {
         .await
         .unwrap();
 
-    sink.record_delivery(f.server.id, id, "SoftFail", "greylisted", "451 try later", false)
-        .await
-        .unwrap();
+    sink.record_delivery(
+        f.server.id,
+        id,
+        "SoftFail",
+        "greylisted",
+        "451 try later",
+        false,
+    )
+    .await
+    .unwrap();
     sink.record_delivery(f.server.id, id, "Sent", "accepted", "250 OK", true)
         .await
         .unwrap();
@@ -793,7 +816,12 @@ async fn server_for_api_token_resolves_and_records_use() {
     // resolves to the owning server
     let resolved = f.store.server_for_api_token(token).await.unwrap().unwrap();
     assert_eq!(resolved.id, f.server.id);
-    assert!(f.store.server_for_api_token("wrong").await.unwrap().is_none());
+    assert!(f
+        .store
+        .server_for_api_token("wrong")
+        .await
+        .unwrap()
+        .is_none());
 
     // last_used_at was stamped
     use sqlx::Row;
@@ -840,7 +868,12 @@ async fn server_store_reads_are_filtered_and_tenant_scoped() {
     welcome.scope = MessageScope::Outgoing;
     welcome.tag = Some("welcome".into());
     welcome.raw_message = b"Subject: Hello A\r\n\r\nBody\r\n".to_vec();
-    let (welcome_id, _) = f.store.store_outgoing(welcome).await.map(|m| (m.id, m.token)).unwrap();
+    let (welcome_id, _) = f
+        .store
+        .store_outgoing(welcome)
+        .await
+        .map(|m| (m.id, m.token))
+        .unwrap();
 
     let mut promo = message_for(f.server.id, "b@dest.example");
     promo.scope = MessageScope::Outgoing;
@@ -866,7 +899,10 @@ async fn server_store_reads_are_filtered_and_tenant_scoped() {
         .store
         .messages(
             f.server.id,
-            &MessageFilter { tag: Some("promo".into()), ..Default::default() },
+            &MessageFilter {
+                tag: Some("promo".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -878,7 +914,10 @@ async fn server_store_reads_are_filtered_and_tenant_scoped() {
         .store
         .messages(
             f.server.id,
-            &MessageFilter { query: Some("hello a".into()), ..Default::default() },
+            &MessageFilter {
+                query: Some("hello a".into()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -901,17 +940,47 @@ async fn server_store_reads_are_filtered_and_tenant_scoped() {
         .await
         .unwrap();
 
-    assert_eq!(f.store.deliveries(f.server.id, welcome_id).await.unwrap().len(), 1);
-    assert_eq!(f.store.opens(f.server.id, welcome_id).await.unwrap().len(), 1);
+    assert_eq!(
+        f.store
+            .deliveries(f.server.id, welcome_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        f.store.opens(f.server.id, welcome_id).await.unwrap().len(),
+        1
+    );
     let clicks = f.store.clicks(f.server.id, welcome_id).await.unwrap();
     assert_eq!(clicks.len(), 1);
     assert_eq!(clicks[0].url.as_deref(), Some("https://example.com"));
 
     // the other tenant sees none of it (RLS)
-    assert!(f.store.message(other.id, welcome_id).await.unwrap().is_none());
-    assert!(f.store.deliveries(other.id, welcome_id).await.unwrap().is_empty());
-    assert!(f.store.opens(other.id, welcome_id).await.unwrap().is_empty());
-    assert!(f.store.clicks(other.id, welcome_id).await.unwrap().is_empty());
+    assert!(f
+        .store
+        .message(other.id, welcome_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(f
+        .store
+        .deliveries(other.id, welcome_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(f
+        .store
+        .opens(other.id, welcome_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(f
+        .store
+        .clicks(other.id, welcome_id)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -937,7 +1006,12 @@ async fn server_store_stats_and_bounces_are_tenant_scoped() {
     // one Bounced. Plus one message for the other tenant.
     let mut sent = message_for(f.server.id, "a@dest.example");
     sent.scope = MessageScope::Outgoing;
-    let (sent_id, _) = f.store.store_outgoing(sent).await.map(|m| (m.id, m.token)).unwrap();
+    let (sent_id, _) = f
+        .store
+        .store_outgoing(sent)
+        .await
+        .map(|m| (m.id, m.token))
+        .unwrap();
     sink.record_delivery(f.server.id, sent_id, "Sent", "250 OK", "", true)
         .await
         .unwrap();
@@ -954,7 +1028,12 @@ async fn server_store_stats_and_bounces_are_tenant_scoped() {
 
     let mut bounced = message_for(f.server.id, "b@dest.example");
     bounced.scope = MessageScope::Outgoing;
-    let (bounced_id, _) = f.store.store_outgoing(bounced).await.map(|m| (m.id, m.token)).unwrap();
+    let (bounced_id, _) = f
+        .store
+        .store_outgoing(bounced)
+        .await
+        .map(|m| (m.id, m.token))
+        .unwrap();
     sink.record_delivery(f.server.id, bounced_id, "Bounced", "550", "", false)
         .await
         .unwrap();
@@ -964,7 +1043,11 @@ async fn server_store_stats_and_bounces_are_tenant_scoped() {
     f.store.store_outgoing(theirs).await.unwrap();
 
     // stats for our tenant
-    let stats = f.store.message_stats(f.server.id, &StatsFilter::default()).await.unwrap();
+    let stats = f
+        .store
+        .message_stats(f.server.id, &StatsFilter::default())
+        .await
+        .unwrap();
     assert_eq!(stats.total, 2);
     assert_eq!(stats.outgoing, 2);
     assert_eq!(stats.sent, 1);
@@ -975,22 +1058,50 @@ async fn server_store_stats_and_bounces_are_tenant_scoped() {
     assert_eq!(stats.unique_clicks, 1);
 
     // bounces list contains only the bounced message
-    let bounces = f.store.bounces(f.server.id, &MessageFilter::default()).await.unwrap();
+    let bounces = f
+        .store
+        .bounces(f.server.id, &MessageFilter::default())
+        .await
+        .unwrap();
     assert_eq!(bounces.len(), 1);
     assert_eq!(bounces[0].id, bounced_id);
-    assert!(f.store.bounce(f.server.id, bounced_id).await.unwrap().is_some());
-    assert!(f.store.bounce(f.server.id, sent_id).await.unwrap().is_none());
+    assert!(f
+        .store
+        .bounce(f.server.id, bounced_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(f
+        .store
+        .bounce(f.server.id, sent_id)
+        .await
+        .unwrap()
+        .is_none());
 
     // delivery stats read the queue (each store_outgoing enqueued one row)
     let queue = f.store.delivery_stats(f.server.id).await.unwrap();
     assert_eq!(queue.queued, 2);
 
     // the other tenant sees only its own data
-    let their_stats = f.store.message_stats(other.id, &StatsFilter::default()).await.unwrap();
+    let their_stats = f
+        .store
+        .message_stats(other.id, &StatsFilter::default())
+        .await
+        .unwrap();
     assert_eq!(their_stats.total, 1);
     assert_eq!(their_stats.sent, 0);
-    assert!(f.store.bounces(other.id, &MessageFilter::default()).await.unwrap().is_empty());
-    assert!(f.store.bounce(other.id, bounced_id).await.unwrap().is_none());
+    assert!(f
+        .store
+        .bounces(other.id, &MessageFilter::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(f
+        .store
+        .bounce(other.id, bounced_id)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(f.store.delivery_stats(other.id).await.unwrap().queued, 1);
 }
 
@@ -1044,13 +1155,21 @@ async fn message_streams_default_crud_and_scoping() {
     let mut msg = message_for(f.server.id, "a@dest.example");
     msg.scope = MessageScope::Outgoing;
     msg.stream_id = Some(broadcast.id);
-    let (msg_id, _) = f.store.store_outgoing(msg).await.map(|m| (m.id, m.token)).unwrap();
+    let (msg_id, _) = f
+        .store
+        .store_outgoing(msg)
+        .await
+        .map(|m| (m.id, m.token))
+        .unwrap();
 
     let in_stream = f
         .store
         .messages(
             f.server.id,
-            &MessageFilter { stream_id: Some(broadcast.id), ..Default::default() },
+            &MessageFilter {
+                stream_id: Some(broadcast.id),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1061,7 +1180,10 @@ async fn message_streams_default_crud_and_scoping() {
     // archive via update_stream
     let archived = f
         .store
-        .update_stream(camelmailer_core::MessageStream { archived: true, ..broadcast.clone() })
+        .update_stream(camelmailer_core::MessageStream {
+            archived: true,
+            ..broadcast.clone()
+        })
         .await
         .unwrap();
     assert!(archived.archived);
@@ -1128,19 +1250,30 @@ async fn inbound_bypass_retry_requeue_and_scope() {
     assert_eq!(inbound[0].id, id);
 
     // bypass re-queues it and flags it
-    let bypassed = f.store.bypass_message(f.server.id, id).await.unwrap().unwrap();
-    assert_eq!(bypassed.status, "Pending");
-    assert!(bypassed.bypassed);
-    let queued: i64 = sqlx::query("SELECT count(*) AS c FROM queued_messages WHERE message_id = $1")
-        .bind(id)
-        .fetch_one(&pool)
+    let bypassed = f
+        .store
+        .bypass_message(f.server.id, id)
         .await
         .unwrap()
-        .get("c");
+        .unwrap();
+    assert_eq!(bypassed.status, "Pending");
+    assert!(bypassed.bypassed);
+    let queued: i64 =
+        sqlx::query("SELECT count(*) AS c FROM queued_messages WHERE message_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("c");
     assert_eq!(queued, 1);
 
     // retry on an outgoing message is rejected (scope guard)
-    assert!(f.store.retry_message(f.server.id, out_id).await.unwrap().is_none());
+    assert!(f
+        .store
+        .retry_message(f.server.id, out_id)
+        .await
+        .unwrap()
+        .is_none());
 
     // the other tenant can neither see nor requeue server A's inbound message
     assert!(f
@@ -1149,15 +1282,26 @@ async fn inbound_bypass_retry_requeue_and_scope() {
         .await
         .unwrap()
         .is_empty());
-    assert!(f.store.inbound_message(other.id, id).await.unwrap().is_none());
-    assert!(f.store.bypass_message(other.id, id).await.unwrap().is_none());
-    // no extra queue row was created by the rejected cross-tenant bypass
-    let queued: i64 = sqlx::query("SELECT count(*) AS c FROM queued_messages WHERE message_id = $1")
-        .bind(id)
-        .fetch_one(&pool)
+    assert!(f
+        .store
+        .inbound_message(other.id, id)
         .await
         .unwrap()
-        .get("c");
+        .is_none());
+    assert!(f
+        .store
+        .bypass_message(other.id, id)
+        .await
+        .unwrap()
+        .is_none());
+    // no extra queue row was created by the rejected cross-tenant bypass
+    let queued: i64 =
+        sqlx::query("SELECT count(*) AS c FROM queued_messages WHERE message_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("c");
     assert_eq!(queued, 1);
 }
 

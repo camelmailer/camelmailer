@@ -57,8 +57,7 @@ mod tests {
         let signer = Signer { key };
         let signature = signer.sign_sha256(b"payload");
 
-        let verifying_key =
-            rsa::pkcs1v15::VerifyingKey::<Sha256>::new(signer.public_key());
+        let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(signer.public_key());
         let signature = rsa::pkcs1v15::Signature::try_from(signature.as_slice()).unwrap();
         verifying_key.verify(b"payload", &signature).unwrap();
     }

@@ -96,7 +96,11 @@ impl IntoResponse for ApiResponse {
     }
 }
 
-pub(crate) fn render_success(start: Option<&RequestStart>, status: StatusCode, data: Value) -> ApiResponse {
+pub(crate) fn render_success(
+    start: Option<&RequestStart>,
+    status: StatusCode,
+    data: Value,
+) -> ApiResponse {
     ApiResponse {
         status,
         body: json!({
@@ -165,7 +169,9 @@ pub(crate) fn render_store_error(start: Option<&RequestStart>, error: StoreError
 }
 
 pub(crate) async fn timing_middleware(mut request: Request, next: Next) -> Response {
-    request.extensions_mut().insert(RequestStart(Instant::now()));
+    request
+        .extensions_mut()
+        .insert(RequestStart(Instant::now()));
     next.run(request).await
 }
 
@@ -308,7 +314,10 @@ async fn organizations_create(
     Json(body): Json<CreateOrganization>,
 ) -> ApiResponse {
     let Some(name) = body.name.filter(|n| !n.is_empty()) else {
-        return render_parameter_missing(Some(&start.0), "param is missing or the value is empty: name");
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: name",
+        );
     };
     let permalink = body
         .permalink
@@ -414,7 +423,10 @@ async fn servers_create(
         Err(error) => return render_store_error(Some(&start.0), error),
     };
     let Some(name) = body.name.filter(|n| !n.is_empty()) else {
-        return render_parameter_missing(Some(&start.0), "param is missing or the value is empty: name");
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: name",
+        );
     };
     let mode = match body.mode.as_deref() {
         None | Some("Live") => ServerMode::Live,
@@ -643,13 +655,21 @@ async fn servers_set_ip_pool(
             {
                 return render_store_error(Some(&start.0), error);
             }
-            match state.store.server_by_permalink(server.organization_id, &permalink).await {
+            match state
+                .store
+                .server_by_permalink(server.organization_id, &permalink)
+                .await
+            {
                 Ok(Some(updated)) => render_success(
                     Some(&start.0),
                     StatusCode::OK,
                     json!({ "server": server_json(&updated) }),
                 ),
-                _ => render_success(Some(&start.0), StatusCode::OK, json!({ "server": server_json(&server) })),
+                _ => render_success(
+                    Some(&start.0),
+                    StatusCode::OK,
+                    json!({ "server": server_json(&server) }),
+                ),
             }
         }
         Ok(None) => render_not_found(Some(&start.0)),
@@ -711,7 +731,11 @@ async fn admin_api_keys_create(
             // The one time the full secret is returned.
             let mut data = admin_api_key_json(&record);
             data["key"] = json!(key);
-            render_success(Some(&start.0), StatusCode::CREATED, json!({ "admin_api_key": data }))
+            render_success(
+                Some(&start.0),
+                StatusCode::CREATED,
+                json!({ "admin_api_key": data }),
+            )
         }
         Err(error) => render_store_error(Some(&start.0), error),
     }
@@ -726,6 +750,16 @@ async fn admin_api_keys_destroy(
         Ok(true) => render_deleted(Some(&start.0)),
         Ok(false) => render_not_found(Some(&start.0)),
         Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
+/// `GET /health` — unauthenticated liveness probe for load balancers and
+/// container healthchecks. Deliberately outside both auth scopes and the
+/// response envelope; it must never depend on storage.
+async fn health() -> ApiResponse {
+    ApiResponse {
+        status: StatusCode::OK,
+        body: json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }),
     }
 }
 
@@ -837,7 +871,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             "/organizations/{permalink}/servers/{server_permalink}/suppressions/{address}",
             axum::routing::delete(resources::suppressions_destroy),
         )
-        .route("/users", get(resources::users_index).post(resources::users_create))
+        .route(
+            "/users",
+            get(resources::users_index).post(resources::users_create),
+        )
         .route(
             "/users/{id}",
             get(resources::users_show)
@@ -867,5 +904,7 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .layer(middleware::from_fn(timing_middleware))
         .with_state(state);
 
-    Router::new().nest("/api/v2/admin", admin)
+    Router::new()
+        .route("/health", get(health))
+        .nest("/api/v2/admin", admin)
 }

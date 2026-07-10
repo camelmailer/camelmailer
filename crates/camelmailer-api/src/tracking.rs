@@ -50,10 +50,7 @@ async fn track_click(
 ) -> Response {
     match state.store.resolve_token(&token).await {
         Ok(Some(target)) if target.kind == "click" => {
-            let url = target
-                .target_url
-                .clone()
-                .unwrap_or_else(|| "/".to_string());
+            let url = target.target_url.clone().unwrap_or_else(|| "/".to_string());
             let _ = state
                 .store
                 .record_click(&target, &client_ip(&headers), &user_agent(&headers))

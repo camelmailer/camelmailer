@@ -217,7 +217,10 @@ use camelmailer_core::{DomainOwner, MemoryStore as MS};
 async fn build_with_verified_domain() -> (Router, String, Arc<MS>, u64) {
     let store = Arc::new(MS::new());
     let org = store
-        .create_organization(NewOrganization { name: "Org".into(), permalink: "org".into() })
+        .create_organization(NewOrganization {
+            name: "Org".into(),
+            permalink: "org".into(),
+        })
         .await
         .unwrap();
     let server = store
@@ -281,7 +284,10 @@ async fn json_request(
         .unwrap();
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test]
@@ -388,7 +394,10 @@ async fn batch_send_returns_per_message_results() {
 async fn build_two_with_domains() -> (Router, String, String, Arc<MS>) {
     let store = Arc::new(MS::new());
     let org = store
-        .create_organization(NewOrganization { name: "Org".into(), permalink: "org".into() })
+        .create_organization(NewOrganization {
+            name: "Org".into(),
+            permalink: "org".into(),
+        })
         .await
         .unwrap();
     let mut tokens = Vec::new();
@@ -422,11 +431,23 @@ async fn build_two_with_domains() -> (Router, String, String, Arc<MS>) {
         tokens.push(token);
     }
     let state = ApiState::with_server_store(store.clone(), store.clone(), None);
-    (build_server_router(state), tokens[0].clone(), tokens[1].clone(), store)
+    (
+        build_server_router(state),
+        tokens[0].clone(),
+        tokens[1].clone(),
+        store,
+    )
 }
 
 /// Send one message and return the stored message id.
-async fn send_one(app: &Router, token: &str, from: &str, to: &str, subject: &str, tag: &str) -> i64 {
+async fn send_one(
+    app: &Router,
+    token: &str,
+    from: &str,
+    to: &str,
+    subject: &str,
+    tag: &str,
+) -> i64 {
     let (status, body) = post_json(
         app,
         "/api/v2/server/messages",
@@ -441,8 +462,24 @@ async fn send_one(app: &Router, token: &str, from: &str, to: &str, subject: &str
 #[tokio::test]
 async fn messages_index_lists_filters_and_paginates() {
     let (app, token, _, _) = build_two_with_domains().await;
-    send_one(&app, &token, "news@alpha.example", "one@dest.example", "First", "welcome").await;
-    send_one(&app, &token, "news@alpha.example", "two@dest.example", "Second", "promo").await;
+    send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "one@dest.example",
+        "First",
+        "welcome",
+    )
+    .await;
+    send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "two@dest.example",
+        "Second",
+        "promo",
+    )
+    .await;
 
     // full list, newest first
     let (status, body) = request(&app, "/api/v2/server/messages", Some(&token)).await;
@@ -463,7 +500,12 @@ async fn messages_index_lists_filters_and_paginates() {
     assert_eq!(body["data"]["messages"].as_array().unwrap().len(), 1);
 
     // pagination
-    let (_, body) = request(&app, "/api/v2/server/messages?per_page=1&page=2", Some(&token)).await;
+    let (_, body) = request(
+        &app,
+        "/api/v2/server/messages?per_page=1&page=2",
+        Some(&token),
+    )
+    .await;
     assert_eq!(body["data"]["messages"].as_array().unwrap().len(), 1);
     assert_eq!(body["data"]["pagination"]["total_pages"], 2);
 }
@@ -471,7 +513,15 @@ async fn messages_index_lists_filters_and_paginates() {
 #[tokio::test]
 async fn message_show_includes_deliveries_opens_and_clicks() {
     let (app, token, _, store) = build_two_with_domains().await;
-    let id = send_one(&app, &token, "news@alpha.example", "one@dest.example", "Hi", "t").await;
+    let id = send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "one@dest.example",
+        "Hi",
+        "t",
+    )
+    .await;
 
     store.insert_delivery_record(
         id,
@@ -504,7 +554,8 @@ async fn message_show_includes_deliveries_opens_and_clicks() {
     );
 
     // show carries the message + its deliveries
-    let (status, body) = request(&app, &format!("/api/v2/server/messages/{id}"), Some(&token)).await;
+    let (status, body) =
+        request(&app, &format!("/api/v2/server/messages/{id}"), Some(&token)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["message"]["subject"], "Hi");
     assert_eq!(body["data"]["message"]["status"], "Pending");
@@ -512,11 +563,26 @@ async fn message_show_includes_deliveries_opens_and_clicks() {
     assert_eq!(body["data"]["deliveries"][0]["status"], "Sent");
 
     // dedicated activity endpoints
-    let (_, body) = request(&app, &format!("/api/v2/server/messages/{id}/deliveries"), Some(&token)).await;
+    let (_, body) = request(
+        &app,
+        &format!("/api/v2/server/messages/{id}/deliveries"),
+        Some(&token),
+    )
+    .await;
     assert_eq!(body["data"]["deliveries"].as_array().unwrap().len(), 1);
-    let (_, body) = request(&app, &format!("/api/v2/server/messages/{id}/opens"), Some(&token)).await;
+    let (_, body) = request(
+        &app,
+        &format!("/api/v2/server/messages/{id}/opens"),
+        Some(&token),
+    )
+    .await;
     assert_eq!(body["data"]["opens"].as_array().unwrap().len(), 1);
-    let (_, body) = request(&app, &format!("/api/v2/server/messages/{id}/clicks"), Some(&token)).await;
+    let (_, body) = request(
+        &app,
+        &format!("/api/v2/server/messages/{id}/clicks"),
+        Some(&token),
+    )
+    .await;
     assert_eq!(body["data"]["clicks"][0]["url"], "https://example.com");
 }
 
@@ -531,9 +597,22 @@ async fn unknown_message_is_not_found() {
 #[tokio::test]
 async fn message_raw_returns_base64_and_respects_privacy_mode() {
     let (app, token, _, store) = build_two_with_domains().await;
-    let id = send_one(&app, &token, "news@alpha.example", "one@dest.example", "Hi", "t").await;
+    let id = send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "one@dest.example",
+        "Hi",
+        "t",
+    )
+    .await;
 
-    let (status, body) = request(&app, &format!("/api/v2/server/messages/{id}/raw"), Some(&token)).await;
+    let (status, body) = request(
+        &app,
+        &format!("/api/v2/server/messages/{id}/raw"),
+        Some(&token),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let raw_b64 = body["data"]["raw_message"].as_str().unwrap();
     let decoded = base64::engine::general_purpose::STANDARD
@@ -545,7 +624,12 @@ async fn message_raw_returns_base64_and_respects_privacy_mode() {
     let mut server = store.server_for_api_token(&token).await.unwrap().unwrap();
     server.privacy_mode = true;
     store.update_server(server).await.unwrap();
-    let (status, body) = request(&app, &format!("/api/v2/server/messages/{id}/raw"), Some(&token)).await;
+    let (status, body) = request(
+        &app,
+        &format!("/api/v2/server/messages/{id}/raw"),
+        Some(&token),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "NotAvailable");
 }
@@ -553,7 +637,15 @@ async fn message_raw_returns_base64_and_respects_privacy_mode() {
 #[tokio::test]
 async fn a_server_token_cannot_read_another_servers_message() {
     let (app, token_a, token_b, _) = build_two_with_domains().await;
-    let id = send_one(&app, &token_a, "news@alpha.example", "one@dest.example", "Secret", "t").await;
+    let id = send_one(
+        &app,
+        &token_a,
+        "news@alpha.example",
+        "one@dest.example",
+        "Secret",
+        "t",
+    )
+    .await;
 
     // token B's list never includes server A's message
     let (_, body) = request(&app, "/api/v2/server/messages", Some(&token_b)).await;
@@ -576,8 +668,24 @@ async fn a_server_token_cannot_read_another_servers_message() {
 #[tokio::test]
 async fn stats_aggregate_status_and_engagement() {
     let (app, token, _, store) = build_two_with_domains().await;
-    let a = send_one(&app, &token, "news@alpha.example", "one@dest.example", "A", "t").await;
-    let b = send_one(&app, &token, "news@alpha.example", "two@dest.example", "B", "t").await;
+    let a = send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "one@dest.example",
+        "A",
+        "t",
+    )
+    .await;
+    let b = send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "two@dest.example",
+        "B",
+        "t",
+    )
+    .await;
 
     // mark one Sent (with an open + two clicks), leave the other Pending
     store.set_message_status(a, "Sent");
@@ -625,8 +733,24 @@ fn click_event() -> camelmailer_core::ActivityEvent {
 #[tokio::test]
 async fn bounces_list_and_show_only_expose_bounces() {
     let (app, token, _, store) = build_two_with_domains().await;
-    let normal = send_one(&app, &token, "news@alpha.example", "one@dest.example", "OK", "t").await;
-    let bounced = send_one(&app, &token, "news@alpha.example", "two@dest.example", "Bad", "t").await;
+    let normal = send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "one@dest.example",
+        "OK",
+        "t",
+    )
+    .await;
+    let bounced = send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "two@dest.example",
+        "Bad",
+        "t",
+    )
+    .await;
     store.set_message_status(bounced, "Bounced");
 
     // list contains only the bounced message
@@ -637,16 +761,34 @@ async fn bounces_list_and_show_only_expose_bounces() {
     assert_eq!(bounces[0]["subject"], "Bad");
 
     // show works for the bounce, 404 for a non-bounce
-    let (status, _) = request(&app, &format!("/api/v2/server/bounces/{bounced}"), Some(&token)).await;
+    let (status, _) = request(
+        &app,
+        &format!("/api/v2/server/bounces/{bounced}"),
+        Some(&token),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = request(&app, &format!("/api/v2/server/bounces/{normal}"), Some(&token)).await;
+    let (status, _) = request(
+        &app,
+        &format!("/api/v2/server/bounces/{normal}"),
+        Some(&token),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn stats_and_bounces_are_tenant_scoped() {
     let (app, token_a, token_b, store) = build_two_with_domains().await;
-    let id = send_one(&app, &token_a, "news@alpha.example", "one@dest.example", "A", "t").await;
+    let id = send_one(
+        &app,
+        &token_a,
+        "news@alpha.example",
+        "one@dest.example",
+        "A",
+        "t",
+    )
+    .await;
     store.set_message_status(id, "Bounced");
 
     // token B sees an empty stat line and no bounces
@@ -654,7 +796,12 @@ async fn stats_and_bounces_are_tenant_scoped() {
     assert_eq!(body["data"]["stats"]["total"], 0);
     let (_, body) = request(&app, "/api/v2/server/bounces", Some(&token_b)).await;
     assert_eq!(body["data"]["bounces"].as_array().unwrap().len(), 0);
-    let (status, _) = request(&app, &format!("/api/v2/server/bounces/{id}"), Some(&token_b)).await;
+    let (status, _) = request(
+        &app,
+        &format!("/api/v2/server/bounces/{id}"),
+        Some(&token_b),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -672,7 +819,10 @@ async fn every_server_has_a_default_stream() {
 
     // the server exposes its default_stream_id
     let (_, body) = request(&app, "/api/v2/server", Some(&token)).await;
-    assert_eq!(body["data"]["server"]["default_stream_id"], streams[0]["id"]);
+    assert_eq!(
+        body["data"]["server"]["default_stream_id"],
+        streams[0]["id"]
+    );
 }
 
 #[tokio::test]
@@ -769,7 +919,15 @@ async fn send_targets_a_stream_and_list_filters_by_it() {
     let broadcast_id = body["data"]["message_id"].as_i64().unwrap();
 
     // send to the default stream (no stream param)
-    send_one(&app, &token, "news@alpha.example", "b@dest.example", "Receipt", "t").await;
+    send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "b@dest.example",
+        "Receipt",
+        "t",
+    )
+    .await;
 
     // the broadcast message carries the broadcasts stream id
     let streams_id = {
@@ -777,13 +935,23 @@ async fn send_targets_a_stream_and_list_filters_by_it() {
         body["data"]["stream"]["id"].as_i64().unwrap()
     };
     let stored = store.message_for(
-        store.server_for_api_token(&token).await.unwrap().unwrap().id,
+        store
+            .server_for_api_token(&token)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
         broadcast_id,
     );
     assert_eq!(stored.unwrap().stream_id, Some(streams_id as u64));
 
     // ?stream= filters the message list
-    let (_, body) = request(&app, "/api/v2/server/messages?stream=broadcasts", Some(&token)).await;
+    let (_, body) = request(
+        &app,
+        "/api/v2/server/messages?stream=broadcasts",
+        Some(&token),
+    )
+    .await;
     let messages = body["data"]["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["subject"], "Promo");
@@ -826,10 +994,23 @@ fn seed_incoming(store: &MS, server_id: u64, rcpt_to: &str, subject: &str) -> i6
 #[tokio::test]
 async fn inbound_list_show_and_scope_exclusion() {
     let (app, token, _, store) = build_two_with_domains().await;
-    let server_id = store.server_for_api_token(&token).await.unwrap().unwrap().id;
+    let server_id = store
+        .server_for_api_token(&token)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
     let inbound_id = seed_incoming(&store, server_id, "support@alpha.example", "Help");
     // an outbound message must NOT appear in the inbound list
-    send_one(&app, &token, "news@alpha.example", "x@dest.example", "Out", "t").await;
+    send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "x@dest.example",
+        "Out",
+        "t",
+    )
+    .await;
 
     let (status, body) = request(&app, "/api/v2/server/inbound", Some(&token)).await;
     assert_eq!(status, StatusCode::OK);
@@ -838,7 +1019,12 @@ async fn inbound_list_show_and_scope_exclusion() {
     assert_eq!(inbound[0]["subject"], "Help");
     assert_eq!(inbound[0]["scope"], "incoming");
 
-    let (status, body) = request(&app, &format!("/api/v2/server/inbound/{inbound_id}"), Some(&token)).await;
+    let (status, body) = request(
+        &app,
+        &format!("/api/v2/server/inbound/{inbound_id}"),
+        Some(&token),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["message"]["subject"], "Help");
 }
@@ -846,12 +1032,23 @@ async fn inbound_list_show_and_scope_exclusion() {
 #[tokio::test]
 async fn inbound_bypass_and_retry_requeue_the_message() {
     let (app, token, _, store) = build_two_with_domains().await;
-    let server_id = store.server_for_api_token(&token).await.unwrap().unwrap().id;
+    let server_id = store
+        .server_for_api_token(&token)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
     let id = seed_incoming(&store, server_id, "support@alpha.example", "Ticket");
     store.set_message_status(id, "HardFail");
 
     // bypass resets status to Pending and flags the message
-    let (status, body) = post_json(&app, &format!("/api/v2/server/inbound/{id}/bypass"), &token, json!({})).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v2/server/inbound/{id}/bypass"),
+        &token,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["requeued"], true);
     assert_eq!(body["data"]["message"]["status"], "Pending");
@@ -859,28 +1056,64 @@ async fn inbound_bypass_and_retry_requeue_the_message() {
 
     // retry resets status again (bypassed stays set)
     store.set_message_status(id, "HardFail");
-    let (status, body) = post_json(&app, &format!("/api/v2/server/inbound/{id}/retry"), &token, json!({})).await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v2/server/inbound/{id}/retry"),
+        &token,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["message"]["status"], "Pending");
 
     // an outbound message can't be retried via the inbound endpoint
-    let out = send_one(&app, &token, "news@alpha.example", "y@dest.example", "Out", "t").await;
-    let (status, _) = post_json(&app, &format!("/api/v2/server/inbound/{out}/retry"), &token, json!({})).await;
+    let out = send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "y@dest.example",
+        "Out",
+        "t",
+    )
+    .await;
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v2/server/inbound/{out}/retry"),
+        &token,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn inbound_is_tenant_scoped() {
     let (app, token_a, token_b, store) = build_two_with_domains().await;
-    let server_a = store.server_for_api_token(&token_a).await.unwrap().unwrap().id;
+    let server_a = store
+        .server_for_api_token(&token_a)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
     let id = seed_incoming(&store, server_a, "support@alpha.example", "Private");
 
     // token B sees no inbound and cannot read/act on A's message
     let (_, body) = request(&app, "/api/v2/server/inbound", Some(&token_b)).await;
     assert_eq!(body["data"]["inbound"].as_array().unwrap().len(), 0);
-    let (status, _) = request(&app, &format!("/api/v2/server/inbound/{id}"), Some(&token_b)).await;
+    let (status, _) = request(
+        &app,
+        &format!("/api/v2/server/inbound/{id}"),
+        Some(&token_b),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = post_json(&app, &format!("/api/v2/server/inbound/{id}/bypass"), &token_b, json!({})).await;
+    let (status, _) = post_json(
+        &app,
+        &format!("/api/v2/server/inbound/{id}/bypass"),
+        &token_b,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -921,7 +1154,10 @@ async fn template_crud_render_and_scoping() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"]["rendered"]["subject"], "Hi &lt;b&gt;Ada&lt;/b&gt;");
+    assert_eq!(
+        body["data"]["rendered"]["subject"],
+        "Hi &lt;b&gt;Ada&lt;/b&gt;"
+    );
 
     // update + archive
     let (status, body) = patch_json(
@@ -981,11 +1217,19 @@ async fn send_with_template_renders_and_enqueues() {
     assert!(body["data"]["message_id"].is_number());
 
     // the enqueued MIME carries the rendered subject + body
-    let server_id = store.server_for_api_token(&token).await.unwrap().unwrap().id;
+    let server_id = store
+        .server_for_api_token(&token)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
     let stored = store.messages_for(server_id);
     assert_eq!(stored.len(), 1);
     let raw = String::from_utf8_lossy(&stored[0].raw_message);
-    assert!(raw.contains("Subject: Order 42"), "subject not rendered: {raw}");
+    assert!(
+        raw.contains("Subject: Order 42"),
+        "subject not rendered: {raw}"
+    );
     assert!(raw.contains("Thanks Ada"));
 
     // unknown template → 422

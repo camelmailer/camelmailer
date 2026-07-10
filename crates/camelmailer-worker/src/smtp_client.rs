@@ -17,11 +17,18 @@ use tokio_rustls::TlsConnector;
 /// Sent / SoftFail / HardFail statuses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendOutcome {
-    Sent { response: String, tls: bool },
+    Sent {
+        response: String,
+        tls: bool,
+    },
     /// Retryable: connection problems and 4xx replies.
-    SoftFail { response: String },
+    SoftFail {
+        response: String,
+    },
     /// Permanent: 5xx replies.
-    HardFail { response: String },
+    HardFail {
+        response: String,
+    },
 }
 
 /// How to treat the remote certificate during STARTTLS.
@@ -118,7 +125,9 @@ impl SmtpConnection {
     }
 
     async fn send_line(&mut self, line: &str) -> std::io::Result<()> {
-        self.stream.write_all(format!("{line}\r\n").as_bytes()).await
+        self.stream
+            .write_all(format!("{line}\r\n").as_bytes())
+            .await
     }
 
     async fn command(&mut self, line: &str) -> std::io::Result<(u16, String)> {
@@ -207,9 +216,13 @@ async fn connect(params: &SendParams) -> std::io::Result<TcpStream> {
             socket.bind(SocketAddr::new(source_ip, 0))?;
             socket.connect(address)
         }
-        None => return tokio::time::timeout(params.timeout, TcpStream::connect(address))
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?,
+        None => {
+            return tokio::time::timeout(params.timeout, TcpStream::connect(address))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout")
+                })?
+        }
     };
     tokio::time::timeout(params.timeout, connect_future)
         .await
@@ -222,7 +235,10 @@ pub async fn send_message(params: &SendParams, raw_message: &[u8]) -> SendOutcom
     match try_send(params, raw_message).await {
         Ok(outcome) => outcome,
         Err(error) => SendOutcome::SoftFail {
-            response: format!("connection error to {}:{}: {error}", params.host, params.port),
+            response: format!(
+                "connection error to {}:{}: {error}",
+                params.host, params.port
+            ),
         },
     }
 }

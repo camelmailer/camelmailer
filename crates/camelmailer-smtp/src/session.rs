@@ -347,7 +347,10 @@ impl Session {
     }
 
     fn ehlo(&mut self, data: &str) -> Reply {
-        self.helo_name = data.trim().split_once(' ').map(|(_, rest)| rest.to_string());
+        self.helo_name = data
+            .trim()
+            .split_once(' ')
+            .map(|(_, rest)| rest.to_string());
         self.transaction_reset();
         self.state = State::Welcomed;
 
@@ -386,7 +389,10 @@ impl Session {
     }
 
     fn helo(&mut self, data: &str) -> Reply {
-        self.helo_name = data.trim().split_once(' ').map(|(_, rest)| rest.to_string());
+        self.helo_name = data
+            .trim()
+            .split_once(' ')
+            .map(|(_, rest)| rest.to_string());
         self.transaction_reset();
         self.state = State::Welcomed;
         Reply::Line(format!("250 {}", self.config.smtp_hostname))
@@ -465,8 +471,9 @@ impl Session {
 
     fn grant_message(&self, credential: &Credential) -> String {
         let server = self.store.server(credential.server_id);
-        let organization =
-            server.as_ref().and_then(|s| self.store.organization(s.organization_id));
+        let organization = server
+            .as_ref()
+            .and_then(|s| self.store.organization(s.organization_id));
         format!(
             "235 Granted for {}/{}",
             organization.map(|o| o.permalink).unwrap_or_default(),
@@ -806,9 +813,9 @@ impl Session {
                         domain_id: authenticated_domain_id,
                         credential_id: self.credential.as_ref().map(|c| c.id),
                         route_id: None,
-            tag: None,
-            metadata: None,
-            stream_id: None,
+                        tag: None,
+                        metadata: None,
+                        stream_id: None,
                     });
                 }
                 RecipientKind::Bounce => {
@@ -826,9 +833,9 @@ impl Session {
                                 domain_id: rp_route.route.domain_id,
                                 credential_id: None,
                                 route_id: Some(rp_route.route.id),
-            tag: None,
-            metadata: None,
-            stream_id: None,
+                                tag: None,
+                                metadata: None,
+                                stream_id: None,
                             });
                         }
                         None => {
@@ -845,15 +852,18 @@ impl Session {
                                 domain_id: None,
                                 credential_id: None,
                                 route_id: None,
-            tag: None,
-            metadata: None,
-            stream_id: None,
+                                tag: None,
+                                metadata: None,
+                                stream_id: None,
                             });
                         }
                     }
                 }
                 RecipientKind::Route => {
-                    let route = recipient.route.as_ref().expect("route recipients carry a route");
+                    let route = recipient
+                        .route
+                        .as_ref()
+                        .expect("route recipients carry a route");
                     self.sink.queue_message(QueuedMessage {
                         server_id: recipient.server.id,
                         rcpt_to: recipient.rcpt_to,
@@ -865,9 +875,9 @@ impl Session {
                         domain_id: route.route.domain_id,
                         credential_id: None,
                         route_id: Some(route.route.id),
-            tag: None,
-            metadata: None,
-            stream_id: None,
+                        tag: None,
+                        metadata: None,
+                        stream_id: None,
                     });
                 }
             }

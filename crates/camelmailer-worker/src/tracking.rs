@@ -17,7 +17,12 @@ fn body_offset(raw_message: &[u8]) -> Option<usize> {
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|p| p + 4)
-        .or_else(|| raw_message.windows(2).position(|w| w == b"\n\n").map(|p| p + 2))
+        .or_else(|| {
+            raw_message
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|p| p + 2)
+        })
 }
 
 fn is_html(headers: &str) -> bool {
@@ -54,7 +59,11 @@ pub fn rewrite_links<F: FnMut(&str) -> String>(
             }
         }
         // copy one char
-        let ch_len = html[index..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let ch_len = html[index..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
         output.push_str(&html[index..index + ch_len]);
         index += ch_len;
     }

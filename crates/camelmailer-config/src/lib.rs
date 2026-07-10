@@ -613,7 +613,10 @@ postgres:
         )
         .unwrap();
         assert!(config.postgres.enabled);
-        assert_eq!(config.postgres.url(), "postgres://app:s3cret@db.internal:5433/mail");
+        assert_eq!(
+            config.postgres.url(),
+            "postgres://app:s3cret@db.internal:5433/mail"
+        );
     }
 
     #[test]

@@ -103,7 +103,9 @@ fn server_from_row(row: &PgRow) -> Server {
         delivery_hook_url: row.get("delivery_hook_url"),
         inbound_domain: row.get("inbound_domain"),
         color: row.get("color"),
-        default_stream_id: row.get::<Option<i64>, _>("default_stream_id").map(|id| id as Id),
+        default_stream_id: row
+            .get::<Option<i64>, _>("default_stream_id")
+            .map(|id| id as Id),
     }
 }
 
@@ -288,7 +290,9 @@ fn resolved_route_from_row(row: &PgRow) -> ResolvedRoute {
             delivery_hook_url: row.get("delivery_hook_url"),
             inbound_domain: row.get("inbound_domain"),
             color: row.get("color"),
-            default_stream_id: row.get::<Option<i64>, _>("default_stream_id").map(|id| id as Id),
+            default_stream_id: row
+                .get::<Option<i64>, _>("default_stream_id")
+                .map(|id| id as Id),
         },
         domain_name: row.get("domain_name"),
     }
@@ -310,20 +314,21 @@ impl PgStore {
     /// highest-priority (lowest priority number) address in the server's
     /// IP pool, if any.
     pub async fn source_ip_for_server(&self, server_id: Id) -> Option<std::net::IpAddr> {
-        let row = self.wait(async {
-            sqlx::query(
-                "SELECT a.ipv4 FROM ip_addresses a
+        let row = self
+            .wait(async {
+                sqlx::query(
+                    "SELECT a.ipv4 FROM ip_addresses a
                  JOIN servers s ON s.ip_pool_id = a.ip_pool_id
                  WHERE s.id = $1
                  ORDER BY a.priority, a.id
                  LIMIT 1",
-            )
-            .bind(server_id as i64)
-            .fetch_optional(&self.pool)
-            .await
-        })
-        .ok()
-        .flatten()?;
+                )
+                .bind(server_id as i64)
+                .fetch_optional(&self.pool)
+                .await
+            })
+            .ok()
+            .flatten()?;
         row.get::<String, _>("ipv4").parse().ok()
     }
 
@@ -479,10 +484,7 @@ impl AdminStore for PgStore {
             .map_err(Self::sqlx_error)
     }
 
-    async fn create_organization(
-        &self,
-        new: NewOrganization,
-    ) -> Result<Organization, StoreError> {
+    async fn create_organization(&self, new: NewOrganization) -> Result<Organization, StoreError> {
         let uuid = token::generate_uuid();
         let row = sqlx::query(
             "INSERT INTO organizations (uuid, name, permalink)
@@ -660,7 +662,9 @@ impl AdminStore for PgStore {
     }
 
     async fn create_admin_api_key(&self, name: &str, key: &str) -> Result<(), StoreError> {
-        self.create_admin_api_key_record(name, key).await.map(|_| ())
+        self.create_admin_api_key_record(name, key)
+            .await
+            .map(|_| ())
     }
 
     async fn server_for_api_token(&self, key: &str) -> Result<Option<Server>, StoreError> {
@@ -715,11 +719,7 @@ impl AdminStore for PgStore {
                         id: row.get::<i64, _>("id") as Id,
                         uuid: row.get("uuid"),
                         name: row.get("name"),
-                        key_prefix: row
-                            .get::<String, _>("key")
-                            .chars()
-                            .take(6)
-                            .collect(),
+                        key_prefix: row.get::<String, _>("key").chars().take(6).collect(),
                     })
                     .collect()
             })
@@ -785,11 +785,7 @@ impl AdminStore for PgStore {
         .map_err(Self::sqlx_error)
     }
 
-    async fn create_server_domain(
-        &self,
-        server_id: Id,
-        name: &str,
-    ) -> Result<Domain, StoreError> {
+    async fn create_server_domain(&self, server_id: Id, name: &str) -> Result<Domain, StoreError> {
         self.create_domain(DomainOwner::Server(server_id), name, false)
             .await
     }
@@ -836,10 +832,7 @@ impl AdminStore for PgStore {
             .map_err(Self::sqlx_error)
     }
 
-    async fn create_credential_record(
-        &self,
-        new: NewCredential,
-    ) -> Result<Credential, StoreError> {
+    async fn create_credential_record(&self, new: NewCredential) -> Result<Credential, StoreError> {
         let key = new.key.unwrap_or_else(token::generate_key);
         let uuid = token::generate_uuid();
         let row = sqlx::query(
@@ -920,14 +913,14 @@ impl AdminStore for PgStore {
             "UPDATE routes SET name = $2, domain_id = $3, mode = $4, endpoint_url = $5
              WHERE id = $1",
         )
-            .bind(route.id as i64)
-            .bind(&route.name)
-            .bind(route.domain_id.map(|id| id as i64))
-            .bind(route_mode_to_str(route.mode))
-            .bind(&route.endpoint_url)
-            .execute(&self.pool)
-            .await
-            .map_err(Self::sqlx_error)?;
+        .bind(route.id as i64)
+        .bind(&route.name)
+        .bind(route.domain_id.map(|id| id as i64))
+        .bind(route_mode_to_str(route.mode))
+        .bind(&route.endpoint_url)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
         Ok(route)
     }
 
@@ -1053,11 +1046,7 @@ impl AdminStore for PgStore {
         })
     }
 
-    async fn delete_suppression(
-        &self,
-        server_id: Id,
-        address: &str,
-    ) -> Result<bool, StoreError> {
+    async fn delete_suppression(&self, server_id: Id, address: &str) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
         set_tenant_context(&mut tx, server_id)
             .await
@@ -1388,12 +1377,11 @@ impl camelmailer_core::ServerStore for PgStore {
         &self,
         server_id: Id,
     ) -> Result<Vec<camelmailer_core::MessageStream>, StoreError> {
-        let rows =
-            sqlx::query("SELECT * FROM message_streams WHERE server_id = $1 ORDER BY id")
-                .bind(server_id as i64)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(Self::sqlx_error)?;
+        let rows = sqlx::query("SELECT * FROM message_streams WHERE server_id = $1 ORDER BY id")
+            .bind(server_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
         Ok(rows.iter().map(message_stream_from_row).collect())
     }
 
@@ -1402,14 +1390,13 @@ impl camelmailer_core::ServerStore for PgStore {
         server_id: Id,
         permalink: &str,
     ) -> Result<Option<camelmailer_core::MessageStream>, StoreError> {
-        let row = sqlx::query(
-            "SELECT * FROM message_streams WHERE server_id = $1 AND permalink = $2",
-        )
-        .bind(server_id as i64)
-        .bind(permalink)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(Self::sqlx_error)?;
+        let row =
+            sqlx::query("SELECT * FROM message_streams WHERE server_id = $1 AND permalink = $2")
+                .bind(server_id as i64)
+                .bind(permalink)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(Self::sqlx_error)?;
         Ok(row.as_ref().map(message_stream_from_row))
     }
 
@@ -1866,7 +1853,9 @@ impl PgMessageSink {
     }
 
     pub async fn insert_message(&self, message: &QueuedMessage) -> Result<i64, sqlx::Error> {
-        self.insert_message_returning(message).await.map(|(id, _)| id)
+        self.insert_message_returning(message)
+            .await
+            .map(|(id, _)| id)
     }
 
     /// Insert and return both the id and the generated public token.

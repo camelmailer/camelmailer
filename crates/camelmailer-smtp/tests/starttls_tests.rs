@@ -43,7 +43,12 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -52,7 +57,12 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -180,8 +190,8 @@ async fn starttls_upgrades_the_session_and_delivers_authenticated_mail() {
 
     // Full authenticated transaction over TLS
     use base64::Engine;
-    let auth = base64::engine::general_purpose::STANDARD
-        .encode(format!("\0XX\0{}", credential.key));
+    let auth =
+        base64::engine::general_purpose::STANDARD.encode(format!("\0XX\0{}", credential.key));
     let reply = client.command(&format!("AUTH PLAIN {auth}")).await;
     assert!(reply[0].starts_with("235 Granted for"));
 

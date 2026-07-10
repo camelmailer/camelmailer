@@ -37,8 +37,11 @@ pub trait Store: Send + Sync {
     fn smtp_credentials_for_server(&self, server_id: Id) -> Vec<Credential>;
 
     /// `Server.includes(:organization).where(organizations: { permalink: .. }, permalink: ..)`
-    fn find_server_by_permalinks(&self, org_permalink: &str, server_permalink: &str)
-        -> Option<Server>;
+    fn find_server_by_permalinks(
+        &self,
+        org_permalink: &str,
+        server_permalink: &str,
+    ) -> Option<Server>;
 
     /// `server.find_authenticated_domain_from_headers` — given the values of
     /// the From (and, if the server allows it, Sender) headers, find a
@@ -366,7 +369,11 @@ impl MemoryStore {
     }
 
     /// One message by id, scoped to the server (test read model).
-    pub fn message_for(&self, server_id: Id, message_id: i64) -> Option<crate::message::MessageRecord> {
+    pub fn message_for(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Option<crate::message::MessageRecord> {
         self.inner
             .read()
             .unwrap()
@@ -542,9 +549,11 @@ impl MemoryStore {
         use std::collections::BTreeMap;
         let inner = self.inner.read().unwrap();
         let mut per_domain: BTreeMap<String, i64> = BTreeMap::new();
-        for message in inner.messages.iter().filter(|m| {
-            m.server_id == server_id && m.scope == "outgoing" && m.status == "Pending"
-        }) {
+        for message in inner
+            .messages
+            .iter()
+            .filter(|m| m.server_id == server_id && m.scope == "outgoing" && m.status == "Pending")
+        {
             let domain = message
                 .rcpt_to
                 .rsplit_once('@')
@@ -595,9 +604,10 @@ impl MemoryStore {
         bypass: bool,
     ) -> Option<crate::message::MessageRecord> {
         let mut inner = self.inner.write().unwrap();
-        let message = inner.messages.iter_mut().find(|m| {
-            m.id == message_id && m.server_id == server_id && m.scope == "incoming"
-        })?;
+        let message = inner
+            .messages
+            .iter_mut()
+            .find(|m| m.id == message_id && m.server_id == server_id && m.scope == "incoming")?;
         message.status = "Pending".into();
         if bypass {
             message.bypassed = true;
@@ -860,10 +870,14 @@ mod tests {
         let narrow = fixtures.credential(CredentialType::SmtpIp, "1.2.3.0/24");
         let store = fixtures.store();
 
-        let found = store.find_ip_credential("1.2.3.4".parse().unwrap()).unwrap();
+        let found = store
+            .find_ip_credential("1.2.3.4".parse().unwrap())
+            .unwrap();
         assert_eq!(found.id, narrow.id);
 
-        let found = store.find_ip_credential("1.9.9.9".parse().unwrap()).unwrap();
+        let found = store
+            .find_ip_credential("1.9.9.9".parse().unwrap())
+            .unwrap();
         assert_eq!(found.id, wide.id);
 
         let found = store
@@ -871,7 +885,9 @@ mod tests {
             .unwrap();
         assert_eq!(found.id, narrow.id);
 
-        assert!(store.find_ip_credential("9.9.9.9".parse().unwrap()).is_none());
+        assert!(store
+            .find_ip_credential("9.9.9.9".parse().unwrap())
+            .is_none());
     }
 
     #[test]

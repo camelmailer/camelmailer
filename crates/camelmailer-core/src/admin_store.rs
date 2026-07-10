@@ -119,14 +119,13 @@ pub trait AdminStore: Send + Sync {
         &self,
         permalink: &str,
     ) -> Result<Option<Organization>, StoreError>;
-    async fn create_organization(
-        &self,
-        new: NewOrganization,
-    ) -> Result<Organization, StoreError>;
+    async fn create_organization(&self, new: NewOrganization) -> Result<Organization, StoreError>;
     async fn delete_organization(&self, id: Id) -> Result<bool, StoreError>;
 
-    async fn servers_for_organization(&self, organization_id: Id)
-        -> Result<Vec<Server>, StoreError>;
+    async fn servers_for_organization(
+        &self,
+        organization_id: Id,
+    ) -> Result<Vec<Server>, StoreError>;
     async fn server_by_permalink(
         &self,
         organization_id: Id,
@@ -145,18 +144,18 @@ pub trait AdminStore: Send + Sync {
     async fn list_domains(&self, server_id: Id) -> Result<Vec<Domain>, StoreError>;
     async fn domain_by_name(&self, server_id: Id, name: &str)
         -> Result<Option<Domain>, StoreError>;
-    async fn create_server_domain(&self, server_id: Id, name: &str)
-        -> Result<Domain, StoreError>;
-    async fn set_domain_verified(&self, domain_id: Id, verified: bool)
-        -> Result<(), StoreError>;
+    async fn create_server_domain(&self, server_id: Id, name: &str) -> Result<Domain, StoreError>;
+    async fn set_domain_verified(&self, domain_id: Id, verified: bool) -> Result<(), StoreError>;
     async fn delete_domain(&self, domain_id: Id) -> Result<bool, StoreError>;
 
     // credentials
     async fn list_credentials(&self, server_id: Id) -> Result<Vec<Credential>, StoreError>;
-    async fn credential_by_id(&self, server_id: Id, id: Id)
-        -> Result<Option<Credential>, StoreError>;
-    async fn create_credential_record(&self, new: NewCredential)
-        -> Result<Credential, StoreError>;
+    async fn credential_by_id(
+        &self,
+        server_id: Id,
+        id: Id,
+    ) -> Result<Option<Credential>, StoreError>;
+    async fn create_credential_record(&self, new: NewCredential) -> Result<Credential, StoreError>;
     async fn update_credential(&self, credential: Credential) -> Result<Credential, StoreError>;
     async fn delete_credential(&self, id: Id) -> Result<bool, StoreError>;
 
@@ -177,8 +176,7 @@ pub trait AdminStore: Send + Sync {
     // suppressions (tenant-scoped)
     async fn list_suppressions(&self, server_id: Id) -> Result<Vec<Suppression>, StoreError>;
     async fn create_suppression(&self, new: NewSuppression) -> Result<Suppression, StoreError>;
-    async fn delete_suppression(&self, server_id: Id, address: &str)
-        -> Result<bool, StoreError>;
+    async fn delete_suppression(&self, server_id: Id, address: &str) -> Result<bool, StoreError>;
 
     // users (global)
     async fn list_users(&self) -> Result<Vec<User>, StoreError>;
@@ -194,8 +192,11 @@ pub trait AdminStore: Send + Sync {
     async fn update_ip_pool(&self, pool: IpPool) -> Result<IpPool, StoreError>;
     async fn delete_ip_pool(&self, id: Id) -> Result<bool, StoreError>;
     async fn list_ip_addresses(&self, ip_pool_id: Id) -> Result<Vec<IpAddress>, StoreError>;
-    async fn ip_address_by_id(&self, ip_pool_id: Id, id: Id)
-        -> Result<Option<IpAddress>, StoreError>;
+    async fn ip_address_by_id(
+        &self,
+        ip_pool_id: Id,
+        id: Id,
+    ) -> Result<Option<IpAddress>, StoreError>;
     async fn create_ip_address(&self, new: NewIpAddress) -> Result<IpAddress, StoreError>;
     async fn delete_ip_address(&self, id: Id) -> Result<bool, StoreError>;
 
@@ -245,10 +246,7 @@ impl AdminStore for crate::store::MemoryStore {
             .find(|o| o.permalink == permalink))
     }
 
-    async fn create_organization(
-        &self,
-        new: NewOrganization,
-    ) -> Result<Organization, StoreError> {
+    async fn create_organization(&self, new: NewOrganization) -> Result<Organization, StoreError> {
         if self
             .organizations()
             .iter()
@@ -362,9 +360,10 @@ impl AdminStore for crate::store::MemoryStore {
 
     async fn server_for_api_token(&self, key: &str) -> Result<Option<Server>, StoreError> {
         let inner = self.inner.read().unwrap();
-        let credential = inner.credentials.values().find(|c| {
-            c.credential_type == CredentialType::Api && c.key == key && !c.hold
-        });
+        let credential = inner
+            .credentials
+            .values()
+            .find(|c| c.credential_type == CredentialType::Api && c.key == key && !c.hold);
         Ok(credential.and_then(|c| inner.servers.get(&c.server_id).cloned()))
     }
 
@@ -433,11 +432,7 @@ impl AdminStore for crate::store::MemoryStore {
             .cloned())
     }
 
-    async fn create_server_domain(
-        &self,
-        server_id: Id,
-        name: &str,
-    ) -> Result<Domain, StoreError> {
+    async fn create_server_domain(&self, server_id: Id, name: &str) -> Result<Domain, StoreError> {
         if self.domain_by_name(server_id, name).await?.is_some() {
             return Err(StoreError::Conflict("Name has already been taken".into()));
         }
@@ -491,10 +486,7 @@ impl AdminStore for crate::store::MemoryStore {
             .cloned())
     }
 
-    async fn create_credential_record(
-        &self,
-        new: NewCredential,
-    ) -> Result<Credential, StoreError> {
+    async fn create_credential_record(&self, new: NewCredential) -> Result<Credential, StoreError> {
         let key = new.key.unwrap_or_else(crate::token::generate_key);
         Ok(self.insert_credential(Credential {
             id: self.next_id(),
@@ -512,7 +504,13 @@ impl AdminStore for crate::store::MemoryStore {
     }
 
     async fn delete_credential(&self, id: Id) -> Result<bool, StoreError> {
-        Ok(self.inner.write().unwrap().credentials.remove(&id).is_some())
+        Ok(self
+            .inner
+            .write()
+            .unwrap()
+            .credentials
+            .remove(&id)
+            .is_some())
     }
 
     async fn list_routes(&self, server_id: Id) -> Result<Vec<Route>, StoreError> {
@@ -640,9 +638,7 @@ impl AdminStore for crate::store::MemoryStore {
                 .values()
                 .any(|s| s.server_id == new.server_id && s.address == new.address)
             {
-                return Err(StoreError::Conflict(
-                    "Address is already suppressed".into(),
-                ));
+                return Err(StoreError::Conflict("Address is already suppressed".into()));
             }
         }
         let suppression = Suppression {
@@ -660,11 +656,7 @@ impl AdminStore for crate::store::MemoryStore {
         Ok(suppression)
     }
 
-    async fn delete_suppression(
-        &self,
-        server_id: Id,
-        address: &str,
-    ) -> Result<bool, StoreError> {
+    async fn delete_suppression(&self, server_id: Id, address: &str) -> Result<bool, StoreError> {
         let mut inner = self.inner.write().unwrap();
         let id = inner
             .suppressions
@@ -675,14 +667,7 @@ impl AdminStore for crate::store::MemoryStore {
     }
 
     async fn list_users(&self) -> Result<Vec<User>, StoreError> {
-        let mut users: Vec<User> = self
-            .inner
-            .read()
-            .unwrap()
-            .users
-            .values()
-            .cloned()
-            .collect();
+        let mut users: Vec<User> = self.inner.read().unwrap().users.values().cloned().collect();
         users.sort_by_key(|u| u.id);
         Ok(users)
     }
@@ -712,12 +697,20 @@ impl AdminStore for crate::store::MemoryStore {
             last_name: new.last_name,
             admin: new.admin,
         };
-        self.inner.write().unwrap().users.insert(user.id, user.clone());
+        self.inner
+            .write()
+            .unwrap()
+            .users
+            .insert(user.id, user.clone());
         Ok(user)
     }
 
     async fn update_user(&self, user: User) -> Result<User, StoreError> {
-        self.inner.write().unwrap().users.insert(user.id, user.clone());
+        self.inner
+            .write()
+            .unwrap()
+            .users
+            .insert(user.id, user.clone());
         Ok(user)
     }
 

@@ -80,9 +80,9 @@ fn load_tls_acceptor(
     // rustls needs a process-wide crypto provider; installing twice is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let certificates = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(certificate_path)?,
-    ))
+    let certificates = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(
+        certificate_path,
+    )?))
     .collect::<Result<Vec<_>, _>>()?;
     let private_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
         std::fs::File::open(private_key_path)?,

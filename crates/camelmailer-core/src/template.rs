@@ -39,7 +39,10 @@ pub enum RenderError {
 #[derive(Debug, PartialEq)]
 enum Node {
     Text(String),
-    Var { path: String, escaped: bool },
+    Var {
+        path: String,
+        escaped: bool,
+    },
     Section {
         path: String,
         inverted: bool,
@@ -94,8 +97,8 @@ fn parse(template: &str) -> Result<Vec<Node>, RenderError> {
         rest = &after[end + 2..];
 
         match tag.chars().next() {
-            None => {}                    // `{{}}` — ignore
-            Some('!') => {}               // comment
+            None => {}      // `{{}}` — ignore
+            Some('!') => {} // comment
             Some('#') | Some('^') => {
                 if stack.len() >= MAX_DEPTH {
                     return Err(RenderError::TooDeep);
@@ -286,10 +289,7 @@ mod tests {
     fn interpolates_and_html_escapes_by_default() {
         let model = json!({ "name": "<script>alert('x')</script>" });
         let out = render("Hi {{ name }}", &model).unwrap();
-        assert_eq!(
-            out,
-            "Hi &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"
-        );
+        assert_eq!(out, "Hi &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;");
     }
 
     #[test]
@@ -361,9 +361,6 @@ mod tests {
         let big = "x".repeat(50_000);
         let model = json!({ "rows": [ {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {} ] });
         let template = format!("{{{{# rows }}}}{big}{{{{/ rows }}}}");
-        assert_eq!(
-            render(&template, &model),
-            Err(RenderError::OutputTooLarge)
-        );
+        assert_eq!(render(&template, &model), Err(RenderError::OutputTooLarge));
     }
 }

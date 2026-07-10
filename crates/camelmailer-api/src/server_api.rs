@@ -102,16 +102,17 @@ async fn server_show(
     start: axum::Extension<RequestStart>,
     server: axum::Extension<Server>,
 ) -> Response {
-    render_success(Some(&start.0), StatusCode::OK, json!({ "server": server_json(&server.0) }))
-        .into_response()
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({ "server": server_json(&server.0) }),
+    )
+    .into_response()
 }
 
 /// `GET /api/v2/server/ping` — a liveness probe that confirms the token
 /// resolved to the expected server.
-async fn ping(
-    start: axum::Extension<RequestStart>,
-    server: axum::Extension<Server>,
-) -> Response {
+async fn ping(start: axum::Extension<RequestStart>, server: axum::Extension<Server>) -> Response {
     render_success(
         Some(&start.0),
         StatusCode::OK,
@@ -367,9 +368,7 @@ async fn messages_send(
     Json(body): Json<SendMessage>,
 ) -> Response {
     match enqueue_send(&state, &server.0, body).await {
-        Ok(data) => {
-            render_success(Some(&start.0), StatusCode::CREATED, data).into_response()
-        }
+        Ok(data) => render_success(Some(&start.0), StatusCode::CREATED, data).into_response(),
         Err((status, code, message)) => {
             render_error(Some(&start.0), status, &code, &message).into_response()
         }
@@ -386,13 +385,16 @@ async fn messages_send_batch(
     for message in messages {
         match enqueue_send(&state, &server.0, message).await {
             Ok(data) => results.push(json!({ "status": "success", "data": data })),
-            Err((_, code, message)) => {
-                results.push(json!({ "status": "error", "error": { "code": code, "message": message } }))
-            }
+            Err((_, code, message)) => results
+                .push(json!({ "status": "error", "error": { "code": code, "message": message } })),
         }
     }
-    render_success(Some(&start.0), StatusCode::OK, json!({ "messages": results }))
-        .into_response()
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({ "messages": results }),
+    )
+    .into_response()
 }
 
 // -------------------------------------------------------------- read APIs
@@ -498,11 +500,11 @@ async fn messages_index(
         Some(store) => store,
         None => return storage_unconfigured(&start.0),
     };
-    let stream_id =
-        match resolve_stream_filter(store, server.0.id, &params.stream, &start.0).await {
-            Ok(stream_id) => stream_id,
-            Err(response) => return response,
-        };
+    let stream_id = match resolve_stream_filter(store, server.0.id, &params.stream, &start.0).await
+    {
+        Ok(stream_id) => stream_id,
+        Err(response) => return response,
+    };
     let filter = MessageFilter {
         scope: params.scope.filter(|s| !s.is_empty()),
         status: params.status.filter(|s| !s.is_empty()),
@@ -554,10 +556,7 @@ async fn message_show(
         Ok(None) => return not_found(&start.0),
         Err(error) => return internal_error(&start.0, &error.to_string()),
     };
-    let deliveries = store
-        .deliveries(server.0.id, id)
-        .await
-        .unwrap_or_default();
+    let deliveries = store.deliveries(server.0.id, id).await.unwrap_or_default();
     render_success(
         Some(&start.0),
         StatusCode::OK,
@@ -730,10 +729,12 @@ async fn stats_show(
         to: params.to,
     };
     match store.message_stats(server.0.id, &filter).await {
-        Ok(stats) => {
-            render_success(Some(&start.0), StatusCode::OK, json!({ "stats": stats_json(&stats) }))
-                .into_response()
-        }
+        Ok(stats) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "stats": stats_json(&stats) }),
+        )
+        .into_response(),
         Err(error) => internal_error(&start.0, &error.to_string()),
     }
 }
@@ -827,8 +828,13 @@ async fn bounce_show(
 }
 
 fn not_found(start: &RequestStart) -> Response {
-    render_error(Some(start), StatusCode::NOT_FOUND, "NotFound", "Resource not found")
-        .into_response()
+    render_error(
+        Some(start),
+        StatusCode::NOT_FOUND,
+        "NotFound",
+        "Resource not found",
+    )
+    .into_response()
 }
 
 fn internal_error(start: &RequestStart, message: &str) -> Response {
@@ -854,11 +860,11 @@ async fn inbound_index(
         Some(store) => store,
         None => return storage_unconfigured(&start.0),
     };
-    let stream_id =
-        match resolve_stream_filter(store, server.0.id, &params.stream, &start.0).await {
-            Ok(stream_id) => stream_id,
-            Err(response) => return response,
-        };
+    let stream_id = match resolve_stream_filter(store, server.0.id, &params.stream, &start.0).await
+    {
+        Ok(stream_id) => stream_id,
+        Err(response) => return response,
+    };
     let filter = MessageFilter {
         scope: None, // forced to incoming by the store
         status: params.status.filter(|s| !s.is_empty()),
@@ -1375,10 +1381,7 @@ struct RenderBody {
 
 /// Render a template's subject/html/text against a model, or a rendered
 /// error tuple (native shape).
-fn render_template_fields(
-    template: &Template,
-    model: &Value,
-) -> Result<RenderedFields, ApiError> {
+fn render_template_fields(template: &Template, model: &Value) -> Result<RenderedFields, ApiError> {
     let render_field = |field: &Option<String>| -> Result<Option<String>, ApiError> {
         match field {
             Some(source) => camelmailer_core::render_template(source, model)
@@ -1526,8 +1529,12 @@ async fn messages_send_with_template_batch(
                 .push(json!({ "status": "error", "error": { "code": code, "message": message } })),
         }
     }
-    render_success(Some(&start.0), StatusCode::OK, json!({ "messages": results }))
-        .into_response()
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({ "messages": results }),
+    )
+    .into_response()
 }
 
 /// Build the `/api/v2/server` router (server-token authenticated).
@@ -1552,7 +1559,10 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/bounces", get(bounces_index))
         .route("/bounces/{id}", get(bounce_show))
         .route("/streams", get(streams_index).post(streams_create))
-        .route("/streams/{permalink}", get(stream_show).patch(stream_update))
+        .route(
+            "/streams/{permalink}",
+            get(stream_show).patch(stream_update),
+        )
         .route("/streams/{permalink}/archive", post(stream_archive))
         .route("/inbound", get(inbound_index))
         .route("/inbound/{id}", get(inbound_show))

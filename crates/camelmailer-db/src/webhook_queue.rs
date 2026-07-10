@@ -166,10 +166,7 @@ impl PgWebhookQueue {
         Ok(())
     }
 
-    pub async fn log_for_server(
-        &self,
-        server_id: Id,
-    ) -> Result<Vec<WebhookLogEntry>, sqlx::Error> {
+    pub async fn log_for_server(&self, server_id: Id) -> Result<Vec<WebhookLogEntry>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         set_tenant_context(&mut tx, server_id).await?;
         let rows = sqlx::query("SELECT * FROM webhook_request_log ORDER BY id")

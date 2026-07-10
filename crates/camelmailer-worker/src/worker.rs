@@ -8,9 +8,9 @@
 use crate::dkim;
 use crate::inspection::{ClamavInspector, RspamdInspector};
 use crate::sender::SmtpSender;
-use crate::tracking;
 use crate::signer::Signer;
 use crate::smtp_client::SendOutcome;
+use crate::tracking;
 use base64::Engine;
 use camelmailer_core::{AdminStore, Id, RouteMode};
 use camelmailer_db::{PgMessageSink, PgQueue, PgStore, PgWebhookQueue, StoredMessage};
@@ -74,8 +74,8 @@ impl Worker {
             .timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client");
-        let signer = Signer::from_pem_file(&config.camelmailer.signing_key_path)
-            .unwrap_or_else(|error| {
+        let signer =
+            Signer::from_pem_file(&config.camelmailer.signing_key_path).unwrap_or_else(|error| {
                 tracing::warn!(%error, "could not load signing key; webhook signing disabled");
                 None
             });
@@ -173,18 +173,16 @@ impl Worker {
         // authenticated domain and a signing key is configured. The stored
         // message stays unsigned, matching the Ruby behaviour.
         let raw_message = match (&self.signer, message.domain_id) {
-            (Some(signer), Some(domain_id)) => {
-                match self.store.domain_by_id(domain_id).await {
-                    Ok(Some(domain)) => dkim::sign_and_prepend(
-                        &tracked,
-                        &domain.name,
-                        &self.dkim_selector,
-                        signer,
-                        chrono::Utc::now().timestamp(),
-                    ),
-                    _ => tracked,
-                }
-            }
+            (Some(signer), Some(domain_id)) => match self.store.domain_by_id(domain_id).await {
+                Ok(Some(domain)) => dkim::sign_and_prepend(
+                    &tracked,
+                    &domain.name,
+                    &self.dkim_selector,
+                    signer,
+                    chrono::Utc::now().timestamp(),
+                ),
+                _ => tracked,
+            },
             _ => tracked,
         };
 
@@ -302,7 +300,10 @@ impl Worker {
         let mut spam_status = "NotChecked".to_string();
         let mut spam_score = 0.0;
         if let Some(rspamd) = &self.rspamd {
-            match rspamd.check(&message.raw_message, self.spam_threshold).await {
+            match rspamd
+                .check(&message.raw_message, self.spam_threshold)
+                .await
+            {
                 Ok(result) => {
                     spam_score = result.score;
                     spam_status = if result.score >= self.spam_failure_threshold {
@@ -375,7 +376,9 @@ impl Worker {
         };
 
         let endpoint_url = route.as_ref().and_then(|r| {
-            (r.mode == RouteMode::Endpoint).then(|| r.endpoint_url.clone()).flatten()
+            (r.mode == RouteMode::Endpoint)
+                .then(|| r.endpoint_url.clone())
+                .flatten()
         });
 
         let Some(endpoint_url) = endpoint_url else {
@@ -562,7 +565,9 @@ impl Worker {
             tracing::warn!(url = %request.url, "webhook given up after {WEBHOOK_MAX_ATTEMPTS} attempts");
             Ok(Some(WebhookOutcome::GivenUp))
         } else {
-            self.webhook_queue.retry(request.id, request.attempts).await?;
+            self.webhook_queue
+                .retry(request.id, request.attempts)
+                .await?;
             Ok(Some(WebhookOutcome::Retrying))
         }
     }

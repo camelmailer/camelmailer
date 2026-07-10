@@ -153,8 +153,8 @@ pub fn sign(
         canonicalize_header(&format!("DKIM-Signature: {unsigned_dkim}")).expect("has a colon");
     signing_input.push_str(&format!("{dkim_name}:{dkim_value}"));
 
-    let signature =
-        base64::engine::general_purpose::STANDARD.encode(signer.sign_sha256(signing_input.as_bytes()));
+    let signature = base64::engine::general_purpose::STANDARD
+        .encode(signer.sign_sha256(signing_input.as_bytes()));
     format!("DKIM-Signature: {unsigned_dkim}{signature}")
 }
 
@@ -187,10 +187,7 @@ mod tests {
     #[test]
     fn relaxed_header_canonicalization_matches_rfc_6376() {
         // RFC 6376 §3.4.5 example
-        assert_eq!(
-            canonicalize_header("A: X"),
-            Some(("a".into(), "X".into()))
-        );
+        assert_eq!(canonicalize_header("A: X"), Some(("a".into(), "X".into())));
         assert_eq!(
             canonicalize_header("B : Y\t\r\n\tZ  "),
             Some(("b".into(), "Y Z".into()))
@@ -217,7 +214,8 @@ mod tests {
 
     #[test]
     fn signature_header_carries_the_expected_tags() {
-        let raw = b"From: sender@org.example\r\nTo: rcpt@dest.example\r\nSubject: Test\r\n\r\nHello\r\n";
+        let raw =
+            b"From: sender@org.example\r\nTo: rcpt@dest.example\r\nSubject: Test\r\n\r\nHello\r\n";
         let header = sign(raw, "org.example", "postal", &test_signer(), 1_700_000_000);
         assert!(header.starts_with("DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; "));
         assert!(header.contains("d=org.example;"));
@@ -230,8 +228,7 @@ mod tests {
 
     #[test]
     fn the_signature_verifies_against_the_public_key() {
-        let raw =
-            b"From: sender@org.example\r\nSubject: Verify me\r\n\r\nSome body content.\r\n";
+        let raw = b"From: sender@org.example\r\nSubject: Verify me\r\n\r\nSome body content.\r\n";
         let signer = test_signer();
         let header = sign(raw, "org.example", "postal", &signer, 1_700_000_000);
 
@@ -256,8 +253,7 @@ mod tests {
         let signature_bytes = base64::engine::general_purpose::STANDARD
             .decode(signature_b64)
             .unwrap();
-        let verifying_key =
-            rsa::pkcs1v15::VerifyingKey::<Sha256>::new(signer.public_key());
+        let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(signer.public_key());
         let signature = rsa::pkcs1v15::Signature::try_from(signature_bytes.as_slice()).unwrap();
         verifying_key
             .verify(signing_input.as_bytes(), &signature)

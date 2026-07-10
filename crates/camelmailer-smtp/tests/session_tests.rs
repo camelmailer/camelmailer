@@ -45,12 +45,8 @@ impl TestSetup {
     fn with_config_and_ip(config: SessionConfig, ip: Option<&str>) -> Self {
         let fixtures = Fixtures::new();
         let sink = Arc::new(MemorySink::new());
-        let mut session = Session::new(
-            config,
-            fixtures.store(),
-            sink.clone(),
-            ip.map(String::from),
-        );
+        let mut session =
+            Session::new(config, fixtures.store(), sink.clone(), ip.map(String::from));
         // Freeze time, mirroring Timecop.freeze in the Ruby specs.
         session.set_clock(Arc::new(|| {
             Utc.with_ymd_and_hms(2026, 7, 9, 12, 34, 56).unwrap()
@@ -215,9 +211,7 @@ fn mail_from_sets_the_address() {
 fn mail_from_discards_the_auth_parameter() {
     let mut setup = TestSetup::new();
     setup.session.handle("HELO test.example.com");
-    setup
-        .session
-        .handle("MAIL FROM:<test@example.com> AUTH=<>");
+    setup.session.handle("MAIL FROM:<test@example.com> AUTH=<>");
     assert_eq!(setup.session.mail_from(), Some("test@example.com"));
 }
 
@@ -362,10 +356,7 @@ fn route_domain_rcpt_resolves_to_the_routes_real_address_with_tag() {
     let recipient = &setup.session.recipients()[0];
     assert_eq!(recipient.kind, RecipientKind::Route);
     assert_eq!(recipient.rcpt_to, "info+tag1@example.com");
-    assert_eq!(
-        recipient.route.as_ref().unwrap().route.id,
-        route.id
-    );
+    assert_eq!(recipient.route.as_ref().unwrap().route.id, route.id);
     assert_eq!(setup.session.state(), State::RcptToReceived);
 }
 
@@ -439,7 +430,9 @@ fn unauthenticated_rcpt_without_route_requires_authentication() {
 #[test]
 fn unauthenticated_rcpt_falls_back_to_ip_credentials() {
     let mut setup = TestSetup::new();
-    setup.fixtures.credential(CredentialType::SmtpIp, "1.0.0.0/8");
+    setup
+        .fixtures
+        .credential(CredentialType::SmtpIp, "1.0.0.0/8");
     helo_and_mail_from(&mut setup.session);
     let reply = setup.session.handle("RCPT TO: test@example.com");
     assert_eq!(line(&reply), "250 OK");
@@ -657,7 +650,10 @@ fn data_logs_headers_including_multiline_continuations() {
     let headers = setup.session.headers().unwrap();
     assert_eq!(headers["subject"], vec!["Test"]);
     assert_eq!(headers["from"], vec!["test@test.com"]);
-    assert_eq!(headers["to"], vec!["test1@example.com", "test2@example.com"]);
+    assert_eq!(
+        headers["to"],
+        vec!["test1@example.com", "test2@example.com"]
+    );
     assert_eq!(headers["x-something"], vec!["abcdef1234"]);
     assert_eq!(headers["x-multiline"], vec!["1234             4567"]);
 }
@@ -669,7 +665,9 @@ fn data_accumulates_raw_content_with_crlf_line_endings() {
     setup.session.handle("DATA");
     setup.session.handle("Subject: Test");
     setup.session.handle("");
-    setup.session.handle("This is some content for the message.");
+    setup
+        .session
+        .handle("This is some content for the message.");
     setup.session.handle("It will keep going.");
     let expected = format!(
         "X-Envelope-From: <test@test.com>\r\n\
@@ -745,17 +743,19 @@ fn finish_rejects_messages_over_the_maximum_size() {
     setup.session.handle(&big_line);
     setup.session.handle("\r");
     let reply = setup.session.handle(".\r");
-    assert_eq!(
-        line(&reply),
-        "552 Message too large (maximum size 1MB)"
-    );
+    assert_eq!(line(&reply), "552 Message too large (maximum size 1MB)");
 }
 
 #[test]
 fn finish_detects_mail_loops() {
     let mut setup = authenticated_setup("test@example.com", "test@example.com");
     setup.session.handle("DATA");
-    for host in ["example1.com", "example2.com", "example1.com", "example2.com"] {
+    for host in [
+        "example1.com",
+        "example2.com",
+        "example1.com",
+        "example2.com",
+    ] {
         setup
             .session
             .handle(&format!("Received: from {host} by {SMTP_HOSTNAME}"));
