@@ -11,7 +11,7 @@ use camelmailer_worker::{ProcessOutcome, Worker};
 use rand::Rng;
 use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 fn base_url() -> Option<String> {
@@ -723,4 +723,208 @@ async fn outgoing_mail_without_a_domain_is_not_dkim_signed() {
 
     let seen = smtp.received.lock().unwrap().clone();
     assert!(!seen.iter().any(|l| l.starts_with("DKIM-Signature:")));
+}
+
+// -------------------------------------------- inspection (commit C)
+
+/// Mock rspamd returning a fixed score/action.
+async fn mock_rspamd(score: f64, action: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = axum::Router::new().route(
+        "/checkv2",
+        axum::routing::post(move |_body: axum::body::Bytes| async move {
+            axum::Json(serde_json::json!({ "score": score, "action": action }))
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    port
+}
+
+/// Mock clamd speaking the INSTREAM protocol, replying with a fixed verdict.
+async fn mock_clamd(reply: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                // drain the INSTREAM upload until the zero-length terminator
+                let mut buffer = vec![0u8; 4096];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            // crude: once we've seen data, respond after a beat
+                            if buffer.windows(4).any(|w| w == [0, 0, 0, 0]) {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                stream
+                    .write_all(format!("{reply}\0").as_bytes())
+                    .await
+                    .ok();
+                stream.shutdown().await.ok();
+            });
+        }
+    });
+    port
+}
+
+async fn incoming_route_setup(s: &Setup) -> (camelmailer_core::Domain, camelmailer_core::Route) {
+    let domain = s
+        .store
+        .create_domain(
+            camelmailer_core::DomainOwner::Server(s.server.id),
+            "org.example",
+            true,
+        )
+        .await
+        .unwrap();
+    let route = s
+        .store
+        .create_route_with_endpoint(
+            s.server.id,
+            Some(domain.id),
+            "info",
+            camelmailer_core::RouteMode::Accept,
+            None,
+        )
+        .await
+        .unwrap();
+    (domain, route)
+}
+
+fn incoming_message(server_id: camelmailer_core::Id, route_id: camelmailer_core::Id) -> QueuedMessage {
+    let mut message = outgoing_message(server_id, "info@org.example");
+    message.scope = MessageScope::Incoming;
+    message.route_id = Some(route_id);
+    message
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_incoming_mail_is_inspected_and_scored_not_spam() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let (_domain, route) = incoming_route_setup(&s).await;
+    let rspamd_port = mock_rspamd(0.5, "no action").await;
+
+    let message_id = s
+        .sink
+        .insert_message(&incoming_message(s.server.id, route.id))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(1);
+    config.rspamd.enabled = true;
+    config.rspamd.host = "127.0.0.1".into();
+    config.rspamd.port = rspamd_port;
+    config.camelmailer.default_spam_threshold = 5;
+    config.camelmailer.default_spam_failure_threshold = 20;
+
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::NothingToDo);
+
+    let message = s.sink.message_by_id(s.server.id, message_id).await.unwrap().unwrap();
+    assert!(message.inspected);
+    assert_eq!(message.spam_status, "NotSpam");
+    assert!((message.spam_score - 0.5).abs() < 1e-9);
+    assert!(!message.threat);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spam_failure_mail_is_held() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let (_domain, route) = incoming_route_setup(&s).await;
+    let rspamd_port = mock_rspamd(25.0, "reject").await;
+
+    let message_id = s
+        .sink
+        .insert_message(&incoming_message(s.server.id, route.id))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(1);
+    config.rspamd.enabled = true;
+    config.rspamd.host = "127.0.0.1".into();
+    config.rspamd.port = rspamd_port;
+    config.camelmailer.default_spam_threshold = 5;
+    config.camelmailer.default_spam_failure_threshold = 20;
+
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::Held);
+
+    let message = s.sink.message_by_id(s.server.id, message_id).await.unwrap().unwrap();
+    assert_eq!(message.spam_status, "SpamFailure");
+    let deliveries = s.sink.deliveries_for_message(s.server.id, message_id).await.unwrap();
+    assert_eq!(deliveries[0].status, "Held");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn virus_mail_is_held_with_the_signature_recorded() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let (_domain, route) = incoming_route_setup(&s).await;
+    let clamd_port = mock_clamd("stream: Eicar-Test-Signature FOUND").await;
+
+    let message_id = s
+        .sink
+        .insert_message(&incoming_message(s.server.id, route.id))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(1);
+    config.clamav.enabled = true;
+    config.clamav.host = "127.0.0.1".into();
+    config.clamav.port = clamd_port;
+
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::Held);
+
+    let message = s.sink.message_by_id(s.server.id, message_id).await.unwrap().unwrap();
+    assert!(message.threat);
+    assert_eq!(message.threat_details.as_deref(), Some("Eicar-Test-Signature"));
+    assert!(message.inspected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_virus_scan_passes() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let (_domain, route) = incoming_route_setup(&s).await;
+    let clamd_port = mock_clamd("stream: OK").await;
+
+    let message_id = s
+        .sink
+        .insert_message(&incoming_message(s.server.id, route.id))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(1);
+    config.clamav.enabled = true;
+    config.clamav.host = "127.0.0.1".into();
+    config.clamav.port = clamd_port;
+
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::NothingToDo);
+
+    let message = s.sink.message_by_id(s.server.id, message_id).await.unwrap().unwrap();
+    assert!(!message.threat);
+    assert!(message.inspected);
 }

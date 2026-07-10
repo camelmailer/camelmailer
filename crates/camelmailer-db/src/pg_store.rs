@@ -1275,6 +1275,9 @@ pub struct StoredMessage {
     pub spam_score: f64,
     pub held: bool,
     pub size: i64,
+    pub threat: bool,
+    pub threat_details: Option<String>,
+    pub inspected: bool,
 }
 
 fn stored_message_from_row(row: &PgRow) -> StoredMessage {
@@ -1300,6 +1303,9 @@ fn stored_message_from_row(row: &PgRow) -> StoredMessage {
         spam_score: row.get("spam_score"),
         held: row.get("held"),
         size: row.get("size"),
+        threat: row.get("threat"),
+        threat_details: row.get("threat_details"),
+        inspected: row.get("inspected"),
     }
 }
 
@@ -1482,6 +1488,37 @@ impl PgMessageSink {
             .bind(spam_score)
             .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Store the result of inspecting an incoming message (rspamd spam
+    /// score + status, ClamAV threat verdict). Sets `inspected = true`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_inspection(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        spam_status: &str,
+        spam_score: f64,
+        threat: bool,
+        threat_details: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        sqlx::query(
+            "UPDATE messages
+             SET spam_status = $2, spam_score = $3, threat = $4, threat_details = $5,
+                 inspected = true
+             WHERE id = $1",
+        )
+        .bind(message_id)
+        .bind(spam_status)
+        .bind(spam_score)
+        .bind(threat)
+        .bind(threat_details)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

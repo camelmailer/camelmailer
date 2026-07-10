@@ -2,6 +2,7 @@
 //! `app/lib/message_dequeuer` and `app/senders`.
 
 pub mod dkim;
+pub mod inspection;
 pub mod sender;
 pub mod signer;
 pub mod smtp_client;

@@ -340,6 +340,50 @@ impl Default for SmtpClient {
     }
 }
 
+/// rspamd spam-scanning integration (`app/lib/postal/message_inspectors`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Rspamd {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub ssl: bool,
+    pub password: Option<String>,
+    pub flags: Option<String>,
+}
+
+impl Default for Rspamd {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".into(),
+            port: 11334,
+            ssl: false,
+            password: None,
+            flags: None,
+        }
+    }
+}
+
+/// ClamAV virus scanning (INSTREAM over TCP).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Clamav {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for Clamav {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".into(),
+            port: 3310,
+        }
+    }
+}
+
 /// PostgreSQL — the single multi-tenant database (replaces MariaDB's
 /// `main_db` + database-per-server `message_db` layout; tenant isolation is
 /// enforced with row-level security).
@@ -411,6 +455,8 @@ pub struct Config {
     pub dns: Dns,
     pub smtp: Smtp,
     pub smtp_client: SmtpClient,
+    pub rspamd: Rspamd,
+    pub clamav: Clamav,
 }
 
 impl Config {
@@ -574,6 +620,23 @@ postgres:
     fn empty_yaml_yields_defaults() {
         let config = Config::from_yaml("").unwrap();
         assert_eq!(config.smtp_server.default_port, 25);
+    }
+
+    #[test]
+    fn rspamd_and_clamav_defaults() {
+        let config = Config::default();
+        assert!(!config.rspamd.enabled);
+        assert_eq!(config.rspamd.port, 11334);
+        assert!(!config.clamav.enabled);
+        assert_eq!(config.clamav.port, 3310);
+
+        let config = Config::from_yaml(
+            "rspamd:\n  enabled: true\n  host: scan.internal\nclamav:\n  enabled: true\n",
+        )
+        .unwrap();
+        assert!(config.rspamd.enabled);
+        assert_eq!(config.rspamd.host, "scan.internal");
+        assert!(config.clamav.enabled);
     }
 
     #[test]

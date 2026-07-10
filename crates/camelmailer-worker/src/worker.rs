@@ -6,6 +6,7 @@
 //! content, so tenant isolation never depends on worker code being careful.
 
 use crate::dkim;
+use crate::inspection::{ClamavInspector, RspamdInspector};
 use crate::sender::SmtpSender;
 use crate::signer::Signer;
 use crate::smtp_client::SendOutcome;
@@ -52,6 +53,10 @@ pub struct Worker {
     sender: SmtpSender,
     signer: Option<Signer>,
     dkim_selector: String,
+    rspamd: Option<RspamdInspector>,
+    clamav: Option<ClamavInspector>,
+    spam_threshold: f64,
+    spam_failure_threshold: f64,
     http: reqwest::Client,
     max_attempts: i32,
     worker_id: String,
@@ -72,6 +77,14 @@ impl Worker {
                 None
             });
         let webhook_queue = PgWebhookQueue::new(store.pool().clone());
+        let rspamd = config
+            .rspamd
+            .enabled
+            .then(|| RspamdInspector::new(&config.rspamd));
+        let clamav = config
+            .clamav
+            .enabled
+            .then(|| ClamavInspector::new(&config.clamav));
         Self {
             store,
             sink,
@@ -79,6 +92,10 @@ impl Worker {
             webhook_queue,
             signer,
             dkim_selector: config.dns.dkim_identifier.clone(),
+            rspamd,
+            clamav,
+            spam_threshold: config.camelmailer.default_spam_threshold as f64,
+            spam_failure_threshold: config.camelmailer.default_spam_failure_threshold as f64,
             sender,
             http,
             max_attempts: config.camelmailer.default_maximum_delivery_attempts as i32,
@@ -255,11 +272,83 @@ impl Worker {
         }
     }
 
+    /// Inspect an incoming message with rspamd/clamav (when enabled) and
+    /// record the verdict. Returns true when the message is a virus threat
+    /// or exceeds the spam-failure threshold and should be held.
+    async fn inspect(&self, message: &StoredMessage) -> Result<bool, sqlx::Error> {
+        if self.rspamd.is_none() && self.clamav.is_none() {
+            return Ok(false);
+        }
+        if message.inspected {
+            return Ok(message.threat || message.spam_status == "SpamFailure");
+        }
+
+        let mut spam_status = "NotChecked".to_string();
+        let mut spam_score = 0.0;
+        if let Some(rspamd) = &self.rspamd {
+            match rspamd.check(&message.raw_message, self.spam_threshold).await {
+                Ok(result) => {
+                    spam_score = result.score;
+                    spam_status = if result.score >= self.spam_failure_threshold {
+                        "SpamFailure".to_string()
+                    } else if result.score >= self.spam_threshold {
+                        "Spam".to_string()
+                    } else {
+                        "NotSpam".to_string()
+                    };
+                }
+                Err(error) => tracing::warn!(%error, "rspamd inspection failed"),
+            }
+        }
+
+        let mut threat = false;
+        let mut threat_details = None;
+        if let Some(clamav) = &self.clamav {
+            match clamav.scan(&message.raw_message).await {
+                Ok(result) => {
+                    threat = result.found;
+                    threat_details = result.details;
+                }
+                Err(error) => tracing::warn!(%error, "clamav inspection failed"),
+            }
+        }
+
+        self.sink
+            .record_inspection(
+                message.server_id,
+                message.id,
+                &spam_status,
+                spam_score,
+                threat,
+                threat_details.as_deref(),
+            )
+            .await?;
+
+        Ok(threat || spam_status == "SpamFailure")
+    }
+
     async fn process_incoming(
         &self,
         queued: &camelmailer_db::QueuedMessageRow,
         message: &StoredMessage,
     ) -> Result<ProcessOutcome, sqlx::Error> {
+        // Inspect incoming mail before routing; a virus or spam-failure
+        // message is held (stored, not delivered).
+        if self.inspect(message).await? {
+            self.sink
+                .record_delivery(
+                    message.server_id,
+                    message.id,
+                    "Held",
+                    "message failed inspection (spam or virus)",
+                    "",
+                    false,
+                )
+                .await?;
+            self.queue.complete(queued.id).await?;
+            return Ok(ProcessOutcome::Held);
+        }
+
         let route = match message.route_id {
             Some(route_id) => self
                 .store
