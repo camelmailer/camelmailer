@@ -24,6 +24,12 @@ pub fn generate_key() -> String {
     random_string(ALPHANUMERIC, 24)
 }
 
+/// A random string over a caller-supplied charset (used for high-entropy
+/// bearer tokens).
+pub fn generate_token_charset(charset: &[u8], length: usize) -> String {
+    random_string(charset, length)
+}
+
 /// A per-connection trace id, e.g. `A1B2C3D4` (ports
 /// `SecureRandom.alphanumeric(8).upcase`).
 pub fn generate_trace_id() -> String {

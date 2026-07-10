@@ -130,6 +130,21 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) message_streams: HashMap<Id, MessageStream>,
     /// Message templates (config; server-scoped).
     pub(crate) templates: HashMap<Id, Template>,
+    /// Per-user authentication state (password digest, TOTP, lockout).
+    pub(crate) user_auth: HashMap<Id, crate::auth::UserAuth>,
+    /// Login sessions keyed by id.
+    pub(crate) auth_sessions: HashMap<Id, crate::auth::AuthSession>,
+    /// Organization memberships (RBAC).
+    pub(crate) memberships: HashMap<Id, crate::auth::OrganizationMembership>,
+    /// Pending/accepted organization invitations.
+    pub(crate) invitations: HashMap<Id, crate::auth::Invitation>,
+    /// Outstanding password-reset tokens: (user_id, token_hash, expires_at).
+    pub(crate) password_resets: Vec<(Id, String, chrono::DateTime<chrono::Utc>)>,
+    /// In-flight OIDC logins: state -> (pkce_verifier, nonce, expires_at).
+    pub(crate) oidc_states:
+        HashMap<String, (String, String, chrono::DateTime<chrono::Utc>)>,
+    /// Authentication audit log, in insertion order.
+    pub(crate) auth_events: Vec<crate::auth::AuthEvent>,
 }
 
 /// A thread-safe in-memory [`Store`].

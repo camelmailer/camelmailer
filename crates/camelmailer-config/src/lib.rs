@@ -112,6 +112,9 @@ pub struct WebServer {
     pub default_port: u16,
     pub default_bind_address: String,
     pub max_threads: u32,
+    /// Origins allowed to call the HTTP APIs from a browser. Empty (the
+    /// default) sends no CORS headers; `["*"]` allows any origin.
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for WebServer {
@@ -120,6 +123,91 @@ impl Default for WebServer {
             default_port: 5000,
             default_bind_address: "127.0.0.1".into(),
             max_threads: 5,
+            cors_origins: vec![],
+        }
+    }
+}
+
+/// User-account authentication (sessions, lockout, invitations).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Auth {
+    /// Sliding session lifetime in days.
+    pub session_timeout_days: u32,
+    /// Consecutive failed logins before the account is locked.
+    pub max_login_attempts: u32,
+    /// How long a lockout lasts.
+    pub lockout_minutes: u32,
+    pub minimum_password_length: u32,
+    /// May any signed-in user create an organization (becoming its owner)?
+    /// When false only global admins can.
+    pub allow_organization_creation: bool,
+    pub invitation_expiry_days: u32,
+    /// Password-reset link lifetime.
+    pub password_reset_expiry_hours: u32,
+    /// Base URL of the web frontend — used to build invitation/reset links
+    /// and as the OIDC post-login redirect target.
+    pub frontend_url: Option<String>,
+}
+
+impl Default for Auth {
+    fn default() -> Self {
+        Self {
+            session_timeout_days: 14,
+            max_login_attempts: 5,
+            lockout_minutes: 15,
+            minimum_password_length: 8,
+            allow_organization_creation: true,
+            invitation_expiry_days: 7,
+            password_reset_expiry_hours: 2,
+            frontend_url: None,
+        }
+    }
+}
+
+/// OpenID Connect single sign-on. Field names match the upstream Postal
+/// `oidc` group so a legacy `postal.yml` loads unchanged.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Oidc {
+    pub enabled: bool,
+    /// Display name for the identity provider (shown on the login page).
+    pub name: String,
+    /// Issuer URL; `{issuer}/.well-known/openid-configuration` must resolve.
+    pub issuer: String,
+    /// OAuth client id (Postal calls this `identifier`).
+    pub identifier: Option<String>,
+    pub secret: Option<String>,
+    pub scopes: Vec<String>,
+    /// Claim used as the stable account link (Postal: `uid_field`).
+    pub uid_field: String,
+    pub email_address_field: String,
+    pub name_field: String,
+    /// Use OIDC discovery (the only supported mode; present for
+    /// config-file compatibility).
+    pub discovery: bool,
+    /// Create accounts on first SSO login. When false, only users that
+    /// already exist (by email) may sign in via SSO.
+    pub auto_provision: bool,
+    /// When non-empty, only these email domains may sign in / provision.
+    pub allowed_email_domains: Vec<String>,
+}
+
+impl Default for Oidc {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            name: "OIDC".into(),
+            issuer: String::new(),
+            identifier: None,
+            secret: None,
+            scopes: vec!["openid".into(), "email".into(), "profile".into()],
+            uid_field: "sub".into(),
+            email_address_field: "email".into(),
+            name_field: "name".into(),
+            discovery: true,
+            auto_provision: true,
+            allowed_email_domains: vec![],
         }
     }
 }
@@ -444,6 +532,8 @@ pub struct Config {
     #[serde(alias = "postal")]
     pub camelmailer: CamelMailer,
     pub web_server: WebServer,
+    pub auth: Auth,
+    pub oidc: Oidc,
     pub worker: Worker,
     pub postgres: Postgres,
     /// Legacy MariaDB settings, accepted for config-file compatibility only.
@@ -535,6 +625,23 @@ impl Config {
                     "smtp_server.log_ip_address_exclusion_matcher must not be empty".into(),
                 ));
             }
+        }
+        if self.oidc.enabled {
+            if self.oidc.issuer.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "oidc.issuer is required when oidc.enabled is true".into(),
+                ));
+            }
+            if self.oidc.identifier.as_deref().unwrap_or("").is_empty() {
+                return Err(ConfigError::Invalid(
+                    "oidc.identifier is required when oidc.enabled is true".into(),
+                ));
+            }
+        }
+        if self.auth.minimum_password_length < 8 {
+            return Err(ConfigError::Invalid(
+                "auth.minimum_password_length must be at least 8".into(),
+            ));
         }
         Ok(())
     }
@@ -731,5 +838,62 @@ rspamd:
             format!("{}/smtp.cert", dir.to_string_lossy())
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn auth_and_oidc_defaults() {
+        let config = Config::default();
+        assert_eq!(config.web_server.cors_origins, Vec::<String>::new());
+        assert_eq!(config.auth.session_timeout_days, 14);
+        assert_eq!(config.auth.max_login_attempts, 5);
+        assert_eq!(config.auth.lockout_minutes, 15);
+        assert_eq!(config.auth.minimum_password_length, 8);
+        assert!(config.auth.allow_organization_creation);
+        assert_eq!(config.auth.invitation_expiry_days, 7);
+        assert_eq!(config.auth.password_reset_expiry_hours, 2);
+        assert_eq!(config.auth.frontend_url, None);
+        assert!(!config.oidc.enabled);
+        assert_eq!(config.oidc.scopes, vec!["openid", "email", "profile"]);
+        assert_eq!(config.oidc.uid_field, "sub");
+        assert_eq!(config.oidc.email_address_field, "email");
+        assert!(config.oidc.auto_provision);
+    }
+
+    #[test]
+    fn oidc_group_accepts_the_legacy_postal_keys() {
+        let config = Config::from_yaml(
+            "oidc:\n  enabled: true\n  name: Okta\n  issuer: https://idp.example.com\n  identifier: client-1\n  secret: s3cret\n  scopes: [openid, email]\n  uid_field: sub\n  email_address_field: email\n  name_field: name\n  discovery: true\n",
+        )
+        .unwrap();
+        assert!(config.oidc.enabled);
+        assert_eq!(config.oidc.issuer, "https://idp.example.com");
+        assert_eq!(config.oidc.identifier.as_deref(), Some("client-1"));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn enabled_oidc_requires_issuer_and_identifier() {
+        let config = Config::from_yaml("oidc:\n  enabled: true\n").unwrap();
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("oidc:\n  enabled: true\n  issuer: https://x\n").unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn weak_minimum_password_length_is_rejected() {
+        let config = Config::from_yaml("auth:\n  minimum_password_length: 4\n").unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn cors_origins_parse_from_yaml() {
+        let config = Config::from_yaml(
+            "web_server:\n  cors_origins:\n    - https://app.example.com\n    - http://localhost:5173\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.web_server.cors_origins,
+            vec!["https://app.example.com", "http://localhost:5173"]
+        );
     }
 }

@@ -5,6 +5,8 @@
 //! `Postal::Helpers`).
 
 pub mod admin_store;
+pub mod auth;
+pub mod auth_store;
 pub mod message;
 pub mod mime;
 pub mod model;
@@ -19,6 +21,11 @@ pub use admin_store::{
     AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewServer, NewSuppression,
     NewUser, NewWebhook, StoreError, TrackingStore, TrackingTarget,
 };
+pub use auth::{
+    AuthEvent, AuthSession, Invitation, NewAuthEvent, NewAuthSession, NewInvitation,
+    OrganizationMembership, Role, UserAuth,
+};
+pub use auth_store::AuthStore;
 pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,
 };
