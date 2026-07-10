@@ -1,10 +1,33 @@
-# CamelMailer
+# CamelMailer 🐫
 
-CamelMailer is the incremental Rust rewrite of this Postal fork. It lives as a
-Cargo workspace next to the Ruby application and re-implements Postal's
-components one by one, test-driven: every ported behaviour is covered by Rust
-tests translated from the corresponding RSpec suite before/alongside the
-implementation.
+**A headless, API-first mail delivery platform in Rust.** SMTP in and out,
+HTTP APIs for everything — sending, templates, message streams, statistics,
+bounces, inbound routing, webhooks, tracking — backed by a single PostgreSQL
+database with row-level-security tenant isolation. One small binary runs
+every process role. MIT licensed; born as a full Rust rewrite of
+[Postal](https://github.com/postalserver/postal).
+
+## Quickstart
+
+```bash
+cp .env.example .env          # set POSTGRES_PASSWORD
+docker compose up -d --build
+curl http://localhost:5000/health
+
+docker compose exec web camelmailer make-admin-api-key ops
+```
+
+That's PostgreSQL + migrations + the HTTP API (`:5000`) + SMTP (`:25`) +
+the delivery worker. Follow **[docs/quickstart.md](docs/quickstart.md)** for
+the five-minute zero-to-first-mail walkthrough, and
+**[docs/configuration.md](docs/configuration.md)** for DKIM, DNS records,
+TLS, and the production checklist.
+
+## How it's built
+
+CamelMailer was developed as an incremental, test-driven Rust rewrite of a
+Postal fork: every ported behaviour is covered by Rust tests translated from
+the corresponding RSpec suite before/alongside the implementation.
 
 ## Workspace layout
 
@@ -58,7 +81,6 @@ From/Sender domain authentication. The Ruby specs in
 ## Build, test, run
 
 ```bash
-cd camelmailer
 cargo test              # all crates (Postgres tests skip without CAMELMAILER_TEST_DATABASE_URL)
 CAMELMAILER_TEST_DATABASE_URL=postgres://user:pass@localhost:5432/cm_test cargo test
 cargo clippy --workspace --all-targets
@@ -177,5 +199,8 @@ domains (DKIM currently uses one installation key + `dns.dkim_identifier`),
 per-address sender signatures, real DNS-based domain verification, webhook
 trigger granularity / HTTP auth headers, and template *push* between servers.
 
-The Ruby application remains fully functional and authoritative while these
-phases land; the two run side by side (strangler-fig migration).
+## License
+
+MIT — see [LICENSE](LICENSE). CamelMailer began as a Rust rewrite of
+[Postal](https://github.com/postalserver/postal) (also MIT); portions of the
+design and behaviour derive from it.

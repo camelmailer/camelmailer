@@ -1,0 +1,75 @@
+# CamelMailer configuration — copy to camelmailer.yml and point
+# CAMELMAILER_CONFIG_FILE_PATH at it. Every key is optional; anything you
+# omit falls back to the built-in default. An existing Postal `postal.yml`
+# loads unchanged (the `postal:` group is accepted as an alias for
+# `camelmailer:`, and POSTAL_CONFIG_FILE_PATH still works).
+#
+# `$config-file-root` in path values expands to this file's directory.
+
+camelmailer:
+  # Public hostnames of this installation.
+  web_hostname: mail.example.com
+  web_protocol: https
+  smtp_hostname: mx.example.com
+
+  # RSA private key (PEM) used for DKIM signatures and webhook signing.
+  # Generate one with:  openssl genrsa -out signing.key 2048
+  signing_key_path: $config-file-root/signing.key
+
+  # Fallback admin API key (X-Admin-API-Key). Prefer database-backed keys
+  # created with `camelmailer make-admin-api-key <name>`.
+  # admin_api_key: change-me
+
+  # Deliver through fixed relays instead of direct-to-MX.
+  # smtp_relays: ["smtp://relay.example.com:25"]
+
+  use_ip_pools: false
+  default_maximum_delivery_attempts: 18
+  default_spam_threshold: 5
+  default_spam_failure_threshold: 20
+
+web_server:
+  default_port: 5000
+  default_bind_address: 127.0.0.1   # containers override via BIND_ADDRESS
+
+smtp_server:
+  default_port: 25
+  default_bind_address: "::"
+  max_message_size: 14              # MB
+  # STARTTLS termination:
+  # tls_enabled: true
+  # tls_certificate_path: $config-file-root/smtp.cert
+  # tls_private_key_path: $config-file-root/smtp.key
+  # proxy_protocol: true            # behind HAProxy etc.
+
+postgres:
+  # The DATABASE_URL environment variable, when set, takes precedence
+  # over everything in this group.
+  enabled: true
+  host: localhost
+  port: 5432
+  username: camelmailer
+  # password: secret
+  database: camelmailer
+  pool_size: 10
+
+dns:
+  # The DNS names you publish for this installation.
+  mx_records:
+    - mx.example.com
+  spf_include: spf.example.com
+  return_path_domain: rp.example.com
+  route_domain: routes.example.com
+  track_domain: track.example.com
+  dkim_identifier: camelmailer
+
+# Optional inbound message inspection (both disabled by default).
+rspamd:
+  enabled: false
+  host: 127.0.0.1
+  port: 11334
+
+clamav:
+  enabled: false
+  host: 127.0.0.1
+  port: 2000

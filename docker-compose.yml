@@ -1,0 +1,81 @@
+# CamelMailer — full stack: PostgreSQL + migrations + web (HTTP APIs) +
+# SMTP server + delivery worker, all from one image.
+#
+#   cp .env.example .env      # set POSTGRES_PASSWORD
+#   docker compose up -d
+#   docker compose exec web camelmailer make-admin-api-key ops
+#
+# See docs/quickstart.md for the zero-to-first-mail walkthrough.
+
+name: camelmailer
+
+x-app: &app
+  image: camelmailer:local
+  build: .
+  environment: &app-env
+    DATABASE_URL: postgres://camelmailer:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/camelmailer
+    RUST_LOG: ${RUST_LOG:-info}
+    # To use a config file (DKIM signing key, DNS names, TLS, relays …),
+    # uncomment the volume below and this variable:
+    # CAMELMAILER_CONFIG_FILE_PATH: /config/camelmailer.yml
+  # volumes:
+  #   - ./config:/config:ro
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: camelmailer
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: camelmailer
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U camelmailer -d camelmailer"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot: creates/upgrades the schema, then exits.
+  migrate:
+    <<: *app
+    command: initialize
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    <<: *app
+    command: web-server
+    ports:
+      - "${WEB_PORT:-5000}:5000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  smtp:
+    <<: *app
+    command: smtp-server
+    ports:
+      - "${SMTP_PORT:-25}:25"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *app
+    command: worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:

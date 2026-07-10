@@ -1,0 +1,12 @@
+target/
+docs/
+*.md
+.env
+.env.*
+!.env.example
+.git/
+.github/
+config/*.yml
+config/*.key
+config/*.cert
+!config/camelmailer.example.yml

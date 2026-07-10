@@ -1,0 +1,118 @@
+# Configuration
+
+CamelMailer reads a single YAML file. Everything has a sensible default —
+an empty (or missing) file is a valid configuration; the two most common
+deployments need only environment variables.
+
+## Where configuration comes from
+
+| Source | Purpose |
+|---|---|
+| `CAMELMAILER_CONFIG_FILE_PATH` | Path to the YAML file (`POSTAL_CONFIG_FILE_PATH` also works; default `config/camelmailer/camelmailer.yml`) |
+| `DATABASE_URL` | PostgreSQL URL — **takes precedence** over the `postgres:` group |
+| `PORT` / `BIND_ADDRESS` | Web-server listen overrides (used by the Docker image) |
+| `RUST_LOG` | Log filter (`info`, `debug`, `camelmailer_worker=debug,info`, …) |
+
+A full annotated example lives at
+[`config/camelmailer.example.yml`](../config/camelmailer.example.yml).
+Existing Postal installations: your `postal.yml` loads unchanged — the
+`postal:` group is accepted as an alias for `camelmailer:`.
+
+`$config-file-root` inside path values expands to the directory containing
+the config file.
+
+## The groups that matter
+
+### `camelmailer:` — installation identity
+
+```yaml
+camelmailer:
+  web_hostname: mail.example.com     # public hostname of the HTTP API
+  smtp_hostname: mx.example.com      # HELO identity of the SMTP server
+  signing_key_path: $config-file-root/signing.key
+  # admin_api_key: …                 # global fallback admin key (prefer DB keys)
+  # smtp_relays: ["smtp://relay:25"] # deliver via relays instead of direct-to-MX
+```
+
+The **signing key** is one RSA private key used for DKIM signatures and
+webhook payload signing:
+
+```bash
+openssl genrsa -out signing.key 2048
+```
+
+Without it the stack still runs — the worker logs a warning and skips
+DKIM/webhook signing. Set it before sending real mail.
+
+### `postgres:` — storage
+
+```yaml
+postgres:
+  enabled: true
+  host: localhost
+  username: camelmailer
+  password: secret
+  database: camelmailer
+  pool_size: 10
+```
+
+Or just set `DATABASE_URL`. Without either, the servers fall back to
+**non-persistent in-memory storage** (fine for kicking the tires, useless
+for production — a warning is logged).
+
+CamelMailer uses one PostgreSQL database for everything; tenant isolation
+on message data is enforced *by the database* via row-level security, not
+by application code. No per-tenant databases to manage.
+
+### `smtp_server:` — intake
+
+```yaml
+smtp_server:
+  default_port: 25
+  max_message_size: 14        # MB
+  tls_enabled: true           # STARTTLS termination
+  tls_certificate_path: $config-file-root/smtp.cert
+  tls_private_key_path: $config-file-root/smtp.key
+  proxy_protocol: false       # enable behind HAProxy/NLB
+```
+
+### `dns:` — the records you publish
+
+For deliverability you publish, per installation:
+
+| Record | Config key | Example |
+|---|---|---|
+| MX for inbound | `dns.mx_records` | `mx.example.com` |
+| SPF include | `dns.spf_include` | `v=spf1 include:spf.example.com ~all` on sender domains |
+| DKIM selector | `dns.dkim_identifier` | `camelmailer._domainkey.<domain>` TXT with the signing key's public part |
+| Return-path | `dns.return_path_domain` | `rp.example.com` |
+| Click/open tracking | `dns.track_domain` | CNAME → the web server |
+
+### `rspamd:` / `clamav:` — inbound inspection (optional)
+
+Both disabled by default; point them at running rspamd/ClamAV instances to
+spam-score and virus-scan inbound mail. Failing messages are held.
+
+## Production checklist
+
+- [ ] `POSTGRES_PASSWORD` strong; database backed up (it holds config *and* mail)
+- [ ] `signing.key` generated, mounted, DKIM TXT record published
+- [ ] SPF include published for every sending domain
+- [ ] `smtp_server.tls_enabled` with a real certificate
+- [ ] Reverse proxy (TLS) in front of port 5000; `/health` as the LB probe
+- [ ] Port 25 egress open (many clouds block it — or use `smtp_relays`)
+- [ ] `RUST_LOG=info`, logs shipped somewhere
+- [ ] Admin API keys are database-backed (`make-admin-api-key`), the global
+      `admin_api_key` is unset
+
+## Process model
+
+One binary, four roles — scale each independently:
+
+```
+camelmailer web-server    # HTTP APIs; stateless, scale horizontally
+camelmailer smtp-server   # SMTP intake; scale behind a TCP LB
+camelmailer worker        # delivery; scale by queue depth (SKIP LOCKED —
+                          # any number of workers cooperate safely)
+camelmailer initialize    # one-shot migrations (idempotent, run per deploy)
+```
