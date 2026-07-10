@@ -1079,3 +1079,174 @@ async fn unknown_tracking_tokens_do_not_leak_validity() {
         .unwrap();
     assert_eq!(response.status(), Code::OK);
 }
+
+// ------------------------------- outbound STARTTLS + IP pools (commit E)
+
+/// A mock SMTP server that advertises STARTTLS and upgrades to TLS with a
+/// self-signed certificate, then accepts the message. Records whether the
+/// final transaction happened over TLS.
+struct MockTlsSmtp {
+    port: u16,
+    used_tls: Arc<Mutex<bool>>,
+}
+
+async fn mock_starttls_smtp() -> MockTlsSmtp {
+    use tokio_rustls::TlsAcceptor;
+
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+    let key = rustls::pki_types::PrivateKeyDer::try_from(
+        certified.key_pair.serialize_der(),
+    )
+    .unwrap();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let used_tls = Arc::new(Mutex::new(false));
+    let flag = used_tls.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            let flag = flag.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                write_half.write_all(b"220 mock ESMTP\r\n").await.ok();
+                // read EHLO
+                let mut line = String::new();
+                reader.read_line(&mut line).await.ok();
+                write_half.write_all(b"250-mock\r\n250 STARTTLS\r\n").await.ok();
+                // expect STARTTLS
+                line.clear();
+                reader.read_line(&mut line).await.ok();
+                if !line.to_uppercase().starts_with("STARTTLS") {
+                    return;
+                }
+                write_half.write_all(b"220 Ready to start TLS\r\n").await.ok();
+                // upgrade
+                let raw = reader.into_inner().reunite(write_half).unwrap();
+                let Ok(tls_stream) = acceptor.accept(raw).await else {
+                    return;
+                };
+                *flag.lock().unwrap() = true;
+                let (tls_read, mut tls_write) = tokio::io::split(tls_stream);
+                let mut reader = BufReader::new(tls_read);
+                let mut in_data = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let trimmed = line.trim_end();
+                    if in_data {
+                        if trimmed == "." {
+                            in_data = false;
+                            tls_write.write_all(b"250 Accepted\r\n").await.ok();
+                        }
+                        continue;
+                    }
+                    let upper = trimmed.to_ascii_uppercase();
+                    let reply: &str = if upper.starts_with("EHLO") {
+                        "250 mock"
+                    } else if upper.starts_with("DATA") {
+                        in_data = true;
+                        "354 Go ahead"
+                    } else if upper.starts_with("QUIT") {
+                        tls_write.write_all(b"221 Bye\r\n").await.ok();
+                        return;
+                    } else {
+                        "250 OK"
+                    };
+                    tls_write
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await
+                        .ok();
+                }
+            });
+        }
+    });
+    MockTlsSmtp { port, used_tls }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outbound_delivery_upgrades_to_starttls_and_records_ssl() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_starttls_smtp().await;
+
+    let message_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(smtp.port);
+    // accept the self-signed cert (openssl_verify_mode=none)
+    config.smtp.openssl_verify_mode = "none".into();
+    config.smtp.enable_starttls_auto = true;
+
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
+    assert!(*smtp.used_tls.lock().unwrap(), "delivery must use STARTTLS");
+
+    let deliveries = s.sink.deliveries_for_message(s.server.id, message_id).await.unwrap();
+    assert_eq!(deliveries[0].status, "Sent");
+    assert!(deliveries[0].sent_with_ssl, "sent_with_ssl must be recorded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_binds_the_ip_pool_source_address() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    // a pool with a loopback source address the OS will let us bind
+    let ip_pool = s.store.create_ip_pool("pool", true).await.unwrap();
+    s.store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: ip_pool.id,
+            ipv4: "127.0.0.1".into(),
+            ipv6: None,
+            hostname: "mx.example".into(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    s.store
+        .set_server_ip_pool(s.server.id, Some(ip_pool.id))
+        .await
+        .unwrap();
+
+    // the resolver returns the bound source for this server
+    assert_eq!(
+        s.store.source_ip_for_server(s.server.id).await,
+        Some("127.0.0.1".parse().unwrap())
+    );
+
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    // binding 127.0.0.1 as source to a 127.0.0.1 relay succeeds
+    assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
+    let seen = smtp.received.lock().unwrap().clone();
+    assert!(seen.iter().any(|l| l == "RCPT TO:<user@dest.example>"));
+}

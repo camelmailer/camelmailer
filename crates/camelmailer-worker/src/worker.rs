@@ -188,6 +188,10 @@ impl Worker {
             _ => tracked,
         };
 
+        // Source-address selection: send from the server's IP pool if one
+        // is assigned (highest-priority IPv4).
+        let source_ip = self.store.source_ip_for_server(message.server_id).await;
+
         let outcome = self
             .sender
             .send(
@@ -195,11 +199,12 @@ impl Worker {
                 &message.mail_from,
                 &message.rcpt_to,
                 &raw_message,
+                source_ip,
             )
             .await;
 
         match outcome {
-            SendOutcome::Sent { response } => {
+            SendOutcome::Sent { response, tls } => {
                 self.queue.complete(queued.id).await?;
                 self.sink
                     .record_delivery(
@@ -208,7 +213,7 @@ impl Worker {
                         "Sent",
                         "message accepted by the remote server",
                         &response,
-                        false,
+                        tls,
                     )
                     .await?;
                 self.send_webhooks(

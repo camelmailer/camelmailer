@@ -93,6 +93,7 @@ fn server_from_row(row: &PgRow) -> Server {
         privacy_mode: row.get("privacy_mode"),
         log_smtp_data: row.get("log_smtp_data"),
         allow_sender: row.get("allow_sender"),
+        ip_pool_id: row.get::<Option<i64>, _>("ip_pool_id").map(|id| id as Id),
     }
 }
 
@@ -240,7 +241,8 @@ const ROUTE_WITH_SERVER: &str = r#"
            COALESCE(d.name, '') AS domain_name,
            s.id AS s_id, s.uuid AS s_uuid, s.organization_id, s.name AS s_name,
            s.permalink, s.token AS s_token, s.mode AS s_mode, s.suspended,
-           s.suspension_reason, s.privacy_mode, s.log_smtp_data, s.allow_sender
+           s.suspension_reason, s.privacy_mode, s.log_smtp_data, s.allow_sender,
+           s.ip_pool_id AS s_ip_pool_id
     FROM routes r
     JOIN servers s ON s.id = r.server_id
     LEFT JOIN domains d ON d.id = r.domain_id
@@ -265,6 +267,7 @@ fn resolved_route_from_row(row: &PgRow) -> ResolvedRoute {
             privacy_mode: row.get("privacy_mode"),
             log_smtp_data: row.get("log_smtp_data"),
             allow_sender: row.get("allow_sender"),
+            ip_pool_id: row.get::<Option<i64>, _>("s_ip_pool_id").map(|id| id as Id),
         },
         domain_name: row.get("domain_name"),
     }
@@ -280,6 +283,27 @@ impl PgStore {
             .await
             .map(|row| row.as_ref().map(organization_from_row))
             .map_err(Self::sqlx_error)
+    }
+
+    /// The source IPv4 address to use for a server's outbound mail: the
+    /// highest-priority (lowest priority number) address in the server's
+    /// IP pool, if any.
+    pub async fn source_ip_for_server(&self, server_id: Id) -> Option<std::net::IpAddr> {
+        let row = self.wait(async {
+            sqlx::query(
+                "SELECT a.ipv4 FROM ip_addresses a
+                 JOIN servers s ON s.ip_pool_id = a.ip_pool_id
+                 WHERE s.id = $1
+                 ORDER BY a.priority, a.id
+                 LIMIT 1",
+            )
+            .bind(server_id as i64)
+            .fetch_optional(&self.pool)
+            .await
+        })
+        .ok()
+        .flatten()?;
+        row.get::<String, _>("ipv4").parse().ok()
     }
 
     pub async fn domain_by_id(&self, id: Id) -> Result<Option<Domain>, StoreError> {
@@ -525,6 +549,7 @@ impl AdminStore for PgStore {
             privacy_mode: false,
             log_smtp_data: false,
             allow_sender: false,
+            ip_pool_id: None,
         })
     }
 
@@ -1066,6 +1091,20 @@ impl AdminStore for PgStore {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn set_server_ip_pool(
+        &self,
+        server_id: Id,
+        ip_pool_id: Option<Id>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE servers SET ip_pool_id = $2 WHERE id = $1")
+            .bind(server_id as i64)
+            .bind(ip_pool_id.map(|id| id as i64))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
             .map_err(Self::sqlx_error)
     }
 }

@@ -6,7 +6,8 @@
 //! 2. the destination domain's MX records (by preference)
 //! 3. the destination domain itself on port 25 (implicit-MX fallback)
 
-use crate::smtp_client::{self, SendOutcome};
+use crate::smtp_client::{self, SendOutcome, SendParams, TlsMode};
+use std::net::IpAddr;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,7 @@ pub struct SmtpSender {
     relays: Vec<Endpoint>,
     helo_hostname: String,
     timeout: Duration,
+    tls_mode: TlsMode,
 }
 
 impl SmtpSender {
@@ -49,10 +51,19 @@ impl SmtpSender {
             .helo_hostname
             .clone()
             .unwrap_or_else(|| config.camelmailer.smtp_hostname.clone());
+        // Opportunistic STARTTLS on outbound delivery, honoring the
+        // configured verification mode. enable_starttls_auto keeps it on by
+        // default; enable_starttls forces it (still opportunistic here since
+        // we cannot require what a remote MX does not offer).
+        let tls_mode = TlsMode::from_verify_mode(
+            &config.smtp.openssl_verify_mode,
+            config.smtp.enable_starttls || config.smtp.enable_starttls_auto,
+        );
         Self {
             relays,
             helo_hostname,
             timeout: Duration::from_secs(config.smtp_client.open_timeout as u64),
+            tls_mode,
         }
     }
 
@@ -86,29 +97,32 @@ impl SmtpSender {
     }
 
     /// Try each endpoint in order until one accepts (or hard-rejects) the
-    /// message. Soft failures fall through to the next endpoint.
+    /// message. Soft failures fall through to the next endpoint. `source_ip`
+    /// binds the local socket for IP-pool-aware delivery.
     pub async fn send(
         &self,
         domain: &str,
         mail_from: &str,
         rcpt_to: &str,
         raw_message: &[u8],
+        source_ip: Option<IpAddr>,
     ) -> SendOutcome {
         let endpoints = self.resolve_endpoints(domain).await;
         let mut last = SendOutcome::SoftFail {
             response: format!("no delivery endpoints for {domain}"),
         };
         for endpoint in endpoints {
-            let outcome = smtp_client::send_message(
-                &endpoint.host,
-                endpoint.port,
-                &self.helo_hostname,
-                mail_from,
-                rcpt_to,
-                raw_message,
-                self.timeout,
-            )
-            .await;
+            let params = SendParams {
+                host: endpoint.host.clone(),
+                port: endpoint.port,
+                helo_hostname: self.helo_hostname.clone(),
+                mail_from: mail_from.to_string(),
+                rcpt_to: rcpt_to.to_string(),
+                timeout: self.timeout,
+                tls_mode: self.tls_mode,
+                source_ip,
+            };
+            let outcome = smtp_client::send_message(&params, raw_message).await;
             match outcome {
                 SendOutcome::SoftFail { .. } => last = outcome,
                 terminal => return terminal,

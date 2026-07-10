@@ -43,6 +43,7 @@ impl Fixtures {
             privacy_mode: false,
             log_smtp_data: false,
             allow_sender: false,
+            ip_pool_id: None,
         });
         Self {
             store,

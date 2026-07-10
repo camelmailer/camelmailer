@@ -198,6 +198,13 @@ pub trait AdminStore: Send + Sync {
         -> Result<Option<IpAddress>, StoreError>;
     async fn create_ip_address(&self, new: NewIpAddress) -> Result<IpAddress, StoreError>;
     async fn delete_ip_address(&self, id: Id) -> Result<bool, StoreError>;
+
+    /// Assign (or clear) a server's outbound IP pool.
+    async fn set_server_ip_pool(
+        &self,
+        server_id: Id,
+        ip_pool_id: Option<Id>,
+    ) -> Result<(), StoreError>;
 }
 
 #[async_trait]
@@ -286,6 +293,7 @@ impl AdminStore for crate::store::MemoryStore {
             privacy_mode: false,
             log_smtp_data: false,
             allow_sender: false,
+            ip_pool_id: None,
         }))
     }
 
@@ -727,5 +735,17 @@ impl AdminStore for crate::store::MemoryStore {
             .ip_addresses
             .remove(&id)
             .is_some())
+    }
+
+    async fn set_server_ip_pool(
+        &self,
+        server_id: Id,
+        ip_pool_id: Option<Id>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(server) = inner.servers.get_mut(&server_id) {
+            server.ip_pool_id = ip_pool_id;
+        }
+        Ok(())
     }
 }

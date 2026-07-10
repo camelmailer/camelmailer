@@ -30,6 +30,8 @@ pub struct Server {
     pub log_smtp_data: bool,
     /// Whether the Sender header may authenticate a message in addition to From
     pub allow_sender: bool,
+    /// IP pool to source outbound mail from (None = system default).
+    pub ip_pool_id: Option<Id>,
 }
 
 impl Server {

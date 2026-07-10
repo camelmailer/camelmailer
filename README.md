@@ -14,8 +14,8 @@ implementation.
 | `camelmailer-core` | `app/models` (domain model), `app/lib/received_header.rb`, `Postal::Helpers`, token generation | ✅ domain model + storage traits (`Store` for SMTP, async `AdminStore` for the API, `MessageSink`) with in-memory implementations |
 | `camelmailer-db` | `lib/postal/message_db/` + the ActiveRecord persistence | ✅ PostgreSQL with row-level security (see below); embedded migrations; message metadata parity (status, spam, deliveries, links/clicks, loads/opens); delivery queue |
 | `camelmailer-smtp` | `app/lib/smtp_server/client.rb` + `server.rb`, `script/smtp_server.rb` | ✅ full protocol state machine (see below), tokio TCP server, STARTTLS termination via rustls |
-| `camelmailer-worker` | `script/worker.rb`, `app/lib/message_dequeuer`, `app/senders` | ✅ queue dequeuer (SKIP LOCKED), SMTP sending (relays/MX), suppression holds, HTTP endpoint delivery for incoming routes, webhooks, delivery recording |
-| `camelmailer-api` | `app/controllers/admin_api/` | ✅ auth (incl. DB-backed keys), envelope, pagination, errors; organizations, servers, domains, credentials, routes, webhooks, suppressions, users, IP pools |
+| `camelmailer-worker` | `script/worker.rb`, `app/lib/message_dequeuer`, `app/senders`, `app/lib/postal/message_inspectors`, `dkim_header.rb`, `signer.rb` | ✅ queue dequeuer (SKIP LOCKED), SMTP sending (relays/MX) with opportunistic outbound STARTTLS and IP-pool source addresses, suppression holds, rspamd/ClamAV inspection, DKIM signing, open/click tracking rewrite, HTTP endpoint delivery, webhook queue with retries + RSA signing, delivery recording |
+| `camelmailer-api` | `app/controllers/admin_api/` | ✅ auth (incl. DB-backed keys), envelope, pagination, errors; organizations, servers, domains, credentials, routes, webhooks, suppressions, users, IP pools; public click/open tracking endpoints |
 | `camelmailer` (bin) | `bin/postal` | ✅ CLI dispatcher: `smtp-server`, `web-server`, `worker`, `initialize` (migrations), `make-admin-api-key`, `version` |
 
 ## Storage: single PostgreSQL database with row-level security
@@ -104,14 +104,33 @@ group is accepted as an alias for `camelmailer:`, and
   route mail is POSTed to the route's HTTP endpoint (`routes.endpoint_url`,
   a deliberate simplification of Postal's polymorphic endpoints).
 
+## Delivery, inspection and signing
+
+- **Outbound STARTTLS.** The SMTP client upgrades opportunistically when the
+  remote MX advertises STARTTLS, honoring `smtp.openssl_verify_mode`
+  (`none` accepts any certificate; otherwise the cert is verified against
+  the webpki roots). Deliveries over TLS are recorded with `sent_with_ssl`.
+- **IP-pool source addresses.** A server can be assigned an IP pool; the
+  worker binds the highest-priority IPv4 of that pool as the local source
+  address for outbound connections.
+- **DKIM.** Outgoing mail with an authenticated domain is signed at delivery
+  time (RFC 6376, rsa-sha256, relaxed/relaxed) with the installation signing
+  key and the `dns.dkim_identifier` selector; the stored copy stays unsigned.
+- **Inspection.** Incoming mail is scored by rspamd and scanned by ClamAV
+  (both opt-in); a virus hit or a spam-failure score holds the message.
+- **Tracking.** HTML links in outgoing mail are rewritten to
+  `/track/c/<token>` redirects and an open pixel is injected; the public,
+  unauthenticated tracking endpoints resolve tokens and record clicks/opens
+  into the RLS-protected tables.
+- **Webhooks.** Events are queued, delivered with retries and exponential
+  backoff, optionally RSA-signed (`X-CamelMailer-Signature`), and every
+  attempt is written to a tenant-scoped audit log.
+
 ## Not yet ported
 
-1. **Web UI** — the management interface remains the Rails app (explicitly
-   out of scope for the Rust port).
-2. Smaller follow-ups: webhook request recording/retrying and payload
-   signing, DKIM signing on outbound mail, rspamd/clamav integration,
-   tracking HTTP endpoints serving the recorded links/loads, outbound
-   STARTTLS in the SMTP client, IP-pool-aware source addresses.
+**Web UI** — the management interface remains the Rails app, explicitly out
+of scope for the Rust port. Everything else Postal does at the MTA and API
+layer is covered here.
 
 The Ruby application remains fully functional and authoritative while these
 phases land; the two run side by side (strangler-fig migration).
