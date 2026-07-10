@@ -18,7 +18,9 @@ pub use admin_store::{
     AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewServer,
     NewSuppression, NewUser, NewWebhook, StoreError, TrackingStore, TrackingTarget,
 };
-pub use server_store::{ServerContext, ServerStore};
+pub use server_store::{
+    ActivityEvent, DeliveryRecord, MessageFilter, ServerContext, ServerStore,
+};
 pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,
 };

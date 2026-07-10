@@ -8,9 +8,10 @@
 //! admin auth middleware.
 
 use crate::app::{
-    render_error, render_success, server_json, timing_middleware, ApiState, RequestStart,
+    paginate, render_error, render_success, server_json, timing_middleware, ApiState,
+    PaginationParams, RequestStart,
 };
-use axum::extract::{Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -18,7 +19,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use camelmailer_core::mime::{self, Address, Attachment, BuildParams};
-use camelmailer_core::{MessageScope, QueuedMessage, Server, ServerContext};
+use camelmailer_core::{
+    ActivityEvent, DeliveryRecord, MessageFilter, MessageRecord, MessageScope, QueuedMessage,
+    Server, ServerContext,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -353,13 +357,297 @@ async fn messages_send_batch(
         .into_response()
 }
 
+// -------------------------------------------------------------- read APIs
+
+fn message_json(message: &MessageRecord) -> Value {
+    json!({
+        "id": message.id,
+        "token": message.token,
+        "scope": message.scope,
+        "rcpt_to": message.rcpt_to,
+        "mail_from": message.mail_from,
+        "subject": message.subject,
+        "message_id": message.message_id_header,
+        "tag": message.tag,
+        "status": message.status,
+        "bounce": message.bounce,
+        "spam_status": message.spam_status,
+        "spam_score": message.spam_score,
+        "held": message.held,
+        "threat": message.threat,
+        "size": message.size,
+        "metadata": message.metadata,
+        "created_at": message.created_at.to_rfc3339(),
+    })
+}
+
+fn delivery_json(delivery: &DeliveryRecord) -> Value {
+    json!({
+        "id": delivery.id,
+        "status": delivery.status,
+        "details": delivery.details,
+        "output": delivery.output,
+        "sent_with_ssl": delivery.sent_with_ssl,
+        "created_at": delivery.created_at.to_rfc3339(),
+    })
+}
+
+fn activity_json(event: &ActivityEvent) -> Value {
+    json!({
+        "ip_address": event.ip_address,
+        "user_agent": event.user_agent,
+        "url": event.url,
+        "created_at": event.created_at.to_rfc3339(),
+    })
+}
+
+/// Query params for `GET /messages`: pagination plus filters.
+#[derive(Debug, Deserialize, Default)]
+struct MessageListParams {
+    page: Option<u64>,
+    per_page: Option<u64>,
+    scope: Option<String>,
+    status: Option<String>,
+    tag: Option<String>,
+    query: Option<String>,
+}
+
+/// The configured tenant-scoped store, if the API was built with one.
+fn server_store(state: &ApiState) -> Option<&Arc<dyn camelmailer_core::ServerStore>> {
+    state.server_store.as_ref()
+}
+
+fn storage_unconfigured(start: &RequestStart) -> Response {
+    render_error(
+        Some(start),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError",
+        "message storage is not configured",
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/messages` — the server's messages, filtered + paged.
+async fn messages_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Query(params): Query<MessageListParams>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let filter = MessageFilter {
+        scope: params.scope.filter(|s| !s.is_empty()),
+        status: params.status.filter(|s| !s.is_empty()),
+        tag: params.tag.filter(|s| !s.is_empty()),
+        query: params.query.filter(|s| !s.is_empty()),
+    };
+    let messages = match store.messages(server.0.id, &filter).await {
+        Ok(messages) => messages,
+        Err(error) => {
+            return render_error(
+                Some(&start.0),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                &error.to_string(),
+            )
+            .into_response()
+        }
+    };
+    let pagination = PaginationParams {
+        page: params.page,
+        per_page: params.per_page,
+    };
+    let result = paginate(&messages, &pagination);
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "messages": result.items.iter().map(message_json).collect::<Vec<_>>(),
+            "pagination": result.pagination,
+        }),
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/messages/{id}` — one message plus its deliveries.
+async fn message_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let message = match store.message(server.0.id, id).await {
+        Ok(Some(message)) => message,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let deliveries = store
+        .deliveries(server.0.id, id)
+        .await
+        .unwrap_or_default();
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "message": message_json(&message),
+            "deliveries": deliveries.iter().map(delivery_json).collect::<Vec<_>>(),
+        }),
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/messages/{id}/deliveries`.
+async fn message_deliveries(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    if !message_exists(store, server.0.id, id).await {
+        return not_found(&start.0);
+    }
+    match store.deliveries(server.0.id, id).await {
+        Ok(deliveries) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "deliveries": deliveries.iter().map(delivery_json).collect::<Vec<_>>() }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `GET /api/v2/server/messages/{id}/opens`.
+async fn message_opens(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    if !message_exists(store, server.0.id, id).await {
+        return not_found(&start.0);
+    }
+    match store.opens(server.0.id, id).await {
+        Ok(opens) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "opens": opens.iter().map(activity_json).collect::<Vec<_>>() }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `GET /api/v2/server/messages/{id}/clicks`.
+async fn message_clicks(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    if !message_exists(store, server.0.id, id).await {
+        return not_found(&start.0);
+    }
+    match store.clicks(server.0.id, id).await {
+        Ok(clicks) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "clicks": clicks.iter().map(activity_json).collect::<Vec<_>>() }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `GET /api/v2/server/messages/{id}/raw` — the raw MIME, base64-encoded.
+/// Returns 404 when the server is in privacy mode (raw content withheld).
+async fn message_raw(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let message = match store.message(server.0.id, id).await {
+        Ok(Some(message)) => message,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    if server.0.privacy_mode {
+        return render_error(
+            Some(&start.0),
+            StatusCode::NOT_FOUND,
+            "NotAvailable",
+            "Raw message content is not retained in privacy mode",
+        )
+        .into_response();
+    }
+    let raw = base64::engine::general_purpose::STANDARD.encode(&message.raw_message);
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({ "raw_message": raw }),
+    )
+    .into_response()
+}
+
+async fn message_exists(
+    store: &Arc<dyn camelmailer_core::ServerStore>,
+    server_id: camelmailer_core::Id,
+    id: i64,
+) -> bool {
+    matches!(store.message(server_id, id).await, Ok(Some(_)))
+}
+
+fn not_found(start: &RequestStart) -> Response {
+    render_error(Some(start), StatusCode::NOT_FOUND, "NotFound", "Resource not found")
+        .into_response()
+}
+
+fn internal_error(start: &RequestStart, message: &str) -> Response {
+    render_error(
+        Some(start),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError",
+        message,
+    )
+    .into_response()
+}
+
 /// Build the `/api/v2/server` router (server-token authenticated).
 pub fn build_server_router(state: Arc<ApiState>) -> Router {
     let server = Router::new()
         .route("/", get(server_show))
         .route("/ping", get(ping))
-        .route("/messages", post(messages_send))
+        .route("/messages", get(messages_index).post(messages_send))
         .route("/messages/batch", post(messages_send_batch))
+        .route("/messages/{id}", get(message_show))
+        .route("/messages/{id}/deliveries", get(message_deliveries))
+        .route("/messages/{id}/opens", get(message_opens))
+        .route("/messages/{id}/clicks", get(message_clicks))
+        .route("/messages/{id}/raw", get(message_raw))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             server_auth_middleware,

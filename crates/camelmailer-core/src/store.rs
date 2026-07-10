@@ -117,6 +117,12 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) suppressions: HashMap<Id, Suppression>,
     /// HTTP-sent / stored messages, for the per-server read API tests.
     pub(crate) messages: Vec<crate::message::MessageRecord>,
+    /// Delivery attempts keyed by message id (per-server read API tests).
+    pub(crate) message_deliveries: Vec<(i64, crate::server_store::DeliveryRecord)>,
+    /// Opens keyed by message id.
+    pub(crate) message_opens: Vec<(i64, crate::server_store::ActivityEvent)>,
+    /// Clicks keyed by message id.
+    pub(crate) message_clicks: Vec<(i64, crate::server_store::ActivityEvent)>,
 }
 
 /// A thread-safe in-memory [`Store`].
@@ -302,6 +308,150 @@ impl MemoryStore {
             .iter()
             .filter(|m| m.server_id == server_id)
             .cloned()
+            .collect()
+    }
+
+    /// Server's messages matching a filter, newest first (test read model).
+    pub fn messages_filtered(
+        &self,
+        server_id: Id,
+        filter: &crate::server_store::MessageFilter,
+    ) -> Vec<crate::message::MessageRecord> {
+        let query = filter.query.as_deref().map(str::to_lowercase);
+        let mut matched: Vec<_> = self
+            .inner
+            .read()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.server_id == server_id)
+            .filter(|m| filter.scope.as_deref().is_none_or(|s| m.scope == s))
+            .filter(|m| filter.status.as_deref().is_none_or(|s| m.status == s))
+            .filter(|m| {
+                filter
+                    .tag
+                    .as_deref()
+                    .is_none_or(|t| m.tag.as_deref() == Some(t))
+            })
+            .filter(|m| {
+                query.as_deref().is_none_or(|q| {
+                    m.subject
+                        .as_deref()
+                        .is_some_and(|s| s.to_lowercase().contains(q))
+                        || m.rcpt_to.to_lowercase().contains(q)
+                })
+            })
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| b.id.cmp(&a.id));
+        matched
+    }
+
+    /// One message by id, scoped to the server (test read model).
+    pub fn message_for(&self, server_id: Id, message_id: i64) -> Option<crate::message::MessageRecord> {
+        self.inner
+            .read()
+            .unwrap()
+            .messages
+            .iter()
+            .find(|m| m.server_id == server_id && m.id == message_id)
+            .cloned()
+    }
+
+    fn message_belongs_to(&self, server_id: Id, message_id: i64) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| m.server_id == server_id && m.id == message_id)
+    }
+
+    /// Attach a delivery attempt to a message (test seeding).
+    pub fn insert_delivery_record(
+        &self,
+        message_id: i64,
+        delivery: crate::server_store::DeliveryRecord,
+    ) {
+        self.inner
+            .write()
+            .unwrap()
+            .message_deliveries
+            .push((message_id, delivery));
+    }
+
+    /// Attach an open to a message (test seeding).
+    pub fn insert_open_record(&self, message_id: i64, open: crate::server_store::ActivityEvent) {
+        self.inner
+            .write()
+            .unwrap()
+            .message_opens
+            .push((message_id, open));
+    }
+
+    /// Attach a click to a message (test seeding).
+    pub fn insert_click_record(&self, message_id: i64, click: crate::server_store::ActivityEvent) {
+        self.inner
+            .write()
+            .unwrap()
+            .message_clicks
+            .push((message_id, click));
+    }
+
+    /// Delivery attempts for a message, tenant-scoped (test read model).
+    pub fn deliveries_for(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Vec<crate::server_store::DeliveryRecord> {
+        if !self.message_belongs_to(server_id, message_id) {
+            return Vec::new();
+        }
+        self.inner
+            .read()
+            .unwrap()
+            .message_deliveries
+            .iter()
+            .filter(|(id, _)| *id == message_id)
+            .map(|(_, d)| d.clone())
+            .collect()
+    }
+
+    /// Opens for a message, tenant-scoped (test read model).
+    pub fn opens_for(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Vec<crate::server_store::ActivityEvent> {
+        if !self.message_belongs_to(server_id, message_id) {
+            return Vec::new();
+        }
+        self.inner
+            .read()
+            .unwrap()
+            .message_opens
+            .iter()
+            .filter(|(id, _)| *id == message_id)
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
+    /// Clicks for a message, tenant-scoped (test read model).
+    pub fn clicks_for(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Vec<crate::server_store::ActivityEvent> {
+        if !self.message_belongs_to(server_id, message_id) {
+            return Vec::new();
+        }
+        self.inner
+            .read()
+            .unwrap()
+            .message_clicks
+            .iter()
+            .filter(|(id, _)| *id == message_id)
+            .map(|(_, e)| e.clone())
             .collect()
     }
 

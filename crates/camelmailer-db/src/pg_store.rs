@@ -7,13 +7,14 @@
 
 use async_trait::async_trait;
 use camelmailer_core::{
-    store, token, AdminApiKey, AdminStore, Credential, CredentialType, Domain, DomainOwner, Id, IpAddress,
-    IpPool, MessageScope, MessageSink, NewCredential, NewIpAddress, NewOrganization, NewRoute,
-    NewServer, NewSuppression, NewUser, NewWebhook, Organization, QueuedMessage, ResolvedRoute,
-    Route, RouteMode, Server, ServerMode, Store, StoreError, Suppression, User, Webhook,
+    store, token, ActivityEvent, AdminApiKey, AdminStore, Credential, CredentialType,
+    DeliveryRecord, Domain, DomainOwner, Id, IpAddress, IpPool, MessageFilter, MessageRecord,
+    MessageScope, MessageSink, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewServer,
+    NewSuppression, NewUser, NewWebhook, Organization, QueuedMessage, ResolvedRoute, Route,
+    RouteMode, Server, ServerMode, Store, StoreError, Suppression, User, Webhook,
 };
 use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, QueryBuilder, Row};
 use std::future::Future;
 use std::net::IpAddr;
 
@@ -1259,6 +1260,63 @@ impl camelmailer_core::ServerStore for PgStore {
             .map_err(|e| StoreError::Other(e.to_string()))?;
         Ok(camelmailer_core::SentMessage { id, token, rcpt_to })
     }
+
+    async fn messages(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        PgMessageSink::new(self.clone())
+            .message_records(server_id, filter)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        PgMessageSink::new(self.clone())
+            .message_record(server_id, message_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn deliveries(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Vec<DeliveryRecord>, StoreError> {
+        // A message id from another tenant returns no rows under RLS, so
+        // there is no cross-tenant leak even without an existence check.
+        PgMessageSink::new(self.clone())
+            .delivery_records(server_id, message_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn opens(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Vec<ActivityEvent>, StoreError> {
+        PgMessageSink::new(self.clone())
+            .opens_for_message(server_id, message_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn clicks(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Vec<ActivityEvent>, StoreError> {
+        PgMessageSink::new(self.clone())
+            .clicks_for_message(server_id, message_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
 }
 
 impl Store for PgStore {
@@ -1856,6 +1914,159 @@ impl PgMessageSink {
             .await?;
         tx.commit().await?;
         Ok(rows.iter().map(stored_message_from_row).collect())
+    }
+
+    /// The tenant's messages matching `filter`, newest first. RLS scopes the
+    /// result to the tenant; the filter narrows scope/status/tag and does an
+    /// ILIKE substring match on subject/recipient.
+    pub async fn message_records(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+    ) -> Result<Vec<MessageRecord>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let mut qb: QueryBuilder<sqlx::Postgres> =
+            QueryBuilder::new("SELECT * FROM messages WHERE TRUE");
+        if let Some(scope) = &filter.scope {
+            qb.push(" AND scope = ").push_bind(scope.clone());
+        }
+        if let Some(status) = &filter.status {
+            qb.push(" AND status = ").push_bind(status.clone());
+        }
+        if let Some(tag) = &filter.tag {
+            qb.push(" AND tag = ").push_bind(tag.clone());
+        }
+        if let Some(query) = &filter.query {
+            let like = format!("%{query}%");
+            qb.push(" AND (subject ILIKE ")
+                .push_bind(like.clone())
+                .push(" OR rcpt_to ILIKE ")
+                .push_bind(like)
+                .push(")");
+        }
+        qb.push(" ORDER BY id DESC");
+        let rows = qb.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(message_record_from_row).collect())
+    }
+
+    /// One message as a read-model record, tenant-scoped.
+    pub async fn message_record(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let row = sqlx::query("SELECT * FROM messages WHERE id = $1")
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row.as_ref().map(message_record_from_row))
+    }
+
+    /// Delivery attempts (with timestamps) for a message, tenant-scoped.
+    pub async fn delivery_records(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Vec<DeliveryRecord>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let rows = sqlx::query("SELECT * FROM deliveries WHERE message_id = $1 ORDER BY id")
+            .bind(message_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(delivery_record_from_row).collect())
+    }
+
+    /// Opens (pixel loads) for a message, newest first, tenant-scoped.
+    pub async fn opens_for_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Vec<ActivityEvent>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let rows = sqlx::query(
+            "SELECT ip_address, user_agent, NULL::text AS url, created_at
+             FROM loads WHERE message_id = $1 ORDER BY id DESC",
+        )
+        .bind(message_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(activity_event_from_row).collect())
+    }
+
+    /// Link clicks for a message, newest first, tenant-scoped.
+    pub async fn clicks_for_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Vec<ActivityEvent>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let rows = sqlx::query(
+            "SELECT lc.ip_address AS ip_address, lc.user_agent AS user_agent,
+                    l.url AS url, lc.created_at AS created_at
+             FROM link_clicks lc
+             JOIN links l ON l.id = lc.link_id
+             WHERE l.message_id = $1
+             ORDER BY lc.id DESC",
+        )
+        .bind(message_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows.iter().map(activity_event_from_row).collect())
+    }
+}
+
+fn message_record_from_row(row: &PgRow) -> MessageRecord {
+    MessageRecord {
+        id: row.get("id"),
+        token: row.get("token"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        scope: row.get("scope"),
+        rcpt_to: row.get("rcpt_to"),
+        mail_from: row.get("mail_from"),
+        subject: row.get("subject"),
+        message_id_header: row.get("message_id_header"),
+        tag: row.get("tag"),
+        status: row.get("status"),
+        bounce: row.get("bounce"),
+        spam_status: row.get("spam_status"),
+        spam_score: row.get("spam_score"),
+        held: row.get("held"),
+        threat: row.get("threat"),
+        size: row.get("size"),
+        metadata: row.get("metadata"),
+        created_at: row.get("created_at"),
+        raw_message: row.get("raw_message"),
+    }
+}
+
+fn delivery_record_from_row(row: &PgRow) -> DeliveryRecord {
+    DeliveryRecord {
+        id: row.get("id"),
+        status: row.get("status"),
+        details: row.get("details"),
+        output: row.get("output"),
+        sent_with_ssl: row.get("sent_with_ssl"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn activity_event_from_row(row: &PgRow) -> ActivityEvent {
+    ActivityEvent {
+        ip_address: row.get("ip_address"),
+        user_agent: row.get("user_agent"),
+        url: row.get("url"),
+        created_at: row.get("created_at"),
     }
 }
 

@@ -3,6 +3,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
+use base64::Engine;
 use camelmailer_api::{build_server_router, ApiState};
 use camelmailer_core::{
     AdminStore, CredentialType, MemoryStore, NewCredential, NewOrganization, NewServer, ServerMode,
@@ -364,4 +365,194 @@ async fn batch_send_returns_per_message_results() {
     assert_eq!(results[1]["status"], "error");
     // only the first (valid) message was stored
     assert_eq!(store.messages_for(server_id).len(), 1);
+}
+
+// ------------------------------------------------ P3: message read APIs
+
+/// Two servers, each with a verified domain + API token, so cross-tenant
+/// isolation can be exercised. Returns (router, token_a, token_b, store).
+async fn build_two_with_domains() -> (Router, String, String, Arc<MS>) {
+    let store = Arc::new(MS::new());
+    let org = store
+        .create_organization(NewOrganization { name: "Org".into(), permalink: "org".into() })
+        .await
+        .unwrap();
+    let mut tokens = Vec::new();
+    for (name, domain) in [("Alpha", "alpha.example"), ("Beta", "beta.example")] {
+        let server = store
+            .create_server(NewServer {
+                organization_id: org.id,
+                name: name.into(),
+                permalink: name.to_lowercase(),
+                mode: ServerMode::Live,
+            })
+            .await
+            .unwrap();
+        store.insert_domain(camelmailer_core::Domain {
+            id: store.next_id(),
+            uuid: format!("d-{name}"),
+            owner: DomainOwner::Server(server.id),
+            name: domain.into(),
+            verified: true,
+        });
+        let token = format!("tok-{}-000000000000", name.to_lowercase());
+        store
+            .create_credential_record(NewCredential {
+                server_id: server.id,
+                credential_type: CredentialType::Api,
+                name: "api".into(),
+                key: Some(token.clone()),
+            })
+            .await
+            .unwrap();
+        tokens.push(token);
+    }
+    let state = ApiState::with_server_store(store.clone(), store.clone(), None);
+    (build_server_router(state), tokens[0].clone(), tokens[1].clone(), store)
+}
+
+/// Send one message and return the stored message id.
+async fn send_one(app: &Router, token: &str, from: &str, to: &str, subject: &str, tag: &str) -> i64 {
+    let (status, body) = post_json(
+        app,
+        "/api/v2/server/messages",
+        token,
+        json!({ "from": from, "to": [to], "subject": subject, "text_body": "x", "tag": tag }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    body["data"]["message_id"].as_i64().unwrap()
+}
+
+#[tokio::test]
+async fn messages_index_lists_filters_and_paginates() {
+    let (app, token, _, _) = build_two_with_domains().await;
+    send_one(&app, &token, "news@alpha.example", "one@dest.example", "First", "welcome").await;
+    send_one(&app, &token, "news@alpha.example", "two@dest.example", "Second", "promo").await;
+
+    // full list, newest first
+    let (status, body) = request(&app, "/api/v2/server/messages", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let messages = body["data"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["subject"], "Second");
+    assert_eq!(body["data"]["pagination"]["total"], 2);
+
+    // filter by tag
+    let (_, body) = request(&app, "/api/v2/server/messages?tag=promo", Some(&token)).await;
+    let messages = body["data"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["subject"], "Second");
+
+    // filter by recipient substring
+    let (_, body) = request(&app, "/api/v2/server/messages?query=one@dest", Some(&token)).await;
+    assert_eq!(body["data"]["messages"].as_array().unwrap().len(), 1);
+
+    // pagination
+    let (_, body) = request(&app, "/api/v2/server/messages?per_page=1&page=2", Some(&token)).await;
+    assert_eq!(body["data"]["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"]["pagination"]["total_pages"], 2);
+}
+
+#[tokio::test]
+async fn message_show_includes_deliveries_opens_and_clicks() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    let id = send_one(&app, &token, "news@alpha.example", "one@dest.example", "Hi", "t").await;
+
+    store.insert_delivery_record(
+        id,
+        camelmailer_core::DeliveryRecord {
+            id: 1,
+            status: "Sent".into(),
+            details: Some("250 OK".into()),
+            output: None,
+            sent_with_ssl: true,
+            created_at: chrono::Utc::now(),
+        },
+    );
+    store.insert_open_record(
+        id,
+        camelmailer_core::ActivityEvent {
+            ip_address: Some("1.2.3.4".into()),
+            user_agent: Some("Mail".into()),
+            url: None,
+            created_at: chrono::Utc::now(),
+        },
+    );
+    store.insert_click_record(
+        id,
+        camelmailer_core::ActivityEvent {
+            ip_address: Some("1.2.3.4".into()),
+            user_agent: Some("Mail".into()),
+            url: Some("https://example.com".into()),
+            created_at: chrono::Utc::now(),
+        },
+    );
+
+    // show carries the message + its deliveries
+    let (status, body) = request(&app, &format!("/api/v2/server/messages/{id}"), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["message"]["subject"], "Hi");
+    assert_eq!(body["data"]["message"]["status"], "Pending");
+    assert_eq!(body["data"]["deliveries"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"]["deliveries"][0]["status"], "Sent");
+
+    // dedicated activity endpoints
+    let (_, body) = request(&app, &format!("/api/v2/server/messages/{id}/deliveries"), Some(&token)).await;
+    assert_eq!(body["data"]["deliveries"].as_array().unwrap().len(), 1);
+    let (_, body) = request(&app, &format!("/api/v2/server/messages/{id}/opens"), Some(&token)).await;
+    assert_eq!(body["data"]["opens"].as_array().unwrap().len(), 1);
+    let (_, body) = request(&app, &format!("/api/v2/server/messages/{id}/clicks"), Some(&token)).await;
+    assert_eq!(body["data"]["clicks"][0]["url"], "https://example.com");
+}
+
+#[tokio::test]
+async fn unknown_message_is_not_found() {
+    let (app, token, _, _) = build_two_with_domains().await;
+    let (status, body) = request(&app, "/api/v2/server/messages/999999", Some(&token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "NotFound");
+}
+
+#[tokio::test]
+async fn message_raw_returns_base64_and_respects_privacy_mode() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    let id = send_one(&app, &token, "news@alpha.example", "one@dest.example", "Hi", "t").await;
+
+    let (status, body) = request(&app, &format!("/api/v2/server/messages/{id}/raw"), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let raw_b64 = body["data"]["raw_message"].as_str().unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw_b64)
+        .unwrap();
+    assert!(String::from_utf8_lossy(&decoded).contains("Subject: Hi"));
+
+    // enabling privacy mode withholds the raw content
+    let mut server = store.server_for_api_token(&token).await.unwrap().unwrap();
+    server.privacy_mode = true;
+    store.update_server(server).await.unwrap();
+    let (status, body) = request(&app, &format!("/api/v2/server/messages/{id}/raw"), Some(&token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "NotAvailable");
+}
+
+#[tokio::test]
+async fn a_server_token_cannot_read_another_servers_message() {
+    let (app, token_a, token_b, _) = build_two_with_domains().await;
+    let id = send_one(&app, &token_a, "news@alpha.example", "one@dest.example", "Secret", "t").await;
+
+    // token B's list never includes server A's message
+    let (_, body) = request(&app, "/api/v2/server/messages", Some(&token_b)).await;
+    assert_eq!(body["data"]["messages"].as_array().unwrap().len(), 0);
+
+    // and every per-message endpoint is a 404 for token B
+    for suffix in ["", "/deliveries", "/opens", "/clicks", "/raw"] {
+        let (status, _) = request(
+            &app,
+            &format!("/api/v2/server/messages/{id}{suffix}"),
+            Some(&token_b),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "endpoint {suffix} leaked");
+    }
 }

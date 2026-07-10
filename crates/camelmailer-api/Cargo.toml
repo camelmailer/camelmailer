@@ -16,5 +16,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
 http-body-util = { workspace = true }
 tower = { workspace = true }

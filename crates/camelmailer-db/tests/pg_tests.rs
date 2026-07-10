@@ -813,3 +813,102 @@ async fn server_for_api_token_resolves_and_records_use() {
         .unwrap();
     assert!(f.store.server_for_api_token(token).await.unwrap().is_none());
 }
+
+// ------------------------------------------- message read APIs (P3)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_store_reads_are_filtered_and_tenant_scoped() {
+    use camelmailer_core::{MessageFilter, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+
+    // two outgoing messages for our server (distinct tags) + one for the other
+    let mut welcome = message_for(f.server.id, "a@dest.example");
+    welcome.scope = MessageScope::Outgoing;
+    welcome.tag = Some("welcome".into());
+    welcome.raw_message = b"Subject: Hello A\r\n\r\nBody\r\n".to_vec();
+    let (welcome_id, _) = f.store.store_outgoing(welcome).await.map(|m| (m.id, m.token)).unwrap();
+
+    let mut promo = message_for(f.server.id, "b@dest.example");
+    promo.scope = MessageScope::Outgoing;
+    promo.tag = Some("promo".into());
+    promo.raw_message = b"Subject: Hello B\r\n\r\nBody\r\n".to_vec();
+    f.store.store_outgoing(promo).await.unwrap();
+
+    let mut theirs = message_for(other.id, "c@dest.example");
+    theirs.scope = MessageScope::Outgoing;
+    f.store.store_outgoing(theirs).await.unwrap();
+
+    // list is scoped to the tenant and newest-first
+    let all = f
+        .store
+        .messages(f.server.id, &MessageFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all[0].id > all[1].id);
+
+    // filter by tag
+    let tagged = f
+        .store
+        .messages(
+            f.server.id,
+            &MessageFilter { tag: Some("promo".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    assert_eq!(tagged.len(), 1);
+    assert_eq!(tagged[0].rcpt_to, "b@dest.example");
+
+    // ILIKE substring on subject
+    let by_subject = f
+        .store
+        .messages(
+            f.server.id,
+            &MessageFilter { query: Some("hello a".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_subject.len(), 1);
+    assert_eq!(by_subject[0].id, welcome_id);
+
+    // a delivery + open + click recorded on our message are readable
+    let sink = PgMessageSink::new(f.store.clone());
+    sink.record_delivery(f.server.id, welcome_id, "Sent", "250 OK", "", true)
+        .await
+        .unwrap();
+    sink.record_load(f.server.id, welcome_id, "1.2.3.4", "Mail")
+        .await
+        .unwrap();
+    let (link_id, _) = sink
+        .create_link(f.server.id, welcome_id, "https://example.com")
+        .await
+        .unwrap();
+    sink.record_link_click(f.server.id, link_id, "1.2.3.4", "Mail")
+        .await
+        .unwrap();
+
+    assert_eq!(f.store.deliveries(f.server.id, welcome_id).await.unwrap().len(), 1);
+    assert_eq!(f.store.opens(f.server.id, welcome_id).await.unwrap().len(), 1);
+    let clicks = f.store.clicks(f.server.id, welcome_id).await.unwrap();
+    assert_eq!(clicks.len(), 1);
+    assert_eq!(clicks[0].url.as_deref(), Some("https://example.com"));
+
+    // the other tenant sees none of it (RLS)
+    assert!(f.store.message(other.id, welcome_id).await.unwrap().is_none());
+    assert!(f.store.deliveries(other.id, welcome_id).await.unwrap().is_empty());
+    assert!(f.store.opens(other.id, welcome_id).await.unwrap().is_empty());
+    assert!(f.store.clicks(other.id, welcome_id).await.unwrap().is_empty());
+}

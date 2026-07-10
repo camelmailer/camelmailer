@@ -182,6 +182,7 @@ dependencies = [
  "base64",
  "camelmailer-config",
  "camelmailer-core",
+ "chrono",
  "http-body-util",
  "serde",
  "serde_json",
