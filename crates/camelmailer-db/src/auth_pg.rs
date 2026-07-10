@@ -410,13 +410,11 @@ impl AuthStore for PgStore {
     }
 
     async fn list_invitations(&self, organization_id: Id) -> Result<Vec<Invitation>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT * FROM invitations WHERE organization_id = $1 ORDER BY id",
-        )
-        .bind(organization_id as i64)
-        .fetch_all(self.pool())
-        .await
-        .map_err(sqlx_error)?;
+        let rows = sqlx::query("SELECT * FROM invitations WHERE organization_id = $1 ORDER BY id")
+            .bind(organization_id as i64)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
         rows.iter().map(invitation_from_row).collect()
     }
 
@@ -578,13 +576,11 @@ impl AuthStore for PgStore {
     }
 
     async fn list_auth_events(&self, limit: u64) -> Result<Vec<AuthEvent>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT * FROM auth_events ORDER BY id DESC LIMIT $1",
-        )
-        .bind(limit as i64)
-        .fetch_all(self.pool())
-        .await
-        .map_err(sqlx_error)?;
+        let rows = sqlx::query("SELECT * FROM auth_events ORDER BY id DESC LIMIT $1")
+            .bind(limit as i64)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
         Ok(rows
             .iter()
             .map(|row| AuthEvent {

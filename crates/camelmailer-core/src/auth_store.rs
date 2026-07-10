@@ -72,11 +72,8 @@ pub trait AuthStore: Send + Sync {
         user_id: Id,
         role: Role,
     ) -> Result<OrganizationMembership, StoreError>;
-    async fn delete_membership(
-        &self,
-        organization_id: Id,
-        user_id: Id,
-    ) -> Result<bool, StoreError>;
+    async fn delete_membership(&self, organization_id: Id, user_id: Id)
+        -> Result<bool, StoreError>;
 
     // -- invitations
     async fn create_invitation(&self, new: NewInvitation) -> Result<Invitation, StoreError>;
@@ -466,11 +463,11 @@ impl AuthStore for MemoryStore {
         token_hash: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        self.inner
-            .write()
-            .unwrap()
-            .password_resets
-            .push((user_id, token_hash.to_string(), expires_at));
+        self.inner.write().unwrap().password_resets.push((
+            user_id,
+            token_hash.to_string(),
+            expires_at,
+        ));
         Ok(())
     }
 
@@ -621,7 +618,10 @@ mod tests {
     #[tokio::test]
     async fn password_and_totp_state_round_trip() {
         let (store, user) = store_with_user("a@example.com");
-        store.set_password_digest(user.id, "$digest$").await.unwrap();
+        store
+            .set_password_digest(user.id, "$digest$")
+            .await
+            .unwrap();
         store.set_totp(user.id, Some("SECRET"), true).await.unwrap();
         let auth = store.user_auth(user.id).await.unwrap().unwrap();
         assert_eq!(auth.password_digest.as_deref(), Some("$digest$"));
@@ -713,11 +713,7 @@ mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].1.id, user.id);
 
-        assert!(store
-            .membership(acme.id, user.id)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(store.membership(acme.id, user.id).await.unwrap().is_some());
         assert!(store.delete_membership(acme.id, user.id).await.unwrap());
         assert!(!store.delete_membership(acme.id, user.id).await.unwrap());
     }
@@ -805,7 +801,12 @@ mod tests {
         );
 
         store
-            .create_oidc_state("state-1", "verifier", "nonce", Utc::now() + Duration::minutes(10))
+            .create_oidc_state(
+                "state-1",
+                "verifier",
+                "nonce",
+                Utc::now() + Duration::minutes(10),
+            )
             .await
             .unwrap();
         assert_eq!(

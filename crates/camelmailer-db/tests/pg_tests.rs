@@ -1414,7 +1414,10 @@ async fn pg_auth_account_state_round_trips() {
         .set_password_digest(user.id, "$argon2id$test")
         .await
         .unwrap();
-    f.store.set_totp(user.id, Some("SECRET32"), true).await.unwrap();
+    f.store
+        .set_totp(user.id, Some("SECRET32"), true)
+        .await
+        .unwrap();
     let locked = chrono::Utc::now() + chrono::Duration::minutes(15);
     f.store
         .set_login_state(user.id, 3, Some(locked), None)
@@ -1431,7 +1434,10 @@ async fn pg_auth_account_state_round_trips() {
         .set_login_state(user.id, 0, None, Some(chrono::Utc::now()))
         .await
         .unwrap();
-    f.store.set_login_state(user.id, 1, None, None).await.unwrap();
+    f.store
+        .set_login_state(user.id, 1, None, None)
+        .await
+        .unwrap();
     let auth = f.store.user_auth(user.id).await.unwrap().unwrap();
     assert!(auth.last_login_at.is_some());
     assert_eq!(auth.failed_login_attempts, 1);
@@ -1466,12 +1472,7 @@ async fn pg_auth_sessions_lifecycle() {
         .await
         .unwrap();
 
-    let (found, found_user) = f
-        .store
-        .session_with_user("hash-1")
-        .await
-        .unwrap()
-        .unwrap();
+    let (found, found_user) = f.store.session_with_user("hash-1").await.unwrap().unwrap();
     assert_eq!(found.id, session.id);
     assert_eq!(found_user.id, user.id);
     assert!(f.store.session_with_user("nope").await.unwrap().is_none());
@@ -1481,12 +1482,7 @@ async fn pg_auth_sessions_lifecycle() {
         .touch_session(session.id, chrono::Utc::now(), new_expiry)
         .await
         .unwrap();
-    let (touched, _) = f
-        .store
-        .session_with_user("hash-1")
-        .await
-        .unwrap()
-        .unwrap();
+    let (touched, _) = f.store.session_with_user("hash-1").await.unwrap().unwrap();
     assert!((touched.expires_at - new_expiry).num_seconds().abs() < 2);
 
     assert!(f.store.delete_session("hash-1").await.unwrap());
@@ -1581,16 +1577,27 @@ async fn pg_auth_memberships_and_invitations() {
         .unwrap()
         .unwrap();
     assert_eq!(found.id, invitation.id);
-    f.store.mark_invitation_accepted(invitation.id).await.unwrap();
+    f.store
+        .mark_invitation_accepted(invitation.id)
+        .await
+        .unwrap();
     f.store
         .create_invitation(new_invite("new@example.com", "inv-3"))
         .await
         .unwrap();
     assert_eq!(
-        f.store.list_invitations(f.organization.id).await.unwrap().len(),
+        f.store
+            .list_invitations(f.organization.id)
+            .await
+            .unwrap()
+            .len(),
         2
     );
-    assert!(!f.store.delete_invitation(999_999, invitation.id).await.unwrap());
+    assert!(!f
+        .store
+        .delete_invitation(999_999, invitation.id)
+        .await
+        .unwrap());
     assert!(f
         .store
         .delete_invitation(f.organization.id, invitation.id)
@@ -1627,7 +1634,11 @@ async fn pg_auth_resets_oidc_and_audit() {
 
     // password resets are single-use and expire
     f.store
-        .create_password_reset(user.id, "reset-1", chrono::Utc::now() + chrono::Duration::hours(2))
+        .create_password_reset(
+            user.id,
+            "reset-1",
+            chrono::Utc::now() + chrono::Duration::hours(2),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1645,7 +1656,11 @@ async fn pg_auth_resets_oidc_and_audit() {
         None
     );
     f.store
-        .create_password_reset(user.id, "reset-2", chrono::Utc::now() - chrono::Duration::hours(1))
+        .create_password_reset(
+            user.id,
+            "reset-2",
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )
         .await
         .unwrap();
     assert_eq!(

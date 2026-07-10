@@ -874,8 +874,7 @@ rspamd:
     fn enabled_oidc_requires_issuer_and_identifier() {
         let config = Config::from_yaml("oidc:\n  enabled: true\n").unwrap();
         assert!(config.validate().is_err());
-        let config =
-            Config::from_yaml("oidc:\n  enabled: true\n  issuer: https://x\n").unwrap();
+        let config = Config::from_yaml("oidc:\n  enabled: true\n  issuer: https://x\n").unwrap();
         assert!(config.validate().is_err());
     }
 

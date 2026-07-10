@@ -33,8 +33,12 @@ pub struct ApiState {
     pub store: Arc<dyn AdminStore>,
     /// Tenant-scoped storage for the per-server API (`/api/v2/server`).
     pub server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
+    /// Account/session storage for user logins and RBAC (`/api/v2/auth`).
+    pub auth_store: Option<Arc<dyn camelmailer_core::AuthStore>>,
     /// `camelmailer.admin_api_key` — the global fallback key.
     pub global_admin_api_key: Option<String>,
+    /// The full configuration (auth policy, OIDC, hostnames).
+    pub config: camelmailer_config::Config,
 }
 
 impl ApiState {
@@ -42,7 +46,9 @@ impl ApiState {
         Arc::new(Self {
             store,
             server_store: None,
+            auth_store: None,
             global_admin_api_key,
+            config: camelmailer_config::Config::default(),
         })
     }
 
@@ -55,7 +61,27 @@ impl ApiState {
         Arc::new(Self {
             store,
             server_store: Some(server_store),
+            auth_store: None,
             global_admin_api_key,
+            config: camelmailer_config::Config::default(),
+        })
+    }
+
+    /// Construct with every storage facet plus configuration — the shape
+    /// used by the production binary (and account-aware tests).
+    pub fn full(
+        store: Arc<dyn AdminStore>,
+        server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
+        auth_store: Option<Arc<dyn camelmailer_core::AuthStore>>,
+        global_admin_api_key: Option<String>,
+        config: camelmailer_config::Config,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            server_store,
+            auth_store,
+            global_admin_api_key,
+            config,
         })
     }
 
