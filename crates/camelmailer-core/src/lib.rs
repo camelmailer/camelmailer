@@ -14,7 +14,7 @@ pub mod token;
 
 pub use admin_store::{
     AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewServer,
-    NewSuppression, NewUser, NewWebhook, StoreError,
+    NewSuppression, NewUser, NewWebhook, StoreError, TrackingStore, TrackingTarget,
 };
 pub use message::{MemorySink, MessageScope, MessageSink, QueuedMessage};
 pub use model::*;

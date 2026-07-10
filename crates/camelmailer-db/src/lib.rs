@@ -14,6 +14,7 @@
 
 mod pg_store;
 mod queue;
+mod tracking;
 mod webhook_queue;
 
 pub use pg_store::{Delivery, PgMessageSink, PgStore, StoredMessage};

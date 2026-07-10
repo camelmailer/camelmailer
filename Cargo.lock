@@ -252,11 +252,13 @@ version = "3.3.4"
 dependencies = [
  "axum",
  "base64",
+ "camelmailer-api",
  "camelmailer-config",
  "camelmailer-core",
  "camelmailer-db",
  "chrono",
  "hickory-resolver",
+ "http-body-util",
  "rand 0.8.6",
  "reqwest",
  "rsa",
@@ -265,6 +267,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
 ]
 

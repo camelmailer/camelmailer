@@ -80,6 +80,38 @@ pub struct NewIpAddress {
     pub priority: i32,
 }
 
+/// A resolved tracking token: which tenant/message it belongs to and, for
+/// click tokens, the original URL to redirect to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackingTarget {
+    pub kind: String,
+    pub server_id: Id,
+    pub message_id: i64,
+    pub link_id: Option<Id>,
+    pub target_url: Option<String>,
+}
+
+/// The storage behind the public click/open tracking endpoints. Kept
+/// separate from [`AdminStore`] because the tracking HTTP server is
+/// unauthenticated and only needs token resolution + recording.
+#[async_trait]
+pub trait TrackingStore: Send + Sync {
+    async fn resolve_token(&self, token: &str) -> Result<Option<TrackingTarget>, StoreError>;
+    /// Record a click on a resolved token (ip/user-agent for the audit row).
+    async fn record_click(
+        &self,
+        target: &TrackingTarget,
+        ip_address: &str,
+        user_agent: &str,
+    ) -> Result<(), StoreError>;
+    async fn record_open(
+        &self,
+        target: &TrackingTarget,
+        ip_address: &str,
+        user_agent: &str,
+    ) -> Result<(), StoreError>;
+}
+
 #[async_trait]
 pub trait AdminStore: Send + Sync {
     async fn list_organizations(&self) -> Result<Vec<Organization>, StoreError>;

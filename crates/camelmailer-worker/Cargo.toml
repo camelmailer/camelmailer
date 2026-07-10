@@ -22,4 +22,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+camelmailer-api = { workspace = true }
+http-body-util = { workspace = true }
 rand = { workspace = true }
+tower = { workspace = true }

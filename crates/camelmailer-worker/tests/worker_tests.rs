@@ -928,3 +928,154 @@ async fn clean_virus_scan_passes() {
     assert!(!message.threat);
     assert!(message.inspected);
 }
+
+// -------------------------------------------------- tracking (commit D)
+
+fn html_outgoing(server_id: camelmailer_core::Id) -> QueuedMessage {
+    let mut message = outgoing_message(server_id, "user@dest.example");
+    message.raw_message = b"Content-Type: text/html\r\n\r\n<html><body>\
+        <a href=\"https://example.com/offer\">Offer</a> and \
+        <a href=\"mailto:x@y.z\">mail</a></body></html>\r\n"
+        .to_vec();
+    message
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn html_outgoing_mail_gets_click_links_rewritten_and_an_open_pixel() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as Code};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    let message_id = s
+        .sink
+        .insert_message(&html_outgoing(s.server.id))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.web_protocol = "https".into();
+    config.dns.track_domain = "track.example.com".into();
+    let worker = Worker::new(&config, s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+
+    // the mock SMTP body carries the rewritten click link and the pixel
+    let seen = smtp.received.lock().unwrap().clone();
+    let body = seen.join("\n");
+    assert!(body.contains("https://track.example.com/track/c/"));
+    assert!(body.contains("/track/o/"));
+    assert!(body.contains(".gif"));
+    // the mailto link is untouched
+    assert!(body.contains("href=\"mailto:x@y.z\""));
+
+    // pull a click token out of the rewritten body
+    let click_token = body
+        .split("/track/c/")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_string();
+    let open_token = body
+        .split("/track/o/")
+        .nth(1)
+        .unwrap()
+        .split(".gif")
+        .next()
+        .unwrap()
+        .to_string();
+
+    // drive the public tracking endpoints against the resolved store
+    let tracking: std::sync::Arc<dyn camelmailer_core::TrackingStore> =
+        std::sync::Arc::new(s.store.clone());
+    let router = camelmailer_api::tracking_router(std::sync::Arc::new(
+        camelmailer_api::TrackingState { store: tracking },
+    ));
+
+    // click → 302 redirect to the original URL, click recorded
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/track/c/{click_token}"))
+                .header("x-forwarded-for", "9.9.9.9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), Code::FOUND);
+    assert_eq!(
+        response.headers().get("location").unwrap(),
+        "https://example.com/offer"
+    );
+
+    // open → 1x1 gif, open recorded
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/track/o/{open_token}.gif"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), Code::OK);
+    assert_eq!(response.headers().get("content-type").unwrap(), "image/gif");
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[0..6], b"GIF89a");
+
+    // the activity counts reflect one click and one open
+    let (clicks, opens) = s.sink.activity_counts(s.server.id, message_id).await.unwrap();
+    assert_eq!(clicks, 1);
+    assert_eq!(opens, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_tracking_tokens_do_not_leak_validity() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as Code};
+    use tower::ServiceExt;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+
+    let tracking: std::sync::Arc<dyn camelmailer_core::TrackingStore> =
+        std::sync::Arc::new(s.store.clone());
+    let router = camelmailer_api::tracking_router(std::sync::Arc::new(
+        camelmailer_api::TrackingState { store: tracking },
+    ));
+
+    // unknown click → 404
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/track/c/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), Code::NOT_FOUND);
+
+    // unknown open → still a 200 pixel (no oracle)
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/track/o/nope.gif")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), Code::OK);
+}

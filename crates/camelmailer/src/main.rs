@@ -1,8 +1,8 @@
 //! The `camelmailer` CLI — the Rust port of `bin/postal`, dispatching the
 //! process roles from a single binary.
 
-use camelmailer_api::{build_router, ApiState};
-use camelmailer_core::{AdminStore, MemorySink, MemoryStore, MessageSink, Store};
+use camelmailer_api::{build_router, tracking_router, ApiState, TrackingState};
+use camelmailer_core::{AdminStore, MemorySink, MemoryStore, MessageSink, Store, TrackingStore};
 use camelmailer_db::{PgMessageSink, PgStore};
 use camelmailer_smtp::SmtpServer;
 use camelmailer_worker::Worker;
@@ -109,8 +109,18 @@ async fn web_server() -> std::io::Result<()> {
         tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
         Arc::new(MemoryStore::new())
     };
+    let tracking: Option<std::sync::Arc<dyn TrackingStore>> = if postgres_enabled(&config) {
+        Some(std::sync::Arc::new(connect_pg(&config).await?))
+    } else {
+        None
+    };
     let state = ApiState::new(store, config.camelmailer.admin_api_key.clone());
-    let router = build_router(state);
+    let mut router = build_router(state);
+    if let Some(tracking) = tracking {
+        router = router.merge(tracking_router(std::sync::Arc::new(TrackingState {
+            store: tracking,
+        })));
+    }
 
     let port = std::env::var("PORT")
         .ok()

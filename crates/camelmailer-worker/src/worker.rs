@@ -8,6 +8,7 @@
 use crate::dkim;
 use crate::inspection::{ClamavInspector, RspamdInspector};
 use crate::sender::SmtpSender;
+use crate::tracking;
 use crate::signer::Signer;
 use crate::smtp_client::SendOutcome;
 use base64::Engine;
@@ -57,6 +58,8 @@ pub struct Worker {
     clamav: Option<ClamavInspector>,
     spam_threshold: f64,
     spam_failure_threshold: f64,
+    /// Base URL for tracking links, e.g. `https://track.example.com`.
+    tracking_base_url: String,
     http: reqwest::Client,
     max_attempts: i32,
     worker_id: String,
@@ -96,6 +99,10 @@ impl Worker {
             clamav,
             spam_threshold: config.camelmailer.default_spam_threshold as f64,
             spam_failure_threshold: config.camelmailer.default_spam_failure_threshold as f64,
+            tracking_base_url: format!(
+                "{}://{}",
+                config.camelmailer.web_protocol, config.dns.track_domain
+            ),
             sender,
             http,
             max_attempts: config.camelmailer.default_maximum_delivery_attempts as i32,
@@ -158,6 +165,10 @@ impl Worker {
             return Ok(ProcessOutcome::Held);
         }
 
+        // Rewrite HTML links for click tracking and append an open pixel
+        // before signing, so the DKIM signature covers the final body.
+        let tracked = self.apply_tracking(message).await?;
+
         // DKIM-sign at delivery time when the message carries an
         // authenticated domain and a signing key is configured. The stored
         // message stays unsigned, matching the Ruby behaviour.
@@ -165,16 +176,16 @@ impl Worker {
             (Some(signer), Some(domain_id)) => {
                 match self.store.domain_by_id(domain_id).await {
                     Ok(Some(domain)) => dkim::sign_and_prepend(
-                        &message.raw_message,
+                        &tracked,
                         &domain.name,
                         &self.dkim_selector,
                         signer,
                         chrono::Utc::now().timestamp(),
                     ),
-                    _ => message.raw_message.clone(),
+                    _ => tracked,
                 }
             }
-            _ => message.raw_message.clone(),
+            _ => tracked,
         };
 
         let outcome = self
@@ -398,6 +409,54 @@ impl Worker {
                 Ok(ProcessOutcome::Delayed { response })
             }
         }
+    }
+
+    /// Register tracking tokens and rewrite the HTML body of an outgoing
+    /// message. No-op for non-HTML messages. Returns the (possibly
+    /// rewritten) raw message.
+    async fn apply_tracking(&self, message: &StoredMessage) -> Result<Vec<u8>, sqlx::Error> {
+        let Some((headers, body)) = tracking::html_body(&message.raw_message) else {
+            return Ok(message.raw_message.clone());
+        };
+
+        // register a link + click token for every rewritten URL
+        let mut pending_links: Vec<String> = Vec::new();
+        let (rewritten, urls) = tracking::rewrite_links(&body, |url| {
+            pending_links.push(url.to_string());
+            format!("__CM_CLICK_{}__", pending_links.len() - 1)
+        });
+        let _ = urls;
+
+        let mut click_tokens = Vec::with_capacity(pending_links.len());
+        for url in &pending_links {
+            let (link_id, _) = self
+                .sink
+                .create_link(message.server_id, message.id, url)
+                .await?;
+            let token = self
+                .store
+                .create_click_token(message.server_id, message.id, link_id, url)
+                .await?;
+            click_tokens.push(token);
+        }
+
+        let mut rewritten = rewritten;
+        for (index, token) in click_tokens.iter().enumerate() {
+            rewritten = rewritten.replace(
+                &format!("__CM_CLICK_{index}__"),
+                &format!("{}/track/c/{token}", self.tracking_base_url),
+            );
+        }
+
+        // open-tracking pixel
+        let open_token = self
+            .store
+            .create_open_token(message.server_id, message.id)
+            .await?;
+        let pixel_url = format!("{}/track/o/{open_token}.gif", self.tracking_base_url);
+        let rewritten = tracking::inject_open_pixel(&rewritten, &pixel_url);
+
+        Ok(tracking::reassemble(&headers, &rewritten))
     }
 
     fn message_payload(&self, message: &StoredMessage, details: &str) -> serde_json::Value {

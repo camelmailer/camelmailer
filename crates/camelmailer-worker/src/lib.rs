@@ -5,6 +5,7 @@ pub mod dkim;
 pub mod inspection;
 pub mod sender;
 pub mod signer;
+pub mod tracking;
 pub mod smtp_client;
 pub mod worker;
 
