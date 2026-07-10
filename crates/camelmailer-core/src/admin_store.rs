@@ -211,6 +211,14 @@ pub trait AdminStore: Send + Sync {
     /// credential is not on hold; records the use (`last_used_at`).
     async fn server_for_api_token(&self, key: &str) -> Result<Option<Server>, StoreError>;
 
+    /// The id of a verified domain named `domain_name` owned by the server
+    /// or its organization — the From-domain authorization for HTTP send.
+    async fn authenticated_domain(
+        &self,
+        server_id: Id,
+        domain_name: &str,
+    ) -> Result<Option<Id>, StoreError>;
+
     // admin API key management (returns display records; never the secret)
     async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError>;
     async fn create_admin_api_key_record(
@@ -343,6 +351,26 @@ impl AdminStore for crate::store::MemoryStore {
             c.credential_type == CredentialType::Api && c.key == key && !c.hold
         });
         Ok(credential.and_then(|c| inner.servers.get(&c.server_id).cloned()))
+    }
+
+    async fn authenticated_domain(
+        &self,
+        server_id: Id,
+        domain_name: &str,
+    ) -> Result<Option<Id>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let Some(server) = inner.servers.get(&server_id) else {
+            return Ok(None);
+        };
+        Ok(inner
+            .domains
+            .values()
+            .filter(|d| d.verified && d.name == domain_name)
+            .find(|d| match d.owner {
+                DomainOwner::Server(id) => id == server.id,
+                DomainOwner::Organization(id) => id == server.organization_id,
+            })
+            .map(|d| d.id))
     }
 
     async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError> {

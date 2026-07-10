@@ -44,6 +44,7 @@ axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 base64 = "0.22"
+mail-builder = "0.4"
 rand = "0.8"
 hmac = "0.12"
 md-5 = "0.10"

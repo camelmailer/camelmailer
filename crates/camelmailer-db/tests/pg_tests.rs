@@ -99,6 +99,8 @@ fn message_for(server_id: camelmailer_core::Id, rcpt_to: &str) -> QueuedMessage 
         domain_id: None,
         credential_id: None,
         route_id: None,
+            tag: None,
+            metadata: None,
     }
 }
 

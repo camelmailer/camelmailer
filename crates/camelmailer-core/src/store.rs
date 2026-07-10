@@ -115,6 +115,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) ip_addresses: HashMap<Id, IpAddress>,
     pub(crate) webhooks: HashMap<Id, Webhook>,
     pub(crate) suppressions: HashMap<Id, Suppression>,
+    /// HTTP-sent / stored messages, for the per-server read API tests.
+    pub(crate) messages: Vec<crate::message::MessageRecord>,
 }
 
 /// A thread-safe in-memory [`Store`].
@@ -249,6 +251,58 @@ impl MemoryStore {
 
     pub fn admin_api_key_exists(&self, key: &str) -> bool {
         self.inner.read().unwrap().admin_api_keys.contains_key(key)
+    }
+
+    /// Store an accepted outbound message as a read-model record and return
+    /// its public identity (in-memory analogue of the Postgres insert path).
+    pub fn insert_message_record(
+        &self,
+        message: crate::message::QueuedMessage,
+    ) -> crate::message::SentMessage {
+        let id = self.next_id() as i64;
+        let token = crate::token::generate_token(12);
+        let record = crate::message::MessageRecord {
+            id,
+            token: token.clone(),
+            server_id: message.server_id,
+            scope: match message.scope {
+                crate::message::MessageScope::Incoming => "incoming".into(),
+                crate::message::MessageScope::Outgoing => "outgoing".into(),
+            },
+            rcpt_to: message.rcpt_to.clone(),
+            mail_from: message.mail_from,
+            subject: crate::message::header_value(&message.raw_message, "subject"),
+            message_id_header: crate::message::header_value(&message.raw_message, "message-id"),
+            tag: message.tag,
+            status: "Pending".into(),
+            bounce: message.bounce,
+            spam_status: "NotChecked".into(),
+            spam_score: 0.0,
+            held: false,
+            threat: false,
+            size: message.raw_message.len() as i64,
+            metadata: message.metadata,
+            created_at: chrono::Utc::now(),
+            raw_message: message.raw_message,
+        };
+        self.inner.write().unwrap().messages.push(record);
+        crate::message::SentMessage {
+            id,
+            token,
+            rcpt_to: message.rcpt_to,
+        }
+    }
+
+    /// All stored messages for a server (test read model).
+    pub fn messages_for(&self, server_id: Id) -> Vec<crate::message::MessageRecord> {
+        self.inner
+            .read()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.server_id == server_id)
+            .cloned()
+            .collect()
     }
 
     pub fn list_admin_api_keys(&self) -> Vec<AdminApiKey> {

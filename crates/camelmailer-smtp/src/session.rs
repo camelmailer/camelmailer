@@ -806,6 +806,8 @@ impl Session {
                         domain_id: authenticated_domain_id,
                         credential_id: self.credential.as_ref().map(|c| c.id),
                         route_id: None,
+            tag: None,
+            metadata: None,
                     });
                 }
                 RecipientKind::Bounce => {
@@ -823,6 +825,8 @@ impl Session {
                                 domain_id: rp_route.route.domain_id,
                                 credential_id: None,
                                 route_id: Some(rp_route.route.id),
+            tag: None,
+            metadata: None,
                             });
                         }
                         None => {
@@ -839,6 +843,8 @@ impl Session {
                                 domain_id: None,
                                 credential_id: None,
                                 route_id: None,
+            tag: None,
+            metadata: None,
                             });
                         }
                     }
@@ -856,6 +862,8 @@ impl Session {
                         domain_id: route.route.domain_id,
                         credential_id: None,
                         route_id: Some(route.route.id),
+            tag: None,
+            metadata: None,
                     });
                 }
             }

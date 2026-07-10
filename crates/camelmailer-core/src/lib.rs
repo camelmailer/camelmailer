@@ -6,6 +6,7 @@
 
 pub mod admin_store;
 pub mod message;
+pub mod mime;
 pub mod model;
 pub mod received_header;
 pub mod server_store;
@@ -18,6 +19,8 @@ pub use admin_store::{
     NewSuppression, NewUser, NewWebhook, StoreError, TrackingStore, TrackingTarget,
 };
 pub use server_store::{ServerContext, ServerStore};
-pub use message::{MemorySink, MessageScope, MessageSink, QueuedMessage};
+pub use message::{
+    MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,
+};
 pub use model::*;
 pub use store::{MemoryStore, Store};

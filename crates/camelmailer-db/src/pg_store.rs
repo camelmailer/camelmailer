@@ -661,6 +661,27 @@ impl AdminStore for PgStore {
         Ok(server)
     }
 
+    async fn authenticated_domain(
+        &self,
+        server_id: Id,
+        domain_name: &str,
+    ) -> Result<Option<Id>, StoreError> {
+        sqlx::query(
+            "SELECT d.id FROM domains d
+             JOIN servers s ON s.id = $1
+             WHERE d.verified AND d.name = $2
+               AND ((d.owner_type = 'Server' AND d.owner_id = s.id)
+                 OR (d.owner_type = 'Organization' AND d.owner_id = s.organization_id))
+             LIMIT 1",
+        )
+        .bind(server_id as i64)
+        .bind(domain_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(|row| row.get::<i64, _>("id") as Id))
+        .map_err(Self::sqlx_error)
+    }
+
     async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError> {
         sqlx::query("SELECT id, uuid, name, key FROM admin_api_keys ORDER BY id")
             .fetch_all(&self.pool)
@@ -1224,7 +1245,21 @@ impl AdminStore for PgStore {
 
 // ----------------------------------------------------- Store (SMTP, sync)
 
-impl camelmailer_core::ServerStore for PgStore {}
+#[async_trait]
+impl camelmailer_core::ServerStore for PgStore {
+    async fn store_outgoing(
+        &self,
+        message: QueuedMessage,
+    ) -> Result<camelmailer_core::SentMessage, StoreError> {
+        let rcpt_to = message.rcpt_to.clone();
+        let sink = PgMessageSink::new(self.clone());
+        let (id, token) = sink
+            .insert_message_returning(&message)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        Ok(camelmailer_core::SentMessage { id, token, rcpt_to })
+    }
+}
 
 impl Store for PgStore {
     fn organization(&self, id: Id) -> Option<Organization> {
@@ -1432,6 +1467,9 @@ pub struct StoredMessage {
     pub threat: bool,
     pub threat_details: Option<String>,
     pub inspected: bool,
+    pub tag: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn stored_message_from_row(row: &PgRow) -> StoredMessage {
@@ -1460,6 +1498,9 @@ fn stored_message_from_row(row: &PgRow) -> StoredMessage {
         threat: row.get("threat"),
         threat_details: row.get("threat_details"),
         inspected: row.get("inspected"),
+        tag: row.get("tag"),
+        metadata: row.get("metadata"),
+        created_at: row.get("created_at"),
     }
 }
 
@@ -1499,11 +1540,20 @@ impl PgMessageSink {
     }
 
     pub async fn insert_message(&self, message: &QueuedMessage) -> Result<i64, sqlx::Error> {
+        self.insert_message_returning(message).await.map(|(id, _)| id)
+    }
+
+    /// Insert and return both the id and the generated public token.
+    pub async fn insert_message_returning(
+        &self,
+        message: &QueuedMessage,
+    ) -> Result<(i64, String), sqlx::Error> {
         // index the interesting headers at insert time, like the Ruby
         // message DB does on save
         let subject = camelmailer_core::message::header_value(&message.raw_message, "subject");
         let message_id_header =
             camelmailer_core::message::header_value(&message.raw_message, "message-id");
+        let public_token = token::generate_token(12);
 
         let mut tx = self.store.pool.begin().await?;
         set_tenant_context(&mut tx, message.server_id).await?;
@@ -1511,12 +1561,12 @@ impl PgMessageSink {
             "INSERT INTO messages
                  (server_id, token, scope, rcpt_to, mail_from, bounce,
                   received_with_ssl, domain_id, credential_id, route_id, raw_message,
-                  subject, message_id_header, size)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                  subject, message_id_header, size, tag, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              RETURNING id",
         )
         .bind(message.server_id as i64)
-        .bind(token::generate_token(12))
+        .bind(&public_token)
         .bind(match message.scope {
             MessageScope::Incoming => "incoming",
             MessageScope::Outgoing => "outgoing",
@@ -1532,6 +1582,8 @@ impl PgMessageSink {
         .bind(&subject)
         .bind(&message_id_header)
         .bind(message.raw_message.len() as i64)
+        .bind(&message.tag)
+        .bind(&message.metadata)
         .fetch_one(&mut *tx)
         .await?;
         let message_id: i64 = row.get("id");
@@ -1553,7 +1605,7 @@ impl PgMessageSink {
         .await?;
 
         tx.commit().await?;
-        Ok(message_id)
+        Ok((message_id, public_token))
     }
 
     /// Load one message within its tenant's RLS context.

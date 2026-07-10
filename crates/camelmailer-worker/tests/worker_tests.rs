@@ -203,6 +203,8 @@ fn outgoing_message(server_id: camelmailer_core::Id, rcpt_to: &str) -> QueuedMes
         domain_id: None,
         credential_id: None,
         route_id: None,
+            tag: None,
+            metadata: None,
     }
 }
 
@@ -1249,4 +1251,60 @@ async fn delivery_binds_the_ip_pool_source_address() {
     assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
     let seen = smtp.received.lock().unwrap().clone();
     assert!(seen.iter().any(|l| l == "RCPT TO:<user@dest.example>"));
+}
+
+// -------------------------------------- HTTP send end-to-end (P2)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_sent_message_is_delivered_by_the_worker() {
+    use camelmailer_core::{DomainOwner, QueuedMessage, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    // a verified sending domain for From-authorization + DKIM
+    let domain = s
+        .store
+        .create_domain(DomainOwner::Server(s.server.id), "org.example", true)
+        .await
+        .unwrap();
+
+    // simulate what the HTTP /messages handler does: build+store an outgoing
+    // message via the ServerStore, carrying the authenticated domain_id.
+    let queued = QueuedMessage {
+        server_id: s.server.id,
+        rcpt_to: "user@dest.example".into(),
+        mail_from: "news@org.example".into(),
+        raw_message: b"From: news@org.example\r\nSubject: API send\r\n\r\nHello via HTTP.\r\n".to_vec(),
+        received_with_ssl: false,
+        scope: MessageScope::Outgoing,
+        bounce: false,
+        domain_id: Some(domain.id),
+        credential_id: None,
+        route_id: None,
+        tag: Some("api".into()),
+        metadata: None,
+    };
+    let sent = s.store.store_outgoing(queued).await.unwrap();
+    assert_eq!(s.queue.queue_size().await.unwrap(), 1);
+
+    // the existing worker delivers it (proving DKIM + tracking reuse)
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
+
+    // the mock SMTP saw a DKIM-signed message with our subject
+    let seen = smtp.received.lock().unwrap().clone();
+    assert!(seen.iter().any(|l| l == "Subject: API send"));
+
+    let message = s
+        .sink
+        .message_by_id(s.server.id, sent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.status, "Sent");
+    assert_eq!(message.tag.as_deref(), Some("api"));
 }

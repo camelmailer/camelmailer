@@ -68,6 +68,43 @@ pub struct QueuedMessage {
     pub domain_id: Option<Id>,
     pub credential_id: Option<Id>,
     pub route_id: Option<Id>,
+    /// Optional categorization tag (HTTP send / template send).
+    pub tag: Option<String>,
+    /// Optional per-message metadata (HTTP send).
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// The public identity of a message accepted via the HTTP send API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMessage {
+    pub id: i64,
+    pub token: String,
+    pub rcpt_to: String,
+}
+
+/// The read model of a stored message, exposed by the per-server read API.
+/// Mirrors the `messages` table columns the API surfaces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageRecord {
+    pub id: i64,
+    pub token: String,
+    pub server_id: Id,
+    pub scope: String,
+    pub rcpt_to: String,
+    pub mail_from: String,
+    pub subject: Option<String>,
+    pub message_id_header: Option<String>,
+    pub tag: Option<String>,
+    pub status: String,
+    pub bounce: bool,
+    pub spam_status: String,
+    pub spam_score: f64,
+    pub held: bool,
+    pub threat: bool,
+    pub size: i64,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub raw_message: Vec<u8>,
 }
 
 /// Where accepted messages go. The production implementation writes to the
