@@ -556,3 +556,90 @@ async fn a_server_token_cannot_read_another_servers_message() {
         assert_eq!(status, StatusCode::NOT_FOUND, "endpoint {suffix} leaked");
     }
 }
+
+// ------------------------------------------- P4: stats + bounces
+
+#[tokio::test]
+async fn stats_aggregate_status_and_engagement() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    let a = send_one(&app, &token, "news@alpha.example", "one@dest.example", "A", "t").await;
+    let b = send_one(&app, &token, "news@alpha.example", "two@dest.example", "B", "t").await;
+
+    // mark one Sent (with an open + two clicks), leave the other Pending
+    store.set_message_status(a, "Sent");
+    store.insert_open_record(a, open_event());
+    store.insert_click_record(a, click_event());
+    store.insert_click_record(a, click_event());
+
+    let (status, body) = request(&app, "/api/v2/server/stats", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let s = &body["data"]["stats"];
+    assert_eq!(s["total"], 2);
+    assert_eq!(s["outgoing"], 2);
+    assert_eq!(s["sent"], 1);
+    assert_eq!(s["pending"], 1);
+    assert_eq!(s["opens"], 1);
+    assert_eq!(s["unique_opens"], 1);
+    assert_eq!(s["clicks"], 2);
+    assert_eq!(s["unique_clicks"], 1);
+
+    // only b is still Pending → the outbound queue snapshot shows one
+    let (_, body) = request(&app, "/api/v2/server/stats/deliveries", Some(&token)).await;
+    assert_eq!(body["data"]["queued"], 1);
+    assert_eq!(body["data"]["domains"][0]["queued"], 1);
+    let _ = b;
+}
+
+fn open_event() -> camelmailer_core::ActivityEvent {
+    camelmailer_core::ActivityEvent {
+        ip_address: Some("1.2.3.4".into()),
+        user_agent: Some("Mail".into()),
+        url: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+fn click_event() -> camelmailer_core::ActivityEvent {
+    camelmailer_core::ActivityEvent {
+        ip_address: Some("1.2.3.4".into()),
+        user_agent: Some("Mail".into()),
+        url: Some("https://example.com".into()),
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn bounces_list_and_show_only_expose_bounces() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    let normal = send_one(&app, &token, "news@alpha.example", "one@dest.example", "OK", "t").await;
+    let bounced = send_one(&app, &token, "news@alpha.example", "two@dest.example", "Bad", "t").await;
+    store.set_message_status(bounced, "Bounced");
+
+    // list contains only the bounced message
+    let (status, body) = request(&app, "/api/v2/server/bounces", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let bounces = body["data"]["bounces"].as_array().unwrap();
+    assert_eq!(bounces.len(), 1);
+    assert_eq!(bounces[0]["subject"], "Bad");
+
+    // show works for the bounce, 404 for a non-bounce
+    let (status, _) = request(&app, &format!("/api/v2/server/bounces/{bounced}"), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(&app, &format!("/api/v2/server/bounces/{normal}"), Some(&token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn stats_and_bounces_are_tenant_scoped() {
+    let (app, token_a, token_b, store) = build_two_with_domains().await;
+    let id = send_one(&app, &token_a, "news@alpha.example", "one@dest.example", "A", "t").await;
+    store.set_message_status(id, "Bounced");
+
+    // token B sees an empty stat line and no bounces
+    let (_, body) = request(&app, "/api/v2/server/stats", Some(&token_b)).await;
+    assert_eq!(body["data"]["stats"]["total"], 0);
+    let (_, body) = request(&app, "/api/v2/server/bounces", Some(&token_b)).await;
+    assert_eq!(body["data"]["bounces"].as_array().unwrap().len(), 0);
+    let (status, _) = request(&app, &format!("/api/v2/server/bounces/{id}"), Some(&token_b)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

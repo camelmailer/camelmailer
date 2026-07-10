@@ -621,6 +621,144 @@ async fn message_exists(
     matches!(store.message(server_id, id).await, Ok(Some(_)))
 }
 
+// -------------------------------------------------------- stats + bounces
+
+/// Query params for `GET /stats`: an optional `created_at` time window.
+#[derive(Debug, Deserialize, Default)]
+struct StatsParams {
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn stats_json(stats: &camelmailer_core::MessageStats) -> Value {
+    json!({
+        "total": stats.total,
+        "incoming": stats.incoming,
+        "outgoing": stats.outgoing,
+        "sent": stats.sent,
+        "held": stats.held,
+        "soft_fail": stats.soft_fail,
+        "hard_fail": stats.hard_fail,
+        "bounced": stats.bounced,
+        "pending": stats.pending,
+        "opens": stats.opens,
+        "unique_opens": stats.unique_opens,
+        "clicks": stats.clicks,
+        "unique_clicks": stats.unique_clicks,
+    })
+}
+
+/// `GET /api/v2/server/stats` — aggregate message + engagement counters.
+async fn stats_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Query(params): Query<StatsParams>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let filter = camelmailer_core::StatsFilter {
+        from: params.from,
+        to: params.to,
+    };
+    match store.message_stats(server.0.id, &filter).await {
+        Ok(stats) => {
+            render_success(Some(&start.0), StatusCode::OK, json!({ "stats": stats_json(&stats) }))
+                .into_response()
+        }
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `GET /api/v2/server/stats/deliveries` — pending outbound queue depth.
+async fn delivery_stats_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.delivery_stats(server.0.id).await {
+        Ok(stats) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({
+                "queued": stats.queued,
+                "domains": stats.domains.iter().map(|d| json!({
+                    "domain": d.domain,
+                    "queued": d.count,
+                })).collect::<Vec<_>>(),
+            }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `GET /api/v2/server/bounces` — bounced messages, filtered + paged.
+async fn bounces_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Query(params): Query<MessageListParams>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let filter = MessageFilter {
+        scope: params.scope.filter(|s| !s.is_empty()),
+        status: params.status.filter(|s| !s.is_empty()),
+        tag: params.tag.filter(|s| !s.is_empty()),
+        query: params.query.filter(|s| !s.is_empty()),
+    };
+    let bounces = match store.bounces(server.0.id, &filter).await {
+        Ok(bounces) => bounces,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let pagination = PaginationParams {
+        page: params.page,
+        per_page: params.per_page,
+    };
+    let result = paginate(&bounces, &pagination);
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "bounces": result.items.iter().map(message_json).collect::<Vec<_>>(),
+            "pagination": result.pagination,
+        }),
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/bounces/{id}` — one bounced message.
+async fn bounce_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.bounce(server.0.id, id).await {
+        Ok(Some(bounce)) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "bounce": message_json(&bounce) }),
+        )
+        .into_response(),
+        Ok(None) => not_found(&start.0),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
 fn not_found(start: &RequestStart) -> Response {
     render_error(Some(start), StatusCode::NOT_FOUND, "NotFound", "Resource not found")
         .into_response()
@@ -648,6 +786,10 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/messages/{id}/opens", get(message_opens))
         .route("/messages/{id}/clicks", get(message_clicks))
         .route("/messages/{id}/raw", get(message_raw))
+        .route("/stats", get(stats_show))
+        .route("/stats/deliveries", get(delivery_stats_show))
+        .route("/bounces", get(bounces_index))
+        .route("/bounces/{id}", get(bounce_show))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             server_auth_middleware,

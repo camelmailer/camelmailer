@@ -912,3 +912,83 @@ async fn server_store_reads_are_filtered_and_tenant_scoped() {
     assert!(f.store.opens(other.id, welcome_id).await.unwrap().is_empty());
     assert!(f.store.clicks(other.id, welcome_id).await.unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_store_stats_and_bounces_are_tenant_scoped() {
+    use camelmailer_core::{MessageFilter, ServerStore, StatsFilter};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let sink = PgMessageSink::new(f.store.clone());
+
+    // two outgoing messages for our server: one Sent (with open + click),
+    // one Bounced. Plus one message for the other tenant.
+    let mut sent = message_for(f.server.id, "a@dest.example");
+    sent.scope = MessageScope::Outgoing;
+    let (sent_id, _) = f.store.store_outgoing(sent).await.map(|m| (m.id, m.token)).unwrap();
+    sink.record_delivery(f.server.id, sent_id, "Sent", "250 OK", "", true)
+        .await
+        .unwrap();
+    sink.record_load(f.server.id, sent_id, "1.2.3.4", "Mail")
+        .await
+        .unwrap();
+    let (link_id, _) = sink
+        .create_link(f.server.id, sent_id, "https://example.com")
+        .await
+        .unwrap();
+    sink.record_link_click(f.server.id, link_id, "1.2.3.4", "Mail")
+        .await
+        .unwrap();
+
+    let mut bounced = message_for(f.server.id, "b@dest.example");
+    bounced.scope = MessageScope::Outgoing;
+    let (bounced_id, _) = f.store.store_outgoing(bounced).await.map(|m| (m.id, m.token)).unwrap();
+    sink.record_delivery(f.server.id, bounced_id, "Bounced", "550", "", false)
+        .await
+        .unwrap();
+
+    let mut theirs = message_for(other.id, "c@dest.example");
+    theirs.scope = MessageScope::Outgoing;
+    f.store.store_outgoing(theirs).await.unwrap();
+
+    // stats for our tenant
+    let stats = f.store.message_stats(f.server.id, &StatsFilter::default()).await.unwrap();
+    assert_eq!(stats.total, 2);
+    assert_eq!(stats.outgoing, 2);
+    assert_eq!(stats.sent, 1);
+    assert_eq!(stats.bounced, 1);
+    assert_eq!(stats.opens, 1);
+    assert_eq!(stats.unique_opens, 1);
+    assert_eq!(stats.clicks, 1);
+    assert_eq!(stats.unique_clicks, 1);
+
+    // bounces list contains only the bounced message
+    let bounces = f.store.bounces(f.server.id, &MessageFilter::default()).await.unwrap();
+    assert_eq!(bounces.len(), 1);
+    assert_eq!(bounces[0].id, bounced_id);
+    assert!(f.store.bounce(f.server.id, bounced_id).await.unwrap().is_some());
+    assert!(f.store.bounce(f.server.id, sent_id).await.unwrap().is_none());
+
+    // delivery stats read the queue (each store_outgoing enqueued one row)
+    let queue = f.store.delivery_stats(f.server.id).await.unwrap();
+    assert_eq!(queue.queued, 2);
+
+    // the other tenant sees only its own data
+    let their_stats = f.store.message_stats(other.id, &StatsFilter::default()).await.unwrap();
+    assert_eq!(their_stats.total, 1);
+    assert_eq!(their_stats.sent, 0);
+    assert!(f.store.bounces(other.id, &MessageFilter::default()).await.unwrap().is_empty());
+    assert!(f.store.bounce(other.id, bounced_id).await.unwrap().is_none());
+    assert_eq!(f.store.delivery_stats(other.id).await.unwrap().queued, 1);
+}

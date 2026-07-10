@@ -48,7 +48,7 @@ mail-builder = "0.4"
 rand = "0.8"
 hmac = "0.12"
 md-5 = "0.10"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 ipnet = "2"
 regex = "1"
 subtle = "2"

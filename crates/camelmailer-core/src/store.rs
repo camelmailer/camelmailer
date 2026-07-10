@@ -299,6 +299,17 @@ impl MemoryStore {
         }
     }
 
+    /// Override a stored message's delivery status (test seeding).
+    pub fn set_message_status(&self, message_id: i64, status: &str) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(message) = inner.messages.iter_mut().find(|m| m.id == message_id) {
+            message.status = status.to_string();
+            if status == "Bounced" {
+                message.bounce = true;
+            }
+        }
+    }
+
     /// All stored messages for a server (test read model).
     pub fn messages_for(&self, server_id: Id) -> Vec<crate::message::MessageRecord> {
         self.inner
@@ -453,6 +464,93 @@ impl MemoryStore {
             .filter(|(id, _)| *id == message_id)
             .map(|(_, e)| e.clone())
             .collect()
+    }
+
+    /// Aggregate message + engagement counters for a server (test read model).
+    pub fn message_stats_for(
+        &self,
+        server_id: Id,
+        filter: &crate::server_store::StatsFilter,
+    ) -> crate::server_store::MessageStats {
+        use std::collections::HashSet;
+        let inner = self.inner.read().unwrap();
+        let ids: HashSet<i64> = inner
+            .messages
+            .iter()
+            .filter(|m| m.server_id == server_id)
+            .filter(|m| filter.from.is_none_or(|from| m.created_at >= from))
+            .filter(|m| filter.to.is_none_or(|to| m.created_at <= to))
+            .map(|m| m.id)
+            .collect();
+
+        let mut stats = crate::server_store::MessageStats::default();
+        for message in inner.messages.iter().filter(|m| ids.contains(&m.id)) {
+            stats.total += 1;
+            match message.scope.as_str() {
+                "incoming" => stats.incoming += 1,
+                _ => stats.outgoing += 1,
+            }
+            match message.status.as_str() {
+                "Sent" => stats.sent += 1,
+                "Held" => stats.held += 1,
+                "SoftFail" => stats.soft_fail += 1,
+                "HardFail" => stats.hard_fail += 1,
+                "Bounced" => stats.bounced += 1,
+                "Pending" => stats.pending += 1,
+                _ => {}
+            }
+        }
+
+        let opens_for: HashSet<i64> = inner
+            .message_opens
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .map(|(id, _)| *id)
+            .collect();
+        stats.opens = inner
+            .message_opens
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .count() as i64;
+        stats.unique_opens = opens_for.len() as i64;
+
+        let clicks_for: HashSet<i64> = inner
+            .message_clicks
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .map(|(id, _)| *id)
+            .collect();
+        stats.clicks = inner
+            .message_clicks
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .count() as i64;
+        stats.unique_clicks = clicks_for.len() as i64;
+        stats
+    }
+
+    /// Pending-outbound queue depth per destination domain (test read model,
+    /// derived from `Pending` outgoing messages as the queue proxy).
+    pub fn delivery_stats_for(&self, server_id: Id) -> crate::server_store::DeliveryStats {
+        use std::collections::BTreeMap;
+        let inner = self.inner.read().unwrap();
+        let mut per_domain: BTreeMap<String, i64> = BTreeMap::new();
+        for message in inner.messages.iter().filter(|m| {
+            m.server_id == server_id && m.scope == "outgoing" && m.status == "Pending"
+        }) {
+            let domain = message
+                .rcpt_to
+                .rsplit_once('@')
+                .map(|(_, d)| d.to_string())
+                .unwrap_or_default();
+            *per_domain.entry(domain).or_insert(0) += 1;
+        }
+        let queued = per_domain.values().sum();
+        let domains = per_domain
+            .into_iter()
+            .map(|(domain, count)| crate::server_store::QueuedDomain { domain, count })
+            .collect();
+        crate::server_store::DeliveryStats { queued, domains }
     }
 
     pub fn list_admin_api_keys(&self) -> Vec<AdminApiKey> {

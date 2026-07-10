@@ -50,6 +50,49 @@ pub struct DeliveryRecord {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Optional time window for statistics (`created_at` bounds, inclusive).
+#[derive(Debug, Clone, Default)]
+pub struct StatsFilter {
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Aggregate message/engagement counters for a server (a time window).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MessageStats {
+    pub total: i64,
+    pub incoming: i64,
+    pub outgoing: i64,
+    pub sent: i64,
+    pub held: i64,
+    pub soft_fail: i64,
+    pub hard_fail: i64,
+    pub bounced: i64,
+    pub pending: i64,
+    /// Total open (pixel-load) events.
+    pub opens: i64,
+    /// Messages with at least one open.
+    pub unique_opens: i64,
+    /// Total click events.
+    pub clicks: i64,
+    /// Messages with at least one click.
+    pub unique_clicks: i64,
+}
+
+/// Outbound queue depth per destination domain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedDomain {
+    pub domain: String,
+    pub count: i64,
+}
+
+/// Snapshot of the server's pending outbound delivery queue.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeliveryStats {
+    pub queued: i64,
+    pub domains: Vec<QueuedDomain>,
+}
+
 /// Storage for the per-server API. Kept separate from [`crate::AdminStore`]
 /// because these endpoints are authenticated by a server token and operate
 /// only within one tenant.
@@ -97,6 +140,32 @@ pub trait ServerStore: Send + Sync {
         server_id: Id,
         message_id: i64,
     ) -> Result<Vec<ActivityEvent>, StoreError>;
+
+    /// Aggregate message + engagement counters over an optional time window.
+    async fn message_stats(
+        &self,
+        server_id: Id,
+        filter: &StatsFilter,
+    ) -> Result<MessageStats, StoreError>;
+
+    /// Pending outbound queue depth (total + per destination domain).
+    async fn delivery_stats(&self, server_id: Id) -> Result<DeliveryStats, StoreError>;
+
+    /// Bounced messages (bounce flag or `Bounced` status), newest first.
+    /// Reuses [`MessageFilter`] for the optional substring/tag narrowing.
+    async fn bounces(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+    ) -> Result<Vec<MessageRecord>, StoreError>;
+
+    /// One bounced message by id, or `None` if it isn't the server's or
+    /// isn't a bounce.
+    async fn bounce(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError>;
 }
 
 #[async_trait]
@@ -143,5 +212,39 @@ impl ServerStore for crate::store::MemoryStore {
         message_id: i64,
     ) -> Result<Vec<ActivityEvent>, StoreError> {
         Ok(self.clicks_for(server_id, message_id))
+    }
+
+    async fn message_stats(
+        &self,
+        server_id: Id,
+        filter: &StatsFilter,
+    ) -> Result<MessageStats, StoreError> {
+        Ok(self.message_stats_for(server_id, filter))
+    }
+
+    async fn delivery_stats(&self, server_id: Id) -> Result<DeliveryStats, StoreError> {
+        Ok(self.delivery_stats_for(server_id))
+    }
+
+    async fn bounces(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        Ok(self
+            .messages_filtered(server_id, filter)
+            .into_iter()
+            .filter(|m| m.bounce || m.status == "Bounced")
+            .collect())
+    }
+
+    async fn bounce(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        Ok(self
+            .message_for(server_id, message_id)
+            .filter(|m| m.bounce || m.status == "Bounced"))
     }
 }

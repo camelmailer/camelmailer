@@ -1317,6 +1317,50 @@ impl camelmailer_core::ServerStore for PgStore {
             .await
             .map_err(|e| StoreError::Other(e.to_string()))
     }
+
+    async fn message_stats(
+        &self,
+        server_id: Id,
+        filter: &camelmailer_core::StatsFilter,
+    ) -> Result<camelmailer_core::MessageStats, StoreError> {
+        PgMessageSink::new(self.clone())
+            .message_stats(server_id, filter)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn delivery_stats(
+        &self,
+        server_id: Id,
+    ) -> Result<camelmailer_core::DeliveryStats, StoreError> {
+        PgMessageSink::new(self.clone())
+            .delivery_stats(server_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn bounces(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        PgMessageSink::new(self.clone())
+            .bounce_records(server_id, filter)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn bounce(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        Ok(PgMessageSink::new(self.clone())
+            .message_record(server_id, message_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?
+            .filter(|m| m.bounce || m.status == "Bounced"))
+    }
 }
 
 impl Store for PgStore {
@@ -1924,10 +1968,31 @@ impl PgMessageSink {
         server_id: Id,
         filter: &MessageFilter,
     ) -> Result<Vec<MessageRecord>, sqlx::Error> {
+        self.message_rows(server_id, filter, false).await
+    }
+
+    /// Bounced messages (`bounce` flag or `Bounced` status), newest first.
+    pub async fn bounce_records(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+    ) -> Result<Vec<MessageRecord>, sqlx::Error> {
+        self.message_rows(server_id, filter, true).await
+    }
+
+    async fn message_rows(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+        only_bounces: bool,
+    ) -> Result<Vec<MessageRecord>, sqlx::Error> {
         let mut tx = self.store.pool.begin().await?;
         set_tenant_context(&mut tx, server_id).await?;
         let mut qb: QueryBuilder<sqlx::Postgres> =
             QueryBuilder::new("SELECT * FROM messages WHERE TRUE");
+        if only_bounces {
+            qb.push(" AND (bounce OR status = 'Bounced')");
+        }
         if let Some(scope) = &filter.scope {
             qb.push(" AND scope = ").push_bind(scope.clone());
         }
@@ -2023,6 +2088,101 @@ impl PgMessageSink {
         .await?;
         tx.commit().await?;
         Ok(rows.iter().map(activity_event_from_row).collect())
+    }
+
+    /// Aggregate message + engagement counters over an optional time window,
+    /// tenant-scoped (RLS).
+    pub async fn message_stats(
+        &self,
+        server_id: Id,
+        filter: &camelmailer_core::StatsFilter,
+    ) -> Result<camelmailer_core::MessageStats, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let from = filter.from;
+        let to = filter.to;
+        let counts = sqlx::query(
+            "SELECT
+                 count(*) AS total,
+                 count(*) FILTER (WHERE scope = 'incoming') AS incoming,
+                 count(*) FILTER (WHERE scope = 'outgoing') AS outgoing,
+                 count(*) FILTER (WHERE status = 'Sent') AS sent,
+                 count(*) FILTER (WHERE status = 'Held') AS held,
+                 count(*) FILTER (WHERE status = 'SoftFail') AS soft_fail,
+                 count(*) FILTER (WHERE status = 'HardFail') AS hard_fail,
+                 count(*) FILTER (WHERE status = 'Bounced') AS bounced,
+                 count(*) FILTER (WHERE status = 'Pending') AS pending
+             FROM messages
+             WHERE ($1::timestamptz IS NULL OR created_at >= $1)
+               AND ($2::timestamptz IS NULL OR created_at <= $2)",
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+        let opens = sqlx::query(
+            "SELECT count(*) AS opens, count(DISTINCT l.message_id) AS unique_opens
+             FROM loads l JOIN messages m ON m.id = l.message_id
+             WHERE ($1::timestamptz IS NULL OR m.created_at >= $1)
+               AND ($2::timestamptz IS NULL OR m.created_at <= $2)",
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+        let clicks = sqlx::query(
+            "SELECT count(*) AS clicks, count(DISTINCT li.message_id) AS unique_clicks
+             FROM link_clicks lc
+             JOIN links li ON li.id = lc.link_id
+             JOIN messages m ON m.id = li.message_id
+             WHERE ($1::timestamptz IS NULL OR m.created_at >= $1)
+               AND ($2::timestamptz IS NULL OR m.created_at <= $2)",
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(camelmailer_core::MessageStats {
+            total: counts.get("total"),
+            incoming: counts.get("incoming"),
+            outgoing: counts.get("outgoing"),
+            sent: counts.get("sent"),
+            held: counts.get("held"),
+            soft_fail: counts.get("soft_fail"),
+            hard_fail: counts.get("hard_fail"),
+            bounced: counts.get("bounced"),
+            pending: counts.get("pending"),
+            opens: opens.get("opens"),
+            unique_opens: opens.get("unique_opens"),
+            clicks: clicks.get("clicks"),
+            unique_clicks: clicks.get("unique_clicks"),
+        })
+    }
+
+    /// Pending outbound queue depth per destination domain. Reads the
+    /// cross-tenant `queued_messages` work list with an explicit
+    /// `server_id` filter (the table is deliberately not RLS-protected).
+    pub async fn delivery_stats(
+        &self,
+        server_id: Id,
+    ) -> Result<camelmailer_core::DeliveryStats, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT domain, count(*) AS c FROM queued_messages
+             WHERE server_id = $1 GROUP BY domain ORDER BY domain",
+        )
+        .bind(server_id as i64)
+        .fetch_all(&self.store.pool)
+        .await?;
+        let domains: Vec<camelmailer_core::QueuedDomain> = rows
+            .iter()
+            .map(|row| camelmailer_core::QueuedDomain {
+                domain: row.get("domain"),
+                count: row.get("c"),
+            })
+            .collect();
+        let queued = domains.iter().map(|d| d.count).sum();
+        Ok(camelmailer_core::DeliveryStats { queued, domains })
     }
 }
 
