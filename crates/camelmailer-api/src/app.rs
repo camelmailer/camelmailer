@@ -201,37 +201,251 @@ pub(crate) async fn timing_middleware(mut request: Request, next: Next) -> Respo
     next.run(request).await
 }
 
+/// The authenticated caller of an admin API request: a machine key (full
+/// access) or a signed-in user (subject to RBAC).
+#[derive(Clone)]
+pub(crate) enum Principal {
+    AdminKey,
+    User(camelmailer_core::User),
+}
+
+impl Principal {
+    /// Full, unscoped access: the machine key or a global admin account.
+    pub(crate) fn is_root(&self) -> bool {
+        match self {
+            Principal::AdminKey => true,
+            Principal::User(user) => user.admin,
+        }
+    }
+
+    pub(crate) fn user(&self) -> Option<&camelmailer_core::User> {
+        match self {
+            Principal::AdminKey => None,
+            Principal::User(user) => Some(user),
+        }
+    }
+}
+
+/// The caller's role within the organization named in the request path
+/// (`None` for root principals, which bypass role checks).
+#[derive(Clone, Copy)]
+pub(crate) struct ActingRole(pub(crate) Option<camelmailer_core::Role>);
+
+impl ActingRole {
+    pub(crate) fn is_owner(&self) -> bool {
+        self.0.is_none() || self.0 == Some(camelmailer_core::Role::Owner)
+    }
+}
+
+/// The minimum role required for a request under
+/// `/api/v2/admin/organizations/{permalink}/…`, by resource and method.
+fn required_role(rest: &[&str], method: &axum::http::Method) -> camelmailer_core::Role {
+    use axum::http::Method;
+    use camelmailer_core::Role;
+    let read = *method == Method::GET || *method == Method::HEAD;
+    match rest.first() {
+        // the organization itself
+        None => {
+            if read {
+                Role::Viewer
+            } else if *method == Method::DELETE {
+                Role::Owner
+            } else {
+                Role::Admin
+            }
+        }
+        // people management
+        Some(&"members") | Some(&"invitations") => {
+            if read {
+                Role::Viewer
+            } else {
+                Role::Admin
+            }
+        }
+        Some(&"servers") => match rest.get(2) {
+            // server lifecycle (create/update/delete/suspend/ip_pool)
+            None | Some(&"suspend") | Some(&"unsuspend") | Some(&"ip_pool") => {
+                if read {
+                    Role::Viewer
+                } else {
+                    Role::Admin
+                }
+            }
+            // resources within a server (domains, credentials, routes, …)
+            Some(_) => {
+                if read {
+                    Role::Viewer
+                } else {
+                    Role::Member
+                }
+            }
+        },
+        // anything unrecognized: readable by members, writable by admins
+        _ => {
+            if read {
+                Role::Viewer
+            } else {
+                Role::Admin
+            }
+        }
+    }
+}
+
 async fn auth_middleware(
     State(state): State<Arc<ApiState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let start = request.extensions().get::<RequestStart>().copied();
+
+    // 1. machine key
     let key = request
         .headers()
         .get("X-Admin-API-Key")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
+    if !key.is_empty() {
+        let key = key.to_string();
+        if !state.key_is_valid(&key).await {
+            return render_error(
+                start.as_ref(),
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                "Invalid API key",
+            )
+            .into_response();
+        }
+        request.extensions_mut().insert(Principal::AdminKey);
+        request.extensions_mut().insert(ActingRole(None));
+        return next.run(request).await;
+    }
 
-    if key.is_empty() {
+    // 2. user session (Bearer), when accounts are enabled
+    let bearer = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+    let (Some(token), Some(auth_store)) = (bearer, state.auth_store.clone()) else {
         return render_error(
             start.as_ref(),
             StatusCode::UNAUTHORIZED,
             "Unauthorized",
-            "Missing X-Admin-API-Key header",
+            "Missing X-Admin-API-Key header or Authorization: Bearer session token",
         )
         .into_response();
-    }
-    let key = key.to_string();
-    if !state.key_is_valid(&key).await {
+    };
+    let token_hash = camelmailer_core::auth::hash_token(&token);
+    let now = chrono::Utc::now();
+    let session = match auth_store.session_with_user(&token_hash).await {
+        Ok(session) => session,
+        Err(error) => return render_store_error(start.as_ref(), error).into_response(),
+    };
+    let Some((session, user)) = session.filter(|(session, _)| session.expires_at > now) else {
         return render_error(
             start.as_ref(),
             StatusCode::UNAUTHORIZED,
             "Unauthorized",
-            "Invalid API key",
+            "The session token is invalid or has expired",
         )
         .into_response();
+    };
+    let _ = auth_store
+        .touch_session(
+            session.id,
+            now,
+            now + chrono::Duration::days(state.config.auth.session_timeout_days as i64),
+        )
+        .await;
+
+    // 3. RBAC for user principals
+    // Inside the nested router the URI is already stripped of the
+    // `/api/v2/admin` prefix; handle both shapes.
+    let path = request.uri().path().to_string();
+    let segments: Vec<&str> = path
+        .strip_prefix("/api/v2/admin")
+        .unwrap_or(&path)
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let method = request.method().clone();
+    let mut acting_role = ActingRole(None);
+
+    if !user.admin {
+        match segments.first() {
+            Some(&"organizations") => match segments.get(1) {
+                // index (handler filters to memberships) / create
+                None => {
+                    if method == axum::http::Method::POST
+                        && !state.config.auth.allow_organization_creation
+                    {
+                        return render_error(
+                            start.as_ref(),
+                            StatusCode::FORBIDDEN,
+                            "Forbidden",
+                            "Organization creation is restricted to administrators",
+                        )
+                        .into_response();
+                    }
+                }
+                Some(permalink) => {
+                    let organization = match state.store.organization_by_permalink(permalink).await
+                    {
+                        Ok(organization) => organization,
+                        Err(error) => {
+                            return render_store_error(start.as_ref(), error).into_response()
+                        }
+                    };
+                    // Unknown org and org-without-membership answer
+                    // identically so existence is not leaked.
+                    let membership = match &organization {
+                        Some(organization) => {
+                            match auth_store.membership(organization.id, user.id).await {
+                                Ok(membership) => membership,
+                                Err(error) => {
+                                    return render_store_error(start.as_ref(), error)
+                                        .into_response()
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    let Some(membership) = membership else {
+                        return render_not_found(start.as_ref()).into_response();
+                    };
+                    let required = required_role(&segments[2..], &method);
+                    if membership.role < required {
+                        return render_error(
+                            start.as_ref(),
+                            StatusCode::FORBIDDEN,
+                            "Forbidden",
+                            &format!(
+                                "This action requires the {} role in this organization",
+                                required.as_str()
+                            ),
+                        )
+                        .into_response();
+                    }
+                    acting_role = ActingRole(Some(membership.role));
+                }
+            },
+            // global resources (users, ip_pools, admin_api_keys, auth_events)
+            _ => {
+                return render_error(
+                    start.as_ref(),
+                    StatusCode::FORBIDDEN,
+                    "Forbidden",
+                    "This action requires a global administrator account",
+                )
+                .into_response();
+            }
+        }
     }
+
+    request.extensions_mut().insert(Principal::User(user));
+    request.extensions_mut().insert(acting_role);
     next.run(request).await
 }
 
@@ -310,11 +524,32 @@ pub(crate) fn server_json(server: &Server) -> Value {
 async fn organizations_index(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
+    principal: axum::Extension<Principal>,
     Query(params): Query<PaginationParams>,
 ) -> ApiResponse {
-    let mut organizations = match state.store.list_organizations().await {
-        Ok(organizations) => organizations,
-        Err(error) => return render_store_error(Some(&start.0), error),
+    // Root principals see every organization; users see the ones they
+    // are members of.
+    let mut organizations = if principal.is_root() {
+        match state.store.list_organizations().await {
+            Ok(organizations) => organizations,
+            Err(error) => return render_store_error(Some(&start.0), error),
+        }
+    } else {
+        let user = principal.user().expect("non-root principal is a user");
+        let Some(auth_store) = state.auth_store.as_ref() else {
+            return render_success(
+                Some(&start.0),
+                StatusCode::OK,
+                json!({ "organizations": [], "pagination": paginate::<Value>(&[], &params).pagination }),
+            );
+        };
+        match auth_store.memberships_for_user(user.id).await {
+            Ok(memberships) => memberships
+                .into_iter()
+                .map(|(_, organization)| organization)
+                .collect(),
+            Err(error) => return render_store_error(Some(&start.0), error),
+        }
     };
     organizations.sort_by(|a, b| a.name.cmp(&b.name));
     let result = paginate(&organizations, &params);
@@ -337,6 +572,7 @@ struct CreateOrganization {
 async fn organizations_create(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
+    principal: axum::Extension<Principal>,
     Json(body): Json<CreateOrganization>,
 ) -> ApiResponse {
     let Some(name) = body.name.filter(|n| !n.is_empty()) else {
@@ -355,11 +591,22 @@ async fn organizations_create(
         .create_organization(CoreNewOrganization { name, permalink })
         .await
     {
-        Ok(organization) => render_success(
-            Some(&start.0),
-            StatusCode::CREATED,
-            json!({ "organization": organization_json(&organization) }),
-        ),
+        Ok(organization) => {
+            // A user creating an organization becomes its owner.
+            if let (Some(user), Some(auth_store)) = (principal.user(), state.auth_store.as_ref()) {
+                if let Err(error) = auth_store
+                    .upsert_membership(organization.id, user.id, camelmailer_core::Role::Owner)
+                    .await
+                {
+                    return render_store_error(Some(&start.0), error);
+                }
+            }
+            render_success(
+                Some(&start.0),
+                StatusCode::CREATED,
+                json!({ "organization": organization_json(&organization) }),
+            )
+        }
         Err(error) => render_store_error(Some(&start.0), error),
     }
 }
@@ -897,6 +1144,24 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             "/organizations/{permalink}/servers/{server_permalink}/suppressions/{address}",
             axum::routing::delete(resources::suppressions_destroy),
         )
+        .route(
+            "/organizations/{permalink}/members",
+            get(crate::memberships::members_index).post(crate::memberships::members_create),
+        )
+        .route(
+            "/organizations/{permalink}/members/{user_id}",
+            axum::routing::patch(crate::memberships::members_update)
+                .delete(crate::memberships::members_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/invitations",
+            get(crate::memberships::invitations_index).post(crate::memberships::invitations_create),
+        )
+        .route(
+            "/organizations/{permalink}/invitations/{id}",
+            axum::routing::delete(crate::memberships::invitations_destroy),
+        )
+        .route("/auth_events", get(crate::memberships::auth_events_index))
         .route(
             "/users",
             get(resources::users_index).post(resources::users_create),

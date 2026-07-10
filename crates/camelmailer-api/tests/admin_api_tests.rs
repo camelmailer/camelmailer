@@ -63,7 +63,10 @@ async fn requests_without_a_key_are_unauthorized() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["status"], "error");
     assert_eq!(body["error"]["code"], "Unauthorized");
-    assert_eq!(body["error"]["message"], "Missing X-Admin-API-Key header");
+    assert_eq!(
+        body["error"]["message"],
+        "Missing X-Admin-API-Key header or Authorization: Bearer session token"
+    );
     assert!(body["time"].is_number());
 }
 

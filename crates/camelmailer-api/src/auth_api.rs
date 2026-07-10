@@ -336,7 +336,9 @@ pub(crate) async fn session_middleware(
             now + Duration::days(state.config.auth.session_timeout_days as i64),
         )
         .await;
-    request.extensions_mut().insert(CurrentUser { user, token_hash });
+    request
+        .extensions_mut()
+        .insert(CurrentUser { user, token_hash });
     next.run(request).await
 }
 
@@ -798,12 +800,197 @@ async fn totp_disable(
     )
 }
 
+// -------------------------------------------------------- invitations
+
+/// `GET /api/v2/auth/invitations/{token}` — preview an invitation for the
+/// accept page: which organization, which address, which role, and
+/// whether an account already exists for the address.
+async fn invitation_preview(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> ApiResponse {
+    let Some(store) = auth_store(&state) else {
+        return unavailable(Some(&start.0));
+    };
+    let invitation = match store
+        .invitation_by_token_hash(&auth::hash_token(&token))
+        .await
+    {
+        Ok(Some(invitation)) => invitation,
+        Ok(None) => return invalid_invitation(&start.0),
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    if invitation.accepted_at.is_some() || invitation.expires_at < Utc::now() {
+        return invalid_invitation(&start.0);
+    }
+    let organization = match state.store.list_organizations().await {
+        Ok(organizations) => organizations
+            .into_iter()
+            .find(|organization| organization.id == invitation.organization_id),
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    let user_exists = matches!(
+        store.user_by_email(&invitation.email_address).await,
+        Ok(Some(_))
+    );
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "invitation": {
+                "email_address": invitation.email_address,
+                "role": invitation.role.as_str(),
+                "expires_at": invitation.expires_at,
+                "organization": organization.map(|organization| json!({
+                    "name": organization.name,
+                    "permalink": organization.permalink,
+                })),
+                "user_exists": user_exists,
+            },
+        }),
+    )
+}
+
+fn invalid_invitation(start: &RequestStart) -> ApiResponse {
+    render_error(
+        Some(start),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "InvalidToken",
+        "The invitation is invalid, expired, or already used",
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptInvitation {
+    token: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    password: Option<String>,
+}
+
+/// `POST /api/v2/auth/invitations/accept` — redeem an invitation. For a
+/// new address this creates the account (name + password required) and
+/// signs it in; for an existing account it only adds the membership (the
+/// holder of an invite link must never gain a session for an account
+/// they don't own).
+async fn invitation_accept(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<AcceptInvitation>,
+) -> ApiResponse {
+    let Some(store) = auth_store(&state) else {
+        return unavailable(Some(&start.0));
+    };
+    let Some(token) = body.token.filter(|t| !t.is_empty()) else {
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: token",
+        );
+    };
+    let invitation = match store
+        .invitation_by_token_hash(&auth::hash_token(&token))
+        .await
+    {
+        Ok(Some(invitation)) => invitation,
+        Ok(None) => return invalid_invitation(&start.0),
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    if invitation.accepted_at.is_some() || invitation.expires_at < Utc::now() {
+        return invalid_invitation(&start.0);
+    }
+
+    let existing = match store.user_by_email(&invitation.email_address).await {
+        Ok(existing) => existing,
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    let (user, created) = match existing {
+        Some(user) => (user, false),
+        None => {
+            let Some(password) = body.password.as_deref().filter(|p| !p.is_empty()) else {
+                return render_parameter_missing(
+                    Some(&start.0),
+                    "param is missing or the value is empty: password",
+                );
+            };
+            if (password.len() as u32) < state.config.auth.minimum_password_length {
+                return render_validation_error(
+                    Some(&start.0),
+                    &format!(
+                        "Password must be at least {} characters",
+                        state.config.auth.minimum_password_length
+                    ),
+                );
+            }
+            let user = match state
+                .store
+                .create_user(camelmailer_core::NewUser {
+                    email_address: invitation.email_address.clone(),
+                    first_name: body.first_name.clone().unwrap_or_default(),
+                    last_name: body.last_name.clone().unwrap_or_default(),
+                    admin: false,
+                })
+                .await
+            {
+                Ok(user) => user,
+                Err(error) => return render_store_error(Some(&start.0), error),
+            };
+            let digest = match auth::hash_password(password) {
+                Ok(digest) => digest,
+                Err(error) => return render_store_error(Some(&start.0), StoreError::Other(error)),
+            };
+            if let Err(error) = store.set_password_digest(user.id, &digest).await {
+                return render_store_error(Some(&start.0), error);
+            }
+            (user, true)
+        }
+    };
+
+    if let Err(error) = store
+        .upsert_membership(invitation.organization_id, user.id, invitation.role)
+        .await
+    {
+        return render_store_error(Some(&start.0), error);
+    }
+    if let Err(error) = store.mark_invitation_accepted(invitation.id).await {
+        return render_store_error(Some(&start.0), error);
+    }
+    audit(
+        store,
+        Some(user.id),
+        Some(&user.email_address),
+        "invitation.accepted",
+        &headers,
+    )
+    .await;
+
+    let mut data = json!({
+        "accepted": true,
+        "user": user_json(&user),
+        "account_created": created,
+    });
+    // Only a freshly created account is signed in by accepting.
+    if created {
+        match issue_session(store, &state, &user, &headers).await {
+            Ok((token, session)) => {
+                data["session_token"] = json!(token);
+                data["expires_at"] = json!(session.expires_at);
+            }
+            Err(error) => return render_store_error(Some(&start.0), error),
+        }
+    }
+    render_success(Some(&start.0), StatusCode::OK, data)
+}
+
 /// Build the `/api/v2/auth` router.
 pub fn build_auth_router(state: Arc<ApiState>) -> Router {
     let public = Router::new()
         .route("/login", post(login))
         .route("/password-reset", post(password_reset_request))
-        .route("/password-reset/complete", post(password_reset_complete));
+        .route("/password-reset/complete", post(password_reset_complete))
+        .route("/invitations/accept", post(invitation_accept))
+        .route("/invitations/{token}", get(invitation_preview));
 
     let protected = Router::new()
         .route("/logout", post(logout))

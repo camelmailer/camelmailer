@@ -831,6 +831,9 @@ pub(crate) struct CreateUser {
     first_name: Option<String>,
     last_name: Option<String>,
     admin: Option<bool>,
+    /// Optional initial password so the account can sign in at
+    /// `/api/v2/auth/login` (requires accounts/persistent storage).
+    password: Option<String>,
 }
 
 pub(crate) async fn users_create(
@@ -847,19 +850,49 @@ pub(crate) async fn users_create(
     if !email_address.contains('@') {
         return render_validation_error(Some(&start), "Email address is invalid");
     }
-    from_result(
-        &start,
-        state
-            .store
-            .create_user(NewUser {
-                email_address,
-                first_name: body.first_name.unwrap_or_default(),
-                last_name: body.last_name.unwrap_or_default(),
-                admin: body.admin.unwrap_or(false),
-            })
-            .await,
-        |user| created(&start, json!({ "user": user_json(&user) })),
-    )
+    let password = match body.password.filter(|p| !p.is_empty()) {
+        None => None,
+        Some(password) => {
+            if state.auth_store.is_none() {
+                return render_validation_error(
+                    Some(&start),
+                    "Passwords require accounts to be enabled (persistent storage)",
+                );
+            }
+            if (password.len() as u32) < state.config.auth.minimum_password_length {
+                return render_validation_error(
+                    Some(&start),
+                    &format!(
+                        "Password must be at least {} characters",
+                        state.config.auth.minimum_password_length
+                    ),
+                );
+            }
+            match camelmailer_core::auth::hash_password(&password) {
+                Ok(digest) => Some(digest),
+                Err(error) => return render_store_error(Some(&start), StoreError::Other(error)),
+            }
+        }
+    };
+    let user = match state
+        .store
+        .create_user(NewUser {
+            email_address,
+            first_name: body.first_name.unwrap_or_default(),
+            last_name: body.last_name.unwrap_or_default(),
+            admin: body.admin.unwrap_or(false),
+        })
+        .await
+    {
+        Ok(user) => user,
+        Err(error) => return render_store_error(Some(&start), error),
+    };
+    if let (Some(digest), Some(auth_store)) = (password, state.auth_store.as_ref()) {
+        if let Err(error) = auth_store.set_password_digest(user.id, &digest).await {
+            return render_store_error(Some(&start), error);
+        }
+    }
+    created(&start, json!({ "user": user_json(&user) }))
 }
 
 async fn require_user(
