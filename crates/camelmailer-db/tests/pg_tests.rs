@@ -1085,3 +1085,78 @@ async fn message_streams_default_crud_and_scoping() {
         .unwrap()
         .is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_bypass_retry_requeue_and_scope() {
+    use camelmailer_core::{MessageFilter, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let sink = PgMessageSink::new(f.store.clone());
+
+    // an incoming message that has already been drained from the queue
+    let incoming = message_for(f.server.id, "support@tenant-a.example");
+    let id = sink.insert_message(&incoming).await.unwrap();
+    sqlx::query("DELETE FROM queued_messages WHERE message_id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // and an outgoing message for the same server
+    let mut outgoing = message_for(f.server.id, "x@dest.example");
+    outgoing.scope = MessageScope::Outgoing;
+    let out_id = sink.insert_message(&outgoing).await.unwrap();
+
+    // inbound list carries only the incoming message
+    let inbound = f
+        .store
+        .inbound_messages(f.server.id, &MessageFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].id, id);
+
+    // bypass re-queues it and flags it
+    let bypassed = f.store.bypass_message(f.server.id, id).await.unwrap().unwrap();
+    assert_eq!(bypassed.status, "Pending");
+    assert!(bypassed.bypassed);
+    let queued: i64 = sqlx::query("SELECT count(*) AS c FROM queued_messages WHERE message_id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("c");
+    assert_eq!(queued, 1);
+
+    // retry on an outgoing message is rejected (scope guard)
+    assert!(f.store.retry_message(f.server.id, out_id).await.unwrap().is_none());
+
+    // the other tenant can neither see nor requeue server A's inbound message
+    assert!(f
+        .store
+        .inbound_messages(other.id, &MessageFilter::default())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(f.store.inbound_message(other.id, id).await.unwrap().is_none());
+    assert!(f.store.bypass_message(other.id, id).await.unwrap().is_none());
+    // no extra queue row was created by the rejected cross-tenant bypass
+    let queued: i64 = sqlx::query("SELECT count(*) AS c FROM queued_messages WHERE message_id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("c");
+    assert_eq!(queued, 1);
+}

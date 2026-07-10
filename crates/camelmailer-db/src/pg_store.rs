@@ -1457,6 +1457,55 @@ impl camelmailer_core::ServerStore for PgStore {
         .map_err(Self::sqlx_error)?;
         Ok(stream)
     }
+
+    async fn inbound_messages(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        let filter = MessageFilter {
+            scope: Some("incoming".into()),
+            ..filter.clone()
+        };
+        PgMessageSink::new(self.clone())
+            .message_records(server_id, &filter)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn inbound_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        Ok(PgMessageSink::new(self.clone())
+            .message_record(server_id, message_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?
+            .filter(|m| m.scope == "incoming"))
+    }
+
+    async fn bypass_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        PgMessageSink::new(self.clone())
+            .requeue_inbound(server_id, message_id, true)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn retry_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        PgMessageSink::new(self.clone())
+            .requeue_inbound(server_id, message_id, false)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
 }
 
 impl Store for PgStore {
@@ -2132,6 +2181,51 @@ impl PgMessageSink {
         Ok(row.as_ref().map(message_record_from_row))
     }
 
+    /// Re-queue an incoming message for processing: reset status to Pending,
+    /// optionally set the `bypassed` flag, and enqueue it (the worker's
+    /// inbound path re-delivers). Both the status update and the enqueue run
+    /// in one tenant transaction. Returns the updated record, or `None` if it
+    /// isn't the server's incoming message.
+    pub async fn requeue_inbound(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        bypass: bool,
+    ) -> Result<Option<MessageRecord>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let row = sqlx::query(
+            "UPDATE messages
+             SET status = 'Pending', bypassed = (bypassed OR $2)
+             WHERE id = $1 AND scope = 'incoming'
+             RETURNING *",
+        )
+        .bind(message_id)
+        .bind(bypass)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let record = message_record_from_row(&row);
+        let domain = record
+            .rcpt_to
+            .rsplit_once('@')
+            .map(|(_, d)| d)
+            .unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO queued_messages (message_id, server_id, domain) VALUES ($1, $2, $3)",
+        )
+        .bind(message_id)
+        .bind(server_id as i64)
+        .bind(domain)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(record))
+    }
+
     /// Delivery attempts (with timestamps) for a message, tenant-scoped.
     pub async fn delivery_records(
         &self,
@@ -2306,6 +2400,7 @@ fn message_record_from_row(row: &PgRow) -> MessageRecord {
         size: row.get("size"),
         metadata: row.get("metadata"),
         stream_id: row.get::<Option<i64>, _>("stream_id").map(|id| id as Id),
+        bypassed: row.get("bypassed"),
         created_at: row.get("created_at"),
         raw_message: row.get("raw_message"),
     }

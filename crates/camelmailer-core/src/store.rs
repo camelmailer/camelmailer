@@ -291,6 +291,7 @@ impl MemoryStore {
             size: message.raw_message.len() as i64,
             metadata: message.metadata,
             stream_id: message.stream_id,
+            bypassed: false,
             created_at: chrono::Utc::now(),
             raw_message: message.raw_message,
         };
@@ -580,6 +581,26 @@ impl MemoryStore {
             .collect();
         streams.sort_by_key(|s| s.id);
         streams
+    }
+
+    /// Re-queue an incoming message: reset status to Pending, optionally set
+    /// the bypassed flag, and return the updated record (test read model).
+    /// `None` if it isn't the server's incoming message.
+    pub fn requeue_inbound(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        bypass: bool,
+    ) -> Option<crate::message::MessageRecord> {
+        let mut inner = self.inner.write().unwrap();
+        let message = inner.messages.iter_mut().find(|m| {
+            m.id == message_id && m.server_id == server_id && m.scope == "incoming"
+        })?;
+        message.status = "Pending".into();
+        if bypass {
+            message.bypassed = true;
+        }
+        Some(message.clone())
     }
 
     /// One of a server's streams by permalink.

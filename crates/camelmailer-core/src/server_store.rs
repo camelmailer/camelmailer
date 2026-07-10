@@ -187,6 +187,40 @@ pub trait ServerStore: Send + Sync {
     ) -> Result<Option<MessageStream>, StoreError>;
     async fn create_stream(&self, new: NewStream) -> Result<MessageStream, StoreError>;
     async fn update_stream(&self, stream: MessageStream) -> Result<MessageStream, StoreError>;
+
+    // inbound message management (scope = incoming)
+    /// Incoming messages matching `filter` (scope is always forced to
+    /// incoming), newest first.
+    async fn inbound_messages(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+    ) -> Result<Vec<MessageRecord>, StoreError>;
+
+    /// One incoming message by id, or `None` if it isn't the server's or
+    /// isn't incoming.
+    async fn inbound_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError>;
+
+    /// Re-queue an incoming message for processing with block rules bypassed
+    /// (sets `bypassed`, resets status to Pending, enqueues). `None` if the
+    /// message isn't the server's incoming message.
+    async fn bypass_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError>;
+
+    /// Re-queue an incoming message for processing (resets status to Pending,
+    /// enqueues) without bypassing rules.
+    async fn retry_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError>;
 }
 
 #[async_trait]
@@ -300,5 +334,43 @@ impl ServerStore for crate::store::MemoryStore {
 
     async fn update_stream(&self, stream: MessageStream) -> Result<MessageStream, StoreError> {
         Ok(self.insert_stream(stream))
+    }
+
+    async fn inbound_messages(
+        &self,
+        server_id: Id,
+        filter: &MessageFilter,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        let filter = MessageFilter {
+            scope: Some("incoming".into()),
+            ..filter.clone()
+        };
+        Ok(self.messages_filtered(server_id, &filter))
+    }
+
+    async fn inbound_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        Ok(self
+            .message_for(server_id, message_id)
+            .filter(|m| m.scope == "incoming"))
+    }
+
+    async fn bypass_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        Ok(self.requeue_inbound(server_id, message_id, true))
+    }
+
+    async fn retry_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        Ok(self.requeue_inbound(server_id, message_id, false))
     }
 }

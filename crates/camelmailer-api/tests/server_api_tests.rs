@@ -799,6 +799,91 @@ async fn send_targets_a_stream_and_list_filters_by_it() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+// ------------------------------------------- P6: inbound management
+
+/// Seed an incoming message directly (inbound normally arrives via SMTP).
+fn seed_incoming(store: &MS, server_id: u64, rcpt_to: &str, subject: &str) -> i64 {
+    let raw = format!("Subject: {subject}\r\n\r\nbody\r\n").into_bytes();
+    store
+        .insert_message_record(camelmailer_core::QueuedMessage {
+            server_id,
+            rcpt_to: rcpt_to.into(),
+            mail_from: "sender@remote.example".into(),
+            raw_message: raw,
+            received_with_ssl: false,
+            scope: camelmailer_core::MessageScope::Incoming,
+            bounce: false,
+            domain_id: None,
+            credential_id: None,
+            route_id: None,
+            tag: None,
+            metadata: None,
+            stream_id: None,
+        })
+        .id
+}
+
+#[tokio::test]
+async fn inbound_list_show_and_scope_exclusion() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    let server_id = store.server_for_api_token(&token).await.unwrap().unwrap().id;
+    let inbound_id = seed_incoming(&store, server_id, "support@alpha.example", "Help");
+    // an outbound message must NOT appear in the inbound list
+    send_one(&app, &token, "news@alpha.example", "x@dest.example", "Out", "t").await;
+
+    let (status, body) = request(&app, "/api/v2/server/inbound", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let inbound = body["data"]["inbound"].as_array().unwrap();
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0]["subject"], "Help");
+    assert_eq!(inbound[0]["scope"], "incoming");
+
+    let (status, body) = request(&app, &format!("/api/v2/server/inbound/{inbound_id}"), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["message"]["subject"], "Help");
+}
+
+#[tokio::test]
+async fn inbound_bypass_and_retry_requeue_the_message() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    let server_id = store.server_for_api_token(&token).await.unwrap().unwrap().id;
+    let id = seed_incoming(&store, server_id, "support@alpha.example", "Ticket");
+    store.set_message_status(id, "HardFail");
+
+    // bypass resets status to Pending and flags the message
+    let (status, body) = post_json(&app, &format!("/api/v2/server/inbound/{id}/bypass"), &token, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["requeued"], true);
+    assert_eq!(body["data"]["message"]["status"], "Pending");
+    assert_eq!(body["data"]["message"]["bypassed"], true);
+
+    // retry resets status again (bypassed stays set)
+    store.set_message_status(id, "HardFail");
+    let (status, body) = post_json(&app, &format!("/api/v2/server/inbound/{id}/retry"), &token, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["message"]["status"], "Pending");
+
+    // an outbound message can't be retried via the inbound endpoint
+    let out = send_one(&app, &token, "news@alpha.example", "y@dest.example", "Out", "t").await;
+    let (status, _) = post_json(&app, &format!("/api/v2/server/inbound/{out}/retry"), &token, json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn inbound_is_tenant_scoped() {
+    let (app, token_a, token_b, store) = build_two_with_domains().await;
+    let server_a = store.server_for_api_token(&token_a).await.unwrap().unwrap().id;
+    let id = seed_incoming(&store, server_a, "support@alpha.example", "Private");
+
+    // token B sees no inbound and cannot read/act on A's message
+    let (_, body) = request(&app, "/api/v2/server/inbound", Some(&token_b)).await;
+    assert_eq!(body["data"]["inbound"].as_array().unwrap().len(), 0);
+    let (status, _) = request(&app, &format!("/api/v2/server/inbound/{id}"), Some(&token_b)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = post_json(&app, &format!("/api/v2/server/inbound/{id}/bypass"), &token_b, json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn streams_are_tenant_scoped() {
     let (app, token_a, token_b, _) = build_two_with_domains().await;

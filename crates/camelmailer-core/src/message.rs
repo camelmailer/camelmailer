@@ -106,6 +106,8 @@ pub struct MessageRecord {
     pub size: i64,
     pub metadata: Option<serde_json::Value>,
     pub stream_id: Option<Id>,
+    /// Incoming message re-queued with block rules bypassed.
+    pub bypassed: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub raw_message: Vec<u8>,
 }

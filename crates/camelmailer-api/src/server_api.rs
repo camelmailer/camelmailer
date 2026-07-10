@@ -411,6 +411,7 @@ fn message_json(message: &MessageRecord) -> Value {
         "size": message.size,
         "metadata": message.metadata,
         "stream_id": message.stream_id,
+        "bypassed": message.bypassed,
         "created_at": message.created_at.to_rfc3339(),
     })
 }
@@ -835,6 +836,122 @@ fn internal_error(start: &RequestStart, message: &str) -> Response {
     .into_response()
 }
 
+// ---------------------------------------------------- inbound management
+
+/// `GET /api/v2/server/inbound` — incoming messages, filtered + paged.
+async fn inbound_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Query(params): Query<MessageListParams>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let stream_id =
+        match resolve_stream_filter(store, server.0.id, &params.stream, &start.0).await {
+            Ok(stream_id) => stream_id,
+            Err(response) => return response,
+        };
+    let filter = MessageFilter {
+        scope: None, // forced to incoming by the store
+        status: params.status.filter(|s| !s.is_empty()),
+        tag: params.tag.filter(|s| !s.is_empty()),
+        query: params.query.filter(|s| !s.is_empty()),
+        stream_id,
+    };
+    let messages = match store.inbound_messages(server.0.id, &filter).await {
+        Ok(messages) => messages,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let pagination = PaginationParams {
+        page: params.page,
+        per_page: params.per_page,
+    };
+    let result = paginate(&messages, &pagination);
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "inbound": result.items.iter().map(message_json).collect::<Vec<_>>(),
+            "pagination": result.pagination,
+        }),
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/inbound/{id}` — one incoming message.
+async fn inbound_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.inbound_message(server.0.id, id).await {
+        Ok(Some(message)) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "message": message_json(&message) }),
+        )
+        .into_response(),
+        Ok(None) => not_found(&start.0),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `POST /api/v2/server/inbound/{id}/bypass` — re-queue, bypassing rules.
+async fn inbound_bypass(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    requeue(&state, &start.0, server.0.id, id, true).await
+}
+
+/// `POST /api/v2/server/inbound/{id}/retry` — re-queue for processing.
+async fn inbound_retry(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    requeue(&state, &start.0, server.0.id, id, false).await
+}
+
+async fn requeue(
+    state: &ApiState,
+    start: &RequestStart,
+    server_id: camelmailer_core::Id,
+    id: i64,
+    bypass: bool,
+) -> Response {
+    let store = match server_store(state) {
+        Some(store) => store,
+        None => return storage_unconfigured(start),
+    };
+    let result = if bypass {
+        store.bypass_message(server_id, id).await
+    } else {
+        store.retry_message(server_id, id).await
+    };
+    match result {
+        Ok(Some(message)) => render_success(
+            Some(start),
+            StatusCode::OK,
+            json!({ "message": message_json(&message), "requeued": true }),
+        )
+        .into_response(),
+        Ok(None) => not_found(start),
+        Err(error) => internal_error(start, &error.to_string()),
+    }
+}
+
 // ------------------------------------------------------- message streams
 
 fn stream_json(stream: &MessageStream) -> Value {
@@ -1064,6 +1181,10 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/streams", get(streams_index).post(streams_create))
         .route("/streams/{permalink}", get(stream_show).patch(stream_update))
         .route("/streams/{permalink}/archive", post(stream_archive))
+        .route("/inbound", get(inbound_index))
+        .route("/inbound/{id}", get(inbound_show))
+        .route("/inbound/{id}/bypass", post(inbound_bypass))
+        .route("/inbound/{id}/retry", post(inbound_retry))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             server_auth_middleware,
