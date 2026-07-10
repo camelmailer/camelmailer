@@ -234,7 +234,7 @@ fn organization_json(organization: &Organization) -> Value {
     })
 }
 
-fn server_json(server: &Server) -> Value {
+pub(crate) fn server_json(server: &Server) -> Value {
     json!({
         "id": server.id,
         "uuid": server.uuid,
@@ -244,6 +244,16 @@ fn server_json(server: &Server) -> Value {
         "suspended": server.suspended,
         "suspension_reason": server.suspension_reason,
         "privacy_mode": server.privacy_mode,
+        "track_opens": server.track_opens,
+        "track_clicks": server.track_clicks,
+        "spam_threshold": server.spam_threshold,
+        "outbound_spam_threshold": server.outbound_spam_threshold,
+        "bounce_hook_url": server.bounce_hook_url,
+        "delivery_hook_url": server.delivery_hook_url,
+        "inbound_domain": server.inbound_domain,
+        "color": server.color,
+        "ip_pool_id": server.ip_pool_id,
+        "default_stream_id": server.default_stream_id,
     })
 }
 
@@ -523,6 +533,186 @@ async fn servers_unsuspend(
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct UpdateServer {
+    name: Option<String>,
+    mode: Option<String>,
+    track_opens: Option<bool>,
+    track_clicks: Option<bool>,
+    spam_threshold: Option<f64>,
+    outbound_spam_threshold: Option<f64>,
+    bounce_hook_url: Option<String>,
+    delivery_hook_url: Option<String>,
+    inbound_domain: Option<String>,
+    color: Option<String>,
+}
+
+async fn servers_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org_permalink, permalink)): Path<(String, String)>,
+    Json(body): Json<UpdateServer>,
+) -> ApiResponse {
+    let mut server = match find_server(&state, &org_permalink, &permalink).await {
+        Ok(Some(server)) => server,
+        Ok(None) => return render_not_found(Some(&start.0)),
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    if let Some(name) = body.name {
+        server.name = name;
+    }
+    if let Some(mode) = body.mode.as_deref() {
+        server.mode = match mode {
+            "Live" => ServerMode::Live,
+            "Development" => ServerMode::Development,
+            other => {
+                return render_validation_error(
+                    Some(&start.0),
+                    &format!("Mode {other:?} is not a valid mode"),
+                )
+            }
+        };
+    }
+    if let Some(v) = body.track_opens {
+        server.track_opens = v;
+    }
+    if let Some(v) = body.track_clicks {
+        server.track_clicks = v;
+    }
+    if body.spam_threshold.is_some() {
+        server.spam_threshold = body.spam_threshold;
+    }
+    if body.outbound_spam_threshold.is_some() {
+        server.outbound_spam_threshold = body.outbound_spam_threshold;
+    }
+    if body.bounce_hook_url.is_some() {
+        server.bounce_hook_url = body.bounce_hook_url;
+    }
+    if body.delivery_hook_url.is_some() {
+        server.delivery_hook_url = body.delivery_hook_url;
+    }
+    if body.inbound_domain.is_some() {
+        server.inbound_domain = body.inbound_domain;
+    }
+    if body.color.is_some() {
+        server.color = body.color;
+    }
+    match state.store.update_server(server).await {
+        Ok(server) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "server": server_json(&server) }),
+        ),
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct IpPoolAssignment {
+    ip_pool_id: Option<u64>,
+}
+
+async fn servers_set_ip_pool(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org_permalink, permalink)): Path<(String, String)>,
+    Json(body): Json<IpPoolAssignment>,
+) -> ApiResponse {
+    match find_server(&state, &org_permalink, &permalink).await {
+        Ok(Some(server)) => {
+            if let Err(error) = state
+                .store
+                .set_server_ip_pool(server.id, body.ip_pool_id)
+                .await
+            {
+                return render_store_error(Some(&start.0), error);
+            }
+            match state.store.server_by_permalink(server.organization_id, &permalink).await {
+                Ok(Some(updated)) => render_success(
+                    Some(&start.0),
+                    StatusCode::OK,
+                    json!({ "server": server_json(&updated) }),
+                ),
+                _ => render_success(Some(&start.0), StatusCode::OK, json!({ "server": server_json(&server) })),
+            }
+        }
+        Ok(None) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
+// ------------------------------------------------------- admin API keys
+
+fn admin_api_key_json(key: &camelmailer_core::AdminApiKey) -> Value {
+    json!({
+        "id": key.id,
+        "uuid": key.uuid,
+        "name": key.name,
+        "key_prefix": key.key_prefix,
+    })
+}
+
+async fn admin_api_keys_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Query(params): Query<PaginationParams>,
+) -> ApiResponse {
+    match state.store.list_admin_api_keys().await {
+        Ok(keys) => {
+            let result = paginate(&keys, &params);
+            render_success(
+                Some(&start.0),
+                StatusCode::OK,
+                json!({
+                    "admin_api_keys": result.items.iter().map(admin_api_key_json).collect::<Vec<_>>(),
+                    "pagination": result.pagination,
+                }),
+            )
+        }
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAdminApiKey {
+    name: Option<String>,
+}
+
+async fn admin_api_keys_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Json(body): Json<CreateAdminApiKey>,
+) -> ApiResponse {
+    let Some(name) = body.name.filter(|n| !n.is_empty()) else {
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: name",
+        );
+    };
+    let key = camelmailer_core::token::generate_key();
+    match state.store.create_admin_api_key_record(&name, &key).await {
+        Ok(record) => {
+            // The one time the full secret is returned.
+            let mut data = admin_api_key_json(&record);
+            data["key"] = json!(key);
+            render_success(Some(&start.0), StatusCode::CREATED, json!({ "admin_api_key": data }))
+        }
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
+async fn admin_api_keys_destroy(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path(id): Path<u64>,
+) -> ApiResponse {
+    match state.store.delete_admin_api_key(id).await {
+        Ok(true) => render_deleted(Some(&start.0)),
+        Ok(false) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
 pub(crate) fn permalink_from(name: &str) -> String {
     name.to_lowercase()
         .chars()
@@ -551,7 +741,21 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}",
-            get(servers_show).delete(servers_destroy),
+            get(servers_show)
+                .patch(servers_update)
+                .delete(servers_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/ip_pool",
+            axum::routing::post(servers_set_ip_pool),
+        )
+        .route(
+            "/admin_api_keys",
+            get(admin_api_keys_index).post(admin_api_keys_create),
+        )
+        .route(
+            "/admin_api_keys/{id}",
+            axum::routing::delete(admin_api_keys_destroy),
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/suspend",

@@ -44,6 +44,15 @@ impl Fixtures {
             log_smtp_data: false,
             allow_sender: false,
             ip_pool_id: None,
+            track_opens: false,
+            track_clicks: false,
+            spam_threshold: None,
+            outbound_spam_threshold: None,
+            bounce_hook_url: None,
+            delivery_hook_url: None,
+            inbound_domain: None,
+            color: None,
+            default_stream_id: None,
         });
         Self {
             store,

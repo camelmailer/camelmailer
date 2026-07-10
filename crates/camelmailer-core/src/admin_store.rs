@@ -205,6 +205,20 @@ pub trait AdminStore: Send + Sync {
         server_id: Id,
         ip_pool_id: Option<Id>,
     ) -> Result<(), StoreError>;
+
+    /// A per-server API token (`credentials` with type=API) resolves to
+    /// exactly one server. Returns the server if the token is valid and the
+    /// credential is not on hold; records the use (`last_used_at`).
+    async fn server_for_api_token(&self, key: &str) -> Result<Option<Server>, StoreError>;
+
+    // admin API key management (returns display records; never the secret)
+    async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError>;
+    async fn create_admin_api_key_record(
+        &self,
+        name: &str,
+        key: &str,
+    ) -> Result<AdminApiKey, StoreError>;
+    async fn delete_admin_api_key(&self, id: Id) -> Result<bool, StoreError>;
 }
 
 #[async_trait]
@@ -294,6 +308,15 @@ impl AdminStore for crate::store::MemoryStore {
             log_smtp_data: false,
             allow_sender: false,
             ip_pool_id: None,
+            track_opens: false,
+            track_clicks: false,
+            spam_threshold: None,
+            outbound_spam_threshold: None,
+            bounce_hook_url: None,
+            delivery_hook_url: None,
+            inbound_domain: None,
+            color: None,
+            default_stream_id: None,
         }))
     }
 
@@ -309,9 +332,33 @@ impl AdminStore for crate::store::MemoryStore {
         Ok(self.admin_api_key_exists(key))
     }
 
-    async fn create_admin_api_key(&self, _name: &str, key: &str) -> Result<(), StoreError> {
-        self.insert_admin_api_key(key);
+    async fn create_admin_api_key(&self, name: &str, key: &str) -> Result<(), StoreError> {
+        self.insert_admin_api_key_named(name, key);
         Ok(())
+    }
+
+    async fn server_for_api_token(&self, key: &str) -> Result<Option<Server>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let credential = inner.credentials.values().find(|c| {
+            c.credential_type == CredentialType::Api && c.key == key && !c.hold
+        });
+        Ok(credential.and_then(|c| inner.servers.get(&c.server_id).cloned()))
+    }
+
+    async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError> {
+        Ok(crate::store::MemoryStore::list_admin_api_keys(self))
+    }
+
+    async fn create_admin_api_key_record(
+        &self,
+        name: &str,
+        key: &str,
+    ) -> Result<AdminApiKey, StoreError> {
+        Ok(self.insert_admin_api_key_named(name, key))
+    }
+
+    async fn delete_admin_api_key(&self, id: Id) -> Result<bool, StoreError> {
+        Ok(crate::store::MemoryStore::delete_admin_api_key(self, id))
     }
 
     async fn list_domains(&self, server_id: Id) -> Result<Vec<Domain>, StoreError> {

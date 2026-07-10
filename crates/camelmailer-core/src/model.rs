@@ -15,7 +15,7 @@ pub struct Organization {
     pub permalink: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Server {
     pub id: Id,
     pub uuid: String,
@@ -32,6 +32,22 @@ pub struct Server {
     pub allow_sender: bool,
     /// IP pool to source outbound mail from (None = system default).
     pub ip_pool_id: Option<Id>,
+    /// Default open-tracking for mail sent via the HTTP API.
+    pub track_opens: bool,
+    /// Default click-tracking for mail sent via the HTTP API.
+    pub track_clicks: bool,
+    /// Per-server spam threshold override (None = installation default).
+    pub spam_threshold: Option<f64>,
+    /// Per-server outbound spam threshold override.
+    pub outbound_spam_threshold: Option<f64>,
+    pub bounce_hook_url: Option<String>,
+    pub delivery_hook_url: Option<String>,
+    /// Domain that accepts inbound mail for this server.
+    pub inbound_domain: Option<String>,
+    /// UI accent color.
+    pub color: Option<String>,
+    /// Default message stream for HTTP sends (populated by migration 0012).
+    pub default_stream_id: Option<Id>,
 }
 
 impl Server {
@@ -111,12 +127,21 @@ pub enum CredentialType {
 
 /// A route joined with its server and domain name — what the SMTP session
 /// needs in one lookup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedRoute {
     pub route: Route,
     pub server: Server,
     /// The name of the route's domain (`route.domain.name` in Ruby)
     pub domain_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminApiKey {
+    pub id: Id,
+    pub uuid: String,
+    pub name: String,
+    /// First few characters of the key, for display; never the full secret.
+    pub key_prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

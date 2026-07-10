@@ -107,7 +107,9 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) routes: HashMap<Id, Route>,
     pub(crate) credentials: HashMap<Id, Credential>,
     pub(crate) credential_uses: HashMap<Id, u64>,
-    pub(crate) admin_api_keys: std::collections::HashSet<String>,
+    /// full key -> record (record holds only prefix for display; the map key
+    /// is the secret used for validation).
+    pub(crate) admin_api_keys: HashMap<String, AdminApiKey>,
     pub(crate) users: HashMap<Id, User>,
     pub(crate) ip_pools: HashMap<Id, IpPool>,
     pub(crate) ip_addresses: HashMap<Id, IpAddress>,
@@ -226,16 +228,50 @@ impl MemoryStore {
         self.inner.read().unwrap().domains.get(&id).cloned()
     }
 
-    pub fn insert_admin_api_key(&self, key: &str) {
+    pub fn insert_admin_api_key(&self, key: &str) -> AdminApiKey {
+        self.insert_admin_api_key_named("api-key", key)
+    }
+
+    pub fn insert_admin_api_key_named(&self, name: &str, key: &str) -> AdminApiKey {
+        let record = AdminApiKey {
+            id: self.next_id(),
+            uuid: crate::token::generate_uuid(),
+            name: name.to_string(),
+            key_prefix: key.chars().take(6).collect(),
+        };
         self.inner
             .write()
             .unwrap()
             .admin_api_keys
-            .insert(key.to_string());
+            .insert(key.to_string(), record.clone());
+        record
     }
 
     pub fn admin_api_key_exists(&self, key: &str) -> bool {
-        self.inner.read().unwrap().admin_api_keys.contains(key)
+        self.inner.read().unwrap().admin_api_keys.contains_key(key)
+    }
+
+    pub fn list_admin_api_keys(&self) -> Vec<AdminApiKey> {
+        let mut all: Vec<_> = self
+            .inner
+            .read()
+            .unwrap()
+            .admin_api_keys
+            .values()
+            .cloned()
+            .collect();
+        all.sort_by_key(|k| k.id);
+        all
+    }
+
+    pub fn delete_admin_api_key(&self, id: Id) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let key = inner
+            .admin_api_keys
+            .iter()
+            .find(|(_, record)| record.id == id)
+            .map(|(k, _)| k.clone());
+        key.map(|k| inner.admin_api_keys.remove(&k)).is_some()
     }
 
     pub fn credential_use_count(&self, credential_id: Id) -> u64 {

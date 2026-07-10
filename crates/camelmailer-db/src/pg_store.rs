@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use camelmailer_core::{
-    store, token, AdminStore, Credential, CredentialType, Domain, DomainOwner, Id, IpAddress,
+    store, token, AdminApiKey, AdminStore, Credential, CredentialType, Domain, DomainOwner, Id, IpAddress,
     IpPool, MessageScope, MessageSink, NewCredential, NewIpAddress, NewOrganization, NewRoute,
     NewServer, NewSuppression, NewUser, NewWebhook, Organization, QueuedMessage, ResolvedRoute,
     Route, RouteMode, Server, ServerMode, Store, StoreError, Suppression, User, Webhook,
@@ -94,6 +94,15 @@ fn server_from_row(row: &PgRow) -> Server {
         log_smtp_data: row.get("log_smtp_data"),
         allow_sender: row.get("allow_sender"),
         ip_pool_id: row.get::<Option<i64>, _>("ip_pool_id").map(|id| id as Id),
+        track_opens: row.get("track_opens"),
+        track_clicks: row.get("track_clicks"),
+        spam_threshold: row.get("spam_threshold"),
+        outbound_spam_threshold: row.get("outbound_spam_threshold"),
+        bounce_hook_url: row.get("bounce_hook_url"),
+        delivery_hook_url: row.get("delivery_hook_url"),
+        inbound_domain: row.get("inbound_domain"),
+        color: row.get("color"),
+        default_stream_id: row.get::<Option<i64>, _>("default_stream_id").map(|id| id as Id),
     }
 }
 
@@ -242,7 +251,9 @@ const ROUTE_WITH_SERVER: &str = r#"
            s.id AS s_id, s.uuid AS s_uuid, s.organization_id, s.name AS s_name,
            s.permalink, s.token AS s_token, s.mode AS s_mode, s.suspended,
            s.suspension_reason, s.privacy_mode, s.log_smtp_data, s.allow_sender,
-           s.ip_pool_id AS s_ip_pool_id
+           s.ip_pool_id AS s_ip_pool_id, s.track_opens, s.track_clicks,
+           s.spam_threshold, s.outbound_spam_threshold, s.bounce_hook_url,
+           s.delivery_hook_url, s.inbound_domain, s.color, s.default_stream_id
     FROM routes r
     JOIN servers s ON s.id = r.server_id
     LEFT JOIN domains d ON d.id = r.domain_id
@@ -268,6 +279,15 @@ fn resolved_route_from_row(row: &PgRow) -> ResolvedRoute {
             log_smtp_data: row.get("log_smtp_data"),
             allow_sender: row.get("allow_sender"),
             ip_pool_id: row.get::<Option<i64>, _>("s_ip_pool_id").map(|id| id as Id),
+            track_opens: row.get("track_opens"),
+            track_clicks: row.get("track_clicks"),
+            spam_threshold: row.get("spam_threshold"),
+            outbound_spam_threshold: row.get("outbound_spam_threshold"),
+            bounce_hook_url: row.get("bounce_hook_url"),
+            delivery_hook_url: row.get("delivery_hook_url"),
+            inbound_domain: row.get("inbound_domain"),
+            color: row.get("color"),
+            default_stream_id: row.get::<Option<i64>, _>("default_stream_id").map(|id| id as Id),
         },
         domain_name: row.get("domain_name"),
     }
@@ -550,13 +570,26 @@ impl AdminStore for PgStore {
             log_smtp_data: false,
             allow_sender: false,
             ip_pool_id: None,
+            track_opens: false,
+            track_clicks: false,
+            spam_threshold: None,
+            outbound_spam_threshold: None,
+            bounce_hook_url: None,
+            delivery_hook_url: None,
+            inbound_domain: None,
+            color: None,
+            default_stream_id: None,
         })
     }
 
     async fn update_server(&self, server: Server) -> Result<Server, StoreError> {
         sqlx::query(
             "UPDATE servers SET name = $2, suspended = $3, suspension_reason = $4,
-                    privacy_mode = $5, log_smtp_data = $6, allow_sender = $7
+                    privacy_mode = $5, log_smtp_data = $6, allow_sender = $7,
+                    mode = $8, track_opens = $9, track_clicks = $10,
+                    spam_threshold = $11, outbound_spam_threshold = $12,
+                    bounce_hook_url = $13, delivery_hook_url = $14,
+                    inbound_domain = $15, color = $16, default_stream_id = $17
              WHERE id = $1",
         )
         .bind(server.id as i64)
@@ -566,6 +599,19 @@ impl AdminStore for PgStore {
         .bind(server.privacy_mode)
         .bind(server.log_smtp_data)
         .bind(server.allow_sender)
+        .bind(match server.mode {
+            ServerMode::Live => "Live",
+            ServerMode::Development => "Development",
+        })
+        .bind(server.track_opens)
+        .bind(server.track_clicks)
+        .bind(server.spam_threshold)
+        .bind(server.outbound_spam_threshold)
+        .bind(&server.bounce_hook_url)
+        .bind(&server.delivery_hook_url)
+        .bind(&server.inbound_domain)
+        .bind(&server.color)
+        .bind(server.default_stream_id.map(|id| id as i64))
         .execute(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -591,13 +637,80 @@ impl AdminStore for PgStore {
     }
 
     async fn create_admin_api_key(&self, name: &str, key: &str) -> Result<(), StoreError> {
-        sqlx::query("INSERT INTO admin_api_keys (uuid, name, key) VALUES ($1, $2, $3)")
-            .bind(token::generate_uuid())
-            .bind(name)
-            .bind(key)
+        self.create_admin_api_key_record(name, key).await.map(|_| ())
+    }
+
+    async fn server_for_api_token(&self, key: &str) -> Result<Option<Server>, StoreError> {
+        let server = sqlx::query(
+            "SELECT s.* FROM credentials c
+             JOIN servers s ON s.id = c.server_id
+             WHERE c.type = 'API' AND c.key = $1 AND NOT c.hold",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?
+        .as_ref()
+        .map(server_from_row);
+        if server.is_some() {
+            let _ = sqlx::query("UPDATE credentials SET last_used_at = now() WHERE key = $1")
+                .bind(key)
+                .execute(&self.pool)
+                .await;
+        }
+        Ok(server)
+    }
+
+    async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError> {
+        sqlx::query("SELECT id, uuid, name, key FROM admin_api_keys ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| AdminApiKey {
+                        id: row.get::<i64, _>("id") as Id,
+                        uuid: row.get("uuid"),
+                        name: row.get("name"),
+                        key_prefix: row
+                            .get::<String, _>("key")
+                            .chars()
+                            .take(6)
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn create_admin_api_key_record(
+        &self,
+        name: &str,
+        key: &str,
+    ) -> Result<AdminApiKey, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO admin_api_keys (uuid, name, key) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(name)
+        .bind(key)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(AdminApiKey {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            name: name.into(),
+            key_prefix: key.chars().take(6).collect(),
+        })
+    }
+
+    async fn delete_admin_api_key(&self, id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM admin_api_keys WHERE id = $1")
+            .bind(id as i64)
             .execute(&self.pool)
             .await
-            .map(|_| ())
+            .map(|result| result.rows_affected() > 0)
             .map_err(Self::sqlx_error)
     }
 

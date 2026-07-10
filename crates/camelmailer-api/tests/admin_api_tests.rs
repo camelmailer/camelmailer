@@ -829,3 +829,122 @@ async fn ip_pools_and_nested_addresses() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+// ------------------------------------------------ P0: server config + keys
+
+#[tokio::test]
+async fn server_update_persists_config_fields() {
+    let app = build_app_with_server().await;
+
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        "/api/v2/admin/organizations/acme/servers/mail",
+        Some(GLOBAL_KEY),
+        Some(json!({
+            "track_opens": true,
+            "track_clicks": true,
+            "spam_threshold": 5.5,
+            "color": "#ff0000",
+            "inbound_domain": "in.acme.example",
+            "mode": "Development"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let server = &body["data"]["server"];
+    assert_eq!(server["track_opens"], true);
+    assert_eq!(server["track_clicks"], true);
+    assert_eq!(server["spam_threshold"], 5.5);
+    assert_eq!(server["color"], "#ff0000");
+    assert_eq!(server["inbound_domain"], "in.acme.example");
+    assert_eq!(server["mode"], "Development");
+
+    // invalid mode → 422
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        "/api/v2/admin/organizations/acme/servers/mail",
+        Some(GLOBAL_KEY),
+        Some(json!({ "mode": "Nonsense" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn admin_api_keys_create_list_delete() {
+    let (app, _) = build_app().await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/admin_api_keys",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "ci-key" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created = &body["data"]["admin_api_key"];
+    assert_eq!(created["name"], "ci-key");
+    let full_key = created["key"].as_str().unwrap().to_string();
+    assert!(full_key.len() >= 24);
+    assert_eq!(created["key_prefix"], &full_key[..6]);
+    let id = created["id"].as_u64().unwrap();
+
+    // the new key actually authenticates
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations",
+        Some(&full_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // list shows only the prefix, never the secret (build_app pre-seeds one key)
+    let (_, body) = request(&app, "GET", "/api/v2/admin/admin_api_keys", Some(GLOBAL_KEY), None).await;
+    let keys = body["data"]["admin_api_keys"].as_array().unwrap();
+    let ci = keys.iter().find(|k| k["name"] == "ci-key").unwrap();
+    assert_eq!(ci["key_prefix"], &full_key[..6]);
+    assert!(keys.iter().all(|k| k.get("key").is_none()));
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("/api/v2/admin/admin_api_keys/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // deleted key no longer authenticates
+    let (status, _) = request(&app, "GET", "/api/v2/admin/organizations", Some(&full_key), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn server_ip_pool_assignment() {
+    let app = build_app_with_server().await;
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/ip_pools",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Pool" })),
+    )
+    .await;
+    let pool_id = body["data"]["ip_pool"]["id"].as_u64().unwrap();
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations/acme/servers/mail/ip_pool",
+        Some(GLOBAL_KEY),
+        Some(json!({ "ip_pool_id": pool_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["server"]["ip_pool_id"], pool_id);
+}
