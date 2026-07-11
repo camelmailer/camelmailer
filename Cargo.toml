@@ -38,6 +38,12 @@ sha2 = "0.10"
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "0.26"
+# 0.6.x is the first webauthn-rs line with pure-Rust crypto (crypto-glue) —
+# the 0.5.x releases require OpenSSL, which this workspace deliberately
+# avoids (rustls everywhere). Pinned exactly because it is a -dev release.
+webauthn-rs = { version = "=0.6.1-dev", features = ["danger-allow-state-serialisation"] }
+webauthn-rs-proto = "=0.6.1-dev"
+webauthn-authenticator-rs = { version = "=0.6.1-dev", features = ["softpasskey"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "migrate", "macros", "chrono"] }
 
 serde = { version = "1", features = ["derive"] }

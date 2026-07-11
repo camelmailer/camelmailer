@@ -8,6 +8,7 @@ pub mod oidc;
 mod resources;
 pub mod server_api;
 pub mod tracking;
+mod webauthn;
 
 pub use app::{build_router, ApiState};
 pub use auth_api::build_auth_router;

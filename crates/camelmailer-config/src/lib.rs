@@ -152,6 +152,8 @@ pub struct Auth {
     /// Base URL of the web frontend — used to build invitation/reset links
     /// and as the OIDC post-login redirect target.
     pub frontend_url: Option<String>,
+    /// WebAuthn / passkeys (see [`WebAuthn`]).
+    pub webauthn: WebAuthn,
 }
 
 impl Default for Auth {
@@ -166,6 +168,37 @@ impl Default for Auth {
             invitation_expiry_days: 7,
             password_reset_expiry_hours: 2,
             frontend_url: None,
+            webauthn: WebAuthn::default(),
+        }
+    }
+}
+
+/// WebAuthn / passkeys (`auth.webauthn`). When enabled, signed-in users
+/// can register passkeys and anyone can sign in with one
+/// (`/api/v2/auth/webauthn/*`); while disabled those endpoints answer
+/// `403 WebAuthnDisabled`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebAuthn {
+    pub enabled: bool,
+    /// The relying-party id — the domain the passkeys are scoped to,
+    /// e.g. `app.camelmailer.com`. Changing it invalidates every
+    /// registered passkey.
+    pub rp_id: String,
+    /// The exact web origin the browser reports during ceremonies,
+    /// e.g. `https://app.camelmailer.com`.
+    pub rp_origin: String,
+    /// Display name shown by browsers/authenticators during registration.
+    pub rp_name: String,
+}
+
+impl Default for WebAuthn {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rp_id: String::new(),
+            rp_origin: String::new(),
+            rp_name: "CamelMailer".into(),
         }
     }
 }
@@ -719,6 +752,18 @@ impl Config {
                 "auth.minimum_password_length must be at least 8".into(),
             ));
         }
+        if self.auth.webauthn.enabled {
+            if self.auth.webauthn.rp_id.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "auth.webauthn.rp_id is required when auth.webauthn.enabled is true".into(),
+                ));
+            }
+            if self.auth.webauthn.rp_origin.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "auth.webauthn.rp_origin is required when auth.webauthn.enabled is true".into(),
+                ));
+            }
+        }
         if self.app_mail.enabled {
             if self
                 .app_mail
@@ -952,6 +997,10 @@ rspamd:
         assert_eq!(config.auth.invitation_expiry_days, 7);
         assert_eq!(config.auth.password_reset_expiry_hours, 2);
         assert_eq!(config.auth.frontend_url, None);
+        assert!(!config.auth.webauthn.enabled);
+        assert_eq!(config.auth.webauthn.rp_id, "");
+        assert_eq!(config.auth.webauthn.rp_origin, "");
+        assert_eq!(config.auth.webauthn.rp_name, "CamelMailer");
         assert!(!config.oidc.enabled);
         assert_eq!(config.oidc.scopes, vec!["openid", "email", "profile"]);
         assert_eq!(config.oidc.uid_field, "sub");
@@ -1017,6 +1066,43 @@ rspamd:
         assert!(config.validate().is_err());
         let config = Config::from_yaml(
             "app_mail:\n  enabled: true\n  server_api_key: k\n  from_address: a@b.c\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn webauthn_parses_from_yaml() {
+        let config = Config::from_yaml(
+            "auth:\n  webauthn:\n    enabled: true\n    rp_id: app.camelmailer.com\n    rp_origin: https://app.camelmailer.com\n    rp_name: Example\n",
+        )
+        .unwrap();
+        assert!(config.auth.webauthn.enabled);
+        assert_eq!(config.auth.webauthn.rp_id, "app.camelmailer.com");
+        assert_eq!(
+            config.auth.webauthn.rp_origin,
+            "https://app.camelmailer.com"
+        );
+        assert_eq!(config.auth.webauthn.rp_name, "Example");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn enabled_webauthn_requires_rp_id_and_rp_origin() {
+        let config = Config::from_yaml("auth:\n  webauthn:\n    enabled: true\n").unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::from_yaml(
+            "auth:\n  webauthn:\n    enabled: true\n    rp_id: app.camelmailer.com\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::from_yaml(
+            "auth:\n  webauthn:\n    enabled: true\n    rp_origin: https://app.camelmailer.com\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::from_yaml(
+            "auth:\n  webauthn:\n    enabled: true\n    rp_id: app.camelmailer.com\n    rp_origin: https://app.camelmailer.com\n",
         )
         .unwrap();
         config.validate().unwrap();

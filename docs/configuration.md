@@ -117,14 +117,18 @@ spam-score and virus-scan inbound mail. Failing messages are held.
 
 ### `auth:` / `app_mail:` / `oidc:` / `web_server.cors_origins` — accounts, SSO, browsers
 
-User accounts (sessions, 2FA, lockout), organization RBAC, invitations,
-platform email delivery, OIDC single sign-on and CORS are documented in
-**[authentication.md](authentication.md)**. Quick anchors:
+User accounts (sessions, 2FA, lockout), passkeys (WebAuthn), organization
+RBAC, invitations, platform email delivery, OIDC single sign-on and CORS
+are documented in **[authentication.md](authentication.md)**. Quick anchors:
 
 ```yaml
 auth:
   session_timeout_days: 14
   # frontend_url: https://mail-admin.example.com
+  webauthn:
+    enabled: false                   # passkeys (Touch ID, security keys, …)
+    # rp_id: app.camelmailer.com
+    # rp_origin: https://app.camelmailer.com
 app_mail:
   enabled: false                     # send reset/invitation/welcome mail
                                      # through the installation's own pipeline

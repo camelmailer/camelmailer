@@ -208,6 +208,19 @@ export type AuthEvent = {
   created_at: string
 }
 
+export type Features = {
+  webauthn: boolean
+  registration: boolean
+  oidc: { enabled: boolean; name: string }
+}
+
+export type PasskeyCredential = {
+  id: number
+  name: string
+  created_at: string
+  last_used_at: string | null
+}
+
 export type Pagination = { page: number; per_page: number; total: number; total_pages: number }
 
 // server API (X-Server-API-Key) types
@@ -347,6 +360,36 @@ export const authApi = {
     api.get<{ authorization_url: string }>("/api/v2/auth/oidc/start", {
       Accept: "application/json",
     }),
+  // Which optional login features this instance exposes (passkeys,
+  // self-registration, OIDC) — unauthenticated, drives the login page.
+  features: () => api.get<Features>("/api/v2/auth/features"),
+  // WebAuthn / passkeys. Binary fields inside the options/credential
+  // payloads are unpadded base64url — see src/lib/webauthn.ts for the
+  // browser-API conversion. 403 WebAuthnDisabled while the feature is off.
+  webauthnRegisterStart: () =>
+    api.post<{ publicKey: Record<string, unknown> }>(
+      "/api/v2/auth/webauthn/register/start",
+      {},
+    ),
+  webauthnRegisterFinish: (name: string, credential: unknown) =>
+    api.post<{ credential: PasskeyCredential }>(
+      "/api/v2/auth/webauthn/register/finish",
+      { name, credential },
+    ),
+  webauthnCredentials: () =>
+    api.get<{ credentials: PasskeyCredential[] }>("/api/v2/auth/webauthn/credentials"),
+  webauthnDeleteCredential: (id: number) =>
+    api.delete<{ deleted: boolean }>(`/api/v2/auth/webauthn/credentials/${id}`),
+  webauthnLoginStart: (email_address: string) =>
+    api.post<{ publicKey: Record<string, unknown> }>(
+      "/api/v2/auth/webauthn/login/start",
+      { email_address },
+    ),
+  webauthnLoginFinish: (credential: unknown) =>
+    api.post<{ session_token: string; expires_at: string; user: User }>(
+      "/api/v2/auth/webauthn/login/finish",
+      { credential },
+    ),
 }
 
 // ------------------------------------------------------------- admin API

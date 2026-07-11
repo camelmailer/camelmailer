@@ -1,8 +1,9 @@
 "use client"
 
-// Account & security: profile, password change, TOTP enrollment.
+// Account & security: profile, password change, TOTP enrollment,
+// passkeys (WebAuthn).
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { QRCodeSVG } from "qrcode.react"
 import { toast } from "sonner"
 import { PageHeader, SecretReveal } from "@/components/shared"
@@ -25,8 +26,9 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { ApiError, authApi, setToken } from "@/lib/api"
+import { ApiError, authApi, setToken, type PasskeyCredential } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
+import { createPasskey, webAuthnSupported, type CreationOptionsJSON } from "@/lib/webauthn"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -45,7 +47,63 @@ export default function Account() {
   const [disableOpen, setDisableOpen] = useState(false)
   const [disablePassword, setDisablePassword] = useState("")
 
+  // Passkeys (only shown when the instance has auth.webauthn enabled)
+  const [webauthnEnabled, setWebauthnEnabled] = useState(false)
+  const [passkeys, setPasskeys] = useState<PasskeyCredential[]>([])
+  const [passkeyName, setPasskeyName] = useState("")
+  const [passkeyBusy, setPasskeyBusy] = useState(false)
+
   const totpEnabled = me?.user.totp_enabled ?? false
+
+  useEffect(() => {
+    authApi
+      .features()
+      .then((features) => {
+        setWebauthnEnabled(features.webauthn)
+        if (features.webauthn) return loadPasskeys()
+      })
+      .catch(() => setWebauthnEnabled(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  async function loadPasskeys() {
+    try {
+      const data = await authApi.webauthnCredentials()
+      setPasskeys(data.credentials)
+    } catch {
+      setPasskeys([])
+    }
+  }
+
+  async function addPasskey() {
+    if (!webAuthnSupported()) {
+      toast.error("This browser does not support passkeys")
+      return
+    }
+    setPasskeyBusy(true)
+    try {
+      const options = await authApi.webauthnRegisterStart()
+      const credential = await createPasskey(options as unknown as CreationOptionsJSON)
+      await authApi.webauthnRegisterFinish(passkeyName.trim(), credential)
+      setPasskeyName("")
+      await loadPasskeys()
+      toast.success("Passkey added")
+    } catch (err) {
+      errorToast(err, "Could not add the passkey")
+    } finally {
+      setPasskeyBusy(false)
+    }
+  }
+
+  async function deletePasskey(id: number) {
+    try {
+      await authApi.webauthnDeleteCredential(id)
+      await loadPasskeys()
+      toast.success("Passkey removed")
+    } catch (err) {
+      errorToast(err, "Could not remove the passkey")
+    }
+  }
 
   async function saveProfile() {
     try {
@@ -207,6 +265,60 @@ export default function Account() {
           )}
         </CardContent>
       </Card>
+
+      {webauthnEnabled && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Passkeys</CardTitle>
+            <CardDescription>
+              Sign in with Touch ID, Windows Hello or a security key instead of
+              your password.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            {passkeys.length > 0 && (
+              <ul className="grid gap-2">
+                {passkeys.map((passkey) => (
+                  <li
+                    key={passkey.id}
+                    className="flex items-center justify-between rounded-md border px-3 py-2"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium">{passkey.name}</div>
+                      <div className="text-xs text-muted-foreground">
+                        Added {new Date(passkey.created_at).toLocaleDateString()}
+                        {passkey.last_used_at
+                          ? ` · Last used ${new Date(passkey.last_used_at).toLocaleString()}`
+                          : " · Never used"}
+                      </div>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => deletePasskey(passkey.id)}
+                    >
+                      Remove
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="flex gap-2">
+              <Input
+                placeholder="Name, e.g. MacBook Touch ID"
+                value={passkeyName}
+                onChange={(e) => setPasskeyName(e.target.value)}
+              />
+              <Button
+                onClick={addPasskey}
+                disabled={passkeyBusy || !passkeyName.trim()}
+              >
+                {passkeyBusy ? "Waiting…" : "Add passkey"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <Dialog open={disableOpen} onOpenChange={setDisableOpen}>
         <DialogContent>

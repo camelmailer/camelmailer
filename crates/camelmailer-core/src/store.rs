@@ -142,6 +142,12 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) password_resets: Vec<(Id, String, chrono::DateTime<chrono::Utc>)>,
     /// In-flight OIDC logins: state -> (pkce_verifier, nonce, expires_at).
     pub(crate) oidc_states: HashMap<String, (String, String, chrono::DateTime<chrono::Utc>)>,
+    /// Registered WebAuthn credentials (passkeys) keyed by id.
+    pub(crate) webauthn_credentials: HashMap<Id, crate::auth::WebAuthnCredential>,
+    /// In-flight WebAuthn ceremonies: challenge key ->
+    /// (user_id, state_json, expires_at).
+    pub(crate) webauthn_states:
+        HashMap<String, (Option<Id>, String, chrono::DateTime<chrono::Utc>)>,
     /// Authentication audit log, in insertion order.
     pub(crate) auth_events: Vec<crate::auth::AuthEvent>,
 }

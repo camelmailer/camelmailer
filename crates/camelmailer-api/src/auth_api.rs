@@ -6,13 +6,18 @@
 //! admin API. Error codes a frontend can branch on:
 //! `InvalidCredentials`, `AccountLocked`, `TOTPRequired`,
 //! `InvalidTOTPCode`, `InvalidToken`, `Unauthorized`,
-//! `RegistrationDisabled`.
+//! `RegistrationDisabled`, `WebAuthnDisabled`.
+//!
+//! WebAuthn / passkey endpoints live in [`crate::webauthn`] and are
+//! mounted into this router; `GET /features` lets frontends discover
+//! which optional login features (passkeys, self-registration, OIDC)
+//! this instance exposes.
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use camelmailer_core::auth::{self, NewAuthEvent, NewAuthSession};
 use camelmailer_core::{AuthSession, AuthStore, StoreError, User};
@@ -55,6 +60,14 @@ fn unavailable(start: Option<&RequestStart>) -> ApiResponse {
     )
 }
 
+/// The auth store, or the standard `503 AccountsUnavailable` response.
+pub(crate) fn auth_store_or_unavailable<'a>(
+    state: &'a ApiState,
+    start: Option<&RequestStart>,
+) -> Result<&'a Arc<dyn AuthStore>, ApiResponse> {
+    auth_store(state).ok_or_else(|| unavailable(start))
+}
+
 pub(crate) fn client_ip(request_headers: &axum::http::HeaderMap) -> Option<String> {
     for header in ["x-forwarded-for", "x-real-ip"] {
         if let Some(value) = request_headers.get(header).and_then(|v| v.to_str().ok()) {
@@ -85,7 +98,7 @@ pub(crate) fn user_json(user: &User) -> Value {
     })
 }
 
-async fn audit(
+pub(crate) async fn audit(
     store: &Arc<dyn AuthStore>,
     user_id: Option<camelmailer_core::Id>,
     email: Option<&str>,
@@ -1131,15 +1144,42 @@ async fn invitation_accept(
     render_success(Some(&start.0), StatusCode::OK, data)
 }
 
+/// `GET /api/v2/auth/features` — which optional login/registration
+/// features this instance exposes; unauthenticated, so login pages can
+/// decide what to render (passkey button, sign-up link, SSO button).
+async fn features(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+) -> ApiResponse {
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "webauthn": state.config.auth.webauthn.enabled,
+            "registration": state.config.auth.allow_registration,
+            "oidc": {
+                "enabled": state.config.oidc.enabled,
+                "name": state.config.oidc.name,
+            },
+        }),
+    )
+}
+
 /// Build the `/api/v2/auth` router.
 pub fn build_auth_router(state: Arc<ApiState>) -> Router {
     let public = Router::new()
         .route("/login", post(login))
         .route("/register", post(register))
+        .route("/features", get(features))
         .route("/password-reset", post(password_reset_request))
         .route("/password-reset/complete", post(password_reset_complete))
         .route("/invitations/accept", post(invitation_accept))
-        .route("/invitations/{token}", get(invitation_preview));
+        .route("/invitations/{token}", get(invitation_preview))
+        .route("/webauthn/login/start", post(crate::webauthn::login_start))
+        .route(
+            "/webauthn/login/finish",
+            post(crate::webauthn::login_finish),
+        );
 
     let protected = Router::new()
         .route("/logout", post(logout))
@@ -1148,6 +1188,22 @@ pub fn build_auth_router(state: Arc<ApiState>) -> Router {
         .route("/totp/enroll", post(totp_enroll))
         .route("/totp/activate", post(totp_activate))
         .route("/totp/disable", post(totp_disable))
+        .route(
+            "/webauthn/register/start",
+            post(crate::webauthn::register_start),
+        )
+        .route(
+            "/webauthn/register/finish",
+            post(crate::webauthn::register_finish),
+        )
+        .route(
+            "/webauthn/credentials",
+            get(crate::webauthn::credentials_index),
+        )
+        .route(
+            "/webauthn/credentials/{id}",
+            delete(crate::webauthn::credentials_destroy),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             session_middleware,
