@@ -1,4 +1,8 @@
-# CamelMailer 🐫
+<p align="center">
+  <img src="web/app/public/camelmailer-logo.png" alt="CamelMailer" width="420">
+</p>
+
+# CamelMailer
 
 **A headless, API-first mail delivery platform in Rust.** SMTP in and out,
 HTTP APIs for everything — sending, templates, message streams, statistics,

@@ -69,7 +69,11 @@ export default function Login() {
     <div className="flex min-h-svh items-center justify-center bg-muted/40 p-4">
       <Card className="w-full max-w-sm">
         <CardHeader>
-          <CardTitle className="text-xl">CamelMailer 🐫</CardTitle>
+          <CardTitle className="flex items-center gap-2 text-xl">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/camelmailer-symbol.png" alt="" className="size-7" />
+            CamelMailer
+          </CardTitle>
           <CardDescription>Sign in to your account</CardDescription>
         </CardHeader>
         <CardContent>

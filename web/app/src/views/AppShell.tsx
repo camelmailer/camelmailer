@@ -85,8 +85,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     <div className="flex min-h-svh">
       <aside className="flex w-60 shrink-0 flex-col border-r bg-sidebar">
         <div className="flex h-14 items-center border-b px-4">
-          <Link href="/dashboard" className="font-semibold">
-            CamelMailer 🐫
+          <Link href="/dashboard" className="flex items-center gap-2 font-semibold">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/camelmailer-symbol.png" alt="" className="size-6" />
+            CamelMailer
           </Link>
         </div>
         <nav className="flex-1 space-y-4 overflow-y-auto p-3">
