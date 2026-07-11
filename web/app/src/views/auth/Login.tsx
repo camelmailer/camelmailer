@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { ApiError, authApi } from "@/lib/api"
+import { ApiError, authApi, ssoStartUrl, type SsoProviderInfo } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
 
 export default function Login() {
@@ -27,6 +27,7 @@ export default function Login() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [ssoUrl, setSsoUrl] = useState<string | null>(null)
+  const [ssoProviders, setSsoProviders] = useState<SsoProviderInfo[]>([])
 
   // The SSO button only renders when OIDC is enabled on the instance.
   useEffect(() => {
@@ -34,6 +35,15 @@ export default function Login() {
       .oidcStartUrl()
       .then((data) => setSsoUrl(data.authorization_url))
       .catch(() => setSsoUrl(null))
+  }, [])
+
+  // Social sign-in buttons (Google, Microsoft, GitHub, …) come from the
+  // instance's feature discovery.
+  useEffect(() => {
+    authApi
+      .features()
+      .then((data) => setSsoProviders(data.sso))
+      .catch(() => setSsoProviders([]))
   }, [])
 
   async function submit(event: React.FormEvent) {
@@ -140,6 +150,16 @@ export default function Login() {
                 Continue with SSO
               </Button>
             )}
+            {ssoProviders.map((provider) => (
+              <Button
+                key={provider.id}
+                type="button"
+                variant="outline"
+                onClick={() => (window.location.href = ssoStartUrl(provider.id))}
+              >
+                Continue with {provider.name}
+              </Button>
+            ))}
             <p className="text-center text-sm text-muted-foreground">
               Don&apos;t have an account?{" "}
               <Link href="/register" className="hover:underline">

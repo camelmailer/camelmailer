@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
@@ -24,4 +25,5 @@ tracing = { workspace = true }
 rand = { workspace = true }
 rsa = { workspace = true }
 http-body-util = { workspace = true }
+serde_yaml = { workspace = true }
 tower = { workspace = true }

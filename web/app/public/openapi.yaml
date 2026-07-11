@@ -613,6 +613,33 @@ paths:
       responses:
         "201": { $ref: "#/components/responses/Success" }
         "307": { description: Redirect to the frontend with the token in the fragment }
+  /api/v2/auth/features:
+    get:
+      tags: [Auth]
+      summary: Feature discovery for login/registration pages (public; sso providers as {id, name, type}, never secrets)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/sso/{id}/start:
+    get:
+      tags: [Auth]
+      summary: Begin social sign-in with a configured provider (redirect, or JSON with Accept application/json)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Provider id from auth.sso_providers }
+      responses:
+        "307": { description: Redirect to the provider }
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { description: SSOProviderNotFound }
+  /api/v2/auth/sso/{id}/callback:
+    get:
+      tags: [Auth]
+      summary: Social sign-in redirect URI (completes the login; 422 SSOEmailUnavailable without a verified email)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Provider id from auth.sso_providers }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+        "307": { description: Redirect to the frontend with the token in the fragment }
+        "404": { description: SSOProviderNotFound }
+        "422": { $ref: "#/components/responses/ValidationError" }
 
   # ------------------------------------------------------------- admin
   /api/v2/admin/organizations:

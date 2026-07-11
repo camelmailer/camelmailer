@@ -226,6 +226,84 @@ API and need no password.
 The upstream Postal `oidc` group uses the same field names, so a legacy
 `postal.yml` loads unchanged.
 
+## Social sign-in (Google / Microsoft / GitHub)
+
+Alongside the single enterprise `oidc` group, any number of **social
+sign-in providers** can be configured. Each renders as a
+"Continue with {name}" button on the login page (and "Sign up with
+{name}" on the registration page — social sign-in provisions accounts
+automatically, subject to the per-provider policy below):
+
+```yaml
+auth:
+  sso_providers:
+    - { id: google,    type: oidc,   name: Google,
+        issuer: "https://accounts.google.com",
+        client_id: "…", client_secret: "…" }
+    - { id: microsoft, type: oidc,   name: Microsoft,
+        issuer: "https://login.microsoftonline.com/common/v2.0",
+        client_id: "…", client_secret: "…" }
+    - { id: github,    type: github, name: GitHub,
+        client_id: "…", client_secret: "…" }
+```
+
+`id` is a unique slug (lowercase letters, digits, hyphens) and becomes
+part of the endpoints. Register this **redirect URI** with each
+provider (Google Cloud Console, Microsoft Entra app registration,
+GitHub OAuth app):
+
+```text
+https://<host>/api/v2/auth/sso/{id}/callback
+# concretely: {camelmailer.web_protocol}://{camelmailer.web_hostname}/api/v2/auth/sso/{id}/callback
+```
+
+Per provider, optionally:
+
+- `allowed_email_domains: [corp.example]` — restrict who may sign in /
+  provision.
+- `auto_provision: false` — only accounts that already exist (by email)
+  may sign in (default `true`).
+
+Flow endpoints (per provider, mirroring the enterprise OIDC pair):
+
+- `GET /api/v2/auth/sso/{id}/start` — redirects the browser to the
+  provider (JSON `{authorization_url}` with `Accept: application/json`).
+- `GET /api/v2/auth/sso/{id}/callback` — completes the login exactly
+  like the OIDC callback (frontend fragment redirect or JSON). An
+  unknown `{id}` answers `404 SSOProviderNotFound`.
+
+`GET /api/v2/auth/features` (public) tells a frontend what to render:
+`{ "sso": [{ "id", "name", "type" }] }` — never secrets.
+
+Provider notes:
+
+- **`type: oidc`** runs the same authorization-code flow with PKCE and
+  full ID-token validation (signature via the issuer's JWKS, `iss`,
+  `aud`, `exp`, `nonce`) as the enterprise OIDC module; the account
+  links by the `sub` claim, `email`/`name` fill the profile.
+- **Microsoft multi-tenant**: with the `common` issuer
+  (`https://login.microsoftonline.com/common/v2.0`) the token's `iss`
+  names the user's tenant (`…/{tenantid}/v2.0`), so it cannot equal the
+  configured string. For issuers ending in `/common/v2.0` the `iss`
+  claim is instead validated against the pattern
+  `https://login.microsoftonline.com/<tenant-guid>/v2.0`; the
+  signature (Microsoft's common JWKS covers all tenants), `aud`, `exp`
+  and `nonce` checks stay hard. Single-tenant apps should configure
+  their tenant issuer and get strict `iss` equality.
+- **`type: github`** uses GitHub's plain OAuth2 code flow (GitHub does
+  not implement OIDC). After the exchange, `/user` and `/user/emails`
+  supply the identity: the primary **verified** email address (falling
+  back to any verified one) becomes the account email — an account
+  without a verified email is rejected with `422 SSOEmailUnavailable`.
+  The display name comes from the profile `name`, falling back to the
+  `login`. The account links by the numeric GitHub user id.
+
+Account resolution and auditing work exactly like the enterprise OIDC
+flow: already linked (per provider) → existing account with the same
+email gets linked → provisioned fresh (`sso.login` / `sso.provision`
+audit events). One account can hold links to several providers at once
+— each provider keeps its own stable subject.
+
 ## CORS
 
 For a browser frontend calling the APIs directly:
@@ -267,6 +345,7 @@ auth:
   invitation_expiry_days: 7
   password_reset_expiry_hours: 2
   frontend_url: null              # e.g. https://mail-admin.example.com
+  sso_providers: []               # social sign-in (see above)
 
 app_mail:                         # platform email delivery (see above)
   enabled: false

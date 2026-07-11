@@ -15,6 +15,29 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Social sign-in with multiple providers (Google / Microsoft /
+  GitHub)** — a new `auth.sso_providers` list configures any number of
+  "Continue with …" providers side by side, each served under
+  `GET /api/v2/auth/sso/{id}/start` and `…/{id}/callback` (register the
+  redirect URI `https://<host>/api/v2/auth/sso/{id}/callback` with the
+  provider). `type: oidc` runs the authorization-code flow with PKCE
+  and full ID-token validation like the enterprise `oidc` group (which
+  keeps working unchanged alongside); Microsoft's multi-tenant `common`
+  issuer is supported by validating the per-tenant `iss` claim against
+  the `https://login.microsoftonline.com/<tenant-guid>/v2.0` pattern
+  while signature, `aud`, `exp` and `nonce` stay strict. `type: github`
+  runs GitHub's OAuth2 flow and requires a verified email address
+  (`422 SSOEmailUnavailable` otherwise). Per provider:
+  `allowed_email_domains` and `auto_provision` (default true). Accounts
+  link per provider (new `sso_identities` table), so one account can
+  hold Google, Microsoft and GitHub links at once. The new public
+  `GET /api/v2/auth/features` endpoint lists the configured providers
+  (`{id, name, type}` — never secrets) and drives the new
+  "Continue with {name}" / "Sign up with {name}" buttons on the login
+  and registration pages.
+
 ## [0.2.0] - 2026-07-11
 
 ### Added

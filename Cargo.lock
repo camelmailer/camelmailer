@@ -199,6 +199,7 @@ dependencies = [
 name = "camelmailer-api"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
  "camelmailer-config",
@@ -211,6 +212,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
  "subtle",
  "tokio",

@@ -35,7 +35,7 @@ use crate::auth_api::{client_ip, issue_session, user_json};
 
 const STATE_TTL_MINUTES: i64 = 10;
 
-fn sso_error(start: Option<&RequestStart>, message: &str) -> ApiResponse {
+pub(crate) fn sso_error(start: Option<&RequestStart>, message: &str) -> ApiResponse {
     render_error(start, StatusCode::UNPROCESSABLE_ENTITY, "SSOError", message)
 }
 
@@ -50,14 +50,14 @@ fn disabled(start: Option<&RequestStart>) -> ApiResponse {
 
 /// The subset of the discovery document we need.
 #[derive(Debug, Clone, Deserialize)]
-struct Discovery {
-    authorization_endpoint: String,
-    token_endpoint: String,
-    jwks_uri: String,
-    issuer: String,
+pub(crate) struct Discovery {
+    pub(crate) authorization_endpoint: String,
+    pub(crate) token_endpoint: String,
+    pub(crate) jwks_uri: String,
+    pub(crate) issuer: String,
 }
 
-async fn fetch_discovery(issuer: &str) -> Result<Discovery, String> {
+pub(crate) async fn fetch_discovery(issuer: &str) -> Result<Discovery, String> {
     let url = format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
@@ -151,7 +151,7 @@ async fn oidc_start(
     }
 }
 
-fn urlencode(value: &str) -> String {
+pub(crate) fn urlencode(value: &str) -> String {
     value
         .bytes()
         .map(|b| match b {
@@ -179,18 +179,46 @@ struct TokenResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct Jwks {
-    keys: Vec<Jwk>,
+pub(crate) struct Jwks {
+    pub(crate) keys: Vec<Jwk>,
 }
 
 #[derive(Debug, Deserialize)]
-struct Jwk {
+pub(crate) struct Jwk {
     #[serde(default)]
-    kid: Option<String>,
+    pub(crate) kid: Option<String>,
     #[serde(default)]
-    kty: String,
-    n: Option<String>,
-    e: Option<String>,
+    pub(crate) kty: String,
+    pub(crate) n: Option<String>,
+    pub(crate) e: Option<String>,
+}
+
+/// Fetch a JWKS document and build the RSA decoding key matching the
+/// token header (by `kid` when both sides carry one).
+pub(crate) async fn decoding_key_from_jwks(
+    jwks_uri: &str,
+    header: &jsonwebtoken::Header,
+) -> Result<jsonwebtoken::DecodingKey, String> {
+    let jwks = reqwest::get(jwks_uri)
+        .await
+        .map_err(|error| format!("could not fetch the provider JWKS: {error}"))?
+        .json::<Jwks>()
+        .await
+        .map_err(|error| format!("invalid JWKS document: {error}"))?;
+    let jwk = jwks
+        .keys
+        .iter()
+        .filter(|key| key.kty == "RSA" && key.n.is_some() && key.e.is_some())
+        .find(|key| match (&header.kid, &key.kid) {
+            (Some(kid), Some(key_kid)) => kid == key_kid,
+            _ => true,
+        })
+        .ok_or("no matching RSA key in the provider JWKS")?;
+    jsonwebtoken::DecodingKey::from_rsa_components(
+        jwk.n.as_deref().unwrap(),
+        jwk.e.as_deref().unwrap(),
+    )
+    .map_err(|error| format!("invalid JWK: {error}"))
 }
 
 async fn oidc_callback(
@@ -438,32 +466,14 @@ async fn validate_id_token(
     id_token: &str,
     expected_nonce: &str,
 ) -> Result<serde_json::Map<String, Value>, String> {
-    use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+    use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
 
     let header = decode_header(id_token).map_err(|error| format!("malformed id_token: {error}"))?;
     let algorithm = match header.alg {
         Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => header.alg,
         other => return Err(format!("unsupported id_token algorithm {other:?}")),
     };
-
-    let jwks = reqwest::get(&discovery.jwks_uri)
-        .await
-        .map_err(|error| format!("could not fetch the provider JWKS: {error}"))?
-        .json::<Jwks>()
-        .await
-        .map_err(|error| format!("invalid JWKS document: {error}"))?;
-    let jwk = jwks
-        .keys
-        .iter()
-        .filter(|key| key.kty == "RSA" && key.n.is_some() && key.e.is_some())
-        .find(|key| match (&header.kid, &key.kid) {
-            (Some(kid), Some(key_kid)) => kid == key_kid,
-            _ => true,
-        })
-        .ok_or("no matching RSA key in the provider JWKS")?;
-    let decoding_key =
-        DecodingKey::from_rsa_components(jwk.n.as_deref().unwrap(), jwk.e.as_deref().unwrap())
-            .map_err(|error| format!("invalid JWK: {error}"))?;
+    let decoding_key = decoding_key_from_jwks(&discovery.jwks_uri, &header).await?;
 
     let mut validation = Validation::new(algorithm);
     validation.set_issuer(&[&discovery.issuer]);

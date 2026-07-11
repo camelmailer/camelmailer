@@ -39,6 +39,9 @@ pub struct ApiState {
     pub global_admin_api_key: Option<String>,
     /// The full configuration (auth policy, OIDC, hostnames).
     pub config: camelmailer_config::Config,
+    /// GitHub's OAuth surface for `auth.sso_providers` — the real client
+    /// in production, a mock in tests.
+    pub sso_github: Arc<dyn crate::sso::GithubOauth>,
 }
 
 impl ApiState {
@@ -49,6 +52,7 @@ impl ApiState {
             auth_store: None,
             global_admin_api_key,
             config: camelmailer_config::Config::default(),
+            sso_github: Arc::new(crate::sso::HttpGithub::default()),
         })
     }
 
@@ -64,6 +68,7 @@ impl ApiState {
             auth_store: None,
             global_admin_api_key,
             config: camelmailer_config::Config::default(),
+            sso_github: Arc::new(crate::sso::HttpGithub::default()),
         })
     }
 
@@ -76,12 +81,33 @@ impl ApiState {
         global_admin_api_key: Option<String>,
         config: camelmailer_config::Config,
     ) -> Arc<Self> {
+        Self::full_with_github(
+            store,
+            server_store,
+            auth_store,
+            global_admin_api_key,
+            config,
+            Arc::new(crate::sso::HttpGithub::default()),
+        )
+    }
+
+    /// [`ApiState::full`] with an explicit GitHub OAuth client — router
+    /// tests inject one pointing at a local mock GitHub.
+    pub fn full_with_github(
+        store: Arc<dyn AdminStore>,
+        server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
+        auth_store: Option<Arc<dyn camelmailer_core::AuthStore>>,
+        global_admin_api_key: Option<String>,
+        config: camelmailer_config::Config,
+        sso_github: Arc<dyn crate::sso::GithubOauth>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             server_store,
             auth_store,
             global_admin_api_key,
             config,
+            sso_github,
         })
     }
 
