@@ -124,6 +124,7 @@ fn credential_from_row(row: &PgRow) -> Credential {
         name: row.get("name"),
         key: row.get("key"),
         hold: row.get("hold"),
+        last_used_at: row.get("last_used_at"),
     }
 }
 
@@ -483,6 +484,7 @@ impl PgStore {
             name: "Credential".into(),
             key: key.into(),
             hold: false,
+            last_used_at: None,
         })
     }
 }
@@ -942,6 +944,7 @@ impl AdminStore for PgStore {
             name: new.name,
             key,
             hold: false,
+            last_used_at: None,
         })
     }
 
@@ -1984,6 +1987,91 @@ impl camelmailer_core::ServerStore for PgStore {
             created_at: row.get("created_at"),
         }))
     }
+
+    async fn tags(
+        &self,
+        server_id: Id,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<camelmailer_core::TagCount>, StoreError> {
+        PgMessageSink::new(self.clone())
+            .tag_counts(server_id, since)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    // The api_requests table is deliberately not RLS-protected (the
+    // worker's retention job deletes across tenants) — every query here
+    // therefore carries an explicit server_id filter.
+    async fn record_api_request(
+        &self,
+        new: camelmailer_core::NewApiRequest,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO api_requests
+                 (server_id, method, path, status_code, duration_ms, user_agent)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(new.server_id as i64)
+        .bind(&new.method)
+        .bind(&new.path)
+        .bind(new.status_code)
+        .bind(new.duration_ms)
+        .bind(&new.user_agent)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(Self::sqlx_error)
+    }
+
+    async fn api_requests(
+        &self,
+        server_id: Id,
+        filter: &camelmailer_core::ApiRequestFilter,
+    ) -> Result<Vec<camelmailer_core::ApiRequestRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM api_requests
+             WHERE server_id = $1
+               AND ($2::int IS NULL OR status_code / 100 = $2)
+               AND ($3::text IS NULL OR upper(method) = upper($3))
+               AND ($4::timestamptz IS NULL OR created_at >= $4)
+               AND ($5::timestamptz IS NULL OR created_at <= $5)
+             ORDER BY id DESC",
+        )
+        .bind(server_id as i64)
+        .bind(filter.status_class)
+        .bind(&filter.method)
+        .bind(filter.from)
+        .bind(filter.to)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(api_request_from_row).collect())
+    }
+
+    async fn prune_api_requests(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StoreError> {
+        sqlx::query("DELETE FROM api_requests WHERE created_at < $1")
+            .bind(older_than)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(Self::sqlx_error)
+    }
+}
+
+fn api_request_from_row(row: &PgRow) -> camelmailer_core::ApiRequestRecord {
+    camelmailer_core::ApiRequestRecord {
+        id: row.get("id"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        method: row.get("method"),
+        path: row.get("path"),
+        status_code: row.get("status_code"),
+        duration_ms: row.get("duration_ms"),
+        user_agent: row.get("user_agent"),
+        created_at: row.get("created_at"),
+    }
 }
 
 fn dmarc_report_from_row(row: &PgRow) -> camelmailer_core::DmarcReport {
@@ -2398,7 +2486,10 @@ impl PgMessageSink {
 
     /// Record a delivery attempt and update the message's status,
     /// `last_delivery_attempt` and `held` flag (port of
-    /// `Postal::MessageDB::Message#create_delivery`).
+    /// `Postal::MessageDB::Message#create_delivery`). `bounce_category`
+    /// (hard / soft / undetermined) is persisted on the message for
+    /// terminal failures; `None` leaves any existing classification alone.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_delivery(
         &self,
         server_id: Id,
@@ -2407,6 +2498,7 @@ impl PgMessageSink {
         details: &str,
         output: &str,
         sent_with_ssl: bool,
+        bounce_category: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
         let mut tx = self.store.pool.begin().await?;
         set_tenant_context(&mut tx, server_id).await?;
@@ -2424,15 +2516,36 @@ impl PgMessageSink {
         .await?;
         sqlx::query(
             "UPDATE messages
-             SET status = $2, held = ($2 = 'Held'), last_delivery_attempt = now()
+             SET status = $2, held = ($2 = 'Held'), last_delivery_attempt = now(),
+                 bounce_category = COALESCE($3, bounce_category)
              WHERE id = $1",
         )
         .bind(message_id)
         .bind(status)
+        .bind(bounce_category)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(row.get("id"))
+    }
+
+    /// Persist a bounce classification on a message without touching its
+    /// delivery state (used when an inbound bounce/DSN is processed).
+    pub async fn set_bounce_category(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        bounce_category: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        sqlx::query("UPDATE messages SET bounce_category = $2 WHERE id = $1")
+            .bind(message_id)
+            .bind(bounce_category)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn deliveries_for_message(
@@ -2819,6 +2932,7 @@ impl PgMessageSink {
         set_tenant_context(&mut tx, server_id).await?;
         let from = filter.from;
         let to = filter.to;
+        let tag = filter.tag.as_deref();
         let counts = sqlx::query(
             "SELECT
                  count(*) AS total,
@@ -2829,23 +2943,32 @@ impl PgMessageSink {
                  count(*) FILTER (WHERE status = 'SoftFail') AS soft_fail,
                  count(*) FILTER (WHERE status = 'HardFail') AS hard_fail,
                  count(*) FILTER (WHERE status = 'Bounced') AS bounced,
-                 count(*) FILTER (WHERE status = 'Pending') AS pending
+                 count(*) FILTER (WHERE status = 'Pending') AS pending,
+                 count(*) FILTER (WHERE bounce_category = 'hard') AS bounces_hard,
+                 count(*) FILTER (WHERE bounce_category = 'soft') AS bounces_soft,
+                 count(*) FILTER (WHERE bounce_category = 'undetermined'
+                     OR (bounce_category IS NULL AND (bounce OR status = 'Bounced')))
+                     AS bounces_undetermined
              FROM messages
              WHERE ($1::timestamptz IS NULL OR created_at >= $1)
-               AND ($2::timestamptz IS NULL OR created_at <= $2)",
+               AND ($2::timestamptz IS NULL OR created_at <= $2)
+               AND ($3::text IS NULL OR tag = $3)",
         )
         .bind(from)
         .bind(to)
+        .bind(tag)
         .fetch_one(&mut *tx)
         .await?;
         let opens = sqlx::query(
             "SELECT count(*) AS opens, count(DISTINCT l.message_id) AS unique_opens
              FROM loads l JOIN messages m ON m.id = l.message_id
              WHERE ($1::timestamptz IS NULL OR m.created_at >= $1)
-               AND ($2::timestamptz IS NULL OR m.created_at <= $2)",
+               AND ($2::timestamptz IS NULL OR m.created_at <= $2)
+               AND ($3::text IS NULL OR m.tag = $3)",
         )
         .bind(from)
         .bind(to)
+        .bind(tag)
         .fetch_one(&mut *tx)
         .await?;
         let clicks = sqlx::query(
@@ -2854,10 +2977,12 @@ impl PgMessageSink {
              JOIN links li ON li.id = lc.link_id
              JOIN messages m ON m.id = li.message_id
              WHERE ($1::timestamptz IS NULL OR m.created_at >= $1)
-               AND ($2::timestamptz IS NULL OR m.created_at <= $2)",
+               AND ($2::timestamptz IS NULL OR m.created_at <= $2)
+               AND ($3::text IS NULL OR m.tag = $3)",
         )
         .bind(from)
         .bind(to)
+        .bind(tag)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -2875,7 +3000,37 @@ impl PgMessageSink {
             unique_opens: opens.get("unique_opens"),
             clicks: clicks.get("clicks"),
             unique_clicks: clicks.get("unique_clicks"),
+            bounces_hard: counts.get("bounces_hard"),
+            bounces_soft: counts.get("bounces_soft"),
+            bounces_undetermined: counts.get("bounces_undetermined"),
         })
+    }
+
+    /// Tags used by the tenant's messages since `since`, with counts,
+    /// most used first. RLS scopes the rows to the tenant context.
+    pub async fn tag_counts(
+        &self,
+        server_id: Id,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<camelmailer_core::TagCount>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let rows = sqlx::query(
+            "SELECT tag, count(*) AS c FROM messages
+             WHERE tag IS NOT NULL AND created_at >= $1
+             GROUP BY tag ORDER BY c DESC, tag ASC",
+        )
+        .bind(since)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .iter()
+            .map(|row| camelmailer_core::TagCount {
+                tag: row.get("tag"),
+                count: row.get("c"),
+            })
+            .collect())
     }
 
     /// Pending outbound queue depth per destination domain. Reads the
@@ -2917,6 +3072,7 @@ fn message_record_from_row(row: &PgRow) -> MessageRecord {
         tag: row.get("tag"),
         status: row.get("status"),
         bounce: row.get("bounce"),
+        bounce_category: row.get("bounce_category"),
         spam_status: row.get("spam_status"),
         spam_score: row.get("spam_score"),
         held: row.get("held"),

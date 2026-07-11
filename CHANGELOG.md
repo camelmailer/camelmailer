@@ -73,6 +73,32 @@ integration tests) is green.
   `{ delivered, status_code, duration_ms, error? }`. The dashboard adds
   a "Send test" action per webhook with event picker, result pill and
   the sample payload (JSON, copyable).
+- **Observability for the messaging API** — four pieces:
+  **Credential usage**: credentials now report `last_used_at` in the
+  management API (`GET …/credentials`), stamped on every successful
+  API-key authentication and SMTP AUTH; null until first use.
+  **Tags as a first-class dimension**: `GET /api/v2/server/tags` lists
+  the tags used in the last 30 days with message counts (most used
+  first, tenant-scoped), and `GET /api/v2/server/stats?tag=` scopes
+  every counter (including opens/clicks) to one tag
+  (`GET /api/v2/server/messages?tag=` already filtered).
+  **Bounce classification**: terminally failed deliveries and processed
+  inbound bounces (DSNs) are classified `hard` (5xx / enhanced status
+  `5.x.x` — permanent), `soft` (4xx / `4.x.x` — retries exhausted) or
+  `undetermined` (connection errors, unparsable output; DSNs are read
+  from their `Status:`/`Diagnostic-Code:` fields only). The category is
+  persisted on the message (`bounce_category`, migration 0027), exposed
+  on messages/bounces and broken down in stats as
+  `bounces: { hard, soft, undetermined }` — unclassified bounces count
+  as undetermined.
+  **API request log**: every authenticated request to
+  `/api/v2/server/*` is logged asynchronously (fire-and-forget — it can
+  neither slow down nor fail the request) with method, path (no query
+  string), status code, duration and a truncated user agent — never
+  bodies or API keys (new `api_requests` table, migration 0028).
+  `GET /api/v2/server/logs` lists the entries newest first, paginated,
+  filterable by status class (`2xx`…`5xx`), method and time window;
+  worker housekeeping deletes entries older than 30 days (hourly).
 
 ## [0.3.0] - 2026-07-11
 

@@ -315,7 +315,8 @@ async fn hard_failures_leave_the_queue_and_fire_failure_webhook() {
         .await
         .unwrap();
 
-    s.sink
+    let id = s
+        .sink
         .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
         .await
         .unwrap();
@@ -327,6 +328,13 @@ async fn hard_failures_leave_the_queue_and_fire_failure_webhook() {
     worker.drain_webhooks().await.unwrap();
     let hooks = hook.requests.lock().unwrap().clone();
     assert_eq!(hooks[0]["event"], "MessageDeliveryFailed");
+
+    // the 5xx reject classifies the bounce as hard
+    let record = camelmailer_core::ServerStore::message(&s.store, s.server.id, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.bounce_category.as_deref(), Some("hard"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -423,7 +431,8 @@ async fn attempts_exhaust_into_terminal_failure() {
     let s = setup(pool).await;
     let smtp = mock_smtp("421 Still broken").await;
 
-    s.sink
+    let id = s
+        .sink
         .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
         .await
         .unwrap();
@@ -435,11 +444,118 @@ async fn attempts_exhaust_into_terminal_failure() {
         let outcome = worker.process_next().await.unwrap().unwrap();
         if expected_delayed {
             assert!(matches!(outcome, ProcessOutcome::Delayed { .. }));
+            // still transient — no bounce category yet
+            let record = camelmailer_core::ServerStore::message(&s.store, s.server.id, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.bounce_category, None);
         } else {
             assert!(matches!(outcome, ProcessOutcome::Failed { .. }));
         }
     }
     assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+
+    // exhausting 4xx retries classifies the bounce as soft
+    let record = camelmailer_core::ServerStore::message(&s.store, s.server.id, id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.bounce_category.as_deref(), Some("soft"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_dsn_bounces_are_classified_from_their_status_fields() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let worker = Worker::new(&worker_config(1), s.store.clone());
+
+    let dsn = |raw: &[u8]| {
+        let mut message = outgoing_message(s.server.id, "return-path@org.example");
+        message.scope = MessageScope::Incoming;
+        message.bounce = true;
+        message.raw_message = raw.to_vec();
+        message
+    };
+
+    // Status: 5.1.1 -> hard; Status: 4.4.1 -> soft; a DSN without
+    // Status:/Diagnostic-Code: fields stays undetermined (numbers in the
+    // human-readable text never classify).
+    let cases: [(&[u8], &str); 3] = [
+        (
+            b"Subject: Delivery Status Notification\r\n\r\n\
+              Final-Recipient: rfc822; gone@example.com\r\n\
+              Action: failed\r\n\
+              Status: 5.1.1\r\n\
+              Diagnostic-Code: smtp; 550 5.1.1 user unknown\r\n",
+            "hard",
+        ),
+        (b"Subject: Delayed\r\n\r\nStatus: 4.4.1\r\n", "soft"),
+        (
+            b"Subject: bounce\r\n\r\nYour mail from 2026 got 550 problems.\r\n",
+            "undetermined",
+        ),
+    ];
+
+    for (raw, expected) in cases {
+        let id = s.sink.insert_message(&dsn(raw)).await.unwrap();
+        let outcome = worker.process_next().await.unwrap().unwrap();
+        assert_eq!(outcome, ProcessOutcome::NothingToDo);
+        let record = camelmailer_core::ServerStore::message(&s.store, s.server.id, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.bounce_category.as_deref(), Some(expected));
+    }
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn housekeeping_prunes_expired_api_request_log_entries() {
+    use camelmailer_core::ServerStore;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let worker = Worker::new(&worker_config(1), s.store.clone());
+
+    let entry = |path: &str| camelmailer_core::NewApiRequest {
+        server_id: s.server.id,
+        method: "GET".into(),
+        path: path.into(),
+        status_code: 200,
+        duration_ms: 3,
+        user_agent: Some("housekeeping-test".into()),
+    };
+    s.store
+        .record_api_request(entry("/api/v2/server/fresh"))
+        .await
+        .unwrap();
+    s.store
+        .record_api_request(entry("/api/v2/server/stale"))
+        .await
+        .unwrap();
+    // age one entry past the 30-day retention
+    sqlx::query("UPDATE api_requests SET created_at = now() - interval '31 days' WHERE path = $1")
+        .bind("/api/v2/server/stale")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let removed = worker.housekeep().await.unwrap();
+    assert_eq!(removed, 1);
+
+    let remaining = s
+        .store
+        .api_requests(s.server.id, &camelmailer_core::ApiRequestFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].path, "/api/v2/server/fresh");
+
+    // a second run has nothing left to prune
+    assert_eq!(worker.housekeep().await.unwrap(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

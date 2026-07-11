@@ -617,6 +617,8 @@ async fn credentials_crud_generates_keys_and_holds() {
     let credential = &body["data"]["credential"];
     assert_eq!(credential["type"], "SMTP");
     assert!(credential["key"].as_str().unwrap().len() >= 24);
+    // never used yet
+    assert!(credential["last_used_at"].is_null());
     let id = credential["id"].as_u64().unwrap();
 
     // SMTP-IP requires an explicit CIDR key
@@ -1352,4 +1354,65 @@ async fn sender_addresses_create_list_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn credential_listings_carry_last_used_at_after_a_use() {
+    use camelmailer_core::AdminStore;
+    let store = Arc::new(MemoryStore::new());
+    let state = ApiState::new(store.clone(), Some(GLOBAL_KEY.to_string()));
+    let app = build_router(state);
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Acme", "permalink": "acme" })),
+    )
+    .await;
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations/acme/servers",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Mail", "permalink": "mail" })),
+    )
+    .await;
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations/acme/servers/mail/credentials",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "App", "type": "API" })),
+    )
+    .await;
+    let key = body["data"]["credential"]["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // never used: the listing shows null
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations/acme/servers/mail/credentials",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert!(body["data"]["credentials"][0]["last_used_at"].is_null());
+
+    // a per-server API authentication records the use ...
+    store.server_for_api_token(&key).await.unwrap().unwrap();
+
+    // ... and the management listing now carries the timestamp
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations/acme/servers/mail/credentials",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert!(body["data"]["credentials"][0]["last_used_at"].is_string());
 }

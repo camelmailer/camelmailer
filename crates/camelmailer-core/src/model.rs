@@ -127,6 +127,9 @@ pub struct Credential {
     /// credentials it is a CIDR (e.g. `1.0.0.0/8`).
     pub key: String,
     pub hold: bool,
+    /// When the credential last authenticated a request (API-key auth on
+    /// the per-server API, SMTP AUTH). `None` = never used.
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

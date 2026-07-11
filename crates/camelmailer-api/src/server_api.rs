@@ -431,6 +431,7 @@ pub(crate) fn message_json(message: &MessageRecord) -> Value {
         "tag": message.tag,
         "status": message.status,
         "bounce": message.bounce,
+        "bounce_category": message.bounce_category,
         "spam_status": message.spam_status,
         "spam_score": message.spam_score,
         "held": message.held,
@@ -815,11 +816,13 @@ async fn message_insights(
 
 // -------------------------------------------------------- stats + bounces
 
-/// Query params for `GET /stats`: an optional `created_at` time window.
+/// Query params for `GET /stats`: an optional `created_at` time window
+/// plus an optional tag to scope every counter to.
 #[derive(Debug, Deserialize, Default)]
 struct StatsParams {
     from: Option<chrono::DateTime<chrono::Utc>>,
     to: Option<chrono::DateTime<chrono::Utc>>,
+    tag: Option<String>,
 }
 
 fn stats_json(stats: &camelmailer_core::MessageStats) -> Value {
@@ -837,6 +840,11 @@ fn stats_json(stats: &camelmailer_core::MessageStats) -> Value {
         "unique_opens": stats.unique_opens,
         "clicks": stats.clicks,
         "unique_clicks": stats.unique_clicks,
+        "bounces": {
+            "hard": stats.bounces_hard,
+            "soft": stats.bounces_soft,
+            "undetermined": stats.bounces_undetermined,
+        },
     })
 }
 
@@ -854,6 +862,7 @@ async fn stats_show(
     let filter = camelmailer_core::StatsFilter {
         from: params.from,
         to: params.to,
+        tag: params.tag.filter(|t| !t.is_empty()),
     };
     match store.message_stats(server.0.id, &filter).await {
         Ok(stats) => render_success(
@@ -952,6 +961,186 @@ async fn bounce_show(
         Ok(None) => not_found(&start.0),
         Err(error) => internal_error(&start.0, &error.to_string()),
     }
+}
+
+// ------------------------------------------------------------------ tags
+
+/// How far back `GET /tags` looks, in days.
+const TAG_WINDOW_DAYS: i64 = 30;
+
+/// `GET /api/v2/server/tags` — the tags used by the server's messages in
+/// the last 30 days, with counts, most used first. Tenant-scoped (RLS).
+async fn tags_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let since = chrono::Utc::now() - chrono::Duration::days(TAG_WINDOW_DAYS);
+    match store.tags(server.0.id, since).await {
+        Ok(tags) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({
+                "tags": tags.iter().map(|t| json!({
+                    "tag": t.tag,
+                    "count": t.count,
+                })).collect::<Vec<_>>(),
+            }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+// ------------------------------------------------------- API request log
+
+/// Log one authenticated request to the API request log (the Resend
+/// `/logs` pattern): method, path without the query string, status code,
+/// duration and a truncated user agent — never bodies, keys or query
+/// strings. The write happens fire-and-forget on a background task, so it
+/// can neither slow down nor fail the request.
+async fn request_log_middleware(
+    State(state): State<Arc<ApiState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let start = request.extensions().get::<RequestStart>().copied();
+    let context = request
+        .extensions()
+        .get::<camelmailer_core::ServerContext>()
+        .copied();
+    let method = request.method().to_string();
+    // inside the nested router the URI is stripped of `/api/v2/server`;
+    // OriginalUri restores the full request path
+    let path = request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|uri| uri.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let user_agent = request
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|ua| ua.chars().take(255).collect::<String>())
+        .filter(|ua| !ua.is_empty());
+
+    let response = next.run(request).await;
+
+    if let (Some(camelmailer_core::ServerContext(server_id)), Some(store)) =
+        (context, state.server_store.clone())
+    {
+        let entry = camelmailer_core::NewApiRequest {
+            server_id,
+            method,
+            path,
+            status_code: response.status().as_u16() as i32,
+            duration_ms: start
+                .map(|start| start.0.elapsed().as_millis().min(i64::MAX as u128) as i64)
+                .unwrap_or(0),
+            user_agent,
+        };
+        tokio::spawn(async move {
+            if let Err(error) = store.record_api_request(entry).await {
+                tracing::warn!(%error, "failed to write the API request log");
+            }
+        });
+    }
+    response
+}
+
+/// Query params for `GET /logs`: pagination plus status-class, method and
+/// time-window filters.
+#[derive(Debug, Deserialize, Default)]
+struct LogsParams {
+    page: Option<u64>,
+    per_page: Option<u64>,
+    /// Status-code class: `2xx`, `3xx`, `4xx` or `5xx`.
+    status: Option<String>,
+    method: Option<String>,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Parse a `status=` class filter (`"2xx"`, `"4xx"`, …; the bare digit is
+/// accepted too). `None` = invalid.
+fn parse_status_class(value: &str) -> Option<i32> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1xx" | "1" => Some(1),
+        "2xx" | "2" => Some(2),
+        "3xx" | "3" => Some(3),
+        "4xx" | "4" => Some(4),
+        "5xx" | "5" => Some(5),
+        _ => None,
+    }
+}
+
+fn api_request_json(request: &camelmailer_core::ApiRequestRecord) -> Value {
+    json!({
+        "id": request.id,
+        "method": request.method,
+        "path": request.path,
+        "status_code": request.status_code,
+        "duration_ms": request.duration_ms,
+        "user_agent": request.user_agent,
+        "created_at": request.created_at.to_rfc3339(),
+    })
+}
+
+/// `GET /api/v2/server/logs` — the server's request log, filtered + paged,
+/// newest first.
+async fn logs_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Query(params): Query<LogsParams>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let status_class = match params.status.as_deref().filter(|s| !s.is_empty()) {
+        None => None,
+        Some(value) => match parse_status_class(value) {
+            Some(class) => Some(class),
+            None => {
+                return render_error(
+                    Some(&start.0),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationError",
+                    &format!("Status class {value:?} is not valid (use 2xx, 3xx, 4xx or 5xx)"),
+                )
+                .into_response()
+            }
+        },
+    };
+    let filter = camelmailer_core::ApiRequestFilter {
+        status_class,
+        method: params.method.filter(|m| !m.is_empty()),
+        from: params.from,
+        to: params.to,
+    };
+    let requests = match store.api_requests(server.0.id, &filter).await {
+        Ok(requests) => requests,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let pagination = PaginationParams {
+        page: params.page,
+        per_page: params.per_page,
+    };
+    let result = paginate(&requests, &pagination);
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "requests": result.items.iter().map(api_request_json).collect::<Vec<_>>(),
+            "pagination": result.pagination,
+        }),
+    )
+    .into_response()
 }
 
 fn not_found(start: &RequestStart) -> Response {
@@ -1835,6 +2024,8 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/messages/{id}/insights", get(message_insights))
         .route("/stats", get(stats_show))
         .route("/stats/deliveries", get(delivery_stats_show))
+        .route("/tags", get(tags_index))
+        .route("/logs", get(logs_index))
         .route("/bounces", get(bounces_index))
         .route("/bounces/{id}", get(bounce_show))
         .route("/streams", get(streams_index).post(streams_create))
@@ -1857,6 +2048,12 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/dmarc/summary", get(dmarc_summary))
         .route("/dmarc/reports", get(dmarc_reports_index))
         .route("/dmarc/reports/{id}", get(dmarc_report_show))
+        // innermost first: the request log runs inside auth, so only
+        // authenticated requests (with a resolved ServerContext) are logged
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_log_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             server_auth_middleware,
