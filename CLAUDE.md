@@ -26,8 +26,7 @@ attribution, but is an independent project — there is no upstream to track.
 | `web/app` | Next.js (App Router) dashboard (`(app)` group, shadcn/ui + TanStack Query); `/` redirects to `/login`; Next proxies `/api` to the backend (`API_PROXY_URL`) |
 | `templates/` | 20 ready-to-clone transactional email templates (JSON) + `import.sh` |
 | `docs/` | quickstart, configuration, authentication (accounts/RBAC/SSO) |
-| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 81 endpoints) |
-| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 77 endpoints; SCIM is noted there but documented in docs/authentication.md) |
+| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 138 endpoints; the SCIM 2.0 surface under `/scim/v2` is separate and documented in docs/authentication.md) |
 
 ## The API surfaces
 
@@ -94,21 +93,28 @@ Other conventions:
 
 ## Known deliberate gaps
 
-SAML and SCIM (OIDC is the SSO path), WebAuthn, billing (planned
-separately). Legal
-SAML and SCIM (OIDC is the SSO path), per-domain DKIM keys
-(one installation key + selector), billing (planned separately). Legal
-WebAuthn, per-domain DKIM keys
-(one installation key + selector), billing (planned separately). SAML
-and SCIM are no longer gaps: SSO speaks OIDC **and** SAML 2.0 (SP role,
-`saml` config group, `/api/v2/auth/saml/*`, strict response validation
-against the configured IdP certificate), and SCIM 2.0 provisioning
-(RFC 7643/7644 Users core) lives under `/scim/v2` behind
-`scim.bearer_token` — `active: false` maps to the `user_auth.disabled`
-flag that blocks every login path. Legal
-pages of the (separately hosted) marketing site are placeholder
-templates and marked as such. App-mail delivery of reset/invitation/welcome mail is no longer a
-gap: the `app_mail` config group (`enabled`, `server_api_key`,
-`from_address`, `from_name`) sends platform mail through the
-installation's own pipeline; when disabled, tokens are surfaced to the
-operator/frontend as before.
+The one deliberate gap for a self-hosted installation is **billing**: it
+serves only the hosted cloud offering and is opt-in via the `billing`
+config group (Stripe, SDK-free). Self-hosted keeps the default
+(`enabled: false`), so `GET …/billing` reports `enabled: false`, the
+dashboard shows no billing UI, and `POST …/billing/portal` returns 403
+`BillingDisabled`. (The legal pages of the separately hosted marketing
+site are placeholder templates, marked as such.)
+
+Everything else once listed here has since landed:
+
+- **SSO** speaks OIDC **and** SAML 2.0 (SP role, `saml` config group,
+  `/api/v2/auth/saml/*`, strict response validation against the
+  configured IdP certificate).
+- **SCIM 2.0** provisioning (RFC 7643/7644 Users core) lives under
+  `/scim/v2` behind `scim.bearer_token`; `active: false` maps to the
+  `user_auth.disabled` flag that blocks every login path.
+- **WebAuthn / passkeys** are supported (see `crates/camelmailer-api/src/webauthn.rs`).
+- **Per-domain DKIM keys**: a domain may carry its own `dkim_private_key`
+  (PEM) + selector; `None` keeps the installation-key fallback.
+- **DNS-based domain verification** (per-domain `verification_token`).
+- **App-mail delivery** of reset/invitation/welcome mail: the `app_mail`
+  config group (`enabled`, `server_api_key`, `from_address`,
+  `from_name`) sends platform mail through the installation's own
+  pipeline; when disabled, tokens are surfaced to the operator/frontend
+  as before.
