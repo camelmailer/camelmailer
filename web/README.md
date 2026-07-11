@@ -11,8 +11,13 @@ Two frontends live here:
   streams, templates), plus the instance-admin area (users, IP pools,
   admin API keys, audit log) and account security (password, 2FA with QR
   enrollment).
-- **`marketing/`** — a dependency-free static landing page
-  (`index.html`); host it anywhere.
+- **`marketing/`** — the dependency-free static marketing site: landing
+  page, cloud pricing, open-source page, legal pages (imprint, privacy,
+  terms, DPA, AUP, sub-processors — placeholder templates for counsel
+  review), API + self-hosting guides, and the public `openapi.yaml`.
+  Pages are generated from a shared layout: edit `build.py` /
+  `content_docs.py`, run `python3 build.py`, commit the output. Host the
+  directory anywhere static.
 
 ## Development
 

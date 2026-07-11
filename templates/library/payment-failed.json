@@ -1,0 +1,15 @@
+{
+  "name": "payment-failed",
+  "description": "Dunning: charge failed, retry date, update-payment CTA.",
+  "variables": [
+    "product",
+    "support_email",
+    "name",
+    "amount",
+    "retry_date",
+    "action_url"
+  ],
+  "subject": "Action needed: payment for {{ product }} failed",
+  "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">We couldn't process your payment.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Payment failed</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, we couldn't charge <strong>{{ amount }}</strong> for your {{ product }} subscription.</p><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">We'll retry on <strong>{{ retry_date }}</strong>. To avoid any interruption, please check your payment details:</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Update payment method</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Already fixed it? Then you're all set — we'll retry automatically.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+  "text_body": "Hi {{ name }},\n\nWe couldn't charge {{ amount }} for your {{ product }} subscription.\nWe'll retry on {{ retry_date }}.\n\nUpdate your payment method to avoid interruption: {{ action_url }}"
+}

@@ -1,0 +1,1331 @@
+openapi: 3.0.3
+info:
+  title: CamelMailer API
+  version: "2"
+  description: |
+    The CamelMailer HTTP API — transactional email, nothing else.
+
+    Three surfaces, three credentials:
+
+    | Surface | Base path | Auth |
+    |---|---|---|
+    | **Messaging** (send + read mail, streams, templates, stats) | `/api/v2/server` | `X-Server-API-Key` — an API credential of one mail server |
+    | **Management** (organizations, servers, domains, credentials, …) | `/api/v2/admin` | `X-Admin-API-Key` (machine) or `Authorization: Bearer` (user session, RBAC-scoped) |
+    | **Accounts** (login, sessions, 2FA, invitations, SSO) | `/api/v2/auth` | none / `Authorization: Bearer` |
+
+    Every response uses the same envelope:
+
+    ```json
+    { "status": "success", "time": 0.004, "data": { … } }
+    { "status": "error",   "time": 0.004, "error": { "code": "…", "message": "…" } }
+    ```
+
+    Error codes worth branching on: `Unauthorized`, `Forbidden`, `NotFound`,
+    `ValidationError`, `ParameterMissing`, `InvalidCredentials`, `TOTPRequired`,
+    `InvalidTOTPCode`, `AccountLocked`, `InvalidToken`, `SSOError`.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: https://{host}
+    variables:
+      host:
+        default: mail.example.com
+        description: Your CamelMailer instance (self-hosted or cloud)
+tags:
+  - name: Send
+  - name: Messages
+  - name: Inbound
+  - name: Stats
+  - name: Streams
+  - name: Templates
+  - name: Auth
+  - name: Organizations
+  - name: Servers
+  - name: Domains
+  - name: Credentials
+  - name: Routes
+  - name: Webhooks
+  - name: Suppressions
+  - name: People
+  - name: Instance
+
+security: []
+
+paths:
+  /health:
+    get:
+      summary: Liveness probe
+      description: Unauthenticated; never touches storage.
+      responses:
+        "200":
+          description: Instance is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  version: { type: string, example: "3.3.4" }
+
+  # ---------------------------------------------------------- messaging
+  /api/v2/server/:
+    get:
+      tags: [Send]
+      summary: Show the authenticated server
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v2/server/ping:
+    get:
+      tags: [Send]
+      summary: Validate the server API key
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v2/server/messages:
+    post:
+      tags: [Send]
+      summary: Send a message
+      description: |
+        Queues one message per recipient. The `from` domain must be a
+        verified sending domain of the server.
+      security: [{ ServerApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SendRequest" }
+            example:
+              from: "billing@acme.com"
+              to: ["ada@example.com"]
+              subject: "Your receipt"
+              text_body: "Thanks for your purchase."
+              tag: "receipt"
+      responses:
+        "201":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/SendResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    get:
+      tags: [Messages]
+      summary: List messages
+      security: [{ ServerApiKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, maximum: 100 } }
+        - { name: scope, in: query, schema: { type: string, enum: [incoming, outgoing] } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: tag, in: query, schema: { type: string } }
+        - { name: query, in: query, description: Substring match on subject / addresses, schema: { type: string } }
+        - { name: stream, in: query, description: Message-stream permalink, schema: { type: string } }
+      responses:
+        "200":
+          description: Messages
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          messages:
+                            type: array
+                            items: { $ref: "#/components/schemas/Message" }
+                          pagination: { $ref: "#/components/schemas/Pagination" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v2/server/messages/batch:
+    post:
+      tags: [Send]
+      summary: Send a batch of messages
+      description: An array of send requests; returns one result per entry.
+      security: [{ ServerApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                messages:
+                  type: array
+                  items: { $ref: "#/components/schemas/SendRequest" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v2/server/messages/with_template:
+    post:
+      tags: [Send]
+      summary: Send using a stored template
+      description: |
+        Renders the named template (Mustache-style `{{ variables }}`)
+        against `template_model`, then sends. Fields set directly
+        (e.g. `subject`) override the rendered ones.
+      security: [{ ServerApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/SendRequest"
+                - type: object
+                  required: [template]
+                  properties:
+                    template: { type: string, description: Template permalink }
+                    template_model: { type: object, additionalProperties: true }
+            example:
+              from: "hello@acme.com"
+              to: ["ada@example.com"]
+              template: "welcome"
+              template_model: { name: "Ada", product: "Acme" }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v2/server/messages/with_template/batch:
+    post:
+      tags: [Send]
+      summary: Send a template to many recipients (batch)
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v2/server/messages/{id}:
+    get:
+      tags: [Messages]
+      summary: Show a message
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v2/server/messages/{id}/deliveries:
+    get:
+      tags: [Messages]
+      summary: Delivery attempts of a message
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v2/server/messages/{id}/opens:
+    get:
+      tags: [Messages]
+      summary: Open events of a message
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/messages/{id}/clicks:
+    get:
+      tags: [Messages]
+      summary: Click events of a message
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/messages/{id}/raw:
+    get:
+      tags: [Messages]
+      summary: Raw RFC 5322 source of a message
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v2/server/inbound:
+    get:
+      tags: [Inbound]
+      summary: Search inbound / held messages
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/inbound/{id}:
+    get:
+      tags: [Inbound]
+      summary: Show an inbound message
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/inbound/{id}/retry:
+    post:
+      tags: [Inbound]
+      summary: Requeue an inbound message for delivery
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/inbound/{id}/bypass:
+    post:
+      tags: [Inbound]
+      summary: Bypass a hold and deliver
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/server/stats:
+    get:
+      tags: [Stats]
+      summary: Message counters
+      security: [{ ServerApiKey: [] }]
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: Counters
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          stats: { $ref: "#/components/schemas/Stats" }
+  /api/v2/server/stats/deliveries:
+    get:
+      tags: [Stats]
+      summary: Delivery/queue statistics
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/bounces:
+    get:
+      tags: [Stats]
+      summary: List bounce messages
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/bounces/{id}:
+    get:
+      tags: [Stats]
+      summary: Show a bounce
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/server/streams:
+    get:
+      tags: [Streams]
+      summary: List message streams
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Streams]
+      summary: Create a message stream
+      security: [{ ServerApiKey: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                stream_type: { type: string, enum: [transactional, broadcast] }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/server/streams/{permalink}:
+    get:
+      tags: [Streams]
+      summary: Show a stream
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Streams]
+      summary: Update a stream
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/streams/{permalink}/archive:
+    post:
+      tags: [Streams]
+      summary: Archive a stream
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/server/templates:
+    get:
+      tags: [Templates]
+      summary: List templates
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Templates]
+      summary: Create a template
+      security: [{ ServerApiKey: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TemplateInput" }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/server/templates/{permalink}:
+    get:
+      tags: [Templates]
+      summary: Show a template
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Templates]
+      summary: Update a template
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TemplateInput" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/templates/{permalink}/archive:
+    post:
+      tags: [Templates]
+      summary: Archive a template
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/templates/{permalink}/render:
+    post:
+      tags: [Templates]
+      summary: Render a template against a model (preview)
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                template_model: { type: object, additionalProperties: true }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  # --------------------------------------------------------------- auth
+  /api/v2/auth/login:
+    post:
+      tags: [Auth]
+      summary: Sign in with email + password (+ optional TOTP)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email_address, password]
+              properties:
+                email_address: { type: string, format: email }
+                password: { type: string }
+                totp_code: { type: string, description: Required when 2FA is enabled }
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          session_token: { type: string }
+                          expires_at: { type: string, format: date-time }
+                          user: { $ref: "#/components/schemas/User" }
+        "401":
+          description: InvalidCredentials / TOTPRequired / InvalidTOTPCode
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "403":
+          description: AccountLocked
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /api/v2/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the current session
+      security: [{ SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user + memberships
+      security: [{ SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Auth]
+      summary: Update profile
+      security: [{ SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/password:
+    post:
+      tags: [Auth]
+      summary: Change password (revokes all sessions, returns a fresh token)
+      security: [{ SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/password-reset:
+    post:
+      tags: [Auth]
+      summary: Request a password reset (identical response for unknown addresses)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/password-reset/complete:
+    post:
+      tags: [Auth]
+      summary: Redeem a reset token
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/auth/totp/enroll:
+    post:
+      tags: [Auth]
+      summary: Start TOTP enrollment (returns secret + otpauth URL)
+      security: [{ SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/totp/activate:
+    post:
+      tags: [Auth]
+      summary: Confirm TOTP with a code — 2FA is enforced from here on
+      security: [{ SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/totp/disable:
+    post:
+      tags: [Auth]
+      summary: Disable TOTP (requires the password)
+      security: [{ SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/invitations/{token}:
+    get:
+      tags: [Auth]
+      summary: Preview an invitation (public)
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/auth/invitations/accept:
+    post:
+      tags: [Auth]
+      summary: Accept an invitation (creates the account when new)
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/auth/oidc/start:
+    get:
+      tags: [Auth]
+      summary: Begin OIDC SSO (redirect, or JSON with Accept application/json)
+      responses:
+        "307": { description: Redirect to the identity provider }
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { description: SSODisabled }
+  /api/v2/auth/oidc/callback:
+    get:
+      tags: [Auth]
+      summary: OIDC redirect URI (completes SSO)
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+        "307": { description: Redirect to the frontend with the token in the fragment }
+
+  # ------------------------------------------------------------- admin
+  /api/v2/admin/organizations:
+    get:
+      tags: [Organizations]
+      summary: List organizations (users see their memberships)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Organizations]
+      summary: Create an organization (a user creator becomes its owner)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}:
+    get:
+      tags: [Organizations]
+      summary: Show an organization
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Organizations]
+      summary: Delete an organization (owner)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/members:
+    get:
+      tags: [People]
+      summary: List members
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [People]
+      summary: Add an existing account as a member (admin)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/members/{user_id}:
+    patch:
+      tags: [People]
+      summary: Change a member's role (owner transitions need an owner)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [People]
+      summary: Remove a member (the last owner is immovable)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/invitations:
+    get:
+      tags: [People]
+      summary: List invitations
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [People]
+      summary: Invite by email (invite token returned exactly once)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/invitations/{id}:
+    delete:
+      tags: [People]
+      summary: Revoke an invitation
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/organizations/{org}/servers:
+    get:
+      tags: [Servers]
+      summary: List mail servers
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Servers]
+      summary: Create a mail server
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}:
+    get:
+      tags: [Servers]
+      summary: Show a server
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Servers]
+      summary: Update server settings
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Servers]
+      summary: Delete a server
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/suspend:
+    post:
+      tags: [Servers]
+      summary: Suspend sending
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/unsuspend:
+    post:
+      tags: [Servers]
+      summary: Lift a suspension
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/ip_pool:
+    post:
+      tags: [Servers]
+      summary: Assign an IP pool
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/organizations/{org}/servers/{server}/domains:
+    get:
+      tags: [Domains]
+      summary: List sending domains
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Domains]
+      summary: Add a sending domain
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/domains/{name}:
+    get:
+      tags: [Domains]
+      summary: Show a domain
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Domains]
+      summary: Delete a domain
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/domains/{name}/verify:
+    post:
+      tags: [Domains]
+      summary: Mark a domain verified
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/organizations/{org}/servers/{server}/credentials:
+    get:
+      tags: [Credentials]
+      summary: List credentials
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Credentials]
+      summary: Create a credential (API, SMTP or SMTP-IP)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/credentials/{id}:
+    get:
+      tags: [Credentials]
+      summary: Show a credential
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Credentials]
+      summary: Update a credential (name, hold)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Credentials]
+      summary: Delete a credential
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/organizations/{org}/servers/{server}/routes:
+    get:
+      tags: [Routes]
+      summary: List inbound routes
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Routes]
+      summary: Create a route
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/routes/{id}:
+    get:
+      tags: [Routes]
+      summary: Show a route
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Routes]
+      summary: Update a route
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Routes]
+      summary: Delete a route
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/organizations/{org}/servers/{server}/webhooks:
+    get:
+      tags: [Webhooks]
+      summary: List webhooks
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Webhooks]
+      summary: Create a webhook
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/webhooks/{id}:
+    get:
+      tags: [Webhooks]
+      summary: Show a webhook
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Webhooks]
+      summary: Delete a webhook
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/webhooks/{id}/enable:
+    post:
+      tags: [Webhooks]
+      summary: Enable a webhook
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/webhooks/{id}/disable:
+    post:
+      tags: [Webhooks]
+      summary: Disable a webhook
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/organizations/{org}/servers/{server}/suppressions:
+    get:
+      tags: [Suppressions]
+      summary: List suppressions
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Suppressions]
+      summary: Suppress an address
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/suppressions/{address}:
+    delete:
+      tags: [Suppressions]
+      summary: Remove a suppression
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { name: address, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/users:
+    get:
+      tags: [Instance]
+      summary: List user accounts (instance admins)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Instance]
+      summary: Create a user (optional initial password)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/users/{id}:
+    get:
+      tags: [Instance]
+      summary: Show a user
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Instance]
+      summary: Update a user
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Instance]
+      summary: Delete a user
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/ip_pools:
+    get:
+      tags: [Instance]
+      summary: List IP pools
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Instance]
+      summary: Create an IP pool
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/ip_pools/{id}:
+    get:
+      tags: [Instance]
+      summary: Show an IP pool
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Instance]
+      summary: Delete an IP pool
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/ip_pools/{pool_id}/ip_addresses:
+    get:
+      tags: [Instance]
+      summary: List addresses of a pool
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: pool_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Instance]
+      summary: Add an address to a pool
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: pool_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/ip_pools/{pool_id}/ip_addresses/{id}:
+    get:
+      tags: [Instance]
+      summary: Show an address
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: pool_id, in: path, required: true, schema: { type: integer } }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Instance]
+      summary: Remove an address
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: pool_id, in: path, required: true, schema: { type: integer } }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/admin_api_keys:
+    get:
+      tags: [Instance]
+      summary: List admin API keys
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Instance]
+      summary: Create an admin API key (secret returned once)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/admin_api_keys/{id}:
+    delete:
+      tags: [Instance]
+      summary: Revoke an admin API key
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/auth_events:
+    get:
+      tags: [Instance]
+      summary: Authentication audit trail (instance admins)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, maximum: 1000 } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+components:
+  securitySchemes:
+    ServerApiKey:
+      type: apiKey
+      in: header
+      name: X-Server-API-Key
+      description: An API credential of one mail server.
+    AdminApiKey:
+      type: apiKey
+      in: header
+      name: X-Admin-API-Key
+      description: A machine key with full management access.
+    SessionToken:
+      type: http
+      scheme: bearer
+      description: A user session from /api/v2/auth/login (RBAC-scoped).
+
+  parameters:
+    MessageId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+    Permalink:
+      name: permalink
+      in: path
+      required: true
+      schema: { type: string }
+    Org:
+      name: org
+      in: path
+      required: true
+      description: Organization permalink
+      schema: { type: string }
+    ServerPermalink:
+      name: server
+      in: path
+      required: true
+      description: Server permalink
+      schema: { type: string }
+
+  responses:
+    Success:
+      description: Success envelope; see the endpoint description for the data shape.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/SuccessEnvelope" }
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    ValidationError:
+      description: The request was understood but invalid
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      required: [status, time]
+      properties:
+        status: { type: string, enum: [success] }
+        time: { type: number, description: Server-side processing seconds }
+        data: { type: object, additionalProperties: true }
+    ErrorEnvelope:
+      type: object
+      required: [status, time, error]
+      properties:
+        status: { type: string, enum: [error] }
+        time: { type: number }
+        error:
+          type: object
+          properties:
+            code: { type: string, example: ValidationError }
+            message: { type: string }
+
+    Address:
+      description: Either a bare email string or an object with a display name.
+      oneOf:
+        - type: string
+          format: email
+        - type: object
+          required: [email]
+          properties:
+            email: { type: string, format: email }
+            name: { type: string }
+
+    Attachment:
+      type: object
+      required: [name, content_type, data_base64]
+      properties:
+        name: { type: string, example: invoice.pdf }
+        content_type: { type: string, example: application/pdf }
+        data_base64: { type: string, description: Base64-encoded content }
+
+    SendRequest:
+      type: object
+      required: [from, to]
+      properties:
+        from: { $ref: "#/components/schemas/Address" }
+        to:
+          type: array
+          items: { $ref: "#/components/schemas/Address" }
+        cc:
+          type: array
+          items: { $ref: "#/components/schemas/Address" }
+        bcc:
+          type: array
+          items: { $ref: "#/components/schemas/Address" }
+        reply_to:
+          type: array
+          items: { $ref: "#/components/schemas/Address" }
+        subject: { type: string }
+        html_body: { type: string }
+        text_body: { type: string }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+        attachments:
+          type: array
+          items: { $ref: "#/components/schemas/Attachment" }
+        tag: { type: string, description: Free-form tag for filtering/stats }
+        metadata: { type: object, additionalProperties: true }
+        stream: { type: string, description: Message-stream permalink (defaults to the server's default stream) }
+
+    SendResult:
+      type: object
+      properties:
+        message_id: { type: integer }
+        recipients:
+          type: array
+          items:
+            type: object
+            properties:
+              rcpt_to: { type: string }
+              status: { type: string, example: queued }
+              token: { type: string }
+
+    Message:
+      type: object
+      properties:
+        id: { type: integer }
+        token: { type: string }
+        scope: { type: string, enum: [incoming, outgoing] }
+        rcpt_to: { type: string }
+        mail_from: { type: string, nullable: true }
+        subject: { type: string, nullable: true }
+        message_id: { type: string, nullable: true }
+        tag: { type: string, nullable: true }
+        status: { type: string, nullable: true, example: Sent }
+        bounce: { type: boolean }
+        spam_status: { type: string, nullable: true }
+        spam_score: { type: number, nullable: true }
+        held: { type: boolean }
+        threat: { type: boolean }
+        size: { type: integer, nullable: true }
+        metadata: { type: object, nullable: true, additionalProperties: true }
+        stream_id: { type: integer, nullable: true }
+        bypassed: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    Stats:
+      type: object
+      properties:
+        total: { type: integer }
+        incoming: { type: integer }
+        outgoing: { type: integer }
+        sent: { type: integer }
+        pending: { type: integer }
+        held: { type: integer }
+        bounced: { type: integer }
+        soft_fail: { type: integer }
+        hard_fail: { type: integer }
+        opens: { type: integer }
+        clicks: { type: integer }
+        unique_opens: { type: integer }
+        unique_clicks: { type: integer }
+
+    TemplateInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        subject: { type: string, description: "May contain {{ variables }}" }
+        html_body: { type: string }
+        text_body: { type: string }
+
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        uuid: { type: string }
+        email_address: { type: string }
+        first_name: { type: string }
+        last_name: { type: string }
+        admin: { type: boolean }
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer }
+        per_page: { type: integer }
+        total: { type: integer }
+        total_pages: { type: integer }

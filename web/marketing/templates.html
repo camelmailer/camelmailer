@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Template library — CamelMailer</title>
+  <meta name="description" content="20 ready-made transactional email templates you can clone with one command.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐫</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="site">
+      <a class="logo" href="index.html">🐫 CamelMailer</a>
+      <nav class="site"><a href="pricing.html">Pricing</a><a href="templates.html" class="active">Templates</a><a href="docs/api.html">API</a><a href="docs/self-hosting.html">Self-hosting</a><a href="open-source.html">Open source</a><a href="/login">Sign in</a></nav>
+    </header>
+
+    <section class="hero" style="padding-bottom: 24px">
+      <h1>20 transactional templates, <em>ready to clone</em>.</h1>
+      <p>Battle-tested layouts for the mail every product sends — responsive
+      HTML with plain-text twins, using simple
+      <code class="inline">{{ variables }}</code>. Import them into any
+      server with one command, then edit in the dashboard.</p>
+    </section>
+    <section style="padding-top: 0">
+      <pre class="code"><span class="c"># clone the library into your mail server:</span>
+git clone https://github.com/relationsoftware/postal
+cd postal/camelmailer
+./templates/import.sh https://mail.yourdomain.com $SERVER_API_KEY
+
+<span class="c"># then send with any of them:</span>
+curl -X POST https://mail.yourdomain.com/api/v2/server/messages/with_template \
+  -H <span class="s">"X-Server-API-Key: $SERVER_API_KEY"</span> -H <span class="s">"Content-Type: application/json"</span> \
+  -d '{"from":"hi@yourdomain.com","to":["a@b.com"],
+       "template":"welcome","template_model":{"name":"Ada","product":"Acme","action_url":"https://app.acme.com"}}'</pre>
+      <div class="grid" style="margin-top: 40px"><div class="card"><span class="tag">Account lifecycle</span><h3>Welcome & getting started</h3><p><code class="inline">welcome</code></p></div><div class="card"><span class="tag">Account lifecycle</span><h3>Verify your email address</h3><p><code class="inline">email-verification</code></p></div><div class="card"><span class="tag">Account lifecycle</span><h3>Passwordless sign-in link</h3><p><code class="inline">magic-link</code></p></div><div class="card"><span class="tag">Security</span><h3>Password reset link</h3><p><code class="inline">password-reset</code></p></div><div class="card"><span class="tag">Security</span><h3>Password changed notice</h3><p><code class="inline">password-changed</code></p></div><div class="card"><span class="tag">Security</span><h3>One-time security code</h3><p><code class="inline">two-factor-code</code></p></div><div class="card"><span class="tag">Security</span><h3>New device sign-in alert</h3><p><code class="inline">new-device-login</code></p></div><div class="card"><span class="tag">Account lifecycle</span><h3>Account deletion confirmation</h3><p><code class="inline">account-deletion</code></p></div><div class="card"><span class="tag">Collaboration</span><h3>Team / workspace invitation</h3><p><code class="inline">team-invitation</code></p></div><div class="card"><span class="tag">Collaboration</span><h3>You were mentioned</h3><p><code class="inline">mention-notification</code></p></div><div class="card"><span class="tag">Collaboration</span><h3>New reply to your thread</h3><p><code class="inline">comment-reply</code></p></div><div class="card"><span class="tag">Commerce</span><h3>Order confirmation</h3><p><code class="inline">order-confirmation</code></p></div><div class="card"><span class="tag">Commerce</span><h3>Payment receipt</h3><p><code class="inline">payment-receipt</code></p></div><div class="card"><span class="tag">Commerce</span><h3>Payment failed (dunning)</h3><p><code class="inline">payment-failed</code></p></div><div class="card"><span class="tag">Commerce</span><h3>Refund processed</h3><p><code class="inline">refund-processed</code></p></div><div class="card"><span class="tag">Commerce</span><h3>Renewal reminder</h3><p><code class="inline">subscription-renewal</code></p></div><div class="card"><span class="tag">Commerce</span><h3>Cancellation confirmation</h3><p><code class="inline">subscription-cancelled</code></p></div><div class="card"><span class="tag">Commerce</span><h3>Trial ending reminder</h3><p><code class="inline">trial-ending</code></p></div><div class="card"><span class="tag">Commerce</span><h3>Order shipped + tracking</h3><p><code class="inline">shipping-notification</code></p></div><div class="card"><span class="tag">Product</span><h3>Your data export is ready</h3><p><code class="inline">data-export-ready</code></p></div></div>
+      <p style="margin-top:24px;color:var(--muted);font-size:14px">
+        Each template ships as JSON (<code class="inline">name</code>,
+        <code class="inline">subject</code>, <code class="inline">html_body</code>,
+        <code class="inline">text_body</code>) in
+        <a href="https://github.com/relationsoftware/postal" style="color:var(--accent)">templates/library/</a>.
+        The import script is ~20 lines of curl — read it, then trust it.
+      </p>
+    </section>
+
+    <footer class="site">
+      <div class="cols"><div><h4>Product</h4><a href="pricing.html">Pricing</a><a href="templates.html">Template library</a><a href="openapi.yaml">OpenAPI spec</a><a href="/login">Sign in</a></div><div><h4>Developers</h4><a href="docs/api.html">API guide</a><a href="docs/self-hosting.html">Self-hosting guide</a><a href="open-source.html">Open source</a><a href="https://github.com/relationsoftware/postal">GitHub</a></div><div><h4>Legal</h4><a href="legal/imprint.html">Imprint</a><a href="legal/privacy.html">Privacy policy</a><a href="legal/terms.html">Terms of service</a><a href="legal/dpa.html">Data processing (DPA)</a><a href="legal/acceptable-use.html">Acceptable use</a><a href="legal/sub-processors.html">Sub-processors</a></div></div>
+      <span>© 2026 CamelMailer. MIT licensed. Self-host it or let us run it.</span>
+    </footer>
+  </div>
+</body>
+</html>

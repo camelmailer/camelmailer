@@ -3,120 +3,118 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CamelMailer — the API-first mail platform</title>
-  <meta name="description" content="Self-hosted, API-first mail delivery in Rust: SMTP in/out, HTTP APIs for everything, PostgreSQL storage, accounts with RBAC and SSO. MIT licensed.">
+  <title>CamelMailer — transactional email, nothing else</title>
+  <meta name="description" content="The self-hosted or EU-cloud alternative to SendGrid, Mailgun and Postmark. Simple transactional email over a JSON API. Open source, MIT.">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐫</text></svg>">
-  <style>
-    :root {
-      --bg: #0a0a0a; --fg: #fafafa; --muted: #a3a3a3; --card: #171717;
-      --border: #262626; --accent: #f59e0b;
-    }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      background: var(--bg); color: var(--fg);
-      font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    }
-    .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px; }
-    header { padding: 24px 0; display: flex; align-items: center; justify-content: space-between; }
-    .logo { font-weight: 700; font-size: 18px; }
-    nav a { color: var(--muted); text-decoration: none; margin-left: 20px; font-size: 14px; }
-    nav a:hover { color: var(--fg); }
-    .hero { padding: 96px 0 64px; text-align: center; }
-    .hero h1 { font-size: clamp(32px, 6vw, 56px); line-height: 1.1; letter-spacing: -0.02em; }
-    .hero h1 em { color: var(--accent); font-style: normal; }
-    .hero p { margin: 20px auto 0; max-width: 640px; color: var(--muted); font-size: 18px; }
-    .cta { margin-top: 32px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
-    .btn {
-      display: inline-block; padding: 10px 20px; border-radius: 8px; font-size: 15px;
-      text-decoration: none; border: 1px solid var(--border);
-    }
-    .btn.primary { background: var(--fg); color: var(--bg); border-color: var(--fg); font-weight: 600; }
-    .btn.ghost { color: var(--fg); }
-    .btn:hover { opacity: .85; }
-    pre {
-      margin: 48px auto 0; max-width: 560px; text-align: left; background: var(--card);
-      border: 1px solid var(--border); border-radius: 12px; padding: 20px;
-      font: 13px/1.7 ui-monospace, "SF Mono", Menlo, monospace; color: #d4d4d4;
-      overflow-x: auto;
-    }
-    pre .c { color: #737373; }
-    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); padding: 64px 0; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
-    .card h3 { font-size: 16px; margin-bottom: 8px; }
-    .card p { color: var(--muted); font-size: 14px; }
-    footer { border-top: 1px solid var(--border); padding: 32px 0; color: var(--muted); font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
-    footer a { color: var(--muted); }
-  </style>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div class="wrap">
-    <header>
-      <div class="logo">🐫 CamelMailer</div>
-      <nav>
-        <a href="#features">Features</a>
-        <a href="docs/quickstart.md">Docs</a>
-        <a href="https://github.com/relationsoftware/postal">GitHub</a>
-        <a href="/login">Sign in</a>
-      </nav>
+    <header class="site">
+      <a class="logo" href="index.html">🐫 CamelMailer</a>
+      <nav class="site"><a href="pricing.html">Pricing</a><a href="templates.html">Templates</a><a href="docs/api.html">API</a><a href="docs/self-hosting.html">Self-hosting</a><a href="open-source.html">Open source</a><a href="/login">Sign in</a></nav>
     </header>
 
     <section class="hero">
-      <h1>The <em>API-first</em> mail platform<br>you can self-host.</h1>
+      <span class="kicker">Open source · MIT · Self-hosted or EU cloud</span>
+      <h1>Transactional email.<br><em>Nothing else.</em></h1>
       <p>
-        Transactional email without the black box: SMTP in and out, HTTP APIs
-        for everything, one PostgreSQL database, one small Rust binary.
-        Open source, MIT licensed.
+        Receipts, password resets, magic links, alerts — the mail your product
+        must send. No marketing suite, no campaign builder, no bloat. A JSON
+        API and an SMTP port, backed by one Rust binary and one PostgreSQL.
+        Run it yourself, or let us run it for you in the EU.
       </p>
       <div class="cta">
-        <a class="btn primary" href="docs/quickstart.md">Get started in 5 minutes</a>
-        <a class="btn ghost" href="https://github.com/relationsoftware/postal">View source</a>
+        <a class="btn primary" href="docs/api.html">Send your first mail →</a>
+        <a class="btn ghost" href="docs/self-hosting.html">Self-host in 5 minutes</a>
       </div>
-      <pre><span class="c"># the whole platform:</span>
-docker compose up -d --build
-
-<span class="c"># send your first mail:</span>
-curl -X POST https://mail.you.com/api/v2/server/messages \
-  -H "X-Server-API-Key: $KEY" -H "Content-Type: application/json" \
-  -d '{"from":"hi@you.com","to":["a@b.com"],
-       "subject":"Hello","text_body":"It works."}'</pre>
+      <pre class="code"><span class="c"># That's the whole integration:</span>
+curl -X POST https://mail.yourdomain.com/api/v2/server/messages \
+  -H <span class="s">"X-Server-API-Key: $KEY"</span> -H <span class="s">"Content-Type: application/json"</span> \
+  -d '{
+    "from": "billing@yourdomain.com",
+    "to": ["customer@example.com"],
+    "template": "payment-receipt",
+    "template_model": { "amount": "49.00", "invoice": "INV-1042" }
+  }'</pre>
     </section>
 
-    <section id="features" class="grid">
-      <div class="card">
-        <h3>Everything over HTTP</h3>
-        <p>Sending, templates, message streams, statistics, bounces, inbound
-           routing, webhooks, open/click tracking — a clean JSON API for all of it.</p>
-      </div>
-      <div class="card">
-        <h3>Enterprise-ready accounts</h3>
-        <p>User logins with TOTP 2FA, organization roles (viewer → owner),
-           invitations, OIDC single sign-on and a full auth audit log.</p>
-      </div>
-      <div class="card">
-        <h3>Deliverability built in</h3>
-        <p>DKIM signing, IP pools, suppression lists, spam & threat scanning
-           hooks (rspamd/ClamAV), automatic bounce processing.</p>
-      </div>
-      <div class="card">
-        <h3>One database, real isolation</h3>
-        <p>PostgreSQL with row-level security keeps every mail server's data
-           apart — enforced by the database, not by application code.</p>
-      </div>
-      <div class="card">
-        <h3>Small footprint</h3>
-        <p>A single Rust binary runs the web API, SMTP server and delivery
-           worker. No Ruby, no Redis, no per-tenant databases.</p>
-      </div>
-      <div class="card">
-        <h3>Open source</h3>
-        <p>MIT licensed and yours to run. Born as a full Rust rewrite of the
-           Postal mail platform.</p>
+    <section id="why">
+      <h2>Why leave the big US providers?</h2>
+      <p class="lead">
+        SendGrid, Mailgun and friends are fine products — that solve a much
+        bigger problem than you have. If all you send is transactional mail,
+        you are paying for a marketing platform and mailing your customer
+        data across the Atlantic to get it.
+      </p>
+      <table class="compare">
+        <tr><th></th><th>US email SaaS</th><th>CamelMailer</th></tr>
+        <tr><td>Focus</td><td class="meh">Marketing suite + transactional add-on</td><td class="yes">Transactional only — by design</td></tr>
+        <tr><td>Your data</td><td class="no">Their cloud, their jurisdiction</td><td class="yes">Your servers — or our EU cloud</td></tr>
+        <tr><td>Source code</td><td class="no">Closed</td><td class="yes">MIT — audit it, fork it, run it</td></tr>
+        <tr><td>Exit path</td><td class="no">Migration project</td><td class="yes">Same code self-hosted; leave anytime</td></tr>
+        <tr><td>Pricing model</td><td class="meh">Contacts, seats, feature gates</td><td class="yes">Emails sent. That's it.</td></tr>
+        <tr><td>Footprint</td><td class="meh">—</td><td class="yes">One binary + PostgreSQL</td></tr>
+      </table>
+    </section>
+
+    <section id="features">
+      <h2>Everything transactional mail needs. Nothing it doesn't.</h2>
+      <div class="grid" style="margin-top: 24px">
+        <div class="card"><span class="tag">Send</span><h3>One POST to send</h3>
+          <p>JSON in, queued mail out. Attachments, custom headers, tags,
+          metadata, reply-to — and batch endpoints when one recipient isn't enough.</p></div>
+        <div class="card"><span class="tag">Templates</span><h3>Stored templates</h3>
+          <p>Mustache-style <code class="inline">{{ variables }}</code> rendered
+          server-side. Start from our library of 20 ready-made transactional
+          templates and keep your HTML out of your application code.</p></div>
+        <div class="card"><span class="tag">Deliverability</span><h3>DKIM, IP pools, suppressions</h3>
+          <p>Signed mail, per-server sending IPs, automatic bounce processing
+          and suppression lists — the unglamorous parts, handled.</p></div>
+        <div class="card"><span class="tag">Feedback</span><h3>Webhooks & tracking</h3>
+          <p>Delivery, bounce, open and click events pushed to your endpoint —
+          RSA-signed. Query everything over the API too.</p></div>
+        <div class="card"><span class="tag">Inbound</span><h3>Receive replies</h3>
+          <p>Route inbound mail to HTTP endpoints. support@ answered by your
+          app, not by a second product.</p></div>
+        <div class="card"><span class="tag">Team</span><h3>Enterprise accounts</h3>
+          <p>Logins with TOTP 2FA, organization roles, invitations, OIDC SSO
+          (Okta, Entra ID, Google, Keycloak) and a full auth audit trail.</p></div>
       </div>
     </section>
 
-    <footer>
-      <span>© 2026 CamelMailer. MIT licensed.</span>
-      <span><a href="docs/authentication.md">Auth docs</a> · <a href="docs/configuration.md">Configuration</a></span>
+    <section id="deploy">
+      <h2>Run it your way</h2>
+      <div class="grid" style="margin-top: 24px">
+        <div class="card">
+          <span class="tag">Self-hosted</span>
+          <h3>Free forever</h3>
+          <p>MIT licensed, no feature gates, no phone-home. One
+          <code class="inline">docker compose up</code> gives you the API,
+          SMTP server, worker and dashboard.
+          <br><br><a href="docs/self-hosting.html">Self-hosting guide →</a></p>
+        </div>
+        <div class="card">
+          <span class="tag">Cloud</span>
+          <h3>We run it, in the EU</h3>
+          <p>Same open-source code, operated for you on EU infrastructure:
+          managed deliverability, backups and upgrades. Simple per-email
+          pricing.
+          <br><br><a href="pricing.html">See pricing →</a></p>
+        </div>
+        <div class="card">
+          <span class="tag">Developers</span>
+          <h3>API-first, spec included</h3>
+          <p>A complete <a href="openapi.yaml">OpenAPI specification</a> for
+          all endpoints — import it into Postman, generate a client, or read
+          the <a href="docs/api.html">API guide</a>.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div class="cols"><div><h4>Product</h4><a href="pricing.html">Pricing</a><a href="templates.html">Template library</a><a href="openapi.yaml">OpenAPI spec</a><a href="/login">Sign in</a></div><div><h4>Developers</h4><a href="docs/api.html">API guide</a><a href="docs/self-hosting.html">Self-hosting guide</a><a href="open-source.html">Open source</a><a href="https://github.com/relationsoftware/postal">GitHub</a></div><div><h4>Legal</h4><a href="legal/imprint.html">Imprint</a><a href="legal/privacy.html">Privacy policy</a><a href="legal/terms.html">Terms of service</a><a href="legal/dpa.html">Data processing (DPA)</a><a href="legal/acceptable-use.html">Acceptable use</a><a href="legal/sub-processors.html">Sub-processors</a></div></div>
+      <span>© 2026 CamelMailer. MIT licensed. Self-host it or let us run it.</span>
     </footer>
   </div>
 </body>

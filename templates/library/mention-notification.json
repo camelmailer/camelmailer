@@ -1,0 +1,16 @@
+{
+  "name": "mention-notification",
+  "description": "Someone mentioned the user; quote + deep link.",
+  "variables": [
+    "product",
+    "support_email",
+    "name",
+    "author",
+    "context",
+    "excerpt",
+    "action_url"
+  ],
+  "subject": "{{ author }} mentioned you in {{ context }}",
+  "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">You were mentioned.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">{{ author }} mentioned you</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">In <strong>{{ context }}</strong>:</p><blockquote style=\"margin:8px 0 20px;padding:12px 16px;border-left:3px solid #e4e4e7;color:#52525b;font-size:14px;line-height:1.6;\">{{ excerpt }}</blockquote><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">View and reply</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+  "text_body": "{{ author }} mentioned you in {{ context }}:\n\n> {{ excerpt }}\n\nView and reply: {{ action_url }}"
+}

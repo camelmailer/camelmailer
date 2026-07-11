@@ -12,8 +12,11 @@ Rust rewrite of [Postal](https://github.com/postalserver/postal).
 **Web frontend included:** `web/app` is a React (shadcn/ui) admin
 application covering the entire API — login with 2FA/SSO, organizations
 and roles, servers with all resources, sending and message browsing —
-and `web/marketing` is a simple static landing page. See
-[web/README.md](web/README.md).
+and `web/marketing` is the dependency-free marketing site (landing,
+cloud pricing, open-source and legal pages, API + self-hosting guides,
+and the public [OpenAPI spec](web/marketing/openapi.yaml)). See
+[web/README.md](web/README.md). A library of 20 ready-to-clone
+transactional email templates lives in [templates/](templates/README.md).
 
 ## Quickstart
 
