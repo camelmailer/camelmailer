@@ -21,6 +21,7 @@ import {
   RefreshCwIcon,
   ScrollTextIcon,
   SearchIcon,
+  SparklesIcon,
   TriangleAlertIcon,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -85,6 +86,8 @@ import {
   type ParsedEmail,
 } from "@/lib/api-p1"
 import { recipientHref } from "@/lib/api-p2"
+import { renderMustache, sampleModel, TEMPLATE_LIBRARY, type LibraryTemplate } from "@/lib/api-p3"
+import { StatusPill } from "@/components/status-pill"
 import { useOrgParams } from "@/lib/params"
 
 function errorToast(err: unknown, fallback: string) {
@@ -1358,114 +1361,126 @@ export function Streams({ api }: { api: Api }) {
 
 // ----------------------------------------------------------- templates
 
-function TemplateEditor({
+/// A scaled, sandboxed thumbnail of an HTML body — a fixed 600px canvas
+/// shrunk into the card. Variables are filled with sample values so the
+/// preview reads like a rendered mail, not raw Mustache.
+function TemplateThumbnail({
+  html,
+  subject,
+  textBody,
+}: {
+  html: string | null
+  subject?: string | null
+  textBody?: string | null
+}) {
+  if (!html) {
+    return (
+      <div className="flex h-36 items-center justify-center rounded-t-md border-b bg-muted/40 text-xs text-muted-foreground">
+        Plain-text template
+      </div>
+    )
+  }
+  const rendered = renderMustache(html, sampleModel(subject, html, textBody))
+  return (
+    <div className="h-36 overflow-hidden rounded-t-md border-b bg-white">
+      <iframe
+        title="Template thumbnail"
+        sandbox=""
+        srcDoc={rendered}
+        tabIndex={-1}
+        aria-hidden
+        className="pointer-events-none origin-top-left"
+        style={{ width: "600px", height: "480px", transform: "scale(0.44)", border: "0" }}
+      />
+    </div>
+  )
+}
+
+/// "Start from library" — the gallery-wizard over the 20 bundled
+/// templates (masterplan §4.7). Each entry previews its thumbnail; Import
+/// calls the create API with the full body.
+function LibraryWizard({
   api,
-  template,
+  existingPermalinks,
   onClose,
-  onSaved,
+  onImported,
 }: {
   api: Api
-  template: Template | null
+  existingPermalinks: Set<string>
   onClose: () => void
-  onSaved: () => void
+  onImported: () => void
 }) {
-  const [name, setName] = useState(template?.name ?? "")
-  const [subject, setSubject] = useState(template?.subject ?? "")
-  const [htmlBody, setHtmlBody] = useState(template?.html_body ?? "")
-  const [textBody, setTextBody] = useState(template?.text_body ?? "")
-  const [model, setModel] = useState('{ "name": "Ada" }')
-  const [preview, setPreview] = useState<string | null>(null)
+  const [importing, setImporting] = useState<string | null>(null)
 
-  async function save() {
+  async function importTemplate(template: LibraryTemplate) {
+    setImporting(template.permalink)
     try {
-      if (template) {
-        await api.templates.update(template.permalink, {
-          name,
-          subject,
-          html_body: htmlBody,
-          text_body: textBody,
-        })
-      } else {
-        await api.templates.create({
-          name,
-          subject,
-          ...(htmlBody ? { html_body: htmlBody } : {}),
-          ...(textBody ? { text_body: textBody } : {}),
-        })
-      }
-      onSaved()
-      onClose()
+      await api.templates.create({
+        name: template.name,
+        subject: template.subject,
+        html_body: template.html_body,
+        text_body: template.text_body,
+      })
+      toast.success(`Imported “${template.name}”`)
+      onImported()
     } catch (err) {
-      errorToast(err, "Could not save the template")
-    }
-  }
-
-  async function renderPreview() {
-    if (!template) return
-    try {
-      const parsed = JSON.parse(model || "{}")
-      const { rendered } = await api.templates.render(template.permalink, parsed)
-      setPreview(
-        `Subject: ${rendered.subject ?? "—"}\n\n${rendered.text_body ?? rendered.html_body ?? ""}`,
-      )
-    } catch (err) {
-      errorToast(err, "Rendering failed (is the model valid JSON?)")
+      errorToast(err, "Could not import the template")
+    } finally {
+      setImporting(null)
     }
   }
 
   return (
-    <FormDialog
-      open
-      onOpenChange={(open) => !open && onClose()}
-      title={template ? `Edit ${template.name}` : "New template"}
-      submitLabel="Save"
-      onSubmit={save}
-      submitDisabled={!name.trim()}
-      wide
-    >
-        <div className="grid max-h-[70svh] gap-4 overflow-y-auto pr-1">
-          <div className="grid grid-cols-2 gap-2">
-            <div className="grid gap-2">
-              <Label>Name</Label>
-              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="welcome" />
-            </div>
-            <div className="grid gap-2">
-              <Label>Subject</Label>
-              <Input
-                value={subject}
-                onChange={(e) => setSubject(e.target.value)}
-                placeholder="Hello {{ name }}"
-              />
-            </div>
-          </div>
-          <div className="grid gap-2">
-            <Label>Text body</Label>
-            <Textarea rows={5} value={textBody} onChange={(e) => setTextBody(e.target.value)} />
-          </div>
-          <div className="grid gap-2">
-            <Label>HTML body</Label>
-            <Textarea rows={5} value={htmlBody} onChange={(e) => setHtmlBody(e.target.value)} />
-          </div>
-          {template && (
-            <div className="grid gap-2 rounded-md border p-3">
-              <Label>Preview with model (JSON)</Label>
-              <div className="flex gap-2">
-                <Input
-                  className="font-mono text-xs"
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>Start from the library</DialogTitle>
+        </DialogHeader>
+        <p className="text-sm text-muted-foreground">
+          Twenty production-ready transactional templates — account lifecycle, security,
+          collaboration and commerce. Import one to make it your own.
+        </p>
+        <div className="grid max-h-[65svh] grid-cols-2 gap-3 overflow-y-auto pr-1 sm:grid-cols-3">
+          {TEMPLATE_LIBRARY.map((template) => {
+            const already = existingPermalinks.has(template.permalink)
+            return (
+              <Card key={template.permalink} className="gap-0 overflow-hidden p-0">
+                <TemplateThumbnail
+                  html={template.html_body}
+                  subject={template.subject}
+                  textBody={template.text_body}
                 />
-                <Button variant="outline" onClick={renderPreview}>
-                  Render
-                </Button>
-              </div>
-              {preview && (
-                <pre className="max-h-48 overflow-auto rounded bg-muted p-2 text-xs">{preview}</pre>
-              )}
-            </div>
-          )}
+                <CardContent className="grid gap-2 p-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">{template.name}</p>
+                    <p className="line-clamp-2 text-xs text-muted-foreground">
+                      {template.description}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant={already ? "outline" : "default"}
+                    disabled={already || importing !== null}
+                    onClick={() => importTemplate(template)}
+                  >
+                    {already
+                      ? "Already imported"
+                      : importing === template.permalink
+                        ? "Importing…"
+                        : "Import"}
+                  </Button>
+                </CardContent>
+              </Card>
+            )
+          })}
         </div>
-    </FormDialog>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Done
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -1560,15 +1575,21 @@ function CopyTemplateDialog({
   )
 }
 
+/// The templates gallery (masterplan §4.7): rendered mini-thumbnails,
+/// slug badge and Published/Archived status; "New template" and Edit open
+/// the focus-mode split editor (a route), "Start from library" the
+/// gallery-wizard, "Copy to server…" the sibling-server push.
 export function Templates({ api, org, server }: { api: Api; org: string; server: string }) {
+  const router = useRouter()
   const queryClient = useQueryClient()
   const templates = useQuery({ queryKey: ["sapi-templates"], queryFn: api.templates.list })
-  const [editor, setEditor] = useState<{ open: boolean; template: Template | null }>({
-    open: false,
-    template: null,
-  })
+  const [library, setLibrary] = useState(false)
   const [copying, setCopying] = useState<Template | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-templates"] })
+
+  const base = `/orgs/${org}/servers/${server}/messaging/templates`
+  const editorHref = (permalink: string) => `${base}/${encodeURIComponent(permalink)}`
+  const existingPermalinks = new Set(templates.data?.templates.map((t) => t.permalink) ?? [])
 
   return (
     <div>
@@ -1576,51 +1597,47 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
         title="Templates"
         description="Mustache-style templates ({{ name }}) rendered per send."
         action={
-          <Button size="sm" onClick={() => setEditor({ open: true, template: null })}>
-            <PlusIcon className="size-4" /> New template
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setLibrary(true)}>
+              <SparklesIcon className="size-4" /> Start from library
+            </Button>
+            <Button size="sm" onClick={() => router.push(`${base}/new`)}>
+              <PlusIcon className="size-4" /> New template
+            </Button>
+          </div>
         }
       />
       {templates.data?.templates.length === 0 ? (
         <EmptyState
           icon={FileTextIcon}
           title="No templates yet"
-          description="Write a Mustache-style template once and render it with fresh data on every send."
-          action={{ label: "New template", onClick: () => setEditor({ open: true, template: null }) }}
+          description="Write a Mustache-style template once and render it with fresh data on every send — or start from one of 20 ready-made designs."
+          action={{ label: "New template", onClick: () => router.push(`${base}/new`) }}
+          secondaryAction={{ label: "Start from library", onClick: () => setLibrary(true) }}
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Name</TableHead>
-              <TableHead>Permalink</TableHead>
-              <TableHead>Subject</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {templates.data?.templates.map((template) => (
-              <TableRow key={template.id}>
-                <TableCell className="font-medium">{template.name}</TableCell>
-                <TableCell className="font-mono text-xs text-muted-foreground">
-                  {template.permalink}
-                </TableCell>
-                <TableCell className="max-w-56 truncate">{template.subject ?? "—"}</TableCell>
-                <TableCell>
-                  {template.archived ? (
-                    <Badge variant="secondary">archived</Badge>
-                  ) : (
-                    <Badge>active</Badge>
-                  )}
-                </TableCell>
-                <TableCell className="space-x-2 text-right">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setEditor({ open: true, template })}
-                  >
-                    Edit
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {templates.data?.templates.map((template) => (
+            <Card key={template.id} className="gap-0 overflow-hidden p-0">
+              <TemplateThumbnail
+                html={template.html_body}
+                subject={template.subject}
+                textBody={template.text_body}
+              />
+              <CardContent className="grid gap-2 p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">{template.name}</p>
+                    <p className="truncate font-mono text-xs text-muted-foreground">
+                      {template.permalink}
+                    </p>
+                  </div>
+                  <StatusPill status={template.archived ? "draft" : "published"} />
+                </div>
+                <p className="truncate text-xs text-muted-foreground">{template.subject ?? "—"}</p>
+                <div className="mt-1 flex flex-wrap items-center gap-2">
+                  <Button variant="outline" size="sm" asChild>
+                    <Link href={editorHref(template.permalink)}>Edit</Link>
                   </Button>
                   <Button variant="outline" size="sm" onClick={() => setCopying(template)}>
                     Copy to server…
@@ -1641,18 +1658,18 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
                       Archive
                     </Button>
                   )}
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
       )}
-      {editor.open && (
-        <TemplateEditor
+      {library && (
+        <LibraryWizard
           api={api}
-          template={editor.template}
-          onClose={() => setEditor({ open: false, template: null })}
-          onSaved={invalidate}
+          existingPermalinks={existingPermalinks}
+          onClose={() => setLibrary(false)}
+          onImported={invalidate}
         />
       )}
       {copying && (
@@ -1692,12 +1709,13 @@ export function useMessagingApiP1(): ApiP1 {
 const SUBTABS = [
   { value: "send", label: "Send" },
   { value: "messages", label: "Activity" },
-  { value: "logs", label: "Logs" },
-  { value: "queue", label: "Queue" },
-  { value: "stats", label: "Summary" },
   { value: "statistics", label: "Statistics" },
+  { value: "stats", label: "Summary" },
   { value: "streams", label: "Streams" },
   { value: "templates", label: "Templates" },
+  { value: "setup", label: "Setup" },
+  { value: "queue", label: "Queue" },
+  { value: "logs", label: "Logs" },
 ]
 
 export function MessagingShell({

@@ -15,6 +15,8 @@ import {
   InboxIcon,
   KeyRoundIcon,
   PlusIcon,
+  SearchIcon,
+  ServerIcon,
   WebhookIcon,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -70,6 +72,17 @@ import {
   suppressionsCsv,
   type SuppressionWithDate,
 } from "@/lib/api-p2"
+import { relativeTime } from "@/lib/api-p1"
+import {
+  deriveSmtpHost,
+  maskKey,
+  SMTP_PORTS,
+  smtpUsername,
+  WEBHOOK_EVENT_META,
+  webhookSamplePayload,
+  type CredentialWithUsage,
+} from "@/lib/api-p3"
+import { Card, CardContent } from "@/components/ui/card"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -213,6 +226,105 @@ export function Domains({ org, server }: Scope) {
 
 // --------------------------------------------------------- credentials
 
+/// The last-used cell: relative time, or "No activity" for a key that has
+/// never authenticated a request (masterplan §4.9 key hygiene).
+function LastUsed({ at }: { at: string | null | undefined }) {
+  if (!at) {
+    return (
+      <span className="inline-flex items-center gap-1 text-muted-foreground" title="This key has never authenticated a request">
+        No activity
+      </span>
+    )
+  }
+  return (
+    <span className="whitespace-nowrap text-muted-foreground" title={formatDate(at)}>
+      {relativeTime(at)}
+    </span>
+  )
+}
+
+/// One copy-first row of the SMTP settings panel.
+function CopyField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid gap-1">
+      <Label className="text-xs text-muted-foreground">{label}</Label>
+      <div className="flex items-center gap-2">
+        <code className="min-w-0 flex-1 truncate rounded bg-muted px-2 py-1.5 font-mono text-xs">
+          {value}
+        </code>
+        <CopyButton value={value} />
+      </div>
+    </div>
+  )
+}
+
+/// Copy-first SMTP connection view for an SMTP credential (masterplan
+/// §4.9): host, ports, username (`org/server`) and the password (= the
+/// credential key), all as copy fields.
+function SmtpDialog({
+  org,
+  server,
+  credential,
+  smtpHost,
+  onClose,
+}: Scope & { credential: CredentialWithUsage; smtpHost: string; onClose: () => void }) {
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>SMTP settings — {credential.name}</DialogTitle>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <CopyField label="Host" value={smtpHost} />
+          <div className="grid gap-1">
+            <Label className="text-xs text-muted-foreground">Ports</Label>
+            <div className="flex flex-wrap gap-1.5">
+              {SMTP_PORTS.map((p) => (
+                <Badge key={p.port} variant="outline" className="font-mono">
+                  {p.port}
+                  <span className="ml-1 font-sans font-normal text-muted-foreground">{p.note}</span>
+                </Badge>
+              ))}
+            </div>
+          </div>
+          <CopyField label="Username" value={smtpUsername(org, server)} />
+          <CopyField label="Password" value={credential.key} />
+          <p className="rounded-md border bg-muted/40 p-2 text-xs text-muted-foreground">
+            Your password is this credential&apos;s key — there is no separate SMTP password. Use
+            port 587 with STARTTLS unless your client needs implicit TLS (465).
+          </p>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Close
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/// The capability explainer (masterplan §4.9): which key does what.
+function CredentialCapabilities() {
+  const rows = [
+    { name: "Server key (API / SMTP)", detail: "Sends mail and reads this one server's messaging API. What you create here." },
+    { name: "Admin key", detail: "Full management access across the whole installation — machine-to-machine. Created under Admin." },
+    { name: "User session", detail: "Your signed-in browser session, scoped by your organization role (viewer → owner)." },
+  ]
+  return (
+    <Card className="mb-4">
+      <CardContent className="grid gap-2 p-4 text-sm sm:grid-cols-3">
+        {rows.map((r) => (
+          <div key={r.name} className="grid gap-0.5">
+            <p className="font-medium">{r.name}</p>
+            <p className="text-xs text-muted-foreground">{r.detail}</p>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  )
+}
+
 export function Credentials({ org, server }: Scope) {
   const queryClient = useQueryClient()
   const key = ["credentials", org, server]
@@ -220,13 +332,24 @@ export function Credentials({ org, server }: Scope) {
     queryKey: key,
     queryFn: () => adminApi.credentials(org, server).list(),
   })
+  const domains = useQuery({
+    queryKey: ["domains", org, server],
+    queryFn: () => adminApi.domains(org, server).list(),
+  })
   const [open, setOpen] = useState(false)
   const [name, setName] = useState("")
   const [type, setType] = useState("API")
   const [cidr, setCidr] = useState("")
   const [issued, setIssued] = useState<string | null>(null)
   const [deleteId, setDeleteId] = useState<number | null>(null)
+  const [smtpFor, setSmtpFor] = useState<CredentialWithUsage | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
+
+  const smtpHost =
+    typeof window !== "undefined"
+      ? deriveSmtpHost(domains.data?.domains, window.location.hostname)
+      : deriveSmtpHost(domains.data?.domains, "smtp.camelmailer.com")
+  const rows = (credentials.data?.credentials ?? []) as CredentialWithUsage[]
 
   const create = useMutation({
     mutationFn: () =>
@@ -247,15 +370,16 @@ export function Credentials({ org, server }: Scope) {
   return (
     <div>
       <PageHeader
-        title="Credentials"
-        description="API keys (HTTP sending + messaging API) and SMTP credentials."
+        title="API keys & SMTP"
+        description="API keys (HTTP sending + messaging API) and SMTP credentials for this server."
         action={
           <Button size="sm" onClick={() => { setIssued(null); setOpen(true) }}>
             <PlusIcon className="size-4" /> New credential
           </Button>
         }
       />
-      {credentials.isSuccess && credentials.data.credentials.length === 0 ? (
+      <CredentialCapabilities />
+      {credentials.isSuccess && rows.length === 0 ? (
         <EmptyState
           icon={KeyRoundIcon}
           title="No credentials yet"
@@ -269,22 +393,30 @@ export function Credentials({ org, server }: Scope) {
             <TableHead>Name</TableHead>
             <TableHead>Type</TableHead>
             <TableHead>Key</TableHead>
+            <TableHead>Last used</TableHead>
             <TableHead>Hold</TableHead>
             <TableHead />
           </TableRow>
         </TableHeader>
         <TableBody>
-          {credentials.data?.credentials.map((credential) => (
+          {rows.map((credential) => (
             <TableRow key={credential.id}>
               <TableCell className="font-medium">{credential.name}</TableCell>
               <TableCell>
                 <Badge variant="outline">{credential.type}</Badge>
               </TableCell>
               <TableCell>
-                <span className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
-                  {credential.key.slice(0, 8)}…
-                  <CopyButton value={credential.key} />
-                </span>
+                {credential.type === "SMTP-IP" ? (
+                  <span className="font-mono text-xs text-muted-foreground">{credential.key}</span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
+                    {maskKey(credential.key)}
+                    <CopyButton value={credential.key} />
+                  </span>
+                )}
+              </TableCell>
+              <TableCell>
+                <LastUsed at={credential.last_used_at} />
               </TableCell>
               <TableCell>
                 <Switch
@@ -299,7 +431,12 @@ export function Credentials({ org, server }: Scope) {
                   }}
                 />
               </TableCell>
-              <TableCell className="text-right">
+              <TableCell className="space-x-2 text-right">
+                {credential.type === "SMTP" && (
+                  <Button variant="outline" size="sm" onClick={() => setSmtpFor(credential)}>
+                    <ServerIcon className="size-4" /> SMTP settings
+                  </Button>
+                )}
                 <Button variant="ghost" size="sm" onClick={() => setDeleteId(credential.id)}>
                   Delete
                 </Button>
@@ -308,6 +445,15 @@ export function Credentials({ org, server }: Scope) {
           ))}
         </TableBody>
       </Table>
+      )}
+      {smtpFor && (
+        <SmtpDialog
+          org={org}
+          server={server}
+          credential={smtpFor}
+          smtpHost={smtpHost}
+          onClose={() => setSmtpFor(null)}
+        />
       )}
       <FormDialog
         open={open}
@@ -539,37 +685,11 @@ export function Routes({ org, server }: Scope) {
 
 // ------------------------------------------------------------ webhooks
 
-/// Details strings of the sample payload per event — mirrors the backend's
-/// `sample_payload` so the JSON shown here matches what actually arrives.
-const SAMPLE_DETAILS: Record<string, string> = {
-  MessageSent: "Message for recipient@example.com accepted by mx.example.com",
-  MessageDelayed: "421 4.7.0 try again later (attempt 2 of 18)",
-  MessageDeliveryFailed: "550 5.1.1 recipient address rejected: user unknown",
-  MessageHeld: "Message held for manual review (spam score above threshold)",
-}
-
-function samplePayload(event: string): string {
-  return JSON.stringify(
-    {
-      event,
-      timestamp: Math.floor(Date.now() / 1000),
-      uuid: "<generated per delivery>",
-      test: true,
-      payload: {
-        message: {
-          id: 1234,
-          token: "AbCdEf123456",
-          rcpt_to: "recipient@example.com",
-          mail_from: "sender@yourdomain.com",
-          scope: "outgoing",
-          bounce: false,
-        },
-        details: SAMPLE_DETAILS[event] ?? "Test delivery",
-      },
-    },
-    null,
-    2,
-  )
+/// A soft, tinted event chip using the shared lifecycle color semantics
+/// (sent green · delayed/held amber · failed red).
+function EventPill({ event }: { event: string }) {
+  const meta = WEBHOOK_EVENT_META[event]
+  return <StatusPill status={meta?.label ?? event} tone={meta?.tone ?? "gray"} />
 }
 
 function resultPill(result: WebhookTestResult) {
@@ -580,6 +700,39 @@ function resultPill(result: WebhookTestResult) {
     return <Badge variant="destructive">failed · HTTP {result.status_code}</Badge>
   }
   return <Badge variant="destructive">failed · no response</Badge>
+}
+
+/// Live example-payload preview for the webhook editor: pick one of the
+/// subscribed events (or any event when none are selected) and see exactly
+/// the JSON body that will POST to the endpoint, with a Copy button.
+function WebhookPayloadPreview({ events }: { events: string[] }) {
+  const choices = events.length > 0 ? events : [...WEBHOOK_EVENTS]
+  const [event, setEvent] = useState(choices[0])
+  const active = choices.includes(event) ? event : choices[0]
+  const payload = webhookSamplePayload(active)
+  return (
+    <div className="grid gap-2 rounded-md border bg-muted/30 p-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Label className="text-xs">Example payload</Label>
+          <Select value={active} onValueChange={setEvent}>
+            <SelectTrigger size="sm" className="h-7 w-48">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {choices.map((name) => (
+                <SelectItem key={name} value={name}>
+                  {name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <CopyButton value={payload} />
+      </div>
+      <pre className="max-h-44 overflow-auto rounded bg-background p-2 text-xs">{payload}</pre>
+    </div>
+  )
 }
 
 /// "Send test": pick an event, POST the sample payload to the webhook URL
@@ -599,7 +752,7 @@ function SendTestDialog({
     onError: (err) => errorToast(err, "Could not send the test event"),
   })
 
-  const payload = samplePayload(event)
+  const payload = webhookSamplePayload(event)
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -675,6 +828,7 @@ export function Webhooks({ org, server }: Scope) {
   const [url, setUrl] = useState("")
   const [sign, setSign] = useState(true)
   const [events, setEvents] = useState<string[]>([])
+  const [eventSearch, setEventSearch] = useState("")
   const [headerRows, setHeaderRows] = useState<{ name: string; value: string }[]>([])
   const [deleteId, setDeleteId] = useState<number | null>(null)
   const [testing, setTesting] = useState<Webhook | null>(null)
@@ -756,9 +910,7 @@ export function Webhooks({ org, server }: Scope) {
                   ) : (
                     <div className="flex max-w-56 flex-wrap gap-1">
                       {webhook.events.map((event) => (
-                        <Badge key={event} variant="outline">
-                          {event}
-                        </Badge>
+                        <EventPill key={event} event={event} />
                       ))}
                     </div>
                   )}
@@ -815,19 +967,37 @@ export function Webhooks({ org, server }: Scope) {
             </div>
             <div className="grid gap-2">
               <Label>Events (none selected = all events)</Label>
-              <div className="grid gap-1">
-                {WEBHOOK_EVENTS.map((event) => (
-                  <label key={event} className="flex items-center gap-2 text-sm">
+              <div className="relative">
+                <SearchIcon className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  className="pl-8"
+                  placeholder="Search events…"
+                  value={eventSearch}
+                  onChange={(e) => setEventSearch(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-1 rounded-md border p-2">
+                {WEBHOOK_EVENTS.filter((event) =>
+                  event.toLowerCase().includes(eventSearch.toLowerCase()),
+                ).map((event) => (
+                  <label
+                    key={event}
+                    className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-muted/60"
+                  >
                     <input
                       type="checkbox"
                       className="size-4 accent-primary"
                       checked={events.includes(event)}
                       onChange={(e) => toggleEvent(event, e.target.checked)}
                     />
-                    {event}
+                    <EventPill event={event} />
+                    <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                      {WEBHOOK_EVENT_META[event]?.description}
+                    </span>
                   </label>
                 ))}
               </div>
+              <WebhookPayloadPreview events={events} />
             </div>
             <div className="grid gap-2">
               <Label>Custom headers (e.g. Authorization)</Label>
