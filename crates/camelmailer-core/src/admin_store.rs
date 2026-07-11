@@ -151,6 +151,12 @@ pub trait AdminStore: Send + Sync {
         permalink: &str,
     ) -> Result<Option<Organization>, StoreError>;
     async fn create_organization(&self, new: NewOrganization) -> Result<Organization, StoreError>;
+    /// Persist changed organization fields (currently `name` and
+    /// `require_two_factor`; the permalink is immutable through the API).
+    async fn update_organization(
+        &self,
+        organization: Organization,
+    ) -> Result<Organization, StoreError>;
     async fn delete_organization(&self, id: Id) -> Result<bool, StoreError>;
 
     async fn servers_for_organization(
@@ -340,7 +346,24 @@ impl AdminStore for crate::store::MemoryStore {
             uuid: crate::token::generate_uuid(),
             name: new.name,
             permalink: new.permalink,
+            require_two_factor: false,
         }))
+    }
+
+    async fn update_organization(
+        &self,
+        organization: Organization,
+    ) -> Result<Organization, StoreError> {
+        if self
+            .organizations()
+            .iter()
+            .any(|o| o.id != organization.id && o.permalink == organization.permalink)
+        {
+            return Err(StoreError::Conflict(
+                "Permalink has already been taken".into(),
+            ));
+        }
+        Ok(self.insert_organization(organization))
     }
 
     async fn delete_organization(&self, id: Id) -> Result<bool, StoreError> {
@@ -1266,6 +1289,62 @@ mod tests {
             .create_user(new())
             .await
             .expect_err("duplicate email must conflict");
+        assert!(matches!(error, StoreError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn organizations_default_to_and_round_trip_require_two_factor() {
+        let store = MemoryStore::new();
+        let organization = store
+            .create_organization(NewOrganization {
+                name: "Acme".into(),
+                permalink: "acme".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!organization.require_two_factor);
+
+        let updated = store
+            .update_organization(Organization {
+                require_two_factor: true,
+                ..organization.clone()
+            })
+            .await
+            .unwrap();
+        assert!(updated.require_two_factor);
+        let reread = store
+            .organization_by_permalink("acme")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reread.require_two_factor);
+        assert_eq!(reread.name, "Acme");
+
+        // switching it back off round-trips too
+        let updated = store
+            .update_organization(Organization {
+                require_two_factor: false,
+                ..updated
+            })
+            .await
+            .unwrap();
+        assert!(!updated.require_two_factor);
+
+        // a permalink collision with another organization is a conflict
+        let other = store
+            .create_organization(NewOrganization {
+                name: "Beta".into(),
+                permalink: "beta".into(),
+            })
+            .await
+            .unwrap();
+        let error = store
+            .update_organization(Organization {
+                permalink: "acme".into(),
+                ..other
+            })
+            .await
+            .expect_err("duplicate permalink must conflict");
         assert!(matches!(error, StoreError::Conflict(_)));
     }
 

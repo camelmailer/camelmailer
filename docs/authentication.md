@@ -92,6 +92,39 @@ RegistrationDisabled`. Other error codes: `ParameterMissing`,
 `auth.minimum_password_length`, or address already taken). Registrations
 appear on the audit log as `registration.success`.
 
+### Bootstrap workspace
+
+With `auth.bootstrap_workspace: true` (off by default; meant for the
+cloud, where a fresh account should be able to send mail immediately)
+every **brand-new** account starts with a ready-made workspace:
+
+- an organization **"\<FirstName>'s Team"** with the user as its owner
+  (the permalink is the slugged name; collisions get a numeric suffix:
+  `grace-s-team`, `grace-s-team-2`, `grace-s-team-3`, …),
+- a server **`production`** inside it,
+- and — registration only — an API credential **`default`**.
+
+The register response then carries the workspace:
+
+```json
+{ "data": { "session_token": "…", "user": { … },
+            "workspace": { "organization": "grace-s-team",
+                           "server": "production",
+                           "api_key": "…" } } }
+```
+
+`api_key` is shown **exactly once, here** — the usual
+"secrets are shown once" convention. The same bootstrap runs when
+OIDC/SAML/social-SSO auto-provisioning creates a new account (only on
+the very first login that creates it), with one difference: SSO logins
+have no response channel that could show a key once, so only the
+organization and the server are created — **no** API credential. The
+user creates one from the dashboard instead.
+
+Bootstrap failures (e.g. no free permalink) never fail the registration
+or SSO login: they are logged (`tracing::warn!`) and the response simply
+carries no `workspace` — the account itself always survives.
+
 ## RBAC
 
 A user's power inside an organization is its **membership role**:
@@ -146,6 +179,46 @@ The invitation flow for people **without** an account:
 
 Invitations expire after `auth.invitation_expiry_days` (default 7) and are
 single-use.
+
+## Org-wide two-factor enforcement
+
+Owners can require a second factor from everyone in an organization
+(the Postmark pattern):
+
+```text
+PATCH /api/v2/admin/organizations/{org}   {"require_two_factor": true}
+GET   /api/v2/admin/organizations/{org}   -> { …, "require_two_factor": true }
+```
+
+The `PATCH` is **owner-only** (admins get `403 Forbidden`). While the
+flag is on, any user whose account has **no active second factor** —
+neither activated TOTP nor at least one registered passkey — receives on
+every resource of that organization:
+
+```json
+{ "status": "error", "error": { "code": "TwoFactorEnforced",
+  "message": "This organization requires two-factor authentication. Enable two-factor authentication on your account to continue." } }
+```
+
+(HTTP 403.) The rules:
+
+- The check sits in the central RBAC layer, so it covers the whole
+  management surface of the organization — the organization itself,
+  servers, domains, credentials, members, billing, everything below
+  `/organizations/{org}`.
+- It applies to **sessions only**. The machine `X-Admin-API-Key` is not
+  a person and is unaffected.
+- **Global admins are enforced too** — there is no backdoor. (That
+  includes the owner who just enabled the flag without having 2FA:
+  enable a second factor to get back in, or fix it via the admin key.)
+- Non-members still get the usual indistinguishable `404`.
+- Other organizations of the same user are untouched; the user's own
+  account pages (`/api/v2/auth/*`) — including TOTP/passkey enrollment —
+  always work, so users can enable 2FA and regain access immediately.
+
+The web app shows affected users a full-page "Enable 2FA to access this
+organization" card linking to Account → Security, and owners find the
+toggle under Organization → Settings → Security.
 
 ## Passkeys (WebAuthn)
 
@@ -503,6 +576,8 @@ auth:
   minimum_password_length: 8      # must be >= 8
   allow_organization_creation: true
   allow_registration: false     # open self-registration (POST /api/v2/auth/register)
+  bootstrap_workspace: false    # auto-create org + server (+ API key on register)
+                                # for brand-new accounts — meant for the cloud
   invitation_expiry_days: 7
   password_reset_expiry_hours: 2
   frontend_url: null              # e.g. https://mail-admin.example.com

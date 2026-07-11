@@ -97,6 +97,9 @@ export type Organization = {
   uuid: string
   name: string
   permalink: string
+  /** Org-wide 2FA enforcement: members without TOTP or a passkey get
+   *  403 TwoFactorEnforced on every org resource. Owner-only setting. */
+  require_two_factor: boolean
 }
 
 export type Role = "viewer" | "member" | "admin" | "owner"
@@ -406,16 +409,20 @@ export const authApi = {
       { email_address, password, ...(totp_code ? { totp_code } : {}) },
     ),
   // 403 RegistrationDisabled unless auth.allow_registration is on.
+  // With auth.bootstrap_workspace (cloud) the response also carries a
+  // ready-made workspace; its api_key is shown exactly once, here.
   register: (fields: {
     email_address: string
     first_name: string
     last_name: string
     password: string
   }) =>
-    api.post<{ session_token: string; expires_at: string; user: User }>(
-      "/api/v2/auth/register",
-      fields,
-    ),
+    api.post<{
+      session_token: string
+      expires_at: string
+      user: User
+      workspace?: { organization: string; server: string; api_key: string }
+    }>("/api/v2/auth/register", fields),
   logout: () => api.post<{ logged_out: boolean }>("/api/v2/auth/logout"),
   me: () => api.get<MeResponse>("/api/v2/auth/me"),
   updateMe: (fields: { first_name?: string; last_name?: string }) =>
@@ -532,6 +539,14 @@ export const adminApi = {
       ),
     create: (name: string) =>
       api.post<{ organization: Organization }>("/api/v2/admin/organizations", { name }),
+    get: (permalink: string) =>
+      api.get<{ organization: Organization }>(`/api/v2/admin/organizations/${permalink}`),
+    // Owner-only; currently the one mutable setting is require_two_factor.
+    update: (permalink: string, fields: { require_two_factor?: boolean }) =>
+      api.patch<{ organization: Organization }>(
+        `/api/v2/admin/organizations/${permalink}`,
+        fields,
+      ),
     delete: (permalink: string) =>
       api.delete<{ deleted: boolean }>(`/api/v2/admin/organizations/${permalink}`),
   },

@@ -23,7 +23,9 @@ info:
     Error codes worth branching on: `Unauthorized`, `Forbidden`, `NotFound`,
     `ValidationError`, `ParameterMissing`, `InvalidCredentials`, `TOTPRequired`,
     `InvalidTOTPCode`, `AccountLocked`, `InvalidToken`, `SSOError`,
-    `WebAuthnDisabled`, `WebAuthnError`.
+    `WebAuthnDisabled`, `WebAuthnError`, `TwoFactorEnforced` (a session
+    without an active second factor touched an organization with
+    `require_two_factor: true`; admin API keys are unaffected).
     `InvalidTOTPCode`, `AccountLocked`, `AccountDisabled`, `InvalidToken`,
     `SSOError`.
 
@@ -601,6 +603,14 @@ paths:
     post:
       tags: [Auth]
       summary: Self-registration (requires auth.allow_registration; signs the new account in)
+      description: |
+        With `auth.bootstrap_workspace` enabled (meant for the cloud) the
+        new account also gets a starter workspace — an organization
+        "<FirstName>'s Team" (user as owner), a server `production` and an
+        API credential `default` — and the response carries a `workspace`
+        object. Its `api_key` is returned **only here, once**. A bootstrap
+        failure never fails the registration; the `workspace` key is then
+        simply absent.
       requestBody:
         required: true
         content:
@@ -629,6 +639,15 @@ paths:
                           session_token: { type: string }
                           expires_at: { type: string, format: date-time }
                           user: { $ref: "#/components/schemas/User" }
+                          workspace:
+                            type: object
+                            description: >-
+                              Only with auth.bootstrap_workspace, and only
+                              when the bootstrap succeeded.
+                            properties:
+                              organization: { type: string, description: Organization permalink }
+                              server: { type: string, description: Server permalink }
+                              api_key: { type: string, description: The API credential's key — shown exactly once, here }
         "403":
           description: RegistrationDisabled
           content:
@@ -981,11 +1000,38 @@ paths:
   /api/v2/admin/organizations/{org}:
     get:
       tags: [Organizations]
-      summary: Show an organization
+      summary: Show an organization (includes require_two_factor)
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters: [{ $ref: "#/components/parameters/Org" }]
       responses:
         "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Organizations]
+      summary: Update an organization (owner)
+      description: |
+        Currently the one mutable setting is `require_two_factor` — org-wide
+        2FA enforcement: while on, users without an active second factor
+        (TOTP or a passkey) get `403 TwoFactorEnforced` on every resource of
+        this organization when using a session. Admin API keys are
+        unaffected; global admin sessions are enforced too.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [require_two_factor]
+              properties:
+                require_two_factor: { type: boolean }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403":
+          description: Forbidden (not an owner) / TwoFactorEnforced
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
     delete:
       tags: [Organizations]
       summary: Delete an organization (owner)

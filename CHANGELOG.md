@@ -15,6 +15,32 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Bootstrap workspace** (`auth.bootstrap_workspace`, default off; meant
+  for the cloud): brand-new accounts — self-registration and the very
+  first OIDC/SAML/social-SSO auto-provisioning — automatically get an
+  organization "\<FirstName>'s Team" (user as owner; permalink slugged,
+  collisions suffixed `-2`, `-3`, …), a server `production` and, for
+  registration only, an API credential `default`. `POST
+  /api/v2/auth/register` then returns `workspace: { organization, server,
+  api_key }` — the key appears exactly once, there; SSO provisioning
+  creates no credential (no response channel to show a key once).
+  Bootstrap failures are logged and never fail the account creation.
+- **Org-wide 2FA enforcement** (Postmark pattern):
+  `organizations.require_two_factor` (migration 0024), readable via `GET`
+  and settable via the new `PATCH /api/v2/admin/organizations/{org}`
+  (owner-only). While on, session users without an active second factor
+  (activated TOTP or ≥ 1 passkey) get a stable `403 TwoFactorEnforced` on
+  every resource of the organization — enforced centrally in the RBAC
+  layer, global admins included (no backdoor); admin API keys are
+  unaffected and non-members keep their indistinguishable 404. New
+  `AuthStore::user_has_two_factor` on both stores backs the check. The
+  web app gains an owner-only "Require two-factor authentication" toggle
+  in Organization → Settings and a full-page "Enable 2FA to access this
+  organization" card (linking to Account → Security) whenever the API
+  answers `TwoFactorEnforced`.
+
 ## [0.3.0] - 2026-07-11
 
 ### Added

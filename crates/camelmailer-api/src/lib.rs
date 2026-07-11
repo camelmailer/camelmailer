@@ -14,6 +14,7 @@ pub mod server_api;
 pub mod sso;
 pub mod tracking;
 mod webauthn;
+mod workspace;
 mod xmldsig;
 
 pub use app::{build_router, ApiState};
