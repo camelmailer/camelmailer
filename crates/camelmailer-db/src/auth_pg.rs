@@ -120,6 +120,7 @@ impl AuthStore for PgStore {
                 locked_until: row.get("locked_until"),
                 last_login_at: row.get("last_login_at"),
                 oidc_sub: row.get("oidc_sub"),
+                disabled: row.get("disabled"),
             },
             None => UserAuth {
                 user_id,
@@ -557,6 +558,74 @@ impl AuthStore for PgStore {
             }
             Some((row.get("pkce_verifier"), row.get("nonce")))
         }))
+    }
+
+    async fn create_saml_request(
+        &self,
+        request_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO saml_requests (request_id, expires_at) VALUES ($1, $2)")
+            .bind(request_id)
+            .bind(expires_at)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(sqlx_error)
+    }
+
+    async fn consume_saml_request(
+        &self,
+        request_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let row =
+            sqlx::query("DELETE FROM saml_requests WHERE request_id = $1 RETURNING expires_at")
+                .bind(request_id)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(sqlx_error)?;
+        Ok(match row {
+            Some(row) => row.get::<DateTime<Utc>, _>("expires_at") >= now,
+            None => false,
+        })
+    }
+
+    async fn register_saml_assertion(
+        &self,
+        assertion_id: &str,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        // Opportunistic cleanup keeps the replay cache from growing.
+        sqlx::query("DELETE FROM saml_assertions WHERE expires_at < $1")
+            .bind(now)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        let result = sqlx::query(
+            "INSERT INTO saml_assertions (assertion_id, expires_at) VALUES ($1, $2)
+             ON CONFLICT (assertion_id) DO NOTHING",
+        )
+        .bind(assertion_id)
+        .bind(expires_at)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn set_user_disabled(&self, user_id: Id, disabled: bool) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO user_auth (user_id, disabled, updated_at) VALUES ($1, $2, now())
+             ON CONFLICT (user_id) DO UPDATE SET disabled = $2, updated_at = now()",
+        )
+        .bind(user_id as i64)
+        .bind(disabled)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(sqlx_error)
     }
 
     async fn record_auth_event(&self, event: NewAuthEvent) -> Result<(), StoreError> {

@@ -26,15 +26,20 @@ attribution, but is an independent project — there is no upstream to track.
 | `web/app` | Next.js (App Router) dashboard (`(app)` group, shadcn/ui + TanStack Query); `/` redirects to `/login`; Next proxies `/api` to the backend (`API_PROXY_URL`) |
 | `templates/` | 20 ready-to-clone transactional email templates (JSON) + `import.sh` |
 | `docs/` | quickstart, configuration, authentication (accounts/RBAC/SSO) |
-| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 74 endpoints) |
+| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 77 endpoints; SCIM is noted there but documented in docs/authentication.md) |
 
-## The three API surfaces
+## The API surfaces
 
 | Surface | Base path | Auth |
 |---|---|---|
 | Messaging (send, messages, streams, templates, stats) | `/api/v2/server` | `X-Server-API-Key` (an API credential of one mail server) |
 | Management (orgs, servers, domains, credentials, …) | `/api/v2/admin` | `X-Admin-API-Key` (machine, full access) **or** `Authorization: Bearer` (user session, RBAC-scoped) |
-| Accounts (login, 2FA, invitations, OIDC SSO) | `/api/v2/auth` | none / Bearer |
+| Accounts (login, 2FA, invitations, OIDC + SAML SSO) | `/api/v2/auth` | none / Bearer |
+
+Plus a fourth, standards-shaped surface: SCIM 2.0 provisioning under
+`/scim/v2` (`Authorization: Bearer` = `scim.bearer_token`,
+`application/scim+json`, SCIM error format — deliberately *not* the
+envelope below).
 
 Conventions (enforced by `crates/camelmailer-api/src/app.rs`): every
 response is `{ status, time, data | error }`; error codes are stable
@@ -88,8 +93,14 @@ Other conventions:
 
 ## Known deliberate gaps
 
-SAML and SCIM (OIDC is the SSO path), WebAuthn, per-domain DKIM keys
-(one installation key + selector), billing (planned separately). Legal
+WebAuthn, per-domain DKIM keys
+(one installation key + selector), billing (planned separately). SAML
+and SCIM are no longer gaps: SSO speaks OIDC **and** SAML 2.0 (SP role,
+`saml` config group, `/api/v2/auth/saml/*`, strict response validation
+against the configured IdP certificate), and SCIM 2.0 provisioning
+(RFC 7643/7644 Users core) lives under `/scim/v2` behind
+`scim.bearer_token` — `active: false` maps to the `user_auth.disabled`
+flag that blocks every login path. Legal
 pages of the (separately hosted) marketing site are placeholder
 templates and marked as such. App-mail delivery of reset/invitation/welcome mail is no longer a
 gap: the `app_mail` config group (`enabled`, `server_api_key`,

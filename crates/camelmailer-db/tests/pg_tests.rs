@@ -1454,6 +1454,59 @@ async fn pg_auth_account_state_round_trips() {
     let auth = f.store.user_auth(user.id).await.unwrap().unwrap();
     assert!(auth.last_login_at.is_some());
     assert_eq!(auth.failed_login_attempts, 1);
+
+    // disabled flag round trip (SCIM active=false)
+    assert!(!auth.disabled);
+    f.store.set_user_disabled(user.id, true).await.unwrap();
+    assert!(f.store.user_auth(user.id).await.unwrap().unwrap().disabled);
+    f.store.set_user_disabled(user.id, false).await.unwrap();
+    assert!(!f.store.user_auth(user.id).await.unwrap().unwrap().disabled);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_saml_requests_and_assertion_replay_cache() {
+    use camelmailer_core::AuthStore;
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+    let now = chrono::Utc::now();
+
+    // request ids are single use and expire
+    f.store
+        .create_saml_request("_req-1", now + chrono::Duration::minutes(10))
+        .await
+        .unwrap();
+    assert!(f.store.consume_saml_request("_req-1", now).await.unwrap());
+    assert!(!f.store.consume_saml_request("_req-1", now).await.unwrap());
+    assert!(!f.store.consume_saml_request("_nope", now).await.unwrap());
+    f.store
+        .create_saml_request("_req-2", now - chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert!(!f.store.consume_saml_request("_req-2", now).await.unwrap());
+
+    // assertion replay cache
+    let expires = now + chrono::Duration::minutes(5);
+    assert!(f
+        .store
+        .register_saml_assertion("_a1", expires, now)
+        .await
+        .unwrap());
+    assert!(!f
+        .store
+        .register_saml_assertion("_a1", expires, now)
+        .await
+        .unwrap());
+    assert!(f
+        .store
+        .register_saml_assertion("_a2", expires, now)
+        .await
+        .unwrap());
+    // after expiry the id may be seen again (cache cleanup)
+    assert!(f
+        .store
+        .register_saml_assertion("_a1", expires, now + chrono::Duration::minutes(6))
+        .await
+        .unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]

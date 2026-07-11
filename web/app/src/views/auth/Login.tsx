@@ -27,13 +27,21 @@ export default function Login() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [ssoUrl, setSsoUrl] = useState<string | null>(null)
+  const [saml, setSaml] = useState<{ url: string; name: string } | null>(null)
 
-  // The SSO button only renders when OIDC is enabled on the instance.
+  // The SSO buttons only render when OIDC/SAML are enabled on the
+  // instance (the start endpoints 404 otherwise).
   useEffect(() => {
     authApi
       .oidcStartUrl()
       .then((data) => setSsoUrl(data.authorization_url))
       .catch(() => setSsoUrl(null))
+    authApi
+      .samlStartUrl()
+      .then((data) =>
+        setSaml({ url: data.authorization_url, name: data.name || "SAML" }),
+      )
+      .catch(() => setSaml(null))
   }, [])
 
   async function submit(event: React.FormEvent) {
@@ -138,6 +146,15 @@ export default function Login() {
                 onClick={() => (window.location.href = ssoUrl)}
               >
                 Continue with SSO
+              </Button>
+            )}
+            {saml && (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => (window.location.href = saml.url)}
+              >
+                Sign in with {saml.name}
               </Button>
             )}
             <p className="text-center text-sm text-muted-foreground">

@@ -15,6 +15,31 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **SAML 2.0 single sign-on** — CamelMailer can act as a SAML service
+  provider (`saml` config group: `enabled`, `name`, `idp_sso_url`,
+  `idp_certificate`, `sp_entity_id`, `auto_provision`,
+  `allowed_email_domains`). HTTP-Redirect binding for the AuthnRequest,
+  HTTP-POST binding at `/api/v2/auth/saml/acs`, SP metadata at
+  `/api/v2/auth/saml/metadata`. Responses are strictly validated:
+  rsa-sha256 XML signature against the configured IdP certificate
+  (unsigned assertions are rejected, `ds:KeyInfo` is ignored),
+  audience, destination, `InResponseTo` against stored single-use
+  request state, `NotBefore`/`NotOnOrAfter`, and an assertion-id replay
+  cache. Accounts resolve by email with optional auto-provisioning;
+  the login page shows a "Sign in with <name>" button when enabled.
+- **SCIM 2.0 provisioning** (RFC 7643/7644, Users core) under
+  `/scim/v2` (`scim` config group: `enabled`, `bearer_token`).
+  Discovery (`ServiceProviderConfig`, `ResourceTypes`, `Schemas`),
+  Users CRUD with `startIndex`/`count` pagination and the
+  `userName eq "…"` filter, PATCH/PUT of `active`, `userName` and
+  `name`; `DELETE` deactivates instead of hard-deleting. Deactivated
+  accounts (`active: false`, new `user_auth.disabled` flag) are blocked
+  from password, OIDC and SAML login and password resets, and their
+  sessions are revoked — login answers the new stable error code
+  `AccountDisabled`.
+
 ## [0.2.0] - 2026-07-11
 
 ### Added

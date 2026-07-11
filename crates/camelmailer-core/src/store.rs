@@ -142,6 +142,10 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) password_resets: Vec<(Id, String, chrono::DateTime<chrono::Utc>)>,
     /// In-flight OIDC logins: state -> (pkce_verifier, nonce, expires_at).
     pub(crate) oidc_states: HashMap<String, (String, String, chrono::DateTime<chrono::Utc>)>,
+    /// In-flight SAML logins: AuthnRequest id -> expires_at.
+    pub(crate) saml_requests: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// Replay cache of consumed SAML assertion ids -> expires_at.
+    pub(crate) saml_assertions: HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// Authentication audit log, in insertion order.
     pub(crate) auth_events: Vec<crate::auth::AuthEvent>,
 }

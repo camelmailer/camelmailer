@@ -231,6 +231,10 @@ pub struct UserAuth {
     pub last_login_at: Option<DateTime<Utc>>,
     /// The OIDC subject this account is linked to, once SSO has been used.
     pub oidc_sub: Option<String>,
+    /// Administratively deactivated (e.g. via SCIM `active: false`).
+    /// A disabled account cannot log in (password, OIDC or SAML) and
+    /// cannot complete a password reset.
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

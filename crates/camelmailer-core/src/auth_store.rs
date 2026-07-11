@@ -123,6 +123,36 @@ pub trait AuthStore: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Option<(String, String)>, StoreError>;
 
+    // -- SSO (SAML)
+    /// Persist an in-flight SAML login (the AuthnRequest id the response
+    /// must reference via `InResponseTo`).
+    async fn create_saml_request(
+        &self,
+        request_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+    /// Redeem a SAML request id — single use. Returns `false` for
+    /// unknown, already-consumed or expired ids.
+    async fn consume_saml_request(
+        &self,
+        request_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError>;
+    /// Record a consumed SAML assertion id for replay protection until
+    /// `expires_at`. Returns `true` when the id is fresh and `false`
+    /// when it was already seen (a replay).
+    async fn register_saml_assertion(
+        &self,
+        assertion_id: &str,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError>;
+
+    // -- account state
+    /// Deactivate/reactivate an account (SCIM `active`). Disabled
+    /// accounts cannot log in or complete password resets.
+    async fn set_user_disabled(&self, user_id: Id, disabled: bool) -> Result<(), StoreError>;
+
     // -- audit log
     async fn record_auth_event(&self, event: NewAuthEvent) -> Result<(), StoreError>;
     /// Most recent events first.
@@ -540,6 +570,58 @@ impl AuthStore for MemoryStore {
         Ok(Some((verifier, nonce)))
     }
 
+    async fn create_saml_request(
+        &self,
+        request_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .write()
+            .unwrap()
+            .saml_requests
+            .insert(request_id.to_string(), expires_at);
+        Ok(())
+    }
+
+    async fn consume_saml_request(
+        &self,
+        request_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        match inner.saml_requests.remove(request_id) {
+            Some(expires_at) => Ok(expires_at >= now),
+            None => Ok(false),
+        }
+    }
+
+    async fn register_saml_assertion(
+        &self,
+        assertion_id: &str,
+        expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        inner.saml_assertions.retain(|_, expiry| *expiry >= now);
+        if inner.saml_assertions.contains_key(assertion_id) {
+            return Ok(false);
+        }
+        inner
+            .saml_assertions
+            .insert(assertion_id.to_string(), expires_at);
+        Ok(true)
+    }
+
+    async fn set_user_disabled(&self, user_id: Id, disabled: bool) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let entry = inner.user_auth.entry(user_id).or_insert_with(|| UserAuth {
+            user_id,
+            ..UserAuth::default()
+        });
+        entry.disabled = disabled;
+        Ok(())
+    }
+
     async fn record_auth_event(&self, event: NewAuthEvent) -> Result<(), StoreError> {
         let id = self.next_id();
         self.inner.write().unwrap().auth_events.push(AuthEvent {
@@ -824,6 +906,73 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn saml_requests_are_single_use_and_expire() {
+        let (store, _user) = store_with_user("a@example.com");
+        store
+            .create_saml_request("_req-1", Utc::now() + Duration::minutes(10))
+            .await
+            .unwrap();
+        assert!(store
+            .consume_saml_request("_req-1", Utc::now())
+            .await
+            .unwrap());
+        // single use
+        assert!(!store
+            .consume_saml_request("_req-1", Utc::now())
+            .await
+            .unwrap());
+        // unknown
+        assert!(!store
+            .consume_saml_request("_nope", Utc::now())
+            .await
+            .unwrap());
+        // expired
+        store
+            .create_saml_request("_req-2", Utc::now() - Duration::minutes(1))
+            .await
+            .unwrap();
+        assert!(!store
+            .consume_saml_request("_req-2", Utc::now())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn saml_assertion_replay_cache_rejects_repeats() {
+        let (store, _user) = store_with_user("a@example.com");
+        let expires = Utc::now() + Duration::minutes(5);
+        assert!(store
+            .register_saml_assertion("_a1", expires, Utc::now())
+            .await
+            .unwrap());
+        // replay
+        assert!(!store
+            .register_saml_assertion("_a1", expires, Utc::now())
+            .await
+            .unwrap());
+        // a different assertion is fine
+        assert!(store
+            .register_saml_assertion("_a2", expires, Utc::now())
+            .await
+            .unwrap());
+        // once the original expires, the id may be seen again
+        assert!(store
+            .register_saml_assertion("_a1", expires, Utc::now() + Duration::minutes(6))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn user_disabled_flag_round_trips() {
+        let (store, user) = store_with_user("a@example.com");
+        assert!(!store.user_auth(user.id).await.unwrap().unwrap().disabled);
+        store.set_user_disabled(user.id, true).await.unwrap();
+        assert!(store.user_auth(user.id).await.unwrap().unwrap().disabled);
+        store.set_user_disabled(user.id, false).await.unwrap();
+        assert!(!store.user_auth(user.id).await.unwrap().unwrap().disabled);
     }
 
     #[tokio::test]

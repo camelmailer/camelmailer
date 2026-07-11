@@ -9,8 +9,9 @@ CamelMailer's HTTP APIs accept three kinds of credentials:
 | **User session** | `Authorization: Bearer <token>` | A person; `/api/v2/auth` + `/api/v2/admin` subject to RBAC |
 
 This document covers the third kind: user accounts with passwords,
-two-factor authentication, organization roles, invitations, and OpenID
-Connect single sign-on. Accounts require PostgreSQL (they are disabled on
+two-factor authentication, organization roles, invitations, single
+sign-on (OpenID Connect and SAML), and SCIM provisioning. Accounts
+require PostgreSQL (they are disabled on
 non-persistent instances, where the endpoints answer `503
 AccountsUnavailable`).
 
@@ -43,8 +44,8 @@ revokes the current session.
 
 Error codes a frontend can branch on at login: `InvalidCredentials`,
 `AccountLocked` (after `auth.max_login_attempts` failures, for
-`auth.lockout_minutes`), `TOTPRequired` (resubmit with `totp_code`),
-`InvalidTOTPCode`.
+`auth.lockout_minutes`), `AccountDisabled` (deactivated, e.g. via SCIM),
+`TOTPRequired` (resubmit with `totp_code`), `InvalidTOTPCode`.
 
 The rest of the account surface:
 
@@ -226,6 +227,111 @@ API and need no password.
 The upstream Postal `oidc` group uses the same field names, so a legacy
 `postal.yml` loads unchanged.
 
+## SAML
+
+For identity providers that only speak SAML 2.0 (or where the SAML app
+catalog entry is the paved path), CamelMailer acts as a SAML service
+provider: HTTP-Redirect binding for the `AuthnRequest`, HTTP-POST
+binding for the response.
+
+```yaml
+saml:
+  enabled: true
+  name: "Okta"                          # login-page button label
+  idp_sso_url: https://acme.okta.com/app/.../sso/saml
+  idp_certificate: |                    # the IdP signing certificate —
+    -----BEGIN CERTIFICATE-----         # inline PEM or a file path
+    …
+    -----END CERTIFICATE-----
+  # sp_entity_id: https://mail.example.com   # default: {web_protocol}://{web_hostname}
+  # auto_provision: true                # create accounts on first login
+  # allowed_email_domains: [acme.com]
+```
+
+Register CamelMailer with the IdP using the SP metadata:
+
+```text
+GET  {web}/api/v2/auth/saml/metadata   SP metadata XML (entity id + ACS)
+GET  {web}/api/v2/auth/saml/start      begins the login (redirect to the IdP;
+                                       JSON {authorization_url, name} with
+                                       Accept: application/json)
+POST {web}/api/v2/auth/saml/acs        assertion consumer service — the
+                                       IdP posts the response here
+```
+
+After a successful login the ACS behaves exactly like the OIDC
+callback: with `auth.frontend_url` set the browser is redirected to
+`{frontend_url}/auth/callback#session_token=…`, otherwise the session
+is returned as JSON. When `saml.enabled` is off the endpoints answer
+`404 SAMLDisabled`.
+
+Every response is fully validated before a session is issued — there
+is no way to turn any of these checks off:
+
+- the XML signature (on the assertion, or on the response enveloping
+  it) is verified against the **configured** `idp_certificate` only;
+  unsigned responses, `rsa-sha1` signatures and keys supplied in the
+  message (`ds:KeyInfo`) are rejected
+- `Audience` must be the SP entity id; `Destination` and the bearer
+  `SubjectConfirmationData` `Recipient` (when present) must be the ACS
+  URL
+- `InResponseTo` must redeem the id of an `AuthnRequest` this instance
+  issued in the last 10 minutes — single use, so IdP-initiated
+  (unsolicited) logins are rejected
+- `NotBefore`/`NotOnOrAfter` on the Conditions and the subject
+  confirmation are enforced with ±90 s clock skew
+- the assertion id enters a replay cache until its `NotOnOrAfter`;
+  presenting the same assertion twice fails
+
+The signed-in identity is the email address: the `NameID` in
+`emailAddress` format, or the usual email attribute (`email`, `mail`,
+`urn:oid:0.9.2342.19200300.100.1.3`). Given/family name come from
+`givenName`/`sn`-style attributes with a display-name fallback.
+Accounts resolve by email: existing account → signed in; unknown →
+provisioned (when `auto_provision` allows it and the domain passes
+`allowed_email_domains`). Logins and provisioning appear on the audit
+log as `saml.login` / `saml.provision`.
+
+## SCIM provisioning
+
+SCIM 2.0 (RFC 7643/7644, Users core) lets Okta, Entra ID & co. create,
+update and deactivate CamelMailer accounts automatically:
+
+```yaml
+scim:
+  enabled: true
+  bearer_token: "<long random secret>"   # required when enabled
+```
+
+The SCIM surface lives under `/scim/v2` (own conventions: bearer-token
+auth, `application/scim+json`, SCIM error format — not the `{ status,
+time, … }` envelope):
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /scim/v2/ServiceProviderConfig` | capabilities (PATCH yes, bulk no, filter `userName eq`) |
+| `GET /scim/v2/ResourceTypes`, `GET /scim/v2/Schemas` | discovery |
+| `GET /scim/v2/Users` | list; `startIndex`/`count` pagination, `filter=userName eq "…"` |
+| `POST /scim/v2/Users` | create — `userName` **is** the email address; duplicate → `409` (`scimType: uniqueness`) |
+| `GET /scim/v2/Users/{id}` | read |
+| `PUT /scim/v2/Users/{id}` | replace `userName`, `name`, `active` |
+| `PATCH /scim/v2/Users/{id}` | RFC 7644 PatchOp: `active`, `userName`, `name.givenName`, `name.familyName` |
+| `DELETE /scim/v2/Users/{id}` | **deactivates** (never hard-deletes — memberships and audit history survive) |
+
+Authenticate every request with `Authorization: Bearer
+<scim.bearer_token>`; the token is compared in constant time and a
+wrong or missing token answers `401` in the SCIM error format.
+
+`active: false` deactivates the account: all sessions are revoked
+immediately and the account can no longer sign in — password login and
+password-reset completion answer `403 AccountDisabled`, and OIDC/SAML
+logins are refused the same way. `active: true` reactivates it. SCIM
+changes appear on the audit log as `scim.provision`,
+`scim.deactivate` and `scim.reactivate`.
+
+SCIM-provisioned accounts have no password; users sign in through SSO,
+or set a password via the reset flow.
+
 ## CORS
 
 For a browser frontend calling the APIs directly:
@@ -273,9 +379,21 @@ app_mail:                         # platform email delivery (see above)
   server_api_key: null            # required when enabled
   from_address: null              # required when enabled
   from_name: CamelMailer
+
+saml:                             # SAML 2.0 SSO (see above)
+  enabled: false
+  name: SAML                      # login-page button label
+  idp_sso_url: null               # required when enabled
+  idp_certificate: null           # required when enabled (PEM or path)
+  sp_entity_id: null              # default {web_protocol}://{web_hostname}
+  auto_provision: true
+  allowed_email_domains: []
+
+scim:                             # SCIM 2.0 provisioning (see above)
+  enabled: false
+  bearer_token: null              # required when enabled
 ```
 
 ## Deliberately deferred
 
-SAML (OIDC is the supported enterprise SSO protocol — most IdPs speak
-both), SCIM provisioning, WebAuthn/passkeys, and per-user API scopes.
+WebAuthn/passkeys and per-user API scopes.

@@ -347,6 +347,13 @@ export const authApi = {
     api.get<{ authorization_url: string }>("/api/v2/auth/oidc/start", {
       Accept: "application/json",
     }),
+  // 404 SAMLDisabled when SAML is off — used to decide whether to render
+  // the "Sign in with <name>" button.
+  samlStartUrl: () =>
+    api.get<{ authorization_url: string; name: string }>(
+      "/api/v2/auth/saml/start",
+      { Accept: "application/json" },
+    ),
 }
 
 // ------------------------------------------------------------- admin API

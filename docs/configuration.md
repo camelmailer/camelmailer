@@ -115,10 +115,11 @@ For deliverability you publish, per installation:
 Both disabled by default; point them at running rspamd/ClamAV instances to
 spam-score and virus-scan inbound mail. Failing messages are held.
 
-### `auth:` / `app_mail:` / `oidc:` / `web_server.cors_origins` — accounts, SSO, browsers
+### `auth:` / `app_mail:` / `oidc:` / `saml:` / `scim:` / `web_server.cors_origins` — accounts, SSO, provisioning, browsers
 
 User accounts (sessions, 2FA, lockout), organization RBAC, invitations,
-platform email delivery, OIDC single sign-on and CORS are documented in
+platform email delivery, OIDC and SAML single sign-on, SCIM
+provisioning and CORS are documented in
 **[authentication.md](authentication.md)**. Quick anchors:
 
 ```yaml
@@ -130,6 +131,10 @@ app_mail:
                                      # through the installation's own pipeline
 oidc:
   enabled: false                     # Okta / Entra ID / Google / Keycloak …
+saml:
+  enabled: false                     # SAML 2.0 SP (signed assertions required)
+scim:
+  enabled: false                     # SCIM 2.0 provisioning under /scim/v2
 web_server:
   cors_origins: []                   # browser origins allowed to call the APIs
 ```
