@@ -38,8 +38,8 @@ pub use message::{
 };
 pub use model::*;
 pub use server_store::{
-    ActivityEvent, DeliveryRecord, DeliveryStats, MessageFilter, MessageStats, NewStream,
-    NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter,
+    ActivityEvent, DeliveryRecord, DeliveryStats, MessageFilter, MessageShare, MessageStats,
+    NewMessageShare, NewStream, NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter,
 };
 pub use store::{MemoryStore, Store};
 pub use template::{render as render_template, RenderError};

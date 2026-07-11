@@ -1916,6 +1916,54 @@ impl camelmailer_core::ServerStore for PgStore {
         tx.commit().await.map_err(Self::sqlx_error)?;
         Ok(rows.iter().map(dmarc_record_from_row).collect())
     }
+
+    // Message share links — a cross-tenant lookup table (like
+    // tracking_tokens): only the token hash is stored, and resolution by
+    // hash deliberately runs without a tenant context.
+
+    async fn create_message_share(
+        &self,
+        new: camelmailer_core::NewMessageShare,
+    ) -> Result<camelmailer_core::MessageShare, StoreError> {
+        let row = sqlx::query(
+            "INSERT INTO message_shares (server_id, message_id, token_hash, expires_at)
+             VALUES ($1, $2, $3, $4) RETURNING id, created_at",
+        )
+        .bind(new.server_id as i64)
+        .bind(new.message_id)
+        .bind(&new.token_hash)
+        .bind(new.expires_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(camelmailer_core::MessageShare {
+            id: row.get("id"),
+            server_id: new.server_id,
+            message_id: new.message_id,
+            token_hash: new.token_hash,
+            expires_at: new.expires_at,
+            created_at: row.get("created_at"),
+        })
+    }
+
+    async fn message_share_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<camelmailer_core::MessageShare>, StoreError> {
+        let row = sqlx::query("SELECT * FROM message_shares WHERE token_hash = $1")
+            .bind(token_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(row.map(|row| camelmailer_core::MessageShare {
+            id: row.get("id"),
+            server_id: row.get::<i64, _>("server_id") as Id,
+            message_id: row.get("message_id"),
+            token_hash: row.get("token_hash"),
+            expires_at: row.get("expires_at"),
+            created_at: row.get("created_at"),
+        }))
+    }
 }
 
 fn dmarc_report_from_row(row: &PgRow) -> camelmailer_core::DmarcReport {

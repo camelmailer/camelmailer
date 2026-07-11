@@ -47,6 +47,8 @@ import {
   WEBHOOK_EVENTS,
   type DnsRecord,
   type Domain,
+  type Webhook,
+  type WebhookTestResult,
 } from "@/lib/api"
 
 function errorToast(err: unknown, fallback: string) {
@@ -542,6 +544,133 @@ export function Routes({ org, server }: Scope) {
 
 // ------------------------------------------------------------ webhooks
 
+/// Details strings of the sample payload per event — mirrors the backend's
+/// `sample_payload` so the JSON shown here matches what actually arrives.
+const SAMPLE_DETAILS: Record<string, string> = {
+  MessageSent: "Message for recipient@example.com accepted by mx.example.com",
+  MessageDelayed: "421 4.7.0 try again later (attempt 2 of 18)",
+  MessageDeliveryFailed: "550 5.1.1 recipient address rejected: user unknown",
+  MessageHeld: "Message held for manual review (spam score above threshold)",
+}
+
+function samplePayload(event: string): string {
+  return JSON.stringify(
+    {
+      event,
+      timestamp: Math.floor(Date.now() / 1000),
+      uuid: "<generated per delivery>",
+      test: true,
+      payload: {
+        message: {
+          id: 1234,
+          token: "AbCdEf123456",
+          rcpt_to: "recipient@example.com",
+          mail_from: "sender@yourdomain.com",
+          scope: "outgoing",
+          bounce: false,
+        },
+        details: SAMPLE_DETAILS[event] ?? "Test delivery",
+      },
+    },
+    null,
+    2,
+  )
+}
+
+function resultPill(result: WebhookTestResult) {
+  if (result.delivered) {
+    return <Badge>delivered · {result.status_code}</Badge>
+  }
+  if (result.status_code != null) {
+    return <Badge variant="destructive">failed · HTTP {result.status_code}</Badge>
+  }
+  return <Badge variant="destructive">failed · no response</Badge>
+}
+
+/// "Send test": pick an event, POST the sample payload to the webhook URL
+/// synchronously, show the outcome — plus the sample payload itself.
+function SendTestDialog({
+  org,
+  server,
+  webhook,
+  onClose,
+}: Scope & { webhook: Webhook; onClose: () => void }) {
+  const [event, setEvent] = useState<string>(webhook.events[0] ?? "MessageSent")
+  const [result, setResult] = useState<WebhookTestResult | null>(null)
+
+  const send = useMutation({
+    mutationFn: () => adminApi.webhooks(org, server).test(webhook.id, event),
+    onSuccess: ({ result }) => setResult(result),
+    onError: (err) => errorToast(err, "Could not send the test event"),
+  })
+
+  const payload = samplePayload(event)
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Send a test to “{webhook.name}”</DialogTitle>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <p className="text-sm text-muted-foreground">
+            Delivers one sample payload to <code className="text-xs">{webhook.url}</code> right
+            now — with your custom headers{webhook.sign ? " and the RSA signature" : ""}, marked
+            as <code className="text-xs">&quot;test&quot;: true</code>.
+          </p>
+          <div className="grid gap-2">
+            <Label>Event</Label>
+            <Select
+              value={event}
+              onValueChange={(value) => {
+                setEvent(value)
+                setResult(null)
+              }}
+            >
+              <SelectTrigger className="w-64">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {WEBHOOK_EVENTS.map((name) => (
+                  <SelectItem key={name} value={name}>
+                    {name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-2">
+            <div className="flex items-center justify-between">
+              <Label>Example payload</Label>
+              <CopyButton value={payload} />
+            </div>
+            <pre className="max-h-48 overflow-auto rounded-md bg-muted p-2 text-xs">
+              {payload}
+            </pre>
+          </div>
+          {result && (
+            <div className="flex items-center gap-2 text-sm">
+              {resultPill(result)}
+              <span className="text-muted-foreground">{result.duration_ms} ms</span>
+              {result.error && (
+                <span className="break-all text-xs text-muted-foreground">{result.error}</span>
+              )}
+            </div>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Close
+          </Button>
+          <Button onClick={() => send.mutate()} disabled={send.isPending}>
+            {send.isPending ? "Sending…" : "Send test"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function Webhooks({ org, server }: Scope) {
   const queryClient = useQueryClient()
   const key = ["webhooks", org, server]
@@ -553,6 +682,7 @@ export function Webhooks({ org, server }: Scope) {
   const [events, setEvents] = useState<string[]>([])
   const [headerRows, setHeaderRows] = useState<{ name: string; value: string }[]>([])
   const [deleteId, setDeleteId] = useState<number | null>(null)
+  const [testing, setTesting] = useState<Webhook | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
 
   const toggleEvent = (event: string, checked: boolean) =>
@@ -653,7 +783,10 @@ export function Webhooks({ org, server }: Scope) {
                     }}
                   />
                 </TableCell>
-                <TableCell className="text-right">
+                <TableCell className="space-x-2 text-right">
+                  <Button variant="outline" size="sm" onClick={() => setTesting(webhook)}>
+                    Send test
+                  </Button>
                   <Button variant="ghost" size="sm" onClick={() => setDeleteId(webhook.id)}>
                     Delete
                   </Button>
@@ -754,6 +887,14 @@ export function Webhooks({ org, server }: Scope) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {testing && (
+        <SendTestDialog
+          org={org}
+          server={server}
+          webhook={testing}
+          onClose={() => setTesting(null)}
+        />
+      )}
       <ConfirmDialog
         open={deleteId !== null}
         onOpenChange={(open) => !open && setDeleteId(null)}

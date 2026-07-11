@@ -116,7 +116,26 @@ curl -s "$API/api/v2/server/messages/1" -H "X-Server-API-Key: $SERVER_KEY"
 
 # aggregate statistics
 curl -s "$API/api/v2/server/stats" -H "X-Server-API-Key: $SERVER_KEY"
+
+# deliverability insights for one message (plain-text part, subject,
+# link/image domains, size, verified domain, DMARC, DKIM — each check
+# reports ok / warning; checks that cannot run are skipped)
+curl -s "$API/api/v2/server/messages/1/insights" -H "X-Server-API-Key: $SERVER_KEY"
+
+# share a message with someone without an account (support triage):
+# returns a one-time URL <frontend_url>/share/m/<token>; the public
+# GET /api/v2/share/messages/<token> works until it expires (default
+# 48 h, max 168). Only a hash of the token is stored.
+curl -s -X POST "$API/api/v2/server/messages/1/share" \
+  -H "X-Server-API-Key: $SERVER_KEY" -H "Content-Type: application/json" \
+  -d '{"expires_in_hours": 48}'
 ```
+
+Webhooks can be exercised without sending real mail: `POST
+/api/v2/admin/organizations/{org}/servers/{server}/webhooks/{id}/test`
+with `{"event": "MessageSent"}` delivers a sample payload (marked
+`"test": true`, signed like the real thing) and reports
+`{delivered, status_code, duration_ms}`.
 
 ## Optional: user accounts for your team
 

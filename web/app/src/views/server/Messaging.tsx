@@ -7,9 +7,9 @@
 import { createContext, useContext, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { usePathname, useRouter } from "next/navigation"
-import { PlusIcon, RefreshCwIcon } from "lucide-react"
+import { MoreVerticalIcon, PlusIcon, RefreshCwIcon } from "lucide-react"
 import { toast } from "sonner"
-import { EmptyState, formatDate, PageHeader } from "@/components/shared"
+import { CopyButton, EmptyState, formatDate, PageHeader } from "@/components/shared"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -25,6 +25,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -42,9 +48,16 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
-import { adminApi, ApiError, serverApi, type Message, type Template } from "@/lib/api"
+import {
+  adminApi,
+  ApiError,
+  serverApi,
+  type InsightCheck,
+  type Message,
+  type Template,
+} from "@/lib/api"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -188,69 +201,244 @@ function statusBadge(message: Message) {
   }
 }
 
+const SHARE_EXPIRY_OPTIONS = [
+  { value: "24", label: "24 hours" },
+  { value: "48", label: "48 hours" },
+  { value: "168", label: "7 days" },
+]
+
+/// "Share" (kebab action of the message detail): pick an expiry, generate
+/// the public link, copy it. The URL is shown exactly once.
+function ShareDialog({ api, id, onClose }: { api: Api; id: number; onClose: () => void }) {
+  const [expiry, setExpiry] = useState("48")
+  const [result, setResult] = useState<{ url: string; expires_at: string } | null>(null)
+
+  const generate = useMutation({
+    mutationFn: () => api.share(id, Number(expiry)),
+    onSuccess: (share) => setResult(share),
+    onError: (err) => errorToast(err, "Could not create the share link"),
+  })
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Share message #{id}</DialogTitle>
+        </DialogHeader>
+        <p className="text-sm text-muted-foreground">
+          Anyone with the link can view this message — including its content and
+          delivery timeline — until the link expires. No account needed.
+        </p>
+        {result ? (
+          <div className="grid gap-2">
+            <Label>Share link</Label>
+            <div className="flex items-center gap-2">
+              <code className="min-w-0 flex-1 break-all rounded bg-muted px-2 py-1 text-xs">
+                {result.url}
+              </code>
+              <CopyButton value={result.url} />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Expires {formatDate(result.expires_at)}.
+            </p>
+          </div>
+        ) : (
+          <div className="grid gap-2">
+            <Label>Link expires after</Label>
+            <Select value={expiry} onValueChange={setExpiry}>
+              <SelectTrigger className="w-40">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SHARE_EXPIRY_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            {result ? "Done" : "Cancel"}
+          </Button>
+          {!result && (
+            <Button onClick={() => generate.mutate()} disabled={generate.isPending}>
+              {generate.isPending ? "Generating…" : "Generate link"}
+            </Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function InsightRow({ check }: { check: InsightCheck }) {
+  return (
+    <div className="flex items-start gap-2 rounded-md border p-2">
+      <Badge
+        variant={check.status === "ok" ? "default" : "destructive"}
+        className="mt-0.5 shrink-0"
+      >
+        {check.status}
+      </Badge>
+      <div className="min-w-0">
+        <p className="text-sm font-medium">{check.title}</p>
+        <p className="text-xs text-muted-foreground">{check.detail}</p>
+      </div>
+    </div>
+  )
+}
+
+/// The "Insights" tab: DOING GREAT / IMPROVE sections over the server-side
+/// deliverability checks, with the generation timestamp underneath.
+function InsightsPanel({ api, id }: { api: Api; id: number }) {
+  const insights = useQuery({
+    queryKey: ["sapi-insights", id],
+    queryFn: () => api.insights(id),
+  })
+  if (insights.isLoading) {
+    return <p className="text-sm text-muted-foreground">Analyzing…</p>
+  }
+  const data = insights.data
+  if (!data) {
+    return <p className="text-sm text-muted-foreground">Insights are unavailable.</p>
+  }
+  const great = data.checks.filter((check) => check.status === "ok")
+  const improve = data.checks.filter((check) => check.status === "warning")
+  return (
+    <div className="grid gap-4">
+      {improve.length > 0 && (
+        <div className="grid gap-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Improve
+          </h3>
+          {improve.map((check) => (
+            <InsightRow key={check.id} check={check} />
+          ))}
+        </div>
+      )}
+      {great.length > 0 && (
+        <div className="grid gap-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Doing great
+          </h3>
+          {great.map((check) => (
+            <InsightRow key={check.id} check={check} />
+          ))}
+        </div>
+      )}
+      <p className="text-xs text-muted-foreground">
+        Report generated on {formatDate(data.generated_at)}.
+      </p>
+    </div>
+  )
+}
+
 function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: () => void }) {
   const message = useQuery({ queryKey: ["sapi-message", id], queryFn: () => api.message(id) })
   const deliveries = useQuery({
     queryKey: ["sapi-deliveries", id],
     queryFn: () => api.deliveries(id),
   })
+  const insights = useQuery({
+    queryKey: ["sapi-insights", id],
+    queryFn: () => api.insights(id),
+  })
+  const [sharing, setSharing] = useState(false)
+  const warnings =
+    insights.data?.checks.filter((check) => check.status === "warning").length ?? 0
   const m = message.data?.message
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
-          <DialogTitle>Message #{id}</DialogTitle>
+          <div className="flex items-center justify-between pr-6">
+            <DialogTitle>Message #{id}</DialogTitle>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon" aria-label="Message actions">
+                  <MoreVerticalIcon className="size-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={() => setSharing(true)}>Share…</DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </DialogHeader>
         {m && (
-          <div className="grid gap-2 text-sm">
-            <div className="grid grid-cols-[7rem_1fr] gap-1">
-              <span className="text-muted-foreground">From</span>
-              <span>{m.mail_from ?? "—"}</span>
-              <span className="text-muted-foreground">To</span>
-              <span>{m.rcpt_to}</span>
-              <span className="text-muted-foreground">Subject</span>
-              <span>{m.subject ?? "—"}</span>
-              <span className="text-muted-foreground">Status</span>
-              <span>{statusBadge(m)}</span>
-              <span className="text-muted-foreground">Spam</span>
-              <span>
-                {m.spam_status ?? "—"}
-                {m.spam_score != null && ` (${m.spam_score})`}
-              </span>
-              <span className="text-muted-foreground">Created</span>
-              <span>{formatDate(m.created_at)}</span>
-            </div>
-            <h3 className="mt-2 font-medium">Delivery attempts</h3>
-            {deliveries.data?.deliveries.length === 0 ? (
-              <p className="text-muted-foreground">No attempts yet.</p>
-            ) : (
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Time</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Details</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {deliveries.data?.deliveries.map((delivery) => (
-                    <TableRow key={delivery.id}>
-                      <TableCell className="whitespace-nowrap text-muted-foreground">
-                        {formatDate(delivery.timestamp)}
-                      </TableCell>
-                      <TableCell>
-                        <Badge variant="outline">{delivery.status}</Badge>
-                      </TableCell>
-                      <TableCell className="text-xs text-muted-foreground">
-                        {delivery.details ?? delivery.output ?? "—"}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            )}
-          </div>
+          <Tabs defaultValue="details">
+            <TabsList className="mb-2">
+              <TabsTrigger value="details">Details</TabsTrigger>
+              <TabsTrigger value="insights">
+                Insights
+                {warnings > 0 && (
+                  <Badge variant="destructive" className="ml-1 px-1.5">
+                    {warnings}
+                  </Badge>
+                )}
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent value="details">
+              <div className="grid gap-2 text-sm">
+                <div className="grid grid-cols-[7rem_1fr] gap-1">
+                  <span className="text-muted-foreground">From</span>
+                  <span>{m.mail_from ?? "—"}</span>
+                  <span className="text-muted-foreground">To</span>
+                  <span>{m.rcpt_to}</span>
+                  <span className="text-muted-foreground">Subject</span>
+                  <span>{m.subject ?? "—"}</span>
+                  <span className="text-muted-foreground">Status</span>
+                  <span>{statusBadge(m)}</span>
+                  <span className="text-muted-foreground">Spam</span>
+                  <span>
+                    {m.spam_status ?? "—"}
+                    {m.spam_score != null && ` (${m.spam_score})`}
+                  </span>
+                  <span className="text-muted-foreground">Created</span>
+                  <span>{formatDate(m.created_at)}</span>
+                </div>
+                <h3 className="mt-2 font-medium">Delivery attempts</h3>
+                {deliveries.data?.deliveries.length === 0 ? (
+                  <p className="text-muted-foreground">No attempts yet.</p>
+                ) : (
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Time</TableHead>
+                        <TableHead>Status</TableHead>
+                        <TableHead>Details</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {deliveries.data?.deliveries.map((delivery) => (
+                        <TableRow key={delivery.id}>
+                          <TableCell className="whitespace-nowrap text-muted-foreground">
+                            {formatDate(delivery.timestamp)}
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant="outline">{delivery.status}</Badge>
+                          </TableCell>
+                          <TableCell className="text-xs text-muted-foreground">
+                            {delivery.details ?? delivery.output ?? "—"}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                )}
+              </div>
+            </TabsContent>
+            <TabsContent value="insights">
+              <div className="max-h-[60svh] overflow-y-auto pr-1">
+                <InsightsPanel api={api} id={id} />
+              </div>
+            </TabsContent>
+          </Tabs>
         )}
+        {sharing && <ShareDialog api={api} id={id} onClose={() => setSharing(false)} />}
       </DialogContent>
     </Dialog>
   )

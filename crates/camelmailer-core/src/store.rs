@@ -141,6 +141,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) message_streams: HashMap<Id, MessageStream>,
     /// Message templates (config; server-scoped).
     pub(crate) templates: HashMap<Id, Template>,
+    /// Public message share links (cross-tenant lookup by token hash).
+    pub(crate) message_shares: Vec<crate::server_store::MessageShare>,
     /// DMARC aggregate reports (tenant-scoped like messages).
     pub(crate) dmarc_reports: Vec<crate::dmarc::DmarcReport>,
     /// Report rows, keyed by owning server for tenant scoping.
@@ -612,6 +614,42 @@ impl MemoryStore {
             .map(|(domain, count)| crate::server_store::QueuedDomain { domain, count })
             .collect();
         crate::server_store::DeliveryStats { queued, domains }
+    }
+
+    /// Persist a message share link (in-memory analogue of the Postgres
+    /// insert; only the token hash arrives here).
+    pub fn insert_message_share(
+        &self,
+        new: crate::server_store::NewMessageShare,
+    ) -> crate::server_store::MessageShare {
+        let share = crate::server_store::MessageShare {
+            id: self.next_id() as i64,
+            server_id: new.server_id,
+            message_id: new.message_id,
+            token_hash: new.token_hash,
+            expires_at: new.expires_at,
+            created_at: chrono::Utc::now(),
+        };
+        self.inner
+            .write()
+            .unwrap()
+            .message_shares
+            .push(share.clone());
+        share
+    }
+
+    /// Resolve a share token hash to its record (cross-tenant lookup).
+    pub fn find_message_share(
+        &self,
+        token_hash: &str,
+    ) -> Option<crate::server_store::MessageShare> {
+        self.inner
+            .read()
+            .unwrap()
+            .message_shares
+            .iter()
+            .find(|share| share.token_hash == token_hash)
+            .cloned()
     }
 
     /// Insert or replace a message stream.

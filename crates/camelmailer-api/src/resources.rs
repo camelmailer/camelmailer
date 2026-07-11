@@ -1299,6 +1299,66 @@ pub(crate) async fn webhooks_disable(
     set_webhook_enabled(state, start.0, org, server, id, false).await
 }
 
+#[derive(Deserialize)]
+pub(crate) struct TestWebhook {
+    event: Option<String>,
+}
+
+/// `POST …/webhooks/{id}/test` — synchronously deliver one sample payload
+/// for the chosen event to the webhook URL (custom headers + signature
+/// exactly like the worker; the payload carries `"test": true`). The
+/// outcome is reported, never retried, and never written to the audit log.
+pub(crate) async fn webhooks_test(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server, id)): Path<(String, String, u64)>,
+    Json(body): Json<TestWebhook>,
+) -> ApiResponse {
+    let webhook = match require_webhook(&state, &start, &org, &server, id).await {
+        Ok(webhook) => webhook,
+        Err(response) => return response,
+    };
+    let Some(event) = body.event.filter(|e| !e.is_empty()) else {
+        return render_parameter_missing(
+            Some(&start),
+            "param is missing or the value is empty: event",
+        );
+    };
+    if !WEBHOOK_EVENTS.contains(&event.as_str()) {
+        return render_validation_error(
+            Some(&start),
+            &format!(
+                "Event {event:?} is not a valid webhook event (valid events: {})",
+                WEBHOOK_EVENTS.join(", ")
+            ),
+        );
+    }
+
+    let request = crate::webhook_send::build_test_request(
+        &webhook,
+        &event,
+        state.installation_signing_key_pem.as_deref(),
+    );
+    let started = std::time::Instant::now();
+    let outcome = state.webhook_sender.send(request).await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    let result = match outcome {
+        Ok(response) => json!({
+            "delivered": (200..300).contains(&response.status),
+            "status_code": response.status,
+            "duration_ms": duration_ms,
+        }),
+        Err(error) => json!({
+            "delivered": false,
+            "status_code": Value::Null,
+            "duration_ms": duration_ms,
+            "error": error,
+        }),
+    };
+    ok(&start, json!({ "result": result }))
+}
+
 // ------------------------------------------------------- sender addresses
 
 fn sender_address_json(address: &SenderAddress) -> Value {

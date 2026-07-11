@@ -266,6 +266,64 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Success" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /api/v2/server/messages/{id}/share:
+    post:
+      tags: [Messages]
+      summary: Create a public share link for a message
+      description: |
+        Returns `{ url, expires_at }` where `url` is
+        `<frontend_url>/share/m/<token>`. The token is random, shown exactly
+        once here, and stored only as a SHA-256 hash. Default expiry 48
+        hours, maximum 168 (7 days).
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expires_in_hours:
+                  type: integer
+                  minimum: 1
+                  maximum: 168
+                  default: 48
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/server/messages/{id}/insights:
+    get:
+      tags: [Messages]
+      summary: Deliverability insights for a message
+      description: |
+        A rule catalog evaluated from the stored message, the server's
+        domain configuration and one live DNS lookup. Returns
+        `{ generated_at, checks: [{ id, title, status, detail }] }` with
+        `status` one of `ok` or `warning`. A check that could not be
+        evaluated (e.g. DNS timeout) is skipped — it never fails the
+        request.
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v2/share/messages/{token}:
+    get:
+      tags: [Messages]
+      summary: Resolve a public message share link (no auth)
+      description: |
+        The public counterpart of `POST /api/v2/server/messages/{id}/share`.
+        Valid tokens return the message plus deliveries, opens, clicks and
+        the decoded `html_body` / `text_body`. Unknown tokens answer
+        `404 NotFound`; expired ones `404 ShareLinkExpired`.
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v2/server/inbound:
     get:
@@ -1519,6 +1577,36 @@ paths:
         - { $ref: "#/components/parameters/Id" }
       responses:
         "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/webhooks/{id}/test:
+    post:
+      tags: [Webhooks]
+      summary: Send a test event to a webhook
+      description: |
+        Synchronously delivers one sample payload for the chosen event to
+        the webhook URL — custom headers and the RSA signature exactly as
+        the worker sends them; the payload carries `"test": true`. The
+        response reports `{ delivered, status_code, duration_ms, error? }`
+        (10-second timeout; nothing is queued, retried or logged).
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event]
+              properties:
+                event:
+                  type: string
+                  enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
 
   /api/v2/admin/organizations/{org}/servers/{server}/sender_addresses:
     get:

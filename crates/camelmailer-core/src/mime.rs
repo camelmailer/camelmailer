@@ -133,6 +133,169 @@ pub fn build_message(params: &BuildParams) -> Vec<u8> {
     builder.write_to_vec().unwrap_or_default()
 }
 
+// ------------------------------------------------------- body extraction
+
+/// The decoded display bodies of a stored raw message — what the shared
+/// message page and the deliverability insights operate on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtractedBodies {
+    pub html: Option<String>,
+    pub text: Option<String>,
+}
+
+/// Offset of the first byte after the header block, if any.
+fn body_offset(raw: &[u8]) -> Option<usize> {
+    raw.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| raw.windows(2).position(|w| w == b"\n\n").map(|i| i + 2))
+}
+
+/// The boundary parameter of a multipart content-type, if any.
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    if !content_type.trim().to_lowercase().starts_with("multipart/") {
+        return None;
+    }
+    content_type.split(';').find_map(|part| {
+        let part = part.trim();
+        let value = part
+            .strip_prefix("boundary=")
+            .or_else(|| part.strip_prefix("Boundary="))?;
+        Some(value.trim_matches('"').to_string())
+    })
+}
+
+/// Decode a quoted-printable body (soft breaks and =XX escapes).
+fn decode_quoted_printable(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        match body[i] {
+            b'=' if body.get(i + 1) == Some(&b'\r') && body.get(i + 2) == Some(&b'\n') => i += 3,
+            b'=' if body.get(i + 1) == Some(&b'\n') => i += 2,
+            b'=' if i + 2 < body.len() => {
+                let hex = std::str::from_utf8(&body[i + 1..i + 3])
+                    .ok()
+                    .and_then(|s| u8::from_str_radix(s, 16).ok());
+                match hex {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(body[i]);
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Decode a part's body per its Content-Transfer-Encoding header.
+fn decode_body(encoding: Option<&str>, body: &[u8]) -> Vec<u8> {
+    match encoding.unwrap_or("").trim().to_lowercase().as_str() {
+        "base64" => {
+            use base64::Engine;
+            let compact: Vec<u8> = body
+                .iter()
+                .copied()
+                .filter(|b| !b" \t\r\n".contains(b))
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(&compact)
+                .unwrap_or_else(|_| body.to_vec())
+        }
+        "quoted-printable" => decode_quoted_printable(body),
+        _ => body.to_vec(),
+    }
+}
+
+fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn walk_parts(raw: &[u8], depth: usize, bodies: &mut ExtractedBodies) {
+    if depth > 8 || (bodies.html.is_some() && bodies.text.is_some()) {
+        return;
+    }
+    let headers = crate::message::parse_headers(raw);
+    let content_type = header_of(&headers, "content-type").unwrap_or("text/plain");
+    let body = body_offset(raw).map(|offset| &raw[offset..]).unwrap_or(b"");
+
+    if let Some(boundary) = multipart_boundary(content_type) {
+        let delimiter = format!("--{boundary}");
+        let text = String::from_utf8_lossy(body);
+        // pieces[0] is the preamble; the final piece follows `--<boundary>--`
+        let pieces: Vec<&str> = text.split(delimiter.as_str()).collect();
+        for piece in pieces.iter().skip(1) {
+            if piece.starts_with("--") {
+                break;
+            }
+            let part = piece
+                .strip_prefix("\r\n")
+                .or_else(|| piece.strip_prefix("\n"))
+                .unwrap_or(piece);
+            // the CRLF preceding the next delimiter belongs to the delimiter
+            let part = part
+                .strip_suffix("\r\n")
+                .or_else(|| part.strip_suffix("\n"))
+                .unwrap_or(part);
+            walk_parts(part.as_bytes(), depth + 1, bodies);
+        }
+        return;
+    }
+
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    // Attachments are never display bodies.
+    if header_of(&headers, "content-disposition")
+        .unwrap_or("")
+        .trim()
+        .to_lowercase()
+        .starts_with("attachment")
+    {
+        return;
+    }
+    let decoded = || -> Option<String> {
+        let bytes = decode_body(header_of(&headers, "content-transfer-encoding"), body);
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    match media_type.as_str() {
+        "text/html" if bodies.html.is_none() => {
+            bodies.html = decoded();
+        }
+        "text/plain" | "" if bodies.text.is_none() => {
+            bodies.text = decoded();
+        }
+        _ => {}
+    }
+}
+
+/// Extract the decoded HTML and plain-text display bodies of a raw MIME
+/// message (walking multipart containers; attachments are skipped, the
+/// first part of each kind wins). Charset is treated as UTF-8 (lossy).
+pub fn extract_bodies(raw_message: &[u8]) -> ExtractedBodies {
+    let mut bodies = ExtractedBodies::default();
+    walk_parts(raw_message, 0, &mut bodies);
+    bodies
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +362,73 @@ mod tests {
         let raw = as_string(&build_message(&p));
         assert!(raw.contains("Subject: Hello"));
         assert!(raw.contains("Hi"));
+    }
+
+    // ------------------------------------------------- extract_bodies
+
+    #[test]
+    fn extracts_both_bodies_from_multipart_alternative() {
+        let raw = build_message(&params());
+        let bodies = extract_bodies(&raw);
+        assert_eq!(bodies.html.as_deref(), Some("<p>Hi</p>"));
+        assert_eq!(bodies.text.as_deref(), Some("Hi"));
+    }
+
+    #[test]
+    fn extracts_single_part_messages() {
+        let mut p = params();
+        p.html_body = None;
+        let bodies = extract_bodies(&build_message(&p));
+        assert_eq!(bodies.text.as_deref(), Some("Hi"));
+        assert_eq!(bodies.html, None);
+
+        let mut p = params();
+        p.text_body = None;
+        let bodies = extract_bodies(&build_message(&p));
+        assert_eq!(bodies.html.as_deref(), Some("<p>Hi</p>"));
+        assert_eq!(bodies.text, None);
+    }
+
+    #[test]
+    fn walks_nested_multipart_and_skips_attachments() {
+        let mut p = params();
+        p.attachments = vec![Attachment {
+            filename: "hello.txt".into(),
+            content_type: "text/plain".into(),
+            data: b"attachment-body".to_vec(),
+        }];
+        // multipart/mixed( multipart/alternative(text, html), attachment )
+        let bodies = extract_bodies(&build_message(&p));
+        assert_eq!(bodies.html.as_deref(), Some("<p>Hi</p>"));
+        assert_eq!(bodies.text.as_deref(), Some("Hi"));
+        // the text/plain attachment must not shadow the real text body
+        assert!(!bodies.text.unwrap().contains("attachment-body"));
+    }
+
+    #[test]
+    fn decodes_quoted_printable_and_base64_bodies() {
+        let qp = b"Content-Type: text/plain\r\n\
+                   Content-Transfer-Encoding: quoted-printable\r\n\
+                   \r\n\
+                   Gr=C3=BC=C3=9Fe=\r\n\
+                   !\r\n";
+        assert_eq!(
+            extract_bodies(qp).text.as_deref(),
+            Some("Gr\u{fc}\u{df}e!\r\n")
+        );
+
+        let b64 = b"Content-Type: text/html\r\n\
+                    Content-Transfer-Encoding: base64\r\n\
+                    \r\n\
+                    PGI+aGk8L2I+\r\n";
+        assert_eq!(extract_bodies(b64).html.as_deref(), Some("<b>hi</b>"));
+    }
+
+    #[test]
+    fn headerless_or_unknown_content_is_treated_as_text() {
+        let plain = b"Subject: x\r\n\r\njust text\r\n";
+        assert_eq!(extract_bodies(plain).text.as_deref(), Some("just text\r\n"));
+        let bodies = extract_bodies(b"");
+        assert_eq!(bodies, ExtractedBodies::default());
     }
 }
