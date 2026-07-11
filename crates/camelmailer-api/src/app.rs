@@ -1253,6 +1253,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             axum::routing::post(resources::domains_verify),
         )
         .route(
+            "/organizations/{permalink}/servers/{server_permalink}/domains/{name}/health",
+            get(resources::domains_health),
+        )
+        .route(
             "/organizations/{permalink}/servers/{server_permalink}/credentials",
             get(resources::credentials_index).post(resources::credentials_create),
         )

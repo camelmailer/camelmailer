@@ -258,6 +258,77 @@ export type PasskeyCredential = {
 
 export type Pagination = { page: number; per_page: number; total: number; total_pages: number }
 
+// DMARC monitoring
+export type HealthStatus = "ok" | "warning" | "missing"
+
+export type DomainHealthCheck = {
+  status: HealthStatus
+  record_name: string
+  found: string[]
+  expected: string | null
+  problems: string[]
+}
+
+export type DomainHealth = {
+  domain: string
+  checks: {
+    spf: DomainHealthCheck
+    dkim: DomainHealthCheck
+    dmarc: DomainHealthCheck & {
+      policy: { p: string | null; sp: string | null; rua: string[]; pct: number } | null
+    }
+  }
+  overall: HealthStatus
+  next_step: string
+  rua_address: string | null
+  compliance: {
+    window_days: number
+    total: number
+    pass: number
+    pass_rate: number
+  } | null
+}
+
+export type DmarcSummary = {
+  total: number
+  pass: number
+  fail: number
+  pass_rate: number
+  by_source: {
+    source_ip: string
+    count: number
+    spf_aligned_pct: number
+    dkim_aligned_pct: number
+    disposition_counts: Record<string, number>
+  }[]
+  by_disposition: Record<string, number>
+}
+
+export type DmarcReport = {
+  id: number
+  domain: string
+  org_name: string | null
+  org_email: string | null
+  report_id: string
+  date_range_begin: string
+  date_range_end: string
+  received_at: string
+  record_count: number
+}
+
+export type DmarcRecord = {
+  id: number
+  source_ip: string
+  count: number
+  disposition: string
+  dkim_result: string | null
+  spf_result: string | null
+  dkim_aligned: boolean
+  spf_aligned: boolean
+  header_from: string | null
+  envelope_from: string | null
+}
+
 // server API (X-Server-API-Key) types
 export type Message = {
   id: number
@@ -532,6 +603,7 @@ export const adminApi = {
       list: () => api.get<{ domains: Domain[]; pagination: Pagination }>(`${base}?per_page=100`),
       create: (name: string) => api.post<{ domain: Domain }>(base, { name }),
       verify: (name: string) => api.post<{ domain: Domain }>(`${base}/${name}/verify`),
+      health: (name: string) => api.get<{ health: DomainHealth }>(`${base}/${name}/health`),
       delete: (name: string) => api.delete<{ deleted: boolean }>(`${base}/${name}`),
     }
   },
@@ -743,6 +815,20 @@ export function serverApi(key: string) {
         api.patch<{ stream: Stream }>(`/api/v2/server/streams/${permalink}`, fields, h),
       archive: (permalink: string) =>
         api.post<unknown>(`/api/v2/server/streams/${permalink}/archive`, {}, h),
+    },
+    dmarc: {
+      summary: (params = "") =>
+        api.get<{ summary: DmarcSummary }>(`/api/v2/server/dmarc/summary${params}`, h),
+      reports: (params = "") =>
+        api.get<{ reports: DmarcReport[]; pagination: Pagination }>(
+          `/api/v2/server/dmarc/reports${params}`,
+          h,
+        ),
+      report: (id: number) =>
+        api.get<{ report: DmarcReport; records: DmarcRecord[] }>(
+          `/api/v2/server/dmarc/reports/${id}`,
+          h,
+        ),
     },
     templates: {
       list: () => api.get<{ templates: Template[] }>("/api/v2/server/templates", h),

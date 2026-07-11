@@ -7,6 +7,7 @@
 pub mod admin_store;
 pub mod auth;
 pub mod auth_store;
+pub mod dmarc;
 pub mod dns;
 pub mod message;
 pub mod mime;
@@ -27,6 +28,10 @@ pub use auth::{
     NewWebAuthnCredential, OrganizationMembership, Role, UserAuth, WebAuthnCredential,
 };
 pub use auth_store::AuthStore;
+pub use dmarc::{
+    DmarcFilter, DmarcRecordRow, DmarcReport, DmarcSourceStat, DmarcSummary, NewDmarcRecord,
+    NewDmarcReport, DMARC_REPORTS_ENDPOINT,
+};
 pub use dns::{DnsError, DnsResolver, StaticDnsResolver};
 pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,

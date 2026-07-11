@@ -141,6 +141,10 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) message_streams: HashMap<Id, MessageStream>,
     /// Message templates (config; server-scoped).
     pub(crate) templates: HashMap<Id, Template>,
+    /// DMARC aggregate reports (tenant-scoped like messages).
+    pub(crate) dmarc_reports: Vec<crate::dmarc::DmarcReport>,
+    /// Report rows, keyed by owning server for tenant scoping.
+    pub(crate) dmarc_records: Vec<(Id, crate::dmarc::DmarcRecordRow)>,
     /// Per-user authentication state (password digest, TOTP, lockout).
     pub(crate) user_auth: HashMap<Id, crate::auth::UserAuth>,
     /// Login sessions keyed by id.
@@ -690,6 +694,115 @@ impl MemoryStore {
             .collect();
         templates.sort_by_key(|t| t.id);
         templates
+    }
+
+    /// Store one parsed DMARC aggregate report with its rows (the
+    /// in-memory analogue of the Postgres two-table insert).
+    pub fn insert_dmarc_report(
+        &self,
+        new: crate::dmarc::NewDmarcReport,
+    ) -> crate::dmarc::DmarcReport {
+        let report_id = self.next_id() as i64;
+        let report = crate::dmarc::DmarcReport {
+            id: report_id,
+            server_id: new.server_id,
+            domain: new.domain,
+            org_name: new.org_name,
+            org_email: new.org_email,
+            report_id: new.report_id,
+            date_range_begin: new.date_range_begin,
+            date_range_end: new.date_range_end,
+            received_at: chrono::Utc::now(),
+            record_count: new.records.len() as i64,
+        };
+        let mut inner = self.inner.write().unwrap();
+        inner.dmarc_reports.push(report.clone());
+        for record in new.records {
+            let id = report_id * 1000 + inner.dmarc_records.len() as i64;
+            inner.dmarc_records.push((
+                report.server_id,
+                crate::dmarc::DmarcRecordRow {
+                    id,
+                    report_id,
+                    source_ip: record.source_ip,
+                    count: record.count,
+                    disposition: record.disposition,
+                    dkim_result: record.dkim_result,
+                    spf_result: record.spf_result,
+                    dkim_aligned: record.dkim_aligned,
+                    spf_aligned: record.spf_aligned,
+                    header_from: record.header_from,
+                    envelope_from: record.envelope_from,
+                },
+            ));
+        }
+        report
+    }
+
+    /// A server's DMARC reports matching the filter, newest range first.
+    pub fn dmarc_reports_for(
+        &self,
+        server_id: Id,
+        filter: &crate::dmarc::DmarcFilter,
+    ) -> Vec<crate::dmarc::DmarcReport> {
+        let mut reports: Vec<_> = self
+            .inner
+            .read()
+            .unwrap()
+            .dmarc_reports
+            .iter()
+            .filter(|r| r.server_id == server_id)
+            .filter(|r| filter.matches(&r.domain, r.date_range_begin, r.date_range_end))
+            .cloned()
+            .collect();
+        reports.sort_by(|a, b| {
+            b.date_range_begin
+                .cmp(&a.date_range_begin)
+                .then(b.id.cmp(&a.id))
+        });
+        reports
+    }
+
+    /// One report plus its rows, tenant-scoped.
+    pub fn dmarc_report_for(
+        &self,
+        server_id: Id,
+        report_id: i64,
+    ) -> Option<(crate::dmarc::DmarcReport, Vec<crate::dmarc::DmarcRecordRow>)> {
+        let inner = self.inner.read().unwrap();
+        let report = inner
+            .dmarc_reports
+            .iter()
+            .find(|r| r.server_id == server_id && r.id == report_id)
+            .cloned()?;
+        let records = inner
+            .dmarc_records
+            .iter()
+            .filter(|(owner, record)| *owner == server_id && record.report_id == report_id)
+            .map(|(_, record)| record.clone())
+            .collect();
+        Some((report, records))
+    }
+
+    /// All rows of a server's reports matching the filter.
+    pub fn dmarc_records_for(
+        &self,
+        server_id: Id,
+        filter: &crate::dmarc::DmarcFilter,
+    ) -> Vec<crate::dmarc::DmarcRecordRow> {
+        let matching: std::collections::HashSet<i64> = self
+            .dmarc_reports_for(server_id, filter)
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        self.inner
+            .read()
+            .unwrap()
+            .dmarc_records
+            .iter()
+            .filter(|(owner, record)| *owner == server_id && matching.contains(&record.report_id))
+            .map(|(_, record)| record.clone())
+            .collect()
     }
 
     /// One of a server's templates by permalink.

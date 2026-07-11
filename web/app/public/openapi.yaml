@@ -50,6 +50,7 @@ tags:
   - name: Stats
   - name: Streams
   - name: Templates
+  - name: DMARC
   - name: Auth
   - name: Organizations
   - name: Servers
@@ -448,6 +449,91 @@ paths:
                 template_model: { type: object, additionalProperties: true }
       responses:
         "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/server/dmarc/summary:
+    get:
+      tags: [DMARC]
+      summary: DMARC compliance summary
+      description: >-
+        Aggregates the stored DMARC aggregate-report rows: total covered
+        messages, pass (DKIM **and** SPF aligned) and fail counts, the
+        pass rate, the top 20 sending sources with per-source alignment
+        percentages and disposition counts, plus totals per disposition.
+        `from`/`to` match reports whose date range overlaps the window.
+      security: [{ ServerApiKey: [] }]
+      parameters:
+        - { name: domain, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: Compliance summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          summary: { $ref: "#/components/schemas/DmarcSummary" }
+  /api/v2/server/dmarc/reports:
+    get:
+      tags: [DMARC]
+      summary: List stored DMARC aggregate reports
+      description: >-
+        Reports ingested via an inbound route targeting
+        `internal://dmarc-reports`, newest report range first.
+      security: [{ ServerApiKey: [] }]
+      parameters:
+        - { name: domain, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, default: 25, maximum: 100 } }
+      responses:
+        "200":
+          description: Report list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          reports:
+                            type: array
+                            items: { $ref: "#/components/schemas/DmarcReport" }
+                          pagination: { $ref: "#/components/schemas/Pagination" }
+  /api/v2/server/dmarc/reports/{id}:
+    get:
+      tags: [DMARC]
+      summary: Show a DMARC report with its records
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200":
+          description: Report detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          report: { $ref: "#/components/schemas/DmarcReport" }
+                          records:
+                            type: array
+                            items: { $ref: "#/components/schemas/DmarcRecord" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /api/v2/auth/sender-addresses/confirm:
     post:
@@ -1208,6 +1294,43 @@ paths:
         "200": { $ref: "#/components/responses/Success" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
+  /api/v2/admin/organizations/{org}/servers/{server}/domains/{name}/health:
+    get:
+      tags: [DMARC]
+      summary: Live DNS health check of a sending domain
+      description: >-
+        Resolves the domain's SPF record, the DKIM record at
+        `<selector>._domainkey.<domain>` and the DMARC record at
+        `_dmarc.<domain>` live, and grades each check `ok`, `warning` or
+        `missing` (with the found records, the expected value and the
+        concrete problems). The response carries the overall traffic
+        light, the recommended next step of the policy journey
+        (no DMARC -> publish p=none with rua; p=none with high compliance
+        on recent reports -> p=quarantine; p=quarantine with high
+        compliance -> p=reject), the server's RUA address (when an
+        inbound route targets `internal://dmarc-reports`) and the stored
+        compliance figures of the last 30 days.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Health report
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          health: { $ref: "#/components/schemas/DomainHealth" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v2/admin/organizations/{org}/servers/{server}/credentials:
     get:
       tags: [Credentials]
@@ -1873,6 +1996,105 @@ components:
         name: { type: string }
         created_at: { type: string, format: date-time }
         last_used_at: { type: string, format: date-time, nullable: true }
+    DmarcReport:
+      type: object
+      properties:
+        id: { type: integer }
+        domain: { type: string, example: example.com }
+        org_name: { type: string, nullable: true, example: google.com }
+        org_email: { type: string, nullable: true }
+        report_id: { type: string, description: The reporter's report id }
+        date_range_begin: { type: string, format: date-time }
+        date_range_end: { type: string, format: date-time }
+        received_at: { type: string, format: date-time }
+        record_count: { type: integer }
+
+    DmarcRecord:
+      type: object
+      properties:
+        id: { type: integer }
+        source_ip: { type: string, example: 203.0.113.10 }
+        count: { type: integer }
+        disposition: { type: string, enum: [none, quarantine, reject] }
+        dkim_result: { type: string, nullable: true, example: pass }
+        spf_result: { type: string, nullable: true, example: softfail }
+        dkim_aligned: { type: boolean }
+        spf_aligned: { type: boolean }
+        header_from: { type: string, nullable: true }
+        envelope_from: { type: string, nullable: true }
+
+    DmarcSummary:
+      type: object
+      properties:
+        total: { type: integer, description: Messages covered by the reports }
+        pass: { type: integer, description: Messages with DKIM and SPF aligned }
+        fail: { type: integer }
+        pass_rate: { type: number, description: pass / total (0.0-1.0) }
+        by_source:
+          type: array
+          description: Top 20 sending sources by volume
+          items:
+            type: object
+            properties:
+              source_ip: { type: string }
+              count: { type: integer }
+              spf_aligned_pct: { type: number }
+              dkim_aligned_pct: { type: number }
+              disposition_counts:
+                type: object
+                additionalProperties: { type: integer }
+        by_disposition:
+          type: object
+          additionalProperties: { type: integer }
+
+    DomainHealthCheck:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, warning, missing] }
+        record_name: { type: string }
+        found:
+          type: array
+          items: { type: string }
+        expected: { type: string, nullable: true }
+        problems:
+          type: array
+          items: { type: string }
+
+    DomainHealth:
+      type: object
+      properties:
+        domain: { type: string }
+        checks:
+          type: object
+          properties:
+            spf: { $ref: "#/components/schemas/DomainHealthCheck" }
+            dkim: { $ref: "#/components/schemas/DomainHealthCheck" }
+            dmarc:
+              allOf:
+                - $ref: "#/components/schemas/DomainHealthCheck"
+                - type: object
+                  properties:
+                    policy:
+                      type: object
+                      nullable: true
+                      properties:
+                        p: { type: string, nullable: true }
+                        sp: { type: string, nullable: true }
+                        rua:
+                          type: array
+                          items: { type: string }
+                        pct: { type: integer }
+        overall: { type: string, enum: [ok, warning, missing] }
+        next_step: { type: string }
+        rua_address: { type: string, nullable: true }
+        compliance:
+          type: object
+          nullable: true
+          properties:
+            window_days: { type: integer }
+            total: { type: integer }
+            pass: { type: integer }
+            pass_rate: { type: number }
 
     Pagination:
       type: object

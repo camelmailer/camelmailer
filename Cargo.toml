@@ -63,6 +63,8 @@ hmac = "0.12"
 md-5 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 ipnet = "2"
+quick-xml = "0.37"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 regex = "1"
 subtle = "2"
 thiserror = "2"
