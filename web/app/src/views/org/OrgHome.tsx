@@ -25,6 +25,7 @@ import {
 import { EmptyState } from "@/components/empty-state"
 import { FormDialog } from "@/components/form-dialog"
 import { OnboardingChecklist } from "@/components/onboarding-checklist"
+import { OrgDashboard } from "@/views/server/Analytics"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -99,6 +100,7 @@ export function Servers({ org }: { org: string }) {
   return (
     <div>
       <OnboardingChecklist org={org} />
+      <OrgDashboard org={org} />
       <PageHeader
         title="Mail servers"
         action={

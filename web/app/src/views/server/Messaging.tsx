@@ -4,7 +4,7 @@
 // (`X-Server-API-Key`). The key is picked from the server's API
 // credentials — no credential, no messaging.
 
-import { createContext, useContext, useMemo, useState } from "react"
+import { createContext, useContext, useEffect, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { usePathname, useRouter } from "next/navigation"
 import {
@@ -17,6 +17,7 @@ import {
   MoreVerticalIcon,
   PlusIcon,
   RefreshCwIcon,
+  ScrollTextIcon,
   SearchIcon,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -71,9 +72,29 @@ import {
   type Message,
   type Template,
 } from "@/lib/api"
+import {
+  httpStatusPillClass,
+  messageEventPill,
+  parseRawEmail,
+  relativeTime,
+  serverApiP1,
+  type ApiRequestEntry,
+  type ParsedEmail,
+} from "@/lib/api-p1"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
+}
+
+/// A lifecycle event pill using the shared color semantics (no
+/// status-pill.tsx component — classes on the existing Badge).
+function EventPill({ message }: { message: Pick<Message, "held" | "status"> }) {
+  const { label, className } = messageEventPill(message)
+  return (
+    <Badge variant="outline" className={className}>
+      {label}
+    </Badge>
+  )
 }
 
 type Api = ReturnType<typeof serverApi>
@@ -349,26 +370,204 @@ function InsightsPanel({ api, id }: { api: Api; id: number }) {
   )
 }
 
+/// The delivery timestamp, tolerant of the API's `created_at` field name.
+function deliveryTime(delivery: { timestamp?: string; created_at?: string }): string {
+  return delivery.timestamp ?? delivery.created_at ?? ""
+}
+
+type TimelineStage = {
+  key: string
+  label: string
+  at: string | null
+  reached: boolean
+  tone: "done" | "bad" | "pending"
+}
+
+/// The horizontal lifecycle timeline: Sent → Delivered → Opened → Clicked,
+/// with the Delivered node flipping to Bounced / Held on failure.
+function EventTimeline({
+  message,
+  deliveries,
+  opens,
+  clicks,
+}: {
+  message: Message
+  deliveries: { status: string; timestamp?: string; created_at?: string }[]
+  opens: { created_at: string }[]
+  clicks: { created_at: string }[]
+}) {
+  const delivered = deliveries.find((d) => d.status === "Sent" || d.status === "Delivered")
+  const firstOpen = [...opens].sort((a, b) => a.created_at.localeCompare(b.created_at))[0]
+  const firstClick = [...clicks].sort((a, b) => a.created_at.localeCompare(b.created_at))[0]
+  const failed =
+    message.status === "Bounced" ||
+    message.status === "HardFail" ||
+    message.bounce === true
+  const lastFail = deliveries
+    .filter((d) => d.status !== "Sent" && d.status !== "Delivered")
+    .slice(-1)[0]
+
+  const middle: TimelineStage = message.held
+    ? { key: "held", label: "Held", at: message.created_at, reached: true, tone: "bad" }
+    : failed
+      ? {
+          key: "bounced",
+          label: "Bounced",
+          at: lastFail ? deliveryTime(lastFail) : message.created_at,
+          reached: true,
+          tone: "bad",
+        }
+      : {
+          key: "delivered",
+          label: "Delivered",
+          at: delivered ? deliveryTime(delivered) : null,
+          reached: !!delivered,
+          tone: "done",
+        }
+
+  const stages: TimelineStage[] = [
+    { key: "sent", label: "Sent", at: message.created_at, reached: true, tone: "done" },
+    middle,
+    {
+      key: "opened",
+      label: "Opened",
+      at: firstOpen?.created_at ?? null,
+      reached: !!firstOpen,
+      tone: "done",
+    },
+    {
+      key: "clicked",
+      label: "Clicked",
+      at: firstClick?.created_at ?? null,
+      reached: !!firstClick,
+      tone: "done",
+    },
+  ]
+
+  return (
+    <ol className="flex items-start gap-1 overflow-x-auto py-2">
+      {stages.map((stage, index) => (
+        <li key={stage.key} className="flex min-w-24 flex-1 items-start gap-1">
+          <div className="flex flex-col items-center gap-1 text-center">
+            <span
+              className={`flex size-6 items-center justify-center rounded-full text-[10px] font-semibold ${
+                !stage.reached
+                  ? "border border-dashed border-border text-muted-foreground"
+                  : stage.tone === "bad"
+                    ? "bg-red-600/15 text-red-700 dark:text-red-400"
+                    : "bg-green-600/15 text-green-700 dark:text-green-400"
+              }`}
+            >
+              {stage.reached ? "✓" : index + 1}
+            </span>
+            <span
+              className={`text-xs font-medium ${stage.reached ? "" : "text-muted-foreground"}`}
+            >
+              {stage.label}
+            </span>
+            <span className="whitespace-nowrap text-[10px] text-muted-foreground">
+              {stage.at ? relativeTime(stage.at) : "—"}
+            </span>
+          </div>
+          {index < stages.length - 1 && (
+            <span
+              className={`mt-3 h-px flex-1 ${
+                stages[index + 1].reached ? "bg-green-600/40" : "bg-border"
+              }`}
+            />
+          )}
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+/// A copyable label:value cell of the metadata grid.
+function MetaRow({
+  label,
+  value,
+  copy,
+}: {
+  label: string
+  value: string | null | undefined
+  copy?: boolean
+}) {
+  return (
+    <>
+      <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        {label}
+      </span>
+      <span className="flex min-w-0 items-center gap-1 break-all">
+        <span className="min-w-0 flex-1">{value || "—"}</span>
+        {copy && value && <CopyButton value={value} />}
+      </span>
+    </>
+  )
+}
+
+/// Initial `?tab=` value (client-only; no useSearchParams so no Suspense
+/// boundary is required and the build stays static-safe).
+function initialTab(fallback: string): string {
+  if (typeof window === "undefined") return fallback
+  return new URLSearchParams(window.location.search).get("tab") || fallback
+}
+
 function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: () => void }) {
+  const p1 = useMessagingApiP1()
   const message = useQuery({ queryKey: ["sapi-message", id], queryFn: () => api.message(id) })
   const deliveries = useQuery({
     queryKey: ["sapi-deliveries", id],
     queryFn: () => api.deliveries(id),
   })
+  const opens = useQuery({ queryKey: ["p1-opens", id], queryFn: () => p1.opens(id) })
+  const clicks = useQuery({ queryKey: ["p1-clicks", id], queryFn: () => p1.clicks(id) })
   const insights = useQuery({
     queryKey: ["sapi-insights", id],
     queryFn: () => api.insights(id),
   })
+  // Raw MIME → display bodies, headers, attachments. 404 in privacy mode.
+  const raw = useQuery({
+    queryKey: ["p1-raw", id],
+    queryFn: () => p1.rawMime(id),
+    retry: false,
+  })
+  const parsed: ParsedEmail | null = useMemo(
+    () => (raw.data ? parseRawEmail(raw.data.raw_message) : null),
+    [raw.data],
+  )
+  const privacyMode =
+    raw.error instanceof ApiError && raw.error.code === "NotAvailable"
+
   const [sharing, setSharing] = useState(false)
+  const [tab, setTab] = useState(() => initialTab("preview"))
+
+  // Reflect the active tab in the URL for a shareable deep link.
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const url = new URL(window.location.href)
+    url.searchParams.set("tab", tab)
+    window.history.replaceState(window.history.state, "", url)
+  }, [tab])
+
   const warnings =
     insights.data?.checks.filter((check) => check.status === "warning").length ?? 0
   const m = message.data?.message
+  const html = parsed?.htmlBody ?? null
+  const text = parsed?.textBody ?? null
+  const replyTo = parsed?.headers["reply-to"] ?? null
+  const attachments = parsed?.attachments ?? []
+
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="max-w-3xl">
         <DialogHeader>
-          <div className="flex items-center justify-between pr-6">
-            <DialogTitle>Message #{id}</DialogTitle>
+          <div className="flex items-start justify-between gap-2 pr-6">
+            <div className="min-w-0">
+              <DialogTitle className="truncate">{m?.subject || `Message #${id}`}</DialogTitle>
+              <p className="mt-0.5 flex items-center gap-1.5 text-sm text-muted-foreground">
+                To {m?.rcpt_to ?? "…"} {m && <EventPill message={m} />}
+              </p>
+            </div>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" size="icon" aria-label="Message actions">
@@ -376,80 +575,116 @@ function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: ()
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => setSharing(true)}>Share…</DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setSharing(true)}>Share email…</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
         </DialogHeader>
         {m && (
-          <Tabs defaultValue="details">
-            <TabsList className="mb-2">
-              <TabsTrigger value="details">Details</TabsTrigger>
-              <TabsTrigger value="insights">
-                Insights
-                {warnings > 0 && (
-                  <Badge variant="destructive" className="ml-1 px-1.5">
-                    {warnings}
-                  </Badge>
-                )}
-              </TabsTrigger>
-            </TabsList>
-            <TabsContent value="details">
-              <div className="grid gap-2 text-sm">
-                <div className="grid grid-cols-[7rem_1fr] gap-1">
-                  <span className="text-muted-foreground">From</span>
-                  <span>{m.mail_from ?? "—"}</span>
-                  <span className="text-muted-foreground">To</span>
-                  <span>{m.rcpt_to}</span>
-                  <span className="text-muted-foreground">Subject</span>
-                  <span>{m.subject ?? "—"}</span>
-                  <span className="text-muted-foreground">Status</span>
-                  <span>{statusBadge(m)}</span>
-                  <span className="text-muted-foreground">Spam</span>
-                  <span>
-                    {m.spam_status ?? "—"}
-                    {m.spam_score != null && ` (${m.spam_score})`}
-                  </span>
-                  <span className="text-muted-foreground">Created</span>
-                  <span>{formatDate(m.created_at)}</span>
-                </div>
-                <h3 className="mt-2 font-medium">Delivery attempts</h3>
-                {deliveries.data?.deliveries.length === 0 ? (
-                  <p className="text-muted-foreground">No attempts yet.</p>
-                ) : (
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Time</TableHead>
-                        <TableHead>Status</TableHead>
-                        <TableHead>Details</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {deliveries.data?.deliveries.map((delivery) => (
-                        <TableRow key={delivery.id}>
-                          <TableCell className="whitespace-nowrap text-muted-foreground">
-                            {formatDate(delivery.timestamp)}
-                          </TableCell>
-                          <TableCell>
-                            <Badge variant="outline">{delivery.status}</Badge>
-                          </TableCell>
-                          <TableCell className="text-xs text-muted-foreground">
-                            {delivery.details ?? delivery.output ?? "—"}
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                )}
+          <div className="space-y-4">
+            <div className="grid grid-cols-[5.5rem_1fr] gap-x-3 gap-y-1.5 text-sm sm:grid-cols-[5.5rem_1fr_5.5rem_1fr]">
+              <MetaRow label="From" value={m.mail_from} />
+              <MetaRow label="Subject" value={m.subject} />
+              <MetaRow label="To" value={m.rcpt_to} />
+              <MetaRow label="ID" value={m.message_id ?? String(m.id)} copy />
+              <MetaRow label="Reply-To" value={replyTo} />
+              <MetaRow
+                label="Attach."
+                value={
+                  attachments.length
+                    ? attachments.map((a) => a.filename ?? a.contentType).join(", ")
+                    : "None"
+                }
+              />
+            </div>
+
+            <div className="rounded-md border bg-muted/30 px-2">
+              <EventTimeline
+                message={m}
+                deliveries={deliveries.data?.deliveries ?? []}
+                opens={opens.data?.opens ?? []}
+                clicks={clicks.data?.clicks ?? []}
+              />
+            </div>
+
+            <Tabs value={tab} onValueChange={setTab}>
+              <TabsList className="mb-2 flex-wrap">
+                <TabsTrigger value="preview">Preview</TabsTrigger>
+                <TabsTrigger value="text">Plain Text</TabsTrigger>
+                <TabsTrigger value="html">HTML</TabsTrigger>
+                <TabsTrigger value="raw">Raw</TabsTrigger>
+                <TabsTrigger value="insights">
+                  Insights
+                  {warnings > 0 && (
+                    <Badge variant="destructive" className="ml-1 px-1.5">
+                      {warnings}
+                    </Badge>
+                  )}
+                </TabsTrigger>
+              </TabsList>
+
+              <div className="max-h-[55svh] overflow-y-auto pr-1">
+                <TabsContent value="preview">
+                  {privacyMode ? (
+                    <PrivacyNote />
+                  ) : html ? (
+                    <iframe
+                      title="Message preview"
+                      sandbox=""
+                      srcDoc={html}
+                      className="h-[45svh] w-full rounded-md border bg-white"
+                    />
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      {raw.isLoading ? "Loading…" : "No HTML part to preview."}
+                    </p>
+                  )}
+                </TabsContent>
+                <TabsContent value="text">
+                  {privacyMode ? (
+                    <PrivacyNote />
+                  ) : text ? (
+                    <pre className="overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 text-xs">
+                      {text}
+                    </pre>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      {raw.isLoading ? "Loading…" : "No plain-text part."}
+                    </p>
+                  )}
+                </TabsContent>
+                <TabsContent value="html">
+                  {privacyMode ? (
+                    <PrivacyNote />
+                  ) : html ? (
+                    <div className="relative">
+                      <div className="absolute right-2 top-2">
+                        <CopyButton value={html} />
+                      </div>
+                      <pre className="overflow-auto rounded-md bg-muted p-3 text-xs">{html}</pre>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      {raw.isLoading ? "Loading…" : "No HTML part."}
+                    </p>
+                  )}
+                </TabsContent>
+                <TabsContent value="raw">
+                  <div className="relative">
+                    <div className="absolute right-2 top-2">
+                      <CopyButton value={JSON.stringify(m, null, 2)} />
+                    </div>
+                    <pre className="overflow-auto rounded-md bg-muted p-3 text-xs">
+                      {JSON.stringify(m, null, 2)}
+                    </pre>
+                  </div>
+                </TabsContent>
+                <TabsContent value="insights">
+                  <InsightsPanel api={api} id={id} />
+                </TabsContent>
               </div>
-            </TabsContent>
-            <TabsContent value="insights">
-              <div className="max-h-[60svh] overflow-y-auto pr-1">
-                <InsightsPanel api={api} id={id} />
-              </div>
-            </TabsContent>
-          </Tabs>
+            </Tabs>
+          </div>
         )}
         {sharing && <ShareDialog api={api} id={id} onClose={() => setSharing(false)} />}
       </DialogContent>
@@ -457,25 +692,96 @@ function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: ()
   )
 }
 
+function PrivacyNote() {
+  return (
+    <p className="text-sm text-muted-foreground">
+      This server runs in privacy mode — message content is not retained, so there is nothing
+      to show here.
+    </p>
+  )
+}
+
+const TIME_RANGES = [
+  { value: "all", label: "All time", ms: null as number | null },
+  { value: "24h", label: "Last 24h", ms: 86_400_000 },
+  { value: "7d", label: "Last 7 days", ms: 7 * 86_400_000 },
+  { value: "30d", label: "Last 30 days", ms: 30 * 86_400_000 },
+]
+
+const STATUS_FILTERS = [
+  { value: "all", label: "Any status" },
+  { value: "Sent", label: "Delivered" },
+  { value: "Pending", label: "Queued" },
+  { value: "Held", label: "Held" },
+  { value: "Bounced", label: "Bounced" },
+  { value: "SoftFail", label: "Soft fail" },
+  { value: "HardFail", label: "Hard fail" },
+]
+
+/// Activity — the event-oriented message stream (masterplan §4.2): one
+/// row per message with its lifecycle pill, recipient (links to the
+/// message detail — recipient detail lands in P2), subject, tag and a
+/// relative time. Omni-search over sender/subject/recipient/tag plus the
+/// Time × Status × Tag × Stream filter row.
 export function Messages({ api }: { api: Api }) {
+  const p1 = useMessagingApiP1()
   const pathname = usePathname() ?? ""
   const messagingBase = pathname.replace(/\/messages$/, "")
   const [scope, setScope] = useState("outgoing")
   const [query, setQuery] = useState("")
+  const [status, setStatus] = useState("all")
+  const [tag, setTag] = useState("all")
+  const [stream, setStream] = useState("all")
+  const [range, setRange] = useState("all")
   const [selected, setSelected] = useState<number | null>(null)
+
+  const tags = useQuery({ queryKey: ["p1-tags"], queryFn: p1.tags })
+  const streams = useQuery({ queryKey: ["sapi-streams"], queryFn: api.streams.list })
+
+  const params = useMemo(() => {
+    const q = new URLSearchParams({ scope, per_page: "50" })
+    if (query) q.set("query", query)
+    if (status !== "all") q.set("status", status)
+    if (tag !== "all") q.set("tag", tag)
+    if (stream !== "all") q.set("stream", stream)
+    return `?${q.toString()}`
+  }, [scope, query, status, tag, stream])
+
   const messages = useQuery({
-    queryKey: ["sapi-messages", scope, query],
-    queryFn: () =>
-      api.messages(
-        `?scope=${scope}&per_page=50${query ? `&query=${encodeURIComponent(query)}` : ""}`,
-      ),
+    queryKey: ["sapi-messages", params],
+    queryFn: () => api.messages(params),
   })
+
+  // Time window is not a server-side filter on /messages, so it applies
+  // client-side to the fetched page.
+  const cutoff = TIME_RANGES.find((r) => r.value === range)?.ms ?? null
+  const rows = useMemo(() => {
+    const now = new Date().getTime()
+    return (messages.data?.messages ?? []).filter(
+      (m) => cutoff == null || now - new Date(m.created_at).getTime() <= cutoff,
+    )
+  }, [messages.data, cutoff])
+  const hasFilters = query || status !== "all" || tag !== "all" || stream !== "all" || range !== "all"
 
   return (
     <div>
+      <div className="mb-3 flex items-center gap-2">
+        <div className="relative flex-1">
+          <SearchIcon className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            className="pl-8"
+            placeholder="Search sender, subject, recipient, tag…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
+        <Button variant="outline" size="icon" onClick={() => messages.refetch()}>
+          <RefreshCwIcon className="size-4" />
+        </Button>
+      </div>
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <Select value={scope} onValueChange={setScope}>
-          <SelectTrigger className="w-36">
+          <SelectTrigger size="sm" className="w-32">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -483,28 +789,71 @@ export function Messages({ api }: { api: Api }) {
             <SelectItem value="incoming">Incoming</SelectItem>
           </SelectContent>
         </Select>
-        <Input
-          className="w-64"
-          placeholder="Search subject / address…"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
-        <Button variant="outline" size="icon" onClick={() => messages.refetch()}>
-          <RefreshCwIcon className="size-4" />
-        </Button>
+        <Select value={range} onValueChange={setRange}>
+          <SelectTrigger size="sm" className="w-36">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {TIME_RANGES.map((r) => (
+              <SelectItem key={r.value} value={r.value}>
+                {r.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={status} onValueChange={setStatus}>
+          <SelectTrigger size="sm" className="w-36">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {STATUS_FILTERS.map((s) => (
+              <SelectItem key={s.value} value={s.value}>
+                {s.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={tag} onValueChange={setTag}>
+          <SelectTrigger size="sm" className="w-36">
+            <SelectValue placeholder="Any tag" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any tag</SelectItem>
+            {tags.data?.tags.map((t) => (
+              <SelectItem key={t.tag} value={t.tag}>
+                {t.tag} ({t.count})
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={stream} onValueChange={setStream}>
+          <SelectTrigger size="sm" className="w-36">
+            <SelectValue placeholder="Any stream" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">Any stream</SelectItem>
+            {streams.data?.streams
+              .filter((s) => !s.archived)
+              .map((s) => (
+                <SelectItem key={s.id} value={s.permalink}>
+                  {s.name}
+                </SelectItem>
+              ))}
+          </SelectContent>
+        </Select>
       </div>
-      {messages.data?.messages.length === 0 ? (
-        query ? (
+      {rows.length === 0 ? (
+        hasFilters ? (
           <EmptyState
             icon={SearchIcon}
-            title="No messages match"
-            description="Try a different search term or switch the scope."
+            title="No events match"
+            description="Try a broader search, a wider time range, or clear a filter."
           />
         ) : (
           <EmptyState
             icon={MailIcon}
-            title="No messages yet"
-            description="Send your first message and watch its delivery here in real time."
+            title="No activity yet"
+            description="Send your first message and watch every delivery, open and click stream in here."
             action={{ label: "Send a message", href: messagingBase }}
           />
         )
@@ -512,26 +861,43 @@ export function Messages({ api }: { api: Api }) {
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>#</TableHead>
-              <TableHead>To</TableHead>
+              <TableHead className="w-28">Event</TableHead>
+              <TableHead>Recipient</TableHead>
               <TableHead>Subject</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Created</TableHead>
+              <TableHead className="w-32">Tag</TableHead>
+              <TableHead className="w-24 text-right">Time</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {messages.data?.messages.map((message) => (
+            {rows.map((message) => (
               <TableRow
                 key={message.id}
                 className="cursor-pointer"
                 onClick={() => setSelected(message.id)}
               >
-                <TableCell className="text-muted-foreground">{message.id}</TableCell>
-                <TableCell>{message.rcpt_to}</TableCell>
+                <TableCell>
+                  <EventPill message={message} />
+                </TableCell>
+                <TableCell className="max-w-48 truncate">
+                  <span className="font-medium text-primary underline-offset-2 hover:underline">
+                    {message.rcpt_to}
+                  </span>
+                </TableCell>
                 <TableCell className="max-w-64 truncate">{message.subject ?? "—"}</TableCell>
-                <TableCell>{statusBadge(message)}</TableCell>
-                <TableCell className="whitespace-nowrap text-muted-foreground">
-                  {formatDate(message.created_at)}
+                <TableCell>
+                  {message.tag ? (
+                    <Badge variant="secondary" className="font-normal">
+                      {message.tag}
+                    </Badge>
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
+                </TableCell>
+                <TableCell
+                  className="whitespace-nowrap text-right text-muted-foreground"
+                  title={formatDate(message.created_at)}
+                >
+                  {relativeTime(message.created_at)}
                 </TableCell>
               </TableRow>
             ))}
@@ -540,6 +906,149 @@ export function Messages({ api }: { api: Api }) {
       )}
       {selected !== null && (
         <MessageDetail api={api} id={selected} onClose={() => setSelected(null)} />
+      )}
+    </div>
+  )
+}
+
+// ------------------------------------------------------------ API logs
+
+const LOG_METHODS = ["all", "GET", "POST", "PATCH", "DELETE"]
+const LOG_STATUS_CLASSES = [
+  { value: "all", label: "Any status" },
+  { value: "2xx", label: "2xx success" },
+  { value: "3xx", label: "3xx redirect" },
+  { value: "4xx", label: "4xx client" },
+  { value: "5xx", label: "5xx server" },
+]
+
+function LogStatusPill({ code }: { code: number }) {
+  return (
+    <Badge variant="outline" className={httpStatusPillClass(code)}>
+      {code}
+    </Badge>
+  )
+}
+
+/// The API request-log view (masterplan §4.8/Resend `/logs`): the server's
+/// own request log with Endpoint / Method / Status (traffic-light pill) /
+/// Time, filterable by time range, method and status class.
+export function LogsView() {
+  const p1 = useMessagingApiP1()
+  const [method, setMethod] = useState("all")
+  const [status, setStatus] = useState("all")
+  const [range, setRange] = useState("24h")
+
+  const params = useMemo(() => {
+    const q = new URLSearchParams({ per_page: "100" })
+    if (method !== "all") q.set("method", method)
+    if (status !== "all") q.set("status", status)
+    const ms = TIME_RANGES.find((r) => r.value === range)?.ms
+    if (ms) q.set("from", new Date(new Date().getTime() - ms).toISOString())
+    return `?${q.toString()}`
+  }, [method, status, range])
+
+  const logs = useQuery({
+    queryKey: ["p1-logs", params],
+    queryFn: () => p1.logs(params),
+    refetchInterval: 30_000,
+  })
+  const rows: ApiRequestEntry[] = logs.data?.requests ?? []
+  const hasFilters = method !== "all" || status !== "all"
+
+  return (
+    <div>
+      <PageHeader
+        title="API request log"
+        description="Every authenticated call to this server's API — method, endpoint, status and latency."
+      />
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <Select value={range} onValueChange={setRange}>
+          <SelectTrigger size="sm" className="w-36">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {TIME_RANGES.filter((r) => r.value !== "all").map((r) => (
+              <SelectItem key={r.value} value={r.value}>
+                {r.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={method} onValueChange={setMethod}>
+          <SelectTrigger size="sm" className="w-32">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {LOG_METHODS.map((m) => (
+              <SelectItem key={m} value={m}>
+                {m === "all" ? "Any method" : m}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={status} onValueChange={setStatus}>
+          <SelectTrigger size="sm" className="w-40">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {LOG_STATUS_CLASSES.map((s) => (
+              <SelectItem key={s.value} value={s.value}>
+                {s.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Button variant="outline" size="icon" onClick={() => logs.refetch()}>
+          <RefreshCwIcon className="size-4" />
+        </Button>
+      </div>
+      {rows.length === 0 ? (
+        <EmptyState
+          icon={ScrollTextIcon}
+          title={hasFilters ? "No requests match" : "No requests logged yet"}
+          description={
+            hasFilters
+              ? "Widen the time range or clear a filter."
+              : "Calls to this server's messaging API show up here as soon as they arrive."
+          }
+        />
+      ) : (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-20">Method</TableHead>
+              <TableHead>Endpoint</TableHead>
+              <TableHead className="w-20">Status</TableHead>
+              <TableHead className="w-24 text-right">Latency</TableHead>
+              <TableHead className="w-24 text-right">Time</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((entry) => (
+              <TableRow key={entry.id}>
+                <TableCell>
+                  <Badge variant="outline" className="font-mono text-[10px]">
+                    {entry.method}
+                  </Badge>
+                </TableCell>
+                <TableCell className="max-w-80 truncate font-mono text-xs">{entry.path}</TableCell>
+                <TableCell>
+                  <LogStatusPill code={entry.status_code} />
+                </TableCell>
+                <TableCell className="text-right tabular-nums text-muted-foreground">
+                  {entry.duration_ms}ms
+                </TableCell>
+                <TableCell
+                  className="whitespace-nowrap text-right text-muted-foreground"
+                  title={formatDate(entry.created_at)}
+                >
+                  {relativeTime(entry.created_at)}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       )}
     </div>
   )
@@ -1126,6 +1635,8 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
 // ---------------------------------------------------------------- shell
 
 const MessagingContext = createContext<Api | null>(null)
+type ApiP1 = ReturnType<typeof serverApiP1>
+const MessagingP1Context = createContext<ApiP1 | null>(null)
 
 /// The server API bound to the first active API credential; only
 /// available inside <MessagingShell>.
@@ -1135,9 +1646,18 @@ export function useMessagingApi(): Api {
   return api
 }
 
+/// The P1 additions to the server API (tags, logs, opens/clicks, raw),
+/// bound to the same credential. Only available inside <MessagingShell>.
+export function useMessagingApiP1(): ApiP1 {
+  const api = useContext(MessagingP1Context)
+  if (!api) throw new Error("useMessagingApiP1 must be used inside MessagingShell")
+  return api
+}
+
 const SUBTABS = [
   { value: "send", label: "Send" },
-  { value: "messages", label: "Messages" },
+  { value: "messages", label: "Activity" },
+  { value: "logs", label: "Logs" },
   { value: "queue", label: "Queue" },
   { value: "stats", label: "Stats" },
   { value: "streams", label: "Streams" },
@@ -1167,12 +1687,13 @@ export function MessagingShell({
     [credentials.data],
   )
   const api = useMemo(() => (apiKey ? serverApi(apiKey) : null), [apiKey])
+  const apiP1 = useMemo(() => (apiKey ? serverApiP1(apiKey) : null), [apiKey])
   const subtab = pathname.split("/messaging")[1]?.split("/")[1] || "send"
 
   if (credentials.isLoading) {
     return <p className="text-sm text-muted-foreground">Loading…</p>
   }
-  if (!api) {
+  if (!api || !apiP1) {
     return (
       <EmptyState
         icon={KeyRoundIcon}
@@ -1201,7 +1722,9 @@ export function MessagingShell({
           ))}
         </TabsList>
       </Tabs>
-      <MessagingContext.Provider value={api}>{children}</MessagingContext.Provider>
+      <MessagingContext.Provider value={api}>
+        <MessagingP1Context.Provider value={apiP1}>{children}</MessagingP1Context.Provider>
+      </MessagingContext.Provider>
     </div>
   )
 }
