@@ -5,6 +5,7 @@
 // credentials — no credential, no messaging.
 
 import { createContext, useContext, useMemo, useState } from "react"
+import Link from "next/link"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { usePathname, useRouter } from "next/navigation"
 import {
@@ -22,6 +23,7 @@ import { toast } from "sonner"
 import { formatDate, PageHeader } from "@/components/shared"
 import { EmptyState } from "@/components/empty-state"
 import { FormDialog } from "@/components/form-dialog"
+import { MessagePill, StatusPill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -56,7 +58,9 @@ import {
 } from "@/components/ui/table"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
-import { adminApi, ApiError, serverApi, type Message, type Template } from "@/lib/api"
+import { adminApi, ApiError, serverApi, type Template } from "@/lib/api"
+import { recipientHref } from "@/lib/api-p2"
+import { useOrgParams } from "@/lib/params"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -184,23 +188,8 @@ export function Send({ api }: { api: Api }) {
 
 // ------------------------------------------------------------ messages
 
-function statusBadge(message: Message) {
-  if (message.held) return <Badge variant="destructive">held</Badge>
-  switch (message.status) {
-    case "Sent":
-      return <Badge>sent</Badge>
-    case "SoftFail":
-      return <Badge variant="secondary">soft fail</Badge>
-    case "HardFail":
-      return <Badge variant="destructive">hard fail</Badge>
-    case "Bounced":
-      return <Badge variant="destructive">bounced</Badge>
-    default:
-      return <Badge variant="outline">{message.status ?? "pending"}</Badge>
-  }
-}
-
-function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: () => void }) {
+/// Message detail dialog — also reused by the recipient-detail view.
+export function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: () => void }) {
   const message = useQuery({ queryKey: ["sapi-message", id], queryFn: () => api.message(id) })
   const deliveries = useQuery({
     queryKey: ["sapi-deliveries", id],
@@ -223,7 +212,9 @@ function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: ()
               <span className="text-muted-foreground">Subject</span>
               <span>{m.subject ?? "—"}</span>
               <span className="text-muted-foreground">Status</span>
-              <span>{statusBadge(m)}</span>
+              <span>
+                <MessagePill message={m} />
+              </span>
               <span className="text-muted-foreground">Spam</span>
               <span>
                 {m.spam_status ?? "—"}
@@ -251,7 +242,7 @@ function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: ()
                         {formatDate(delivery.timestamp)}
                       </TableCell>
                       <TableCell>
-                        <Badge variant="outline">{delivery.status}</Badge>
+                        <StatusPill status={delivery.status} />
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
                         {delivery.details ?? delivery.output ?? "—"}
@@ -269,6 +260,7 @@ function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: ()
 }
 
 export function Messages({ api }: { api: Api }) {
+  const { org, server } = useOrgParams()
   const pathname = usePathname() ?? ""
   const messagingBase = pathname.replace(/\/messages$/, "")
   const [scope, setScope] = useState("outgoing")
@@ -338,9 +330,20 @@ export function Messages({ api }: { api: Api }) {
                 onClick={() => setSelected(message.id)}
               >
                 <TableCell className="text-muted-foreground">{message.id}</TableCell>
-                <TableCell>{message.rcpt_to}</TableCell>
+                <TableCell>
+                  {/* recipient history, not the message — hence stopPropagation */}
+                  <Link
+                    href={recipientHref(org, server, message.rcpt_to)}
+                    className="hover:underline"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {message.rcpt_to}
+                  </Link>
+                </TableCell>
                 <TableCell className="max-w-64 truncate">{message.subject ?? "—"}</TableCell>
-                <TableCell>{statusBadge(message)}</TableCell>
+                <TableCell>
+                  <MessagePill message={message} />
+                </TableCell>
                 <TableCell className="whitespace-nowrap text-muted-foreground">
                   {formatDate(message.created_at)}
                 </TableCell>
@@ -395,7 +398,9 @@ export function InboundQueue({ api }: { api: Api }) {
                 <TableCell className="text-muted-foreground">{message.id}</TableCell>
                 <TableCell>{message.rcpt_to}</TableCell>
                 <TableCell className="max-w-64 truncate">{message.subject ?? "—"}</TableCell>
-                <TableCell>{statusBadge(message)}</TableCell>
+                <TableCell>
+                  <MessagePill message={message} />
+                </TableCell>
                 <TableCell className="space-x-2 text-right">
                   <Button
                     variant="outline"

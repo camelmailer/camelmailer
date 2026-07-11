@@ -4,10 +4,13 @@
 // routes, webhooks, suppressions.
 
 import { useState } from "react"
+import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   AtSignIcon,
   BanIcon,
+  DownloadIcon,
   GlobeIcon,
   InboxIcon,
   KeyRoundIcon,
@@ -18,11 +21,13 @@ import { toast } from "sonner"
 import {
   ConfirmDialog,
   CopyButton,
+  formatDate,
   PageHeader,
   SecretReveal,
 } from "@/components/shared"
 import { EmptyState } from "@/components/empty-state"
 import { FormDialog } from "@/components/form-dialog"
+import { StatusPill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -50,13 +55,14 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { adminApi, ApiError, WEBHOOK_EVENTS, type Suppression } from "@/lib/api"
 import {
-  adminApi,
-  ApiError,
-  WEBHOOK_EVENTS,
-  type DnsRecord,
-  type Domain,
-} from "@/lib/api"
+  downloadFile,
+  recipientHref,
+  suppressionReasonText,
+  suppressionsCsv,
+  type SuppressionWithDate,
+} from "@/lib/api-p2"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -66,36 +72,19 @@ type Scope = { org: string; server: string }
 
 // ------------------------------------------------------------- domains
 
-function DnsRecordRow({ label, record }: { label: string; record: DnsRecord }) {
-  return (
-    <div className="grid gap-1">
-      <Label>
-        {label} ({record.type})
-      </Label>
-      <div className="flex items-center gap-2">
-        <code className="min-w-0 flex-1 break-all rounded bg-muted px-2 py-1 text-xs">
-          {record.name}
-        </code>
-        <CopyButton value={record.name} />
-      </div>
-      <div className="flex items-center gap-2">
-        <code className="min-w-0 flex-1 break-all rounded bg-muted px-2 py-1 text-xs">
-          {record.value}
-        </code>
-        <CopyButton value={record.value} />
-      </div>
-    </div>
-  )
+/// App route of the domain-detail view (records, health, delegation).
+function domainHref(org: string, server: string, name: string): string {
+  return `/orgs/${org}/servers/${server}/domains/${encodeURIComponent(name)}`
 }
 
 export function Domains({ org, server }: Scope) {
+  const router = useRouter()
   const queryClient = useQueryClient()
   const key = ["domains", org, server]
   const domains = useQuery({ queryKey: key, queryFn: () => adminApi.domains(org, server).list() })
   const [open, setOpen] = useState(false)
   const [name, setName] = useState("")
   const [deleteName, setDeleteName] = useState<string | null>(null)
-  const [recordsFor, setRecordsFor] = useState<Domain | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
 
   const create = useMutation({
@@ -104,7 +93,8 @@ export function Domains({ org, server }: Scope) {
       invalidate()
       setOpen(false)
       setName("")
-      setRecordsFor(domain)
+      // straight to the records that need publishing
+      router.push(domainHref(org, server, domain.name))
     },
     onError: (err) => errorToast(err, "Could not add the domain"),
   })
@@ -139,17 +129,23 @@ export function Domains({ org, server }: Scope) {
           <TableBody>
             {domains.data?.domains.map((domain) => (
               <TableRow key={domain.id}>
-                <TableCell className="font-medium">{domain.name}</TableCell>
                 <TableCell>
-                  {domain.verified ? (
-                    <Badge>verified</Badge>
-                  ) : (
-                    <Badge variant="secondary">unverified</Badge>
-                  )}
+                  <Link
+                    href={domainHref(org, server, domain.name)}
+                    className="font-medium hover:underline"
+                  >
+                    {domain.name}
+                  </Link>
+                </TableCell>
+                <TableCell>
+                  <div className="flex flex-wrap gap-1.5">
+                    <StatusPill status={domain.verified ? "verified" : "unverified"} />
+                    {domain.dkim_record === null && <StatusPill status="no key" tone="amber" />}
+                  </div>
                 </TableCell>
                 <TableCell className="space-x-2 text-right">
-                  <Button variant="outline" size="sm" onClick={() => setRecordsFor(domain)}>
-                    DNS records
+                  <Button variant="outline" size="sm" asChild>
+                    <Link href={domainHref(org, server, domain.name)}>Records &amp; health</Link>
                   </Button>
                   {!domain.verified && (
                     <Button
@@ -190,26 +186,6 @@ export function Domains({ org, server }: Scope) {
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="mail.acme.com" />
         </div>
       </FormDialog>
-      <Dialog open={recordsFor !== null} onOpenChange={(open) => !open && setRecordsFor(null)}>
-        <DialogContent className="sm:max-w-xl">
-          <DialogHeader>
-            <DialogTitle>DNS records for {recordsFor?.name}</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground">
-            Publish these TXT records, then hit Verify. The verification record proves
-            ownership; SPF and DKIM authenticate the mail itself.
-          </p>
-          {recordsFor && (
-            <div className="grid gap-4">
-              <DnsRecordRow label="Verification" record={recordsFor.verification_record} />
-              <DnsRecordRow label="SPF" record={recordsFor.spf_record} />
-              {recordsFor.dkim_record && (
-                <DnsRecordRow label="DKIM" record={recordsFor.dkim_record} />
-              )}
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
       <ConfirmDialog
         open={deleteName !== null}
         onOpenChange={(open) => !open && setDeleteName(null)}
@@ -794,7 +770,9 @@ export function Suppressions({ org, server }: Scope) {
   const [open, setOpen] = useState(false)
   const [address, setAddress] = useState("")
   const [reason, setReason] = useState("")
+  const [reactivating, setReactivating] = useState<Suppression | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
+  const rows: SuppressionWithDate[] = suppressions.data?.suppressions ?? []
 
   const create = useMutation({
     mutationFn: () =>
@@ -818,9 +796,22 @@ export function Suppressions({ org, server }: Scope) {
         title="Suppression list"
         description="Addresses this server will not deliver to (holds instead)."
         action={
-          <Button size="sm" onClick={() => setOpen(true)}>
-            <PlusIcon className="size-4" /> Suppress address
-          </Button>
+          <div className="flex items-center gap-2">
+            {rows.length > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  downloadFile(`suppressions-${server}.csv`, suppressionsCsv(rows))
+                }
+              >
+                <DownloadIcon className="size-4" /> Export CSV
+              </Button>
+            )}
+            <Button size="sm" onClick={() => setOpen(true)}>
+              <PlusIcon className="size-4" /> Suppress address
+            </Button>
+          </div>
         }
       />
       {suppressions.data?.suppressions.length === 0 ? (
@@ -837,33 +828,37 @@ export function Suppressions({ org, server }: Scope) {
               <TableHead>Address</TableHead>
               <TableHead>Type</TableHead>
               <TableHead>Reason</TableHead>
+              <TableHead>Date added</TableHead>
               <TableHead />
             </TableRow>
           </TableHeader>
           <TableBody>
-            {suppressions.data?.suppressions.map((suppression) => (
+            {rows.map((suppression) => (
               <TableRow key={suppression.id}>
-                <TableCell className="font-medium">{suppression.address}</TableCell>
+                <TableCell>
+                  <Link
+                    href={recipientHref(org, server, suppression.address)}
+                    className="font-medium hover:underline"
+                  >
+                    {suppression.address}
+                  </Link>
+                </TableCell>
                 <TableCell>
                   <Badge variant="outline">{suppression.type}</Badge>
                 </TableCell>
                 <TableCell className="text-muted-foreground">
-                  {suppression.reason ?? "—"}
+                  {suppressionReasonText(suppression)}
+                </TableCell>
+                <TableCell className="whitespace-nowrap text-muted-foreground">
+                  {formatDate(suppression.created_at)}
                 </TableCell>
                 <TableCell className="text-right">
                   <Button
-                    variant="ghost"
+                    variant="outline"
                     size="sm"
-                    onClick={async () => {
-                      try {
-                        await adminApi.suppressions(org, server).delete(suppression.address)
-                        invalidate()
-                      } catch (err) {
-                        errorToast(err, "Could not remove the suppression")
-                      }
-                    }}
+                    onClick={() => setReactivating(suppression)}
                   >
-                    Remove
+                    Reactivate
                   </Button>
                 </TableCell>
               </TableRow>
@@ -871,6 +866,22 @@ export function Suppressions({ org, server }: Scope) {
           </TableBody>
         </Table>
       )}
+      <ConfirmDialog
+        open={reactivating !== null}
+        onOpenChange={(open) => !open && setReactivating(null)}
+        title={`Reactivate ${reactivating?.address}?`}
+        description="The suppression is removed and this server delivers to the address again — make sure the underlying problem (bounce, complaint) is resolved."
+        confirmLabel="Reactivate"
+        onConfirm={async () => {
+          try {
+            await adminApi.suppressions(org, server).delete(reactivating!.address)
+            invalidate()
+            toast.success(`${reactivating!.address} reactivated`)
+          } catch (err) {
+            errorToast(err, "Could not reactivate the address")
+          }
+        }}
+      />
       <FormDialog
         open={open}
         onOpenChange={setOpen}
