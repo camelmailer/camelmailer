@@ -5,6 +5,7 @@
 // credentials — no credential, no messaging.
 
 import { createContext, useContext, useEffect, useMemo, useState } from "react"
+import Link from "next/link"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { usePathname, useRouter } from "next/navigation"
 import {
@@ -24,6 +25,7 @@ import { toast } from "sonner"
 import { CopyButton, formatDate, PageHeader } from "@/components/shared"
 import { EmptyState } from "@/components/empty-state"
 import { FormDialog } from "@/components/form-dialog"
+import { MessagePill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -74,13 +76,14 @@ import {
 } from "@/lib/api"
 import {
   httpStatusPillClass,
-  messageEventPill,
   parseRawEmail,
   relativeTime,
   serverApiP1,
   type ApiRequestEntry,
   type ParsedEmail,
 } from "@/lib/api-p1"
+import { recipientHref } from "@/lib/api-p2"
+import { useOrgParams } from "@/lib/params"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -88,15 +91,6 @@ function errorToast(err: unknown, fallback: string) {
 
 /// A lifecycle event pill using the shared color semantics (no
 /// status-pill.tsx component — classes on the existing Badge).
-function EventPill({ message }: { message: Pick<Message, "held" | "status"> }) {
-  const { label, className } = messageEventPill(message)
-  return (
-    <Badge variant="outline" className={className}>
-      {label}
-    </Badge>
-  )
-}
-
 type Api = ReturnType<typeof serverApi>
 
 // ---------------------------------------------------------------- send
@@ -218,22 +212,6 @@ export function Send({ api }: { api: Api }) {
 }
 
 // ------------------------------------------------------------ messages
-
-function statusBadge(message: Message) {
-  if (message.held) return <Badge variant="destructive">held</Badge>
-  switch (message.status) {
-    case "Sent":
-      return <Badge>sent</Badge>
-    case "SoftFail":
-      return <Badge variant="secondary">soft fail</Badge>
-    case "HardFail":
-      return <Badge variant="destructive">hard fail</Badge>
-    case "Bounced":
-      return <Badge variant="destructive">bounced</Badge>
-    default:
-      return <Badge variant="outline">{message.status ?? "pending"}</Badge>
-  }
-}
 
 const SHARE_EXPIRY_OPTIONS = [
   { value: "24", label: "24 hours" },
@@ -512,7 +490,8 @@ function initialTab(fallback: string): string {
   return new URLSearchParams(window.location.search).get("tab") || fallback
 }
 
-function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: () => void }) {
+/// Message detail dialog — also reused by the recipient-detail view.
+export function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: () => void }) {
   const p1 = useMessagingApiP1()
   const message = useQuery({ queryKey: ["sapi-message", id], queryFn: () => api.message(id) })
   const deliveries = useQuery({
@@ -565,7 +544,7 @@ function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: ()
             <div className="min-w-0">
               <DialogTitle className="truncate">{m?.subject || `Message #${id}`}</DialogTitle>
               <p className="mt-0.5 flex items-center gap-1.5 text-sm text-muted-foreground">
-                To {m?.rcpt_to ?? "…"} {m && <EventPill message={m} />}
+                To {m?.rcpt_to ?? "…"} {m && <MessagePill message={m} />}
               </p>
             </div>
             <DropdownMenu>
@@ -725,6 +704,7 @@ const STATUS_FILTERS = [
 /// Time × Status × Tag × Stream filter row.
 export function Messages({ api }: { api: Api }) {
   const p1 = useMessagingApiP1()
+  const { org, server } = useOrgParams()
   const pathname = usePathname() ?? ""
   const messagingBase = pathname.replace(/\/messages$/, "")
   const [scope, setScope] = useState("outgoing")
@@ -876,12 +856,17 @@ export function Messages({ api }: { api: Api }) {
                 onClick={() => setSelected(message.id)}
               >
                 <TableCell>
-                  <EventPill message={message} />
+                  <MessagePill message={message} />
                 </TableCell>
                 <TableCell className="max-w-48 truncate">
-                  <span className="font-medium text-primary underline-offset-2 hover:underline">
+                  {/* recipient history, not the message — hence stopPropagation */}
+                  <Link
+                    href={recipientHref(org, server, message.rcpt_to)}
+                    className="font-medium text-primary underline-offset-2 hover:underline"
+                    onClick={(e) => e.stopPropagation()}
+                  >
                     {message.rcpt_to}
-                  </span>
+                  </Link>
                 </TableCell>
                 <TableCell className="max-w-64 truncate">{message.subject ?? "—"}</TableCell>
                 <TableCell>
@@ -1093,7 +1078,9 @@ export function InboundQueue({ api }: { api: Api }) {
                 <TableCell className="text-muted-foreground">{message.id}</TableCell>
                 <TableCell>{message.rcpt_to}</TableCell>
                 <TableCell className="max-w-64 truncate">{message.subject ?? "—"}</TableCell>
-                <TableCell>{statusBadge(message)}</TableCell>
+                <TableCell>
+                  <MessagePill message={message} />
+                </TableCell>
                 <TableCell className="space-x-2 text-right">
                   <Button
                     variant="outline"

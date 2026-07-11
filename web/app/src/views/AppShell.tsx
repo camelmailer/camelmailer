@@ -87,6 +87,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   suppressions: "Suppressions",
   "sender-addresses": "Sender addresses",
   dmarc: "DMARC",
+  recipients: "Recipients",
   messaging: "Messaging",
   messages: "Messages",
   queue: "Queue",
@@ -100,10 +101,11 @@ const SEGMENT_LABELS: Record<string, string> = {
 }
 
 function segmentLabel(segment: string) {
-  return (
-    SEGMENT_LABELS[segment] ??
-    segment.charAt(0).toUpperCase() + segment.slice(1).replaceAll("-", " ")
-  )
+  const decoded = decodeURIComponent(segment)
+  if (SEGMENT_LABELS[decoded]) return SEGMENT_LABELS[decoded]
+  // dynamic values (domain names, recipient addresses) render verbatim
+  if (decoded.includes(".") || decoded.includes("@")) return decoded
+  return decoded.charAt(0).toUpperCase() + decoded.slice(1).replaceAll("-", " ")
 }
 
 /// The servers of the active organization — shared (via the query key)

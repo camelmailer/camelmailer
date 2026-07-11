@@ -2,13 +2,14 @@
 
 // The DMARC tab of a mail server: pick a sending domain, see the live
 // DNS health traffic lights (admin health endpoint), the compliance
-// summary and top sources (per-server DMARC endpoints), and how to set
-// up the RUA ingestion route.
+// sentence + top sources (per-server DMARC endpoints), and how to set
+// up the RUA ingestion route. Positioning: "EasyDMARC built in".
 
 import { useMemo, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
-import { RefreshCwIcon } from "lucide-react"
-import { EmptyState, formatDate, PageHeader } from "@/components/shared"
+import { InboxIcon, RefreshCwIcon } from "lucide-react"
+import { CopyButton, EmptyState, formatDate, PageHeader } from "@/components/shared"
+import { StatusPill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -33,19 +34,29 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import {
-  adminApi,
-  serverApi,
-  type DomainHealthCheck,
-  type HealthStatus,
-} from "@/lib/api"
+import { cn } from "@/lib/utils"
+import { adminApi, serverApi, type DomainHealthCheck } from "@/lib/api"
 
 type Scope = { org: string; server: string }
 
-function StatusBadge({ status }: { status: HealthStatus }) {
-  if (status === "ok") return <Badge>ok</Badge>
-  if (status === "warning") return <Badge variant="secondary">warning</Badge>
-  return <Badge variant="destructive">missing</Badge>
+/// A value with a thin underline bar underneath — the ranking style of
+/// the sources table (aligned share per source IP).
+function UnderlineBar({ pct }: { pct: number }) {
+  const clamped = Math.min(100, Math.max(0, pct))
+  return (
+    <div className="ml-auto w-24 space-y-1">
+      <div className="text-right text-sm tabular-nums">{pct}%</div>
+      <div className="h-0.5 w-full rounded-full bg-muted">
+        <div
+          className={cn(
+            "h-full rounded-full",
+            clamped >= 90 ? "bg-emerald-500" : clamped >= 50 ? "bg-amber-500" : "bg-red-500",
+          )}
+          style={{ width: `${clamped}%` }}
+        />
+      </div>
+    </div>
+  )
 }
 
 function HealthCheckCard({
@@ -61,7 +72,7 @@ function HealthCheckCard({
     <Card>
       <CardHeader className="pb-2">
         <CardTitle className="flex items-center justify-between text-base">
-          {title} <StatusBadge status={check.status} />
+          {title} <StatusPill status={check.status} />
         </CardTitle>
         <CardDescription className="break-all font-mono text-xs">
           {check.record_name}
@@ -187,7 +198,7 @@ export function Dmarc({ org, server }: Scope) {
         <>
           <Card>
             <CardContent className="flex flex-wrap items-center gap-3 pt-6">
-              <StatusBadge status={result.overall} />
+              <StatusPill status={result.overall} />
               <span className="text-sm">{result.next_step}</span>
             </CardContent>
           </Card>
@@ -233,23 +244,44 @@ export function Dmarc({ org, server }: Scope) {
             </p>
           ) : summary.data && summary.data.summary.total > 0 ? (
             <>
-              <div className="flex flex-wrap gap-6 text-sm">
-                <div>
-                  <div className="text-2xl font-semibold">{summary.data.summary.total}</div>
-                  <div className="text-muted-foreground">messages covered</div>
-                </div>
-                <div>
-                  <div className="text-2xl font-semibold">
-                    {Math.round(summary.data.summary.pass_rate * 1000) / 10}%
-                  </div>
-                  <div className="text-muted-foreground">DMARC pass (DKIM + SPF aligned)</div>
-                </div>
-                {Object.entries(summary.data.summary.by_disposition).map(([disposition, count]) => (
-                  <div key={disposition}>
-                    <div className="text-2xl font-semibold">{count}</div>
-                    <div className="text-muted-foreground">disposition: {disposition}</div>
-                  </div>
-                ))}
+              {/* honest numbers with a denominator, as one sentence */}
+              <p className="text-sm">
+                Reporters covered{" "}
+                <span className="font-semibold tabular-nums">
+                  {summary.data.summary.total.toLocaleString()}
+                </span>{" "}
+                messages from {domain} —{" "}
+                <span
+                  className={cn(
+                    "font-semibold tabular-nums",
+                    summary.data.summary.pass_rate >= 0.95
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-amber-600 dark:text-amber-400",
+                  )}
+                >
+                  {Math.round(summary.data.summary.pass_rate * 1000) / 10}%
+                </span>{" "}
+                passed DMARC (DKIM or SPF aligned)
+                {summary.data.summary.fail > 0 ? (
+                  <>
+                    ,{" "}
+                    <span className="font-semibold tabular-nums text-red-600 dark:text-red-400">
+                      {summary.data.summary.fail.toLocaleString()}
+                    </span>{" "}
+                    failed.
+                  </>
+                ) : (
+                  <> — no failures. Looking good.</>
+                )}
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {Object.entries(summary.data.summary.by_disposition).map(
+                  ([disposition, count]) => (
+                    <Badge key={disposition} variant="outline">
+                      {disposition}: {count}
+                    </Badge>
+                  ),
+                )}
               </div>
               <Table>
                 <TableHeader>
@@ -265,9 +297,13 @@ export function Dmarc({ org, server }: Scope) {
                   {summary.data.summary.by_source.map((source) => (
                     <TableRow key={source.source_ip}>
                       <TableCell className="font-mono text-xs">{source.source_ip}</TableCell>
-                      <TableCell className="text-right">{source.count}</TableCell>
-                      <TableCell className="text-right">{source.spf_aligned_pct}%</TableCell>
-                      <TableCell className="text-right">{source.dkim_aligned_pct}%</TableCell>
+                      <TableCell className="text-right tabular-nums">{source.count}</TableCell>
+                      <TableCell>
+                        <UnderlineBar pct={source.spf_aligned_pct} />
+                      </TableCell>
+                      <TableCell>
+                        <UnderlineBar pct={source.dkim_aligned_pct} />
+                      </TableCell>
                       <TableCell className="text-muted-foreground">
                         {Object.entries(source.disposition_counts)
                           .map(([disposition, count]) => `${disposition}: ${count}`)
@@ -315,22 +351,40 @@ export function Dmarc({ org, server }: Scope) {
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Receive aggregate reports here</CardTitle>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <InboxIcon className="size-4" /> Receive aggregate reports here
+          </CardTitle>
+          <CardDescription>
+            Two records and the reports flow straight into this dashboard — no external
+            DMARC service needed.
+          </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-2 text-sm text-muted-foreground">
-          <p>
-            1. Create an inbound route (Routes tab) for e.g.{" "}
-            <code>dmarc@{domain ?? "your-domain"}</code> with the endpoint{" "}
-            <code>internal://dmarc-reports</code> — arriving reports are parsed and stored
-            instead of being forwarded.
-          </p>
-          <p>
-            2. Put that address into your DMARC record:{" "}
-            <code className="break-all rounded bg-muted px-1 py-0.5 text-xs">
-              v=DMARC1; p=none; rua=mailto:{ruaAddress}
-            </code>
-          </p>
-          <p>
+        <CardContent className="space-y-3 text-sm">
+          <div className="space-y-1">
+            <p className="text-muted-foreground">
+              1. Create an inbound route (Routes tab) for e.g.{" "}
+              <code>dmarc@{domain ?? "your-domain"}</code> with this endpoint — arriving
+              reports are parsed and stored instead of being forwarded:
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="rounded bg-muted px-2 py-1 text-xs">
+                internal://dmarc-reports
+              </code>
+              <CopyButton value="internal://dmarc-reports" />
+            </div>
+          </div>
+          <div className="space-y-1">
+            <p className="text-muted-foreground">
+              2. Point your DMARC record at that address:
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="min-w-0 break-all rounded bg-muted px-2 py-1 text-xs">
+                v=DMARC1; p=none; rua=mailto:{ruaAddress}
+              </code>
+              <CopyButton value={`v=DMARC1; p=none; rua=mailto:${ruaAddress}`} />
+            </div>
+          </div>
+          <p className="text-muted-foreground">
             3. Watch the compliance data above and follow the recommended next step to
             tighten the policy (none → quarantine → reject). Details in docs/dmarc.md.
           </p>
