@@ -310,6 +310,120 @@ async fn successful_registration_signs_the_new_account_in() {
     // and the registration is on the audit log
     let events = store.list_auth_events(10).await.unwrap();
     assert!(events.iter().any(|e| e.event == "registration.success"));
+
+    // without auth.bootstrap_workspace there is no workspace in the
+    // response and no organization was created
+    use camelmailer_core::AdminStore;
+    assert!(body["data"].get("workspace").is_none());
+    assert!(store.list_organizations().await.unwrap().is_empty());
+}
+
+// ------------------------------------------------- workspace bootstrap
+
+fn bootstrap_config() -> camelmailer_config::Config {
+    let mut config = registration_config();
+    config.auth.bootstrap_workspace = true;
+    config
+}
+
+#[tokio::test]
+async fn registration_bootstraps_a_workspace_with_a_one_time_api_key() {
+    use camelmailer_core::{AdminStore, CredentialType, Role};
+    let (app, store, _) = build_app_with(bootstrap_config()).await;
+    let (status, body) = register(&app, registration_body()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // the response names the workspace and carries the API key (once)
+    let workspace = &body["data"]["workspace"];
+    assert_eq!(workspace["organization"], "grace-s-team");
+    assert_eq!(workspace["server"], "production");
+    let api_key = workspace["api_key"].as_str().unwrap().to_string();
+    assert!(!api_key.is_empty());
+
+    // organization "<FirstName>'s Team", user as owner
+    let org = store
+        .organization_by_permalink("grace-s-team")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(org.name, "Grace's Team");
+    assert!(!org.require_two_factor);
+    let user = store
+        .user_by_email("grace@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    let membership = store.membership(org.id, user.id).await.unwrap().unwrap();
+    assert_eq!(membership.role, Role::Owner);
+
+    // server "production" with exactly one API credential "default"
+    let server = store
+        .server_by_permalink(org.id, "production")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(server.name, "production");
+    let credentials = store.list_credentials(server.id).await.unwrap();
+    assert_eq!(credentials.len(), 1);
+    assert_eq!(credentials[0].name, "default");
+    assert_eq!(credentials[0].credential_type, CredentialType::Api);
+    assert_eq!(credentials[0].key, api_key);
+
+    // the key really authenticates as that server
+    let resolved = store.server_for_api_token(&api_key).await.unwrap().unwrap();
+    assert_eq!(resolved.id, server.id);
+}
+
+#[tokio::test]
+async fn bootstrap_slug_collisions_get_numeric_suffixes() {
+    use camelmailer_core::{AdminStore, NewOrganization};
+    let (app, store, _) = build_app_with(bootstrap_config()).await;
+    store
+        .create_organization(NewOrganization {
+            name: "Taken".into(),
+            permalink: "grace-s-team".into(),
+        })
+        .await
+        .unwrap();
+    let (status, body) = register(&app, registration_body()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["data"]["workspace"]["organization"], "grace-s-team-2");
+    assert!(store
+        .organization_by_permalink("grace-s-team-2")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn bootstrap_failure_never_fails_the_registration() {
+    use camelmailer_core::{AdminStore, NewOrganization};
+    let (app, store, _) = build_app_with(bootstrap_config()).await;
+    // occupy the base slug and every numeric suffix the bootstrap tries
+    for suffix in std::iter::once(String::new()).chain((2..=50).map(|n| format!("-{n}"))) {
+        store
+            .create_organization(NewOrganization {
+                name: "Squatter".into(),
+                permalink: format!("grace-s-team{suffix}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let (status, body) = register(&app, registration_body()).await;
+    // the registration succeeds; only the workspace is missing
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["data"].get("workspace").is_none());
+    assert!(store
+        .user_by_email("grace@example.com")
+        .await
+        .unwrap()
+        .is_some());
+
+    // the returned session works — the account is fully usable
+    let token = body["data"]["session_token"].as_str().unwrap().to_string();
+    let (status, _) = request(&app, "GET", "/api/v2/auth/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 // ----------------------------------------------------------- sessions

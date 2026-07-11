@@ -207,6 +207,20 @@ impl AuthStore for PgStore {
         .map_err(sqlx_error)
     }
 
+    async fn user_has_two_factor(&self, user_id: Id) -> Result<bool, StoreError> {
+        sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM user_auth
+                           WHERE user_id = $1 AND totp_enabled)
+                 OR EXISTS(SELECT 1 FROM webauthn_credentials
+                           WHERE user_id = $1) AS has_two_factor",
+        )
+        .bind(user_id as i64)
+        .fetch_one(self.pool())
+        .await
+        .map(|row| row.get("has_two_factor"))
+        .map_err(sqlx_error)
+    }
+
     async fn create_session(&self, new: NewAuthSession) -> Result<AuthSession, StoreError> {
         sqlx::query(
             "INSERT INTO auth_sessions (user_id, token_hash, expires_at, ip_address, user_agent)
@@ -294,7 +308,8 @@ impl AuthStore for PgStore {
     ) -> Result<Vec<(OrganizationMembership, Organization)>, StoreError> {
         let rows = sqlx::query(
             "SELECT m.id, m.organization_id, m.user_id, m.role, m.created_at,
-                    o.id AS o_id, o.uuid AS o_uuid, o.name AS o_name, o.permalink AS o_permalink
+                    o.id AS o_id, o.uuid AS o_uuid, o.name AS o_name, o.permalink AS o_permalink,
+                    o.require_two_factor AS o_require_two_factor
              FROM organization_memberships m
              JOIN organizations o ON o.id = m.organization_id
              WHERE m.user_id = $1
@@ -313,6 +328,7 @@ impl AuthStore for PgStore {
                         uuid: row.get("o_uuid"),
                         name: row.get("o_name"),
                         permalink: row.get("o_permalink"),
+                        require_two_factor: row.get("o_require_two_factor"),
                     },
                 ))
             })

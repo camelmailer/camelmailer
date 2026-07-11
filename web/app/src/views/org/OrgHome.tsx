@@ -7,7 +7,13 @@ import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { MailPlusIcon, PlusIcon, ServerIcon, UsersIcon } from "lucide-react"
+import {
+  MailPlusIcon,
+  PlusIcon,
+  ServerIcon,
+  ShieldCheckIcon,
+  UsersIcon,
+} from "lucide-react"
 import { toast } from "sonner"
 import {
   ConfirmDialog,
@@ -38,6 +44,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Switch } from "@/components/ui/switch"
 import {
   Table,
   TableBody,
@@ -509,13 +516,34 @@ export function Invitations({ org }: { org: string }) {
 
 export function OrgSettings({ org }: { org: string }) {
   const router = useRouter()
+  const queryClient = useQueryClient()
   const { refresh } = useAuth()
   const role = useOrgRole(org)
   const [confirmOpen, setConfirmOpen] = useState(false)
 
-  // Billing needs admin+; the danger zone stays owner-only.
+  // Billing needs admin+; security and the danger zone stay owner-only.
   const canBilling = role === "root" || role === "owner" || role === "admin"
   const isOwner = role === "root" || role === "owner"
+
+  const orgQuery = useQuery({
+    queryKey: ["org", org],
+    queryFn: () => adminApi.organizations.get(org),
+    enabled: isOwner,
+    retry: false,
+  })
+  const setRequireTwoFactor = useMutation({
+    mutationFn: (require_two_factor: boolean) =>
+      adminApi.organizations.update(org, { require_two_factor }),
+    onSuccess: ({ organization }) => {
+      queryClient.setQueryData(["org", org], { organization })
+      toast.success(
+        organization.require_two_factor
+          ? "Two-factor authentication is now required for this organization."
+          : "Two-factor authentication is no longer required.",
+      )
+    },
+    onError: (err) => errorToast(err, "Could not update the organization"),
+  })
 
   // `enabled: false` (the self-hosted default) hides billing entirely.
   const billing = useQuery({
@@ -570,6 +598,27 @@ export function OrgSettings({ org }: { org: string }) {
       )}
       {isOwner && (
         <>
+          <PageHeader title="Security" />
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">
+                Require two-factor authentication
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="flex items-center justify-between gap-4">
+              <p className="text-sm text-muted-foreground">
+                Every member must have two-factor authentication (an
+                authenticator app or a passkey) to access this organization.
+                Members without it are blocked until they enable it — that
+                includes you.
+              </p>
+              <Switch
+                checked={orgQuery.data?.organization.require_two_factor ?? false}
+                onCheckedChange={(value) => setRequireTwoFactor.mutate(value)}
+                disabled={!orgQuery.data || setRequireTwoFactor.isPending}
+              />
+            </CardContent>
+          </Card>
           <PageHeader title="Danger zone" />
           <Card>
             <CardHeader>
@@ -601,6 +650,52 @@ export function OrgSettings({ org }: { org: string }) {
           />
         </>
       )}
+    </div>
+  )
+}
+
+// ------------------------------------------------------------ 2FA gate
+
+/// Wraps every /orgs/[org] page: when the API answers `TwoFactorEnforced`
+/// (the organization requires 2FA and this account has none), a friendly
+/// full-page card replaces the organization content.
+export function OrgTwoFactorGate({
+  org,
+  children,
+}: {
+  org: string
+  children: React.ReactNode
+}) {
+  const orgQuery = useQuery({
+    queryKey: ["org", org],
+    queryFn: () => adminApi.organizations.get(org),
+    retry: false,
+  })
+  const enforced =
+    orgQuery.error instanceof ApiError &&
+    orgQuery.error.code === "TwoFactorEnforced"
+
+  if (!enforced) return <>{children}</>
+  return (
+    <div className="flex min-h-[60vh] items-center justify-center">
+      <Card className="max-w-md text-center">
+        <CardHeader>
+          <ShieldCheckIcon className="mx-auto size-10 text-muted-foreground" />
+          <CardTitle className="text-lg">
+            Enable 2FA to access this organization
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            This organization requires two-factor authentication. Set up an
+            authenticator app or a passkey on your account and come right
+            back — access is restored immediately.
+          </p>
+          <Button asChild>
+            <Link href="/account">Go to Account &amp; Security</Link>
+          </Button>
+        </CardContent>
+      </Card>
     </div>
   )
 }

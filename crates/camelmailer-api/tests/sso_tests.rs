@@ -578,6 +578,57 @@ async fn a_strict_issuer_still_rejects_iss_mismatches() {
 // ------------------------------------------------------------ GitHub flow
 
 #[tokio::test]
+async fn sso_provisioning_bootstraps_a_workspace_without_an_api_key() {
+    use camelmailer_core::Role;
+    let issuer = start_mock_idp("", "g-1", "ada@corp.example", "Ada Lovelace", None).await;
+    let h = harness_with_github(
+        vec![oidc_provider("google", "Google", &issuer, "g-1")],
+        None,
+        |config| config.auth.bootstrap_workspace = true,
+    );
+
+    let (status, body) = h.sso_login("google").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // organization "<FirstName>'s Team" with the user as owner ...
+    let org = h
+        .store
+        .organization_by_permalink("ada-s-team")
+        .await
+        .unwrap()
+        .expect("provisioning must bootstrap the organization");
+    assert_eq!(org.name, "Ada's Team");
+    let user = h
+        .store
+        .user_by_email("ada@corp.example")
+        .await
+        .unwrap()
+        .unwrap();
+    let membership = h.store.membership(org.id, user.id).await.unwrap().unwrap();
+    assert_eq!(membership.role, Role::Owner);
+
+    // ... and a server "production" — but NO credential: there is no
+    // response channel that could show the key exactly once.
+    let server = h
+        .store
+        .server_by_permalink(org.id, "production")
+        .await
+        .unwrap()
+        .expect("provisioning must bootstrap the server");
+    assert!(h
+        .store
+        .list_credentials(server.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // a second login is not a provisioning — no second workspace
+    let (status, _) = h.sso_login("google").await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(h.store.list_organizations().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn github_logs_in_end_to_end() {
     let github = start_mock_github(
         "octocat",

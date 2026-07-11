@@ -394,14 +394,13 @@ fn required_role(rest: &[&str], method: &axum::http::Method) -> camelmailer_core
     use camelmailer_core::Role;
     let read = *method == Method::GET || *method == Method::HEAD;
     match rest.first() {
-        // the organization itself
+        // the organization itself: any write (PATCH `require_two_factor`,
+        // DELETE) is reserved for owners
         None => {
             if read {
                 Role::Viewer
-            } else if *method == Method::DELETE {
-                Role::Owner
             } else {
-                Role::Admin
+                Role::Owner
             }
         }
         // people management
@@ -525,6 +524,18 @@ async fn auth_middleware(
     let method = request.method().clone();
     let mut acting_role = ActingRole(None);
 
+    // Resolve the organization for org-scoped paths once — the RBAC role
+    // check and the org-wide 2FA enforcement below both need it.
+    let organization = match (segments.first(), segments.get(1)) {
+        (Some(&"organizations"), Some(permalink)) => {
+            match state.store.organization_by_permalink(permalink).await {
+                Ok(organization) => organization,
+                Err(error) => return render_store_error(start.as_ref(), error).into_response(),
+            }
+        }
+        _ => None,
+    };
+
     if !user.admin {
         match segments.first() {
             Some(&"organizations") => match segments.get(1) {
@@ -542,14 +553,7 @@ async fn auth_middleware(
                         .into_response();
                     }
                 }
-                Some(permalink) => {
-                    let organization = match state.store.organization_by_permalink(permalink).await
-                    {
-                        Ok(organization) => organization,
-                        Err(error) => {
-                            return render_store_error(start.as_ref(), error).into_response()
-                        }
-                    };
+                Some(_) => {
                     // Unknown org and org-without-membership answer
                     // identically so existence is not leaked.
                     let membership = match &organization {
@@ -592,6 +596,29 @@ async fn auth_middleware(
                     "This action requires a global administrator account",
                 )
                 .into_response();
+            }
+        }
+    }
+
+    // Org-wide 2FA enforcement (Postmark-style). Applies to every session
+    // principal touching an organization that requires two-factor —
+    // including global admins (no backdoor). Admin API keys returned
+    // earlier and are unaffected; non-members already got their 404 above.
+    if let Some(organization) = &organization {
+        if organization.require_two_factor {
+            match auth_store.user_has_two_factor(user.id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return render_error(
+                        start.as_ref(),
+                        StatusCode::FORBIDDEN,
+                        "TwoFactorEnforced",
+                        "This organization requires two-factor authentication. \
+                         Enable two-factor authentication on your account to continue.",
+                    )
+                    .into_response();
+                }
+                Err(error) => return render_store_error(start.as_ref(), error).into_response(),
             }
         }
     }
@@ -645,6 +672,7 @@ fn organization_json(organization: &Organization) -> Value {
         "uuid": organization.uuid,
         "name": organization.name,
         "permalink": organization.permalink,
+        "require_two_factor": organization.require_two_factor,
     })
 }
 
@@ -782,6 +810,42 @@ async fn organizations_show(
             json!({ "organization": organization_json(&organization) }),
         ),
         Ok(None) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UpdateOrganization {
+    require_two_factor: Option<bool>,
+}
+
+/// `PATCH /organizations/{permalink}` — update organization settings.
+/// Owner-only (enforced centrally via [`required_role`]); currently the
+/// one mutable setting is `require_two_factor` (org-wide 2FA enforcement).
+async fn organizations_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path(permalink): Path<String>,
+    Json(body): Json<UpdateOrganization>,
+) -> ApiResponse {
+    let mut organization = match find_organization(&state, &permalink).await {
+        Ok(Some(organization)) => organization,
+        Ok(None) => return render_not_found(Some(&start.0)),
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    let Some(require_two_factor) = body.require_two_factor else {
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: require_two_factor",
+        );
+    };
+    organization.require_two_factor = require_two_factor;
+    match state.store.update_organization(organization).await {
+        Ok(organization) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "organization": organization_json(&organization) }),
+        ),
         Err(error) => render_store_error(Some(&start.0), error),
     }
 }
@@ -1208,7 +1272,9 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         )
         .route(
             "/organizations/{permalink}",
-            get(organizations_show).delete(organizations_destroy),
+            get(organizations_show)
+                .patch(organizations_update)
+                .delete(organizations_destroy),
         )
         .route(
             "/organizations/{permalink}/servers",

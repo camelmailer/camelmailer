@@ -406,16 +406,27 @@ async fn register(
         ),
     )
     .await;
+    // Starter workspace (auth.bootstrap_workspace, cloud): org + server +
+    // one API credential whose key appears exactly once, right here. A
+    // bootstrap failure is logged and never fails the registration.
+    let workspace = crate::workspace::bootstrap_workspace(&state, &user, true).await;
     match issue_session(store, &state, &user, &headers).await {
-        Ok((token, session)) => render_success(
-            Some(&start.0),
-            StatusCode::CREATED,
-            json!({
+        Ok((token, session)) => {
+            let mut data = json!({
                 "session_token": token,
                 "expires_at": session.expires_at,
                 "user": user_json(&user),
-            }),
-        ),
+            });
+            if let Some(workspace) = workspace {
+                data["workspace"] = json!({
+                    "organization": workspace.organization.permalink,
+                    "server": workspace.server.permalink,
+                    // the one time the full API key is returned
+                    "api_key": workspace.api_key,
+                });
+            }
+            render_success(Some(&start.0), StatusCode::CREATED, data)
+        }
         Err(error) => render_store_error(Some(&start.0), error),
     }
 }

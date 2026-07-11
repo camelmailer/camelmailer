@@ -29,6 +29,7 @@ impl Fixtures {
             uuid: token::generate_uuid(),
             name: "Example Org".into(),
             permalink: "example-org".into(),
+            require_two_factor: false,
         });
         let server = store.insert_server(Server {
             id: store.next_id(),

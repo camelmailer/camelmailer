@@ -1528,6 +1528,138 @@ async fn pg_auth_account_state_round_trips() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pg_organization_require_two_factor_round_trips() {
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+
+    // defaults to off (same as MemoryStore)
+    assert!(!f.organization.require_two_factor);
+    let reread = f
+        .store
+        .organization_by_permalink("example-org")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!reread.require_two_factor);
+
+    // update_organization round trip
+    let updated = f
+        .store
+        .update_organization(camelmailer_core::Organization {
+            require_two_factor: true,
+            ..f.organization.clone()
+        })
+        .await
+        .unwrap();
+    assert!(updated.require_two_factor);
+    let reread = f
+        .store
+        .organization_by_permalink("example-org")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reread.require_two_factor);
+    assert_eq!(reread.name, "Example Org");
+
+    // the joined membership lookup carries the flag too
+    {
+        use camelmailer_core::{AuthStore, NewUser, Role};
+        let user = f
+            .store
+            .create_user(NewUser {
+                email_address: "member@example.com".into(),
+                first_name: "M".into(),
+                last_name: "Ember".into(),
+                admin: false,
+            })
+            .await
+            .unwrap();
+        f.store
+            .upsert_membership(f.organization.id, user.id, Role::Member)
+            .await
+            .unwrap();
+        let memberships = f.store.memberships_for_user(user.id).await.unwrap();
+        assert_eq!(memberships.len(), 1);
+        assert!(memberships[0].1.require_two_factor);
+    }
+
+    // a permalink collision on update is a conflict, like on create
+    let other = f
+        .store
+        .create_organization(NewOrganization {
+            name: "Other".into(),
+            permalink: "other-org".into(),
+        })
+        .await
+        .unwrap();
+    let error = f
+        .store
+        .update_organization(camelmailer_core::Organization {
+            permalink: "example-org".into(),
+            ..other
+        })
+        .await
+        .expect_err("duplicate permalink must conflict");
+    assert!(matches!(error, camelmailer_core::StoreError::Conflict(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_user_has_two_factor_covers_totp_and_passkeys() {
+    use camelmailer_core::{AuthStore, NewUser, NewWebAuthnCredential};
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+    let user = f
+        .store
+        .create_user(NewUser {
+            email_address: "2fa@example.com".into(),
+            first_name: "Two".into(),
+            last_name: "Factor".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+
+    assert!(!f.store.user_has_two_factor(user.id).await.unwrap());
+
+    // enrolled but not activated does not count
+    f.store
+        .set_totp(user.id, Some("SECRET32"), false)
+        .await
+        .unwrap();
+    assert!(!f.store.user_has_two_factor(user.id).await.unwrap());
+
+    // activated TOTP counts, disabling clears it again
+    f.store
+        .set_totp(user.id, Some("SECRET32"), true)
+        .await
+        .unwrap();
+    assert!(f.store.user_has_two_factor(user.id).await.unwrap());
+    f.store.set_totp(user.id, None, false).await.unwrap();
+    assert!(!f.store.user_has_two_factor(user.id).await.unwrap());
+
+    // a registered passkey counts on its own
+    let credential = f
+        .store
+        .add_webauthn_credential(NewWebAuthnCredential {
+            user_id: user.id,
+            name: "MacBook".into(),
+            credential_id: "cred-2fa".into(),
+            credential_json: "{}".into(),
+        })
+        .await
+        .unwrap();
+    assert!(f.store.user_has_two_factor(user.id).await.unwrap());
+    f.store
+        .delete_webauthn_credential(user.id, credential.id)
+        .await
+        .unwrap();
+    assert!(!f.store.user_has_two_factor(user.id).await.unwrap());
+
+    // unknown users simply have no second factor
+    assert!(!f.store.user_has_two_factor(999_999).await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pg_saml_requests_and_assertion_replay_cache() {
     use camelmailer_core::AuthStore;
     let base = require_db!();

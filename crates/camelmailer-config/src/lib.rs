@@ -185,6 +185,12 @@ pub struct Auth {
     /// Off by default; meant for public cloud offerings. Self-hosters
     /// typically keep this off and use invitations or `make-user`.
     pub allow_registration: bool,
+    /// Automatically create a starter workspace for brand-new accounts
+    /// (self-registration and SSO auto-provisioning): an organization
+    /// "<FirstName>'s Team" owned by the user, a server "production" and —
+    /// for registration only, where the response can show it once — an
+    /// API credential "default". Off by default; meant for the cloud.
+    pub bootstrap_workspace: bool,
     pub invitation_expiry_days: u32,
     /// Password-reset link lifetime.
     pub password_reset_expiry_hours: u32,
@@ -208,6 +214,7 @@ impl Default for Auth {
             minimum_password_length: 8,
             allow_organization_creation: true,
             allow_registration: false,
+            bootstrap_workspace: false,
             invitation_expiry_days: 7,
             password_reset_expiry_hours: 2,
             frontend_url: None,
@@ -1198,6 +1205,7 @@ rspamd:
         assert_eq!(config.auth.minimum_password_length, 8);
         assert!(config.auth.allow_organization_creation);
         assert!(!config.auth.allow_registration);
+        assert!(!config.auth.bootstrap_workspace);
         assert_eq!(config.auth.invitation_expiry_days, 7);
         assert_eq!(config.auth.password_reset_expiry_hours, 2);
         assert_eq!(config.auth.frontend_url, None);

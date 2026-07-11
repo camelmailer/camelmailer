@@ -469,6 +469,10 @@ async fn resolve_user(
             user_agent: None,
         })
         .await;
+    // Starter workspace (auth.bootstrap_workspace) — org + server only:
+    // SSO provisioning has no response channel that could show an API
+    // key exactly once, so no credential is created here.
+    let _ = crate::workspace::bootstrap_workspace(state, &user, false).await;
     Ok(user)
 }
 

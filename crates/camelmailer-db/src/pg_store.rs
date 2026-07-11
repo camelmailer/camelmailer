@@ -75,6 +75,7 @@ fn organization_from_row(row: &PgRow) -> Organization {
         uuid: row.get("uuid"),
         name: row.get("name"),
         permalink: row.get("permalink"),
+        require_two_factor: row.get("require_two_factor"),
     }
 }
 
@@ -527,7 +528,26 @@ impl AdminStore for PgStore {
             uuid,
             name: new.name,
             permalink: new.permalink,
+            require_two_factor: false,
         })
+    }
+
+    async fn update_organization(
+        &self,
+        organization: Organization,
+    ) -> Result<Organization, StoreError> {
+        sqlx::query(
+            "UPDATE organizations SET name = $2, permalink = $3, require_two_factor = $4
+             WHERE id = $1",
+        )
+        .bind(organization.id as i64)
+        .bind(&organization.name)
+        .bind(&organization.permalink)
+        .bind(organization.require_two_factor)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(organization)
     }
 
     async fn organization_billing_customer_id(

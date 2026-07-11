@@ -110,6 +110,11 @@ auth:
   # cloud offerings; self-hosters typically leave this off and create
   # accounts via invitations or make-user.
   allow_registration: false
+  # Give every brand-new account (registration or SSO auto-provisioning) a
+  # starter workspace: an organization "<FirstName>'s Team", a server
+  # "production" and — on registration only — an API credential "default"
+  # returned once in the register response. Meant for the cloud.
+  bootstrap_workspace: false
   invitation_expiry_days: 7
   password_reset_expiry_hours: 2
   # Base URL of your web frontend — used for invitation/reset links and

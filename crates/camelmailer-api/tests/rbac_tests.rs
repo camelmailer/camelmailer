@@ -981,3 +981,316 @@ async fn the_audit_feed_records_the_journey() {
     assert!(events.contains(&"login.success"));
     assert!(events.contains(&"invitation.created"));
 }
+
+// --------------------------------------- org-wide 2FA enforcement
+
+impl Harness {
+    /// A GET with the machine `X-Admin-API-Key` instead of a session.
+    async fn admin_key_get(&self, path: &str, key: &str) -> StatusCode {
+        self.app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header("X-Admin-API-Key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Flip `require_two_factor` on an organization directly in the store.
+    async fn require_two_factor(&self, org: &camelmailer_core::Organization) {
+        self.store
+            .update_organization(camelmailer_core::Organization {
+                require_two_factor: true,
+                ..org.clone()
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn two_factor_enforcement_blocks_sessions_without_a_second_factor() {
+    let h = harness().await;
+    let org = h.org("Acme").await;
+    let member = h.member(&org, "member@example.com", Role::Member).await;
+    let token = h.login("member@example.com").await;
+
+    // while the flag is off, the member passes
+    let (status, _) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    h.require_two_factor(&org).await;
+
+    // now the same session answers 403 with the stable code — on the org
+    // itself and on everything below it
+    for path in [
+        "/api/v2/admin/organizations/acme",
+        "/api/v2/admin/organizations/acme/servers",
+        "/api/v2/admin/organizations/acme/members",
+    ] {
+        let (status, body) = h.request("GET", path, Some(&token), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "TwoFactorEnforced", "{path}");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires two-factor authentication"));
+    }
+
+    // other (unenforced) organizations of the same user stay reachable
+    let other = h.org("Beta").await;
+    h.store
+        .upsert_membership(other.id, member.id, Role::Member)
+        .await
+        .unwrap();
+    let (status, _) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/beta/servers",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn users_with_totp_or_a_passkey_pass_the_enforcement() {
+    let h = harness().await;
+    let org = h.org("Acme").await;
+    h.require_two_factor(&org).await;
+
+    // an activated TOTP second factor passes
+    // (log in first — with TOTP active, the login would need a code)
+    let totp_user = h.member(&org, "totp@example.com", Role::Member).await;
+    let token = h.login("totp@example.com").await;
+    h.store
+        .set_totp(totp_user.id, Some("SECRET"), true)
+        .await
+        .unwrap();
+    let (status, _) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // an enrolled-but-unactivated TOTP secret does not
+    let pending = h.member(&org, "pending@example.com", Role::Member).await;
+    h.store
+        .set_totp(pending.id, Some("SECRET"), false)
+        .await
+        .unwrap();
+    let token = h.login("pending@example.com").await;
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "TwoFactorEnforced");
+
+    // a registered passkey passes on its own
+    let passkey_user = h.member(&org, "passkey@example.com", Role::Member).await;
+    h.store
+        .add_webauthn_credential(camelmailer_core::NewWebAuthnCredential {
+            user_id: passkey_user.id,
+            name: "MacBook".into(),
+            credential_id: "cred-enforce".into(),
+            credential_json: "{}".into(),
+        })
+        .await
+        .unwrap();
+    let token = h.login("passkey@example.com").await;
+    let (status, _) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_api_keys_are_exempt_but_global_admin_sessions_are_not() {
+    let h = harness().await;
+    let org = h.org("Acme").await;
+    h.require_two_factor(&org).await;
+
+    // the machine key is unaffected by the enforcement
+    h.store
+        .create_admin_api_key("ci", "machine-key")
+        .await
+        .unwrap();
+    assert_eq!(
+        h.admin_key_get("/api/v2/admin/organizations/acme/servers", "machine-key")
+            .await,
+        StatusCode::OK
+    );
+
+    // a global admin *session* without a second factor is enforced too —
+    // no backdoor
+    h.user("root@example.com", true).await;
+    let token = h.login("root@example.com").await;
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "TwoFactorEnforced");
+
+    // ... and passes once 2FA is on the account
+    let root = h
+        .store
+        .user_by_email("root@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    h.store
+        .set_totp(root.id, Some("SECRET"), true)
+        .await
+        .unwrap();
+    let (status, _) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // non-members still get the indistinguishable 404, not the 403
+    h.user("outsider@example.com", false).await;
+    let outsider = h.login("outsider@example.com").await;
+    let (status, _) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers",
+            Some(&outsider),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn require_two_factor_is_patched_by_owners_only_and_shown_in_get() {
+    let h = harness().await;
+    let org = h.org("Acme").await;
+    h.member(&org, "admin@example.com", Role::Admin).await;
+    let owner = h.member(&org, "owner@example.com", Role::Owner).await;
+
+    // GET carries the flag (default false)
+    let admin_token = h.login("admin@example.com").await;
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme",
+            Some(&admin_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["organization"]["require_two_factor"], false);
+
+    // an org admin may not flip it
+    let (status, body) = h
+        .request(
+            "PATCH",
+            "/api/v2/admin/organizations/acme",
+            Some(&admin_token),
+            Some(json!({ "require_two_factor": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "Forbidden");
+
+    // the owner may — a missing parameter is a 400 first
+    let owner_token = h.login("owner@example.com").await;
+    let (status, body) = h
+        .request(
+            "PATCH",
+            "/api/v2/admin/organizations/acme",
+            Some(&owner_token),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "ParameterMissing");
+
+    let (status, body) = h
+        .request(
+            "PATCH",
+            "/api/v2/admin/organizations/acme",
+            Some(&owner_token),
+            Some(json!({ "require_two_factor": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["organization"]["require_two_factor"], true);
+
+    // the enforcement now applies to the owner too (no backdoor): with
+    // 2FA enabled the owner can read the flag back and turn it off again
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme",
+            Some(&owner_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "TwoFactorEnforced");
+
+    h.store
+        .set_totp(owner.id, Some("SECRET"), true)
+        .await
+        .unwrap();
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme",
+            Some(&owner_token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["organization"]["require_two_factor"], true);
+
+    let (status, body) = h
+        .request(
+            "PATCH",
+            "/api/v2/admin/organizations/acme",
+            Some(&owner_token),
+            Some(json!({ "require_two_factor": false })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["organization"]["require_two_factor"], false);
+}

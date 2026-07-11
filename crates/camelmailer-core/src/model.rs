@@ -13,6 +13,11 @@ pub struct Organization {
     pub uuid: String,
     pub name: String,
     pub permalink: String,
+    /// Org-wide two-factor enforcement (Postmark-style): while set, users
+    /// without an active second factor (TOTP or a passkey) may not access
+    /// this organization's resources via a user session. Admin API keys
+    /// are unaffected.
+    pub require_two_factor: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

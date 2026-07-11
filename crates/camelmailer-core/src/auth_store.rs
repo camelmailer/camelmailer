@@ -34,6 +34,10 @@ pub trait AuthStore: Send + Sync {
         locked_until: Option<DateTime<Utc>>,
         last_login_at: Option<DateTime<Utc>>,
     ) -> Result<(), StoreError>;
+    /// Does the user have an active second factor — TOTP enabled or at
+    /// least one registered passkey? One cheap query; the org-wide 2FA
+    /// enforcement check runs on every org-scoped session request.
+    async fn user_has_two_factor(&self, user_id: Id) -> Result<bool, StoreError>;
 
     // -- sessions
     async fn create_session(&self, new: NewAuthSession) -> Result<AuthSession, StoreError>;
@@ -300,6 +304,20 @@ impl AuthStore for MemoryStore {
             entry.last_login_at = last_login_at;
         }
         Ok(())
+    }
+
+    async fn user_has_two_factor(&self, user_id: Id) -> Result<bool, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let totp = inner
+            .user_auth
+            .get(&user_id)
+            .map(|auth| auth.totp_enabled)
+            .unwrap_or(false);
+        Ok(totp
+            || inner
+                .webauthn_credentials
+                .values()
+                .any(|credential| credential.user_id == user_id))
     }
 
     async fn create_session(&self, new: NewAuthSession) -> Result<AuthSession, StoreError> {
@@ -897,6 +915,7 @@ mod tests {
             uuid: crate::token::generate_uuid(),
             name: name.to_string(),
             permalink: name.to_lowercase(),
+            require_two_factor: false,
         };
         store
             .inner
@@ -1414,6 +1433,47 @@ mod tests {
             .register_saml_assertion("_a1", expires, Utc::now() + Duration::minutes(6))
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn user_has_two_factor_covers_totp_and_passkeys() {
+        let (store, user) = store_with_user("a@example.com");
+        assert!(!store.user_has_two_factor(user.id).await.unwrap());
+
+        // an enrolled-but-unactivated TOTP secret does not count
+        store
+            .set_totp(user.id, Some("SECRET"), false)
+            .await
+            .unwrap();
+        assert!(!store.user_has_two_factor(user.id).await.unwrap());
+
+        // activated TOTP counts
+        store.set_totp(user.id, Some("SECRET"), true).await.unwrap();
+        assert!(store.user_has_two_factor(user.id).await.unwrap());
+
+        // ... until disabled again
+        store.set_totp(user.id, None, false).await.unwrap();
+        assert!(!store.user_has_two_factor(user.id).await.unwrap());
+
+        // a registered passkey counts on its own
+        let credential = store
+            .add_webauthn_credential(NewWebAuthnCredential {
+                user_id: user.id,
+                name: "MacBook".into(),
+                credential_id: "cred-2fa".into(),
+                credential_json: "{}".into(),
+            })
+            .await
+            .unwrap();
+        assert!(store.user_has_two_factor(user.id).await.unwrap());
+        store
+            .delete_webauthn_credential(user.id, credential.id)
+            .await
+            .unwrap();
+        assert!(!store.user_has_two_factor(user.id).await.unwrap());
+
+        // unknown users simply have no second factor
+        assert!(!store.user_has_two_factor(9999).await.unwrap());
     }
 
     #[tokio::test]
