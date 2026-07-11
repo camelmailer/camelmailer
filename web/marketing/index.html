@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CamelMailer — the API-first mail platform</title>
+  <meta name="description" content="Self-hosted, API-first mail delivery in Rust: SMTP in/out, HTTP APIs for everything, PostgreSQL storage, accounts with RBAC and SSO. MIT licensed.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐫</text></svg>">
+  <style>
+    :root {
+      --bg: #0a0a0a; --fg: #fafafa; --muted: #a3a3a3; --card: #171717;
+      --border: #262626; --accent: #f59e0b;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: var(--bg); color: var(--fg);
+      font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+    header { padding: 24px 0; display: flex; align-items: center; justify-content: space-between; }
+    .logo { font-weight: 700; font-size: 18px; }
+    nav a { color: var(--muted); text-decoration: none; margin-left: 20px; font-size: 14px; }
+    nav a:hover { color: var(--fg); }
+    .hero { padding: 96px 0 64px; text-align: center; }
+    .hero h1 { font-size: clamp(32px, 6vw, 56px); line-height: 1.1; letter-spacing: -0.02em; }
+    .hero h1 em { color: var(--accent); font-style: normal; }
+    .hero p { margin: 20px auto 0; max-width: 640px; color: var(--muted); font-size: 18px; }
+    .cta { margin-top: 32px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-block; padding: 10px 20px; border-radius: 8px; font-size: 15px;
+      text-decoration: none; border: 1px solid var(--border);
+    }
+    .btn.primary { background: var(--fg); color: var(--bg); border-color: var(--fg); font-weight: 600; }
+    .btn.ghost { color: var(--fg); }
+    .btn:hover { opacity: .85; }
+    pre {
+      margin: 48px auto 0; max-width: 560px; text-align: left; background: var(--card);
+      border: 1px solid var(--border); border-radius: 12px; padding: 20px;
+      font: 13px/1.7 ui-monospace, "SF Mono", Menlo, monospace; color: #d4d4d4;
+      overflow-x: auto;
+    }
+    pre .c { color: #737373; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); padding: 64px 0; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
+    .card h3 { font-size: 16px; margin-bottom: 8px; }
+    .card p { color: var(--muted); font-size: 14px; }
+    footer { border-top: 1px solid var(--border); padding: 32px 0; color: var(--muted); font-size: 13px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+    footer a { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="logo">🐫 CamelMailer</div>
+      <nav>
+        <a href="#features">Features</a>
+        <a href="docs/quickstart.md">Docs</a>
+        <a href="https://github.com/relationsoftware/postal">GitHub</a>
+        <a href="/login">Sign in</a>
+      </nav>
+    </header>
+
+    <section class="hero">
+      <h1>The <em>API-first</em> mail platform<br>you can self-host.</h1>
+      <p>
+        Transactional email without the black box: SMTP in and out, HTTP APIs
+        for everything, one PostgreSQL database, one small Rust binary.
+        Open source, MIT licensed.
+      </p>
+      <div class="cta">
+        <a class="btn primary" href="docs/quickstart.md">Get started in 5 minutes</a>
+        <a class="btn ghost" href="https://github.com/relationsoftware/postal">View source</a>
+      </div>
+      <pre><span class="c"># the whole platform:</span>
+docker compose up -d --build
+
+<span class="c"># send your first mail:</span>
+curl -X POST https://mail.you.com/api/v2/server/messages \
+  -H "X-Server-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"from":"hi@you.com","to":["a@b.com"],
+       "subject":"Hello","text_body":"It works."}'</pre>
+    </section>
+
+    <section id="features" class="grid">
+      <div class="card">
+        <h3>Everything over HTTP</h3>
+        <p>Sending, templates, message streams, statistics, bounces, inbound
+           routing, webhooks, open/click tracking — a clean JSON API for all of it.</p>
+      </div>
+      <div class="card">
+        <h3>Enterprise-ready accounts</h3>
+        <p>User logins with TOTP 2FA, organization roles (viewer → owner),
+           invitations, OIDC single sign-on and a full auth audit log.</p>
+      </div>
+      <div class="card">
+        <h3>Deliverability built in</h3>
+        <p>DKIM signing, IP pools, suppression lists, spam & threat scanning
+           hooks (rspamd/ClamAV), automatic bounce processing.</p>
+      </div>
+      <div class="card">
+        <h3>One database, real isolation</h3>
+        <p>PostgreSQL with row-level security keeps every mail server's data
+           apart — enforced by the database, not by application code.</p>
+      </div>
+      <div class="card">
+        <h3>Small footprint</h3>
+        <p>A single Rust binary runs the web API, SMTP server and delivery
+           worker. No Ruby, no Redis, no per-tenant databases.</p>
+      </div>
+      <div class="card">
+        <h3>Open source</h3>
+        <p>MIT licensed and yours to run. Born as a full Rust rewrite of the
+           Postal mail platform.</p>
+      </div>
+    </section>
+
+    <footer>
+      <span>© 2026 CamelMailer. MIT licensed.</span>
+      <span><a href="docs/authentication.md">Auth docs</a> · <a href="docs/configuration.md">Configuration</a></span>
+    </footer>
+  </div>
+</body>
+</html>

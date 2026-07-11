@@ -9,6 +9,12 @@ audit log and CORS make it frontend- and enterprise-ready out of the box.
 One small binary runs every process role. MIT licensed; born as a full
 Rust rewrite of [Postal](https://github.com/postalserver/postal).
 
+**Web frontend included:** `web/app` is a React (shadcn/ui) admin
+application covering the entire API — login with 2FA/SSO, organizations
+and roles, servers with all resources, sending and message browsing —
+and `web/marketing` is a simple static landing page. See
+[web/README.md](web/README.md).
+
 ## Quickstart
 
 ```bash
