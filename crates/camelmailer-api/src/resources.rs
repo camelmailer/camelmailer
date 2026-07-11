@@ -288,6 +288,358 @@ pub(crate) async fn domains_destroy(
     }
 }
 
+// ---------------------------------------------------------- domain health
+
+/// Order of severity for the health traffic light.
+fn health_rank(status: &str) -> u8 {
+    match status {
+        "ok" => 0,
+        "warning" => 1,
+        _ => 2, // missing
+    }
+}
+
+fn health_check_json(
+    status: &str,
+    record_name: &str,
+    found: &[String],
+    expected: Option<&str>,
+    problems: &[String],
+) -> Value {
+    json!({
+        "status": status,
+        "record_name": record_name,
+        "found": found,
+        "expected": expected,
+        "problems": problems,
+    })
+}
+
+/// Escalation heuristics for the recommended next step: with at least
+/// this many reported messages and this pass rate, the next-stricter
+/// DMARC policy is suggested (documented in docs/dmarc.md).
+const DMARC_ESCALATION_MIN_VOLUME: i64 = 10;
+const DMARC_ESCALATION_MIN_PASS_RATE: f64 = 0.95;
+/// Compliance window the health check looks at.
+const DMARC_COMPLIANCE_WINDOW_DAYS: i64 = 30;
+
+/// `GET …/domains/{name}/health` — live DNS health check of a sending
+/// domain: SPF, DKIM and DMARC via the injected [`camelmailer_core::DnsResolver`],
+/// plus the stored DMARC compliance data (when message storage is
+/// configured) to recommend the next policy step.
+pub(crate) async fn domains_health(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server, name)): Path<(String, String, String)>,
+) -> ApiResponse {
+    let server = match require_server(&state, &start, &org, &server).await {
+        Ok(server) => server,
+        Err(response) => return response,
+    };
+    let domain = match state.store.domain_by_name(server.id, &name).await {
+        Ok(Some(domain)) => domain,
+        Ok(None) => return render_not_found(Some(&start)),
+        Err(error) => return render_store_error(Some(&start), error),
+    };
+
+    use camelmailer_core::dmarc as dmarc_rules;
+    let dns = &state.config.dns;
+
+    // ---- SPF: TXT at the domain itself
+    let spf_mechanism = if dns.spf_include.is_empty() {
+        format!("a:{}", state.config.camelmailer.smtp_hostname)
+    } else {
+        format!("include:{}", dns.spf_include)
+    };
+    let expected_spf = format!("v=spf1 {spf_mechanism} ~all");
+    let mut spf_problems: Vec<String> = Vec::new();
+    let mut spf_found: Vec<String> = Vec::new();
+    let spf_status = match state.dns_resolver.txt_records(&domain.name).await {
+        Err(error) => {
+            spf_problems.push(format!("DNS lookup failed: {error}"));
+            "warning"
+        }
+        Ok(records) => {
+            spf_found = records
+                .iter()
+                .filter(|record| dmarc_rules::is_spf_record(record))
+                .cloned()
+                .collect();
+            match spf_found.len() {
+                0 => {
+                    spf_problems.push(format!("no v=spf1 TXT record found at {}", domain.name));
+                    "missing"
+                }
+                1 => {
+                    let record = &spf_found[0];
+                    if !dmarc_rules::spf_contains_mechanism(record, &spf_mechanism) {
+                        spf_problems.push(format!(
+                            "the record does not include this installation ({spf_mechanism})"
+                        ));
+                    }
+                    match dmarc_rules::spf_all_qualifier(record) {
+                        Some('-') | Some('~') => {}
+                        Some(other) => spf_problems.push(format!(
+                            "the record ends with \"{other}all\" — use ~all or -all so unauthorized senders fail SPF"
+                        )),
+                        None => spf_problems.push(
+                            "the record has no all mechanism — append ~all or -all".into(),
+                        ),
+                    }
+                    if spf_problems.is_empty() {
+                        "ok"
+                    } else {
+                        "warning"
+                    }
+                }
+                n => {
+                    spf_problems.push(format!(
+                        "{n} v=spf1 records found — receivers treat multiple SPF records as a permanent error"
+                    ));
+                    "warning"
+                }
+            }
+        }
+    };
+
+    // ---- DKIM: TXT at <selector>._domainkey.<domain>
+    let dkim_record_name = format!("{}._domainkey.{}", dns.dkim_identifier, domain.name);
+    let expected_dkim_key = domain
+        .dkim_private_key
+        .as_deref()
+        .and_then(dkim_public_key_b64)
+        .or_else(|| state.installation_dkim_public_key.clone());
+    let expected_dkim = expected_dkim_key
+        .as_deref()
+        .map(|key| format!("v=DKIM1; k=rsa; p={key}"));
+    let mut dkim_problems: Vec<String> = Vec::new();
+    let mut dkim_found: Vec<String> = Vec::new();
+    let dkim_status = match state.dns_resolver.txt_records(&dkim_record_name).await {
+        Err(error) => {
+            dkim_problems.push(format!("DNS lookup failed: {error}"));
+            "warning"
+        }
+        Ok(records) if records.is_empty() => {
+            dkim_problems.push(format!("no TXT record found at {dkim_record_name}"));
+            "missing"
+        }
+        Ok(records) => {
+            dkim_found = records;
+            match expected_dkim_key.as_deref() {
+                None => {
+                    dkim_problems.push(
+                        "neither the domain nor the installation has a DKIM key configured".into(),
+                    );
+                    "warning"
+                }
+                Some(expected) => {
+                    let matches = dkim_found.iter().any(|record| {
+                        dmarc_rules::dkim_public_key_of_record(record).as_deref() == Some(expected)
+                    });
+                    if matches {
+                        "ok"
+                    } else {
+                        dkim_problems.push(
+                            "the published public key does not match the key this server signs with"
+                                .into(),
+                        );
+                        "warning"
+                    }
+                }
+            }
+        }
+    };
+
+    // ---- DMARC: TXT at _dmarc.<domain>
+    let dmarc_record_name = format!("_dmarc.{}", domain.name);
+    let mut dmarc_problems: Vec<String> = Vec::new();
+    let mut dmarc_found: Vec<String> = Vec::new();
+    let mut dmarc_policy: Option<camelmailer_core::dmarc::DmarcPolicy> = None;
+    let dmarc_status = match state.dns_resolver.txt_records(&dmarc_record_name).await {
+        Err(error) => {
+            dmarc_problems.push(format!("DNS lookup failed: {error}"));
+            "warning"
+        }
+        Ok(records) => {
+            dmarc_found = records
+                .iter()
+                .filter(|record| dmarc_rules::is_dmarc_record(record))
+                .cloned()
+                .collect();
+            match dmarc_found.len() {
+                0 => {
+                    dmarc_problems.push(format!(
+                        "no v=DMARC1 TXT record found at {dmarc_record_name}"
+                    ));
+                    "missing"
+                }
+                n => {
+                    if n > 1 {
+                        dmarc_problems.push(format!(
+                            "{n} DMARC records found — receivers ignore the policy entirely"
+                        ));
+                    }
+                    let policy =
+                        dmarc_rules::parse_dmarc_record(&dmarc_found[0]).unwrap_or_default();
+                    if policy.p.is_none() {
+                        dmarc_problems.push(
+                            "the record has no valid p= tag (none, quarantine or reject)".into(),
+                        );
+                    }
+                    if policy.rua.is_empty() {
+                        dmarc_problems.push(
+                            "the record has no rua= tag — you receive no aggregate reports".into(),
+                        );
+                    }
+                    dmarc_policy = Some(policy);
+                    if dmarc_problems.is_empty() {
+                        "ok"
+                    } else {
+                        "warning"
+                    }
+                }
+            }
+        }
+    };
+
+    // ---- stored compliance data (drives the policy recommendation)
+    let compliance = match state.server_store.as_ref() {
+        None => None,
+        Some(server_store) => {
+            let filter = camelmailer_core::DmarcFilter {
+                domain: Some(domain.name.clone()),
+                from: Some(
+                    chrono::Utc::now() - chrono::Duration::days(DMARC_COMPLIANCE_WINDOW_DAYS),
+                ),
+                to: None,
+            };
+            match server_store.dmarc_records(server.id, &filter).await {
+                Ok(records) => Some(camelmailer_core::dmarc::summarize(&records)),
+                Err(error) => {
+                    tracing::warn!(%error, "could not load DMARC compliance data");
+                    None
+                }
+            }
+        }
+    };
+
+    // ---- the RUA address of this server's internal DMARC route, if any
+    let rua_address = match state.store.list_routes(server.id).await {
+        Ok(routes) => {
+            let dmarc_route = routes.into_iter().find(|route| {
+                route.endpoint_url.as_deref() == Some(dmarc_rules::DMARC_REPORTS_ENDPOINT)
+            });
+            match dmarc_route {
+                Some(route) => {
+                    let route_domain = match route.domain_id {
+                        Some(domain_id) => state
+                            .store
+                            .list_domains(server.id)
+                            .await
+                            .ok()
+                            .and_then(|domains| domains.into_iter().find(|d| d.id == domain_id))
+                            .map(|d| d.name),
+                        None => server.inbound_domain.clone(),
+                    };
+                    route_domain.map(|domain| format!("{}@{}", route.name, domain))
+                }
+                None => None,
+            }
+        }
+        Err(_) => None,
+    };
+
+    // ---- next step: walk the policy journey
+    let policy = dmarc_policy.as_ref().and_then(|p| p.p.as_deref());
+    let high_compliance = compliance.as_ref().is_some_and(|summary| {
+        summary.total >= DMARC_ESCALATION_MIN_VOLUME
+            && summary.pass_rate >= DMARC_ESCALATION_MIN_PASS_RATE
+    });
+    let rua_hint = rua_address
+        .as_deref()
+        .map(|address| format!("mailto:{address}"))
+        .unwrap_or_else(|| {
+            "mailto:<address of an inbound route targeting internal://dmarc-reports>".into()
+        });
+    let next_step = if dmarc_status == "missing" {
+        format!(
+            "Publish a DMARC record at {dmarc_record_name}: start monitoring with \
+             \"v=DMARC1; p=none; rua={rua_hint}\" — reports will appear here."
+        )
+    } else if policy == Some("none") && high_compliance {
+        "Compliance is high on recent aggregate reports — tighten the policy to p=quarantine."
+            .to_string()
+    } else if policy == Some("none") {
+        if dmarc_policy.as_ref().is_some_and(|p| p.rua.is_empty()) {
+            format!(
+                "Add rua={rua_hint} to the DMARC record so aggregate reports arrive here, \
+                 then escalate the policy once compliance is high."
+            )
+        } else {
+            "Keep collecting aggregate reports; move to p=quarantine once the pass rate stays high."
+                .to_string()
+        }
+    } else if policy == Some("quarantine") && high_compliance {
+        "Compliance is high on recent aggregate reports — consider the final step to p=reject."
+            .to_string()
+    } else if spf_status != "ok" || dkim_status != "ok" {
+        "Fix the SPF/DKIM issues listed in the checks so aligned mail passes DMARC.".to_string()
+    } else {
+        "Everything looks good — keep monitoring the aggregate reports.".to_string()
+    };
+
+    let overall = [spf_status, dkim_status, dmarc_status]
+        .into_iter()
+        .max_by_key(|status| health_rank(status))
+        .unwrap_or("ok");
+
+    ok(
+        &start,
+        json!({
+            "health": {
+                "domain": domain.name,
+                "checks": {
+                    "spf": health_check_json(
+                        spf_status,
+                        &domain.name,
+                        &spf_found,
+                        Some(&expected_spf),
+                        &spf_problems,
+                    ),
+                    "dkim": health_check_json(
+                        dkim_status,
+                        &dkim_record_name,
+                        &dkim_found,
+                        expected_dkim.as_deref(),
+                        &dkim_problems,
+                    ),
+                    "dmarc": {
+                        "status": dmarc_status,
+                        "record_name": dmarc_record_name,
+                        "found": dmarc_found,
+                        "policy": dmarc_policy.map(|policy| json!({
+                            "p": policy.p,
+                            "sp": policy.sp,
+                            "rua": policy.rua,
+                            "pct": policy.pct,
+                        })),
+                        "problems": dmarc_problems,
+                    },
+                },
+                "overall": overall,
+                "next_step": next_step,
+                "rua_address": rua_address,
+                "compliance": compliance.map(|summary| json!({
+                    "window_days": DMARC_COMPLIANCE_WINDOW_DAYS,
+                    "total": summary.total,
+                    "pass": summary.pass,
+                    "pass_rate": summary.pass_rate,
+                })),
+            }
+        }),
+    )
+}
+
 // ------------------------------------------------------------- credentials
 
 fn credential_json(credential: &Credential) -> Value {
@@ -491,6 +843,27 @@ fn route_json(route: &Route) -> Value {
     })
 }
 
+/// Validate a route's delivery target: an HTTP(S) URL, or exactly the
+/// internal DMARC-ingestion target [`camelmailer_core::DMARC_REPORTS_ENDPOINT`].
+fn validate_route_endpoint(url: &str) -> Result<(), String> {
+    if url.starts_with("http://")
+        || url.starts_with("https://")
+        || url == camelmailer_core::DMARC_REPORTS_ENDPOINT
+    {
+        return Ok(());
+    }
+    if url.starts_with("internal://") {
+        return Err(format!(
+            "Endpoint URL {url:?} is not a known internal target (the only one is {})",
+            camelmailer_core::DMARC_REPORTS_ENDPOINT
+        ));
+    }
+    Err(format!(
+        "Endpoint URL must be an HTTP(S) URL or {}",
+        camelmailer_core::DMARC_REPORTS_ENDPOINT
+    ))
+}
+
 fn parse_route_mode(mode: Option<&str>) -> Result<RouteMode, String> {
     match mode {
         None | Some("Endpoint") => Ok(RouteMode::Endpoint),
@@ -552,6 +925,11 @@ pub(crate) async fn routes_create(
         Ok(mode) => mode,
         Err(message) => return render_validation_error(Some(&start), &message),
     };
+    if let Some(url) = body.endpoint_url.as_deref().filter(|u| !u.is_empty()) {
+        if let Err(message) = validate_route_endpoint(url) {
+            return render_validation_error(Some(&start), &message);
+        }
+    }
     let domain_id = match body.domain.filter(|d| !d.is_empty()) {
         Some(domain_name) => match state.store.domain_by_name(server.id, &domain_name).await {
             Ok(Some(domain)) => Some(domain.id),

@@ -2029,3 +2029,229 @@ async fn billing_customer_id_roundtrip() {
         .await
         .is_err());
 }
+
+// ------------------------------------------------- DMARC reports (RLS)
+
+fn dmarc_report_for(
+    server_id: camelmailer_core::Id,
+    domain: &str,
+    external_id: &str,
+) -> camelmailer_core::NewDmarcReport {
+    let now = chrono::Utc::now();
+    camelmailer_core::NewDmarcReport {
+        server_id,
+        domain: domain.into(),
+        org_name: Some("google.com".into()),
+        org_email: Some("noreply@google.com".into()),
+        report_id: external_id.into(),
+        date_range_begin: now - chrono::Duration::days(1),
+        date_range_end: now,
+        records: vec![
+            camelmailer_core::NewDmarcRecord {
+                source_ip: "203.0.113.10".into(),
+                count: 7,
+                disposition: "none".into(),
+                dkim_result: Some("pass".into()),
+                spf_result: Some("pass".into()),
+                dkim_aligned: true,
+                spf_aligned: true,
+                header_from: Some(domain.to_string()),
+                envelope_from: None,
+            },
+            camelmailer_core::NewDmarcRecord {
+                source_ip: "198.51.100.7".into(),
+                count: 3,
+                disposition: "quarantine".into(),
+                dkim_result: Some("fail".into()),
+                spf_result: Some("softfail".into()),
+                dkim_aligned: false,
+                spf_aligned: false,
+                header_from: Some(domain.to_string()),
+                envelope_from: Some("spoof.example".into()),
+            },
+        ],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dmarc_reports_are_tenant_isolated_by_rls() {
+    use camelmailer_core::ServerStore;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other_server = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+
+    let mine = f
+        .store
+        .store_dmarc_report(dmarc_report_for(f.server.id, "tenant-a.example", "a-1"))
+        .await
+        .unwrap();
+    f.store
+        .store_dmarc_report(dmarc_report_for(other_server.id, "tenant-b.example", "b-1"))
+        .await
+        .unwrap();
+
+    // each tenant lists exactly its own reports (queries carry no WHERE
+    // server_id — RLS does the filtering)
+    let filter = camelmailer_core::DmarcFilter::default();
+    let tenant_a = f.store.dmarc_reports(f.server.id, &filter).await.unwrap();
+    assert_eq!(tenant_a.len(), 1);
+    assert_eq!(tenant_a[0].domain, "tenant-a.example");
+    assert_eq!(tenant_a[0].record_count, 2);
+    let tenant_b = f
+        .store
+        .dmarc_reports(other_server.id, &filter)
+        .await
+        .unwrap();
+    assert_eq!(tenant_b.len(), 1);
+    assert_eq!(tenant_b[0].domain, "tenant-b.example");
+
+    // a foreign report id resolves to nothing (indistinguishable from
+    // not existing)
+    assert!(f
+        .store
+        .dmarc_report(other_server.id, mine.id)
+        .await
+        .unwrap()
+        .is_none());
+    let (report, records) = f
+        .store
+        .dmarc_report(f.server.id, mine.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.report_id, "a-1");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].source_ip, "203.0.113.10");
+    assert!(records[0].dkim_aligned);
+    assert_eq!(records[1].disposition, "quarantine");
+
+    // record queries are scoped the same way
+    let rows_a = f.store.dmarc_records(f.server.id, &filter).await.unwrap();
+    assert_eq!(rows_a.len(), 2);
+    let rows_b = f
+        .store
+        .dmarc_records(other_server.id, &filter)
+        .await
+        .unwrap();
+    assert_eq!(rows_b.len(), 2);
+    assert!(rows_b.iter().all(|r| r.report_id != mine.id));
+
+    // the domain filter narrows within the tenant
+    let filtered = f
+        .store
+        .dmarc_reports(
+            f.server.id,
+            &camelmailer_core::DmarcFilter {
+                domain: Some("tenant-b.example".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(filtered.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dmarc_tables_hide_all_rows_without_a_tenant_context() {
+    use camelmailer_core::ServerStore;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    f.store
+        .store_dmarc_report(dmarc_report_for(f.server.id, "tenant-a.example", "a-1"))
+        .await
+        .unwrap();
+
+    // FORCE ROW LEVEL SECURITY: even the table owner sees nothing
+    // without the tenant context — on both tables.
+    for table in ["dmarc_reports", "dmarc_report_records"] {
+        let count: i64 = sqlx::query(&format!("SELECT count(*) AS c FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("c");
+        assert_eq!(count, 0, "{table} must be empty without a tenant context");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dmarc_tables_reject_writes_for_a_foreign_tenant() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other_server = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+
+    // Insert a report for server A inside server B's tenant context —
+    // the WITH CHECK clause must reject it.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+        .bind(other_server.id.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let result = sqlx::query(
+        "INSERT INTO dmarc_reports
+             (server_id, domain, report_id, date_range_begin, date_range_end)
+         VALUES ($1, 'x.example', 'r-1', now(), now())",
+    )
+    .bind(f.server.id as i64)
+    .execute(&mut *tx)
+    .await;
+    let error = result.expect_err("cross-tenant report insert must be rejected");
+    assert!(
+        error.to_string().contains("row-level security"),
+        "unexpected error: {error}"
+    );
+    drop(tx);
+
+    // the records table enforces the same policy
+    let report = {
+        use camelmailer_core::ServerStore;
+        f.store
+            .store_dmarc_report(dmarc_report_for(f.server.id, "tenant-a.example", "a-1"))
+            .await
+            .unwrap()
+    };
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+        .bind(other_server.id.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let result = sqlx::query(
+        "INSERT INTO dmarc_report_records
+             (server_id, report_id, source_ip, count, disposition,
+              dkim_aligned, spf_aligned)
+         VALUES ($1, $2, '1.2.3.4', 1, 'none', true, true)",
+    )
+    .bind(f.server.id as i64)
+    .bind(report.id)
+    .execute(&mut *tx)
+    .await;
+    let error = result.expect_err("cross-tenant record insert must be rejected");
+    assert!(
+        error.to_string().contains("row-level security"),
+        "unexpected error: {error}"
+    );
+}

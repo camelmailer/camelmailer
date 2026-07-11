@@ -1750,6 +1750,203 @@ impl camelmailer_core::ServerStore for PgStore {
         .map_err(Self::sqlx_error)?;
         Ok(template)
     }
+
+    // DMARC aggregate reports — tenant tables: every query runs inside a
+    // transaction that enters the tenant context first; RLS scopes the rows.
+
+    async fn store_dmarc_report(
+        &self,
+        new: camelmailer_core::NewDmarcReport,
+    ) -> Result<camelmailer_core::DmarcReport, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, new.server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let row = sqlx::query(
+            "INSERT INTO dmarc_reports
+                 (server_id, domain, org_name, org_email, report_id,
+                  date_range_begin, date_range_end)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id, received_at",
+        )
+        .bind(new.server_id as i64)
+        .bind(&new.domain)
+        .bind(&new.org_name)
+        .bind(&new.org_email)
+        .bind(&new.report_id)
+        .bind(new.date_range_begin)
+        .bind(new.date_range_end)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        let id: i64 = row.get("id");
+        let received_at: chrono::DateTime<chrono::Utc> = row.get("received_at");
+        for record in &new.records {
+            sqlx::query(
+                "INSERT INTO dmarc_report_records
+                     (server_id, report_id, source_ip, count, disposition,
+                      dkim_result, spf_result, dkim_aligned, spf_aligned,
+                      header_from, envelope_from)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            )
+            .bind(new.server_id as i64)
+            .bind(id)
+            .bind(&record.source_ip)
+            .bind(record.count)
+            .bind(&record.disposition)
+            .bind(&record.dkim_result)
+            .bind(&record.spf_result)
+            .bind(record.dkim_aligned)
+            .bind(record.spf_aligned)
+            .bind(&record.header_from)
+            .bind(&record.envelope_from)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        }
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(camelmailer_core::DmarcReport {
+            id,
+            server_id: new.server_id,
+            domain: new.domain,
+            org_name: new.org_name,
+            org_email: new.org_email,
+            report_id: new.report_id,
+            date_range_begin: new.date_range_begin,
+            date_range_end: new.date_range_end,
+            received_at,
+            record_count: new.records.len() as i64,
+        })
+    }
+
+    async fn dmarc_reports(
+        &self,
+        server_id: Id,
+        filter: &camelmailer_core::DmarcFilter,
+    ) -> Result<Vec<camelmailer_core::DmarcReport>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        // No WHERE server_id — RLS scopes the rows to the tenant context.
+        let rows = sqlx::query(
+            "SELECT r.*, (SELECT COUNT(*) FROM dmarc_report_records d
+                          WHERE d.report_id = r.id) AS record_count
+             FROM dmarc_reports r
+             WHERE ($1::text IS NULL OR lower(r.domain) = lower($1))
+               AND ($2::timestamptz IS NULL OR r.date_range_end >= $2)
+               AND ($3::timestamptz IS NULL OR r.date_range_begin <= $3)
+             ORDER BY r.date_range_begin DESC, r.id DESC",
+        )
+        .bind(&filter.domain)
+        .bind(filter.from)
+        .bind(filter.to)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(dmarc_report_from_row).collect())
+    }
+
+    async fn dmarc_report(
+        &self,
+        server_id: Id,
+        report_id: i64,
+    ) -> Result<
+        Option<(
+            camelmailer_core::DmarcReport,
+            Vec<camelmailer_core::DmarcRecordRow>,
+        )>,
+        StoreError,
+    > {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let row = sqlx::query(
+            "SELECT r.*, (SELECT COUNT(*) FROM dmarc_report_records d
+                          WHERE d.report_id = r.id) AS record_count
+             FROM dmarc_reports r WHERE r.id = $1",
+        )
+        .bind(report_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        let Some(row) = row else {
+            tx.commit().await.map_err(Self::sqlx_error)?;
+            return Ok(None);
+        };
+        let report = dmarc_report_from_row(&row);
+        let records =
+            sqlx::query("SELECT * FROM dmarc_report_records WHERE report_id = $1 ORDER BY id")
+                .bind(report_id)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(Some((
+            report,
+            records.iter().map(dmarc_record_from_row).collect(),
+        )))
+    }
+
+    async fn dmarc_records(
+        &self,
+        server_id: Id,
+        filter: &camelmailer_core::DmarcFilter,
+    ) -> Result<Vec<camelmailer_core::DmarcRecordRow>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let rows = sqlx::query(
+            "SELECT d.* FROM dmarc_report_records d
+             JOIN dmarc_reports r ON r.id = d.report_id
+             WHERE ($1::text IS NULL OR lower(r.domain) = lower($1))
+               AND ($2::timestamptz IS NULL OR r.date_range_end >= $2)
+               AND ($3::timestamptz IS NULL OR r.date_range_begin <= $3)
+             ORDER BY d.id",
+        )
+        .bind(&filter.domain)
+        .bind(filter.from)
+        .bind(filter.to)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(dmarc_record_from_row).collect())
+    }
+}
+
+fn dmarc_report_from_row(row: &PgRow) -> camelmailer_core::DmarcReport {
+    camelmailer_core::DmarcReport {
+        id: row.get("id"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        domain: row.get("domain"),
+        org_name: row.get("org_name"),
+        org_email: row.get("org_email"),
+        report_id: row.get("report_id"),
+        date_range_begin: row.get("date_range_begin"),
+        date_range_end: row.get("date_range_end"),
+        received_at: row.get("received_at"),
+        record_count: row.get("record_count"),
+    }
+}
+
+fn dmarc_record_from_row(row: &PgRow) -> camelmailer_core::DmarcRecordRow {
+    camelmailer_core::DmarcRecordRow {
+        id: row.get("id"),
+        report_id: row.get("report_id"),
+        source_ip: row.get("source_ip"),
+        count: row.get("count"),
+        disposition: row.get("disposition"),
+        dkim_result: row.get("dkim_result"),
+        spf_result: row.get("spf_result"),
+        dkim_aligned: row.get("dkim_aligned"),
+        spf_aligned: row.get("spf_aligned"),
+        header_from: row.get("header_from"),
+        envelope_from: row.get("envelope_from"),
+    }
 }
 
 impl Store for PgStore {

@@ -1451,3 +1451,182 @@ async fn http_sent_message_is_delivered_by_the_worker() {
     assert_eq!(message.status, "Sent");
     assert_eq!(message.tag.as_deref(), Some("api"));
 }
+
+// ------------------------------------------ DMARC ingestion (RUA route)
+
+/// A raw inbound mail carrying the given payload as a base64 attachment.
+fn dmarc_mail(filename: &str, content_type: &str, payload: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+    format!(
+        "From: noreply-dmarc-support@acme.com\r\n\
+         To: dmarc@org.example\r\n\
+         Subject: Report Domain: example.com\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"B\"\r\n\
+         \r\n\
+         --B\r\n\
+         Content-Type: {content_type}; name=\"{filename}\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         Content-Disposition: attachment; filename=\"{filename}\"\r\n\
+         \r\n\
+         {encoded}\r\n\
+         --B--\r\n"
+    )
+    .into_bytes()
+}
+
+fn gzipped_fixture_report() -> Vec<u8> {
+    use std::io::Write;
+    let xml = std::fs::read(format!(
+        "{}/tests/fixtures/dmarc/rfc-appendix-c.xml",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&xml).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A route targeting `internal://dmarc-reports` on org.example.
+async fn dmarc_route_setup(s: &Setup) -> camelmailer_core::Route {
+    let domain = s
+        .store
+        .create_domain(
+            camelmailer_core::DomainOwner::Server(s.server.id),
+            "org.example",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    s.store
+        .create_route_with_endpoint(
+            s.server.id,
+            Some(domain.id),
+            "dmarc",
+            camelmailer_core::RouteMode::Endpoint,
+            Some(camelmailer_core::DMARC_REPORTS_ENDPOINT.to_string()),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dmarc_route_messages_are_ingested_into_the_report_tables() {
+    use camelmailer_core::ServerStore;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let route = dmarc_route_setup(&s).await;
+
+    let mut message = outgoing_message(s.server.id, "dmarc@org.example");
+    message.scope = MessageScope::Incoming;
+    message.route_id = Some(route.id);
+    message.raw_message = dmarc_mail(
+        "acme.com!example.com!1335571200!1335657599.xml.gz",
+        "application/gzip",
+        &gzipped_fixture_report(),
+    );
+    let message_id = s.sink.insert_message(&message).await.unwrap();
+
+    let worker = Worker::new(&worker_config(1), s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::DmarcReportIngested);
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+
+    // the report landed in the tenant's tables
+    let reports = s
+        .store
+        .dmarc_reports(s.server.id, &camelmailer_core::DmarcFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].domain, "example.com");
+    assert_eq!(reports[0].org_name.as_deref(), Some("acme.com"));
+    assert_eq!(reports[0].report_id, "9391651994964116463");
+    assert_eq!(reports[0].record_count, 1);
+    let (_, records) = s
+        .store
+        .dmarc_report(s.server.id, reports[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].source_ip, "72.150.241.94");
+    assert_eq!(records[0].count, 2);
+    assert!(records[0].spf_aligned);
+    assert!(!records[0].dkim_aligned);
+
+    // the message was marked processed — and nothing was POSTed anywhere
+    // (an HTTP attempt against internal:// would have failed the message)
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Processed");
+    let deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, message_id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert!(deliveries[0]
+        .details
+        .as_deref()
+        .unwrap_or_default()
+        .contains("DMARC aggregate report"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unparseable_dmarc_route_messages_are_held_not_fatal() {
+    use camelmailer_core::ServerStore;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let route = dmarc_route_setup(&s).await;
+
+    let mut message = outgoing_message(s.server.id, "dmarc@org.example");
+    message.scope = MessageScope::Incoming;
+    message.route_id = Some(route.id);
+    message.raw_message =
+        b"From: x@y.z\r\nContent-Type: text/plain\r\n\r\nnot a report at all\r\n".to_vec();
+    let message_id = s.sink.insert_message(&message).await.unwrap();
+
+    let worker = Worker::new(&worker_config(1), s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::Held);
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+
+    // held like any undeliverable inbound message; nothing was stored
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Held");
+    assert!(s
+        .store
+        .dmarc_reports(s.server.id, &camelmailer_core::DmarcFilter::default())
+        .await
+        .unwrap()
+        .is_empty());
+
+    // the worker keeps running: a second, valid report still ingests
+    let mut valid = outgoing_message(s.server.id, "dmarc@org.example");
+    valid.scope = MessageScope::Incoming;
+    valid.route_id = Some(route.id);
+    valid.raw_message = dmarc_mail(
+        "report.xml.gz",
+        "application/gzip",
+        &gzipped_fixture_report(),
+    );
+    s.sink.insert_message(&valid).await.unwrap();
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::DmarcReportIngested);
+}

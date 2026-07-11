@@ -10,7 +10,9 @@ camelmailer-config = { workspace = true }
 camelmailer-core = { workspace = true }
 camelmailer-db = { workspace = true }
 chrono = { workspace = true }
+flate2 = { workspace = true }
 hickory-resolver = { workspace = true }
+quick-xml = { workspace = true }
 reqwest = { workspace = true }
 rsa = { workspace = true }
 rustls = { workspace = true }
@@ -22,6 +24,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 webpki-roots = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

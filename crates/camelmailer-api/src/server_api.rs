@@ -1557,6 +1557,156 @@ async fn messages_send_with_template_batch(
     .into_response()
 }
 
+// ------------------------------------------------------- DMARC monitoring
+
+/// Query params shared by the DMARC endpoints: an optional domain and
+/// report date-range window, plus pagination for the report list.
+#[derive(Debug, Deserialize, Default)]
+struct DmarcParams {
+    domain: Option<String>,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+    page: Option<u64>,
+    per_page: Option<u64>,
+}
+
+impl DmarcParams {
+    fn filter(&self) -> camelmailer_core::DmarcFilter {
+        camelmailer_core::DmarcFilter {
+            domain: self.domain.clone().filter(|d| !d.is_empty()),
+            from: self.from,
+            to: self.to,
+        }
+    }
+}
+
+fn dmarc_report_json(report: &camelmailer_core::DmarcReport) -> Value {
+    json!({
+        "id": report.id,
+        "domain": report.domain,
+        "org_name": report.org_name,
+        "org_email": report.org_email,
+        "report_id": report.report_id,
+        "date_range_begin": report.date_range_begin.to_rfc3339(),
+        "date_range_end": report.date_range_end.to_rfc3339(),
+        "received_at": report.received_at.to_rfc3339(),
+        "record_count": report.record_count,
+    })
+}
+
+fn dmarc_record_json(record: &camelmailer_core::DmarcRecordRow) -> Value {
+    json!({
+        "id": record.id,
+        "source_ip": record.source_ip,
+        "count": record.count,
+        "disposition": record.disposition,
+        "dkim_result": record.dkim_result,
+        "spf_result": record.spf_result,
+        "dkim_aligned": record.dkim_aligned,
+        "spf_aligned": record.spf_aligned,
+        "header_from": record.header_from,
+        "envelope_from": record.envelope_from,
+    })
+}
+
+/// `GET /api/v2/server/dmarc/summary?domain=&from=&to=` — the compliance
+/// summary over the stored aggregate-report rows (top 20 sources).
+async fn dmarc_summary(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Query(params): Query<DmarcParams>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let records = match store.dmarc_records(server.0.id, &params.filter()).await {
+        Ok(records) => records,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let summary = camelmailer_core::dmarc::summarize(&records);
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "summary": {
+                "total": summary.total,
+                "pass": summary.pass,
+                "fail": summary.fail,
+                "pass_rate": summary.pass_rate,
+                "by_source": summary.by_source.iter().map(|source| json!({
+                    "source_ip": source.source_ip,
+                    "count": source.count,
+                    "spf_aligned_pct": source.spf_aligned_pct,
+                    "dkim_aligned_pct": source.dkim_aligned_pct,
+                    "disposition_counts": source.disposition_counts,
+                })).collect::<Vec<_>>(),
+                "by_disposition": summary.by_disposition,
+            }
+        }),
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/dmarc/reports` — stored aggregate reports,
+/// filtered + paged, newest report range first.
+async fn dmarc_reports_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Query(params): Query<DmarcParams>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let reports = match store.dmarc_reports(server.0.id, &params.filter()).await {
+        Ok(reports) => reports,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let pagination = PaginationParams {
+        page: params.page,
+        per_page: params.per_page,
+    };
+    let result = paginate(&reports, &pagination);
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "reports": result.items.iter().map(dmarc_report_json).collect::<Vec<_>>(),
+            "pagination": result.pagination,
+        }),
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/dmarc/reports/{id}` — one report with its rows.
+async fn dmarc_report_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.dmarc_report(server.0.id, id).await {
+        Ok(Some((report, records))) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({
+                "report": dmarc_report_json(&report),
+                "records": records.iter().map(dmarc_record_json).collect::<Vec<_>>(),
+            }),
+        )
+        .into_response(),
+        Ok(None) => not_found(&start.0),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
 /// Build the `/api/v2/server` router (server-token authenticated).
 pub fn build_server_router(state: Arc<ApiState>) -> Router {
     let server = Router::new()
@@ -1595,6 +1745,9 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         )
         .route("/templates/{permalink}/archive", post(template_archive))
         .route("/templates/{permalink}/render", post(template_render))
+        .route("/dmarc/summary", get(dmarc_summary))
+        .route("/dmarc/reports", get(dmarc_reports_index))
+        .route("/dmarc/reports/{id}", get(dmarc_report_show))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             server_auth_middleware,

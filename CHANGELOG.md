@@ -17,6 +17,31 @@ integration tests) is green.
 
 ### Added
 
+- **DMARC monitoring** (see `docs/dmarc.md`) — three pieces:
+  a live **domain health check**
+  (`GET /api/v2/admin/organizations/{org}/servers/{server}/domains/{name}/health`)
+  that resolves SPF, DKIM (`<selector>._domainkey.<domain>`) and DMARC
+  (`_dmarc.<domain>`) via DNS, grades each check ok/warning/missing with
+  the found records, the expected value and concrete problems, and
+  recommends the next policy step (no DMARC → `p=none` with `rua=`;
+  `p=none` with high compliance on recent reports → `p=quarantine`;
+  `p=quarantine` with high compliance → `p=reject`).
+  **Aggregate-report ingestion (RUA)**: inbound routes may target
+  `internal://dmarc-reports` (the only accepted non-HTTP endpoint); the
+  worker then parses arriving mail as RFC 7489 aggregate reports
+  (`.xml`, `.xml.gz`, `.zip` attachments or XML directly in the body)
+  into the new RLS-protected `dmarc_reports` / `dmarc_report_records`
+  tables (tenant = server, FORCE row-level security like `messages`);
+  unparseable reports are held like any undeliverable inbound message —
+  they never crash the worker.
+  **Compliance API + dashboard**: `GET /api/v2/server/dmarc/summary`
+  (pass rate, top-20 sources with alignment percentages, dispositions),
+  `GET /api/v2/server/dmarc/reports` (paginated) and
+  `GET /api/v2/server/dmarc/reports/{id}` (rows included), plus a
+  "DMARC" tab per server in the dashboard with the health traffic
+  lights, the compliance summary, the sources table and the RUA setup
+  hint. Ingested report messages get the new `Processed` status.
+
 - **Stripe billing for the hosted cloud** — a new `billing` config group
   (`enabled`, `stripe_secret_key`, `portal_return_url`; the secret is
   never logged). When enabled, organization admins/owners get

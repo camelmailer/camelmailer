@@ -269,6 +269,7 @@ const TABS = [
   { value: "webhooks", label: "Webhooks" },
   { value: "sender-addresses", label: "Senders" },
   { value: "suppressions", label: "Suppressions" },
+  { value: "dmarc", label: "DMARC" },
   { value: "messaging", label: "Messaging" },
 ]
 

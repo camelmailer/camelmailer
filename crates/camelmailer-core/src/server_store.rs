@@ -8,6 +8,7 @@
 //! module starts with the request-scope newtype and the trait shell.
 
 use crate::admin_store::StoreError;
+use crate::dmarc::{DmarcFilter, DmarcRecordRow, DmarcReport, NewDmarcReport};
 use crate::message::{MessageRecord, QueuedMessage, SentMessage};
 use crate::model::{Id, MessageStream, Template};
 use async_trait::async_trait;
@@ -239,6 +240,32 @@ pub trait ServerStore: Send + Sync {
     ) -> Result<Option<Template>, StoreError>;
     async fn create_template(&self, new: NewTemplate) -> Result<Template, StoreError>;
     async fn update_template(&self, template: Template) -> Result<Template, StoreError>;
+
+    // DMARC aggregate reports (tenant-scoped: RLS in Postgres)
+    /// Persist one parsed aggregate report with all its rows.
+    async fn store_dmarc_report(&self, new: NewDmarcReport) -> Result<DmarcReport, StoreError>;
+
+    /// The server's reports matching `filter`, newest range first.
+    async fn dmarc_reports(
+        &self,
+        server_id: Id,
+        filter: &DmarcFilter,
+    ) -> Result<Vec<DmarcReport>, StoreError>;
+
+    /// One report with its rows, or `None` if it isn't the server's.
+    async fn dmarc_report(
+        &self,
+        server_id: Id,
+        report_id: i64,
+    ) -> Result<Option<(DmarcReport, Vec<DmarcRecordRow>)>, StoreError>;
+
+    /// All rows of the server's reports matching `filter` — the input of
+    /// [`crate::dmarc::summarize`].
+    async fn dmarc_records(
+        &self,
+        server_id: Id,
+        filter: &DmarcFilter,
+    ) -> Result<Vec<DmarcRecordRow>, StoreError>;
 }
 
 #[async_trait]
@@ -425,5 +452,33 @@ impl ServerStore for crate::store::MemoryStore {
 
     async fn update_template(&self, template: Template) -> Result<Template, StoreError> {
         Ok(self.insert_template(template))
+    }
+
+    async fn store_dmarc_report(&self, new: NewDmarcReport) -> Result<DmarcReport, StoreError> {
+        Ok(self.insert_dmarc_report(new))
+    }
+
+    async fn dmarc_reports(
+        &self,
+        server_id: Id,
+        filter: &DmarcFilter,
+    ) -> Result<Vec<DmarcReport>, StoreError> {
+        Ok(self.dmarc_reports_for(server_id, filter))
+    }
+
+    async fn dmarc_report(
+        &self,
+        server_id: Id,
+        report_id: i64,
+    ) -> Result<Option<(DmarcReport, Vec<DmarcRecordRow>)>, StoreError> {
+        Ok(self.dmarc_report_for(server_id, report_id))
+    }
+
+    async fn dmarc_records(
+        &self,
+        server_id: Id,
+        filter: &DmarcFilter,
+    ) -> Result<Vec<DmarcRecordRow>, StoreError> {
+        Ok(self.dmarc_records_for(server_id, filter))
     }
 }

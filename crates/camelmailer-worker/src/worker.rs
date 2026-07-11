@@ -33,6 +33,9 @@ pub enum ProcessOutcome {
     Held,
     /// Incoming message POSTed to its route endpoint.
     Routed,
+    /// Incoming message parsed and stored as a DMARC aggregate report
+    /// (route target `internal://dmarc-reports`).
+    DmarcReportIngested,
     /// Nothing to deliver (incoming without an endpoint, bounces).
     NothingToDo,
     /// The queued message no longer exists.
@@ -395,6 +398,12 @@ impl Worker {
             return Ok(ProcessOutcome::NothingToDo);
         };
 
+        // The internal DMARC target: parse the message as an aggregate
+        // report instead of POSTing it anywhere.
+        if endpoint_url == camelmailer_core::DMARC_REPORTS_ENDPOINT {
+            return self.ingest_dmarc_report(queued, message).await;
+        }
+
         let payload = json!({
             "message": {
                 "id": message.id,
@@ -422,6 +431,93 @@ impl Worker {
             } else {
                 self.queue.retry(queued.id, queued.attempts).await?;
                 Ok(ProcessOutcome::Delayed { response })
+            }
+        }
+    }
+
+    /// Parse an inbound message as a DMARC aggregate report and store it
+    /// in the tenant's report tables. Parse failures hold the message
+    /// (like any undeliverable inbound mail); storage failures retry with
+    /// backoff. Never panics — a malformed report must not take the
+    /// worker down.
+    async fn ingest_dmarc_report(
+        &self,
+        queued: &camelmailer_db::QueuedMessageRow,
+        message: &StoredMessage,
+    ) -> Result<ProcessOutcome, sqlx::Error> {
+        let report = match crate::dmarc::extract_report(&message.raw_message) {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(%error, message_id = message.id, "unparseable DMARC report held");
+                self.queue.complete(queued.id).await?;
+                self.sink
+                    .record_delivery(
+                        message.server_id,
+                        message.id,
+                        "Held",
+                        "message could not be parsed as a DMARC aggregate report",
+                        &error.to_string(),
+                        false,
+                    )
+                    .await?;
+                return Ok(ProcessOutcome::Held);
+            }
+        };
+
+        let new = camelmailer_core::NewDmarcReport {
+            server_id: message.server_id,
+            domain: report.domain,
+            org_name: report.org_name,
+            org_email: report.org_email,
+            report_id: report.report_id,
+            date_range_begin: report.date_range_begin,
+            date_range_end: report.date_range_end,
+            records: report
+                .records
+                .into_iter()
+                .map(|record| camelmailer_core::NewDmarcRecord {
+                    source_ip: record.source_ip,
+                    count: record.count,
+                    disposition: record.disposition,
+                    dkim_result: record.dkim_result,
+                    spf_result: record.spf_result,
+                    dkim_aligned: record.dkim_aligned,
+                    spf_aligned: record.spf_aligned,
+                    header_from: record.header_from,
+                    envelope_from: record.envelope_from,
+                })
+                .collect(),
+        };
+        match camelmailer_core::ServerStore::store_dmarc_report(&self.store, new).await {
+            Ok(stored) => {
+                self.queue.complete(queued.id).await?;
+                self.sink
+                    .record_delivery(
+                        message.server_id,
+                        message.id,
+                        "Processed",
+                        &format!(
+                            "DMARC aggregate report for {} stored (#{}, {} records)",
+                            stored.domain, stored.id, stored.record_count
+                        ),
+                        "",
+                        false,
+                    )
+                    .await?;
+                Ok(ProcessOutcome::DmarcReportIngested)
+            }
+            Err(error) => {
+                // storage trouble is transient — retry like a failing
+                // endpoint instead of losing the report
+                tracing::warn!(%error, message_id = message.id, "could not store DMARC report");
+                let response = format!("could not store the DMARC report: {error}");
+                if queued.attempts + 1 >= self.max_attempts {
+                    self.queue.complete(queued.id).await?;
+                    Ok(ProcessOutcome::Failed { response })
+                } else {
+                    self.queue.retry(queued.id, queued.attempts).await?;
+                    Ok(ProcessOutcome::Delayed { response })
+                }
             }
         }
     }
