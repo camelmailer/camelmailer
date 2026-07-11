@@ -15,6 +15,23 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-port SMTP intake** — the SMTP server can listen on several
+  ports at once via `smtp_server.listeners` (each `{ port, mode }`),
+  alongside `default_port`. Mode `smtp` is plaintext + optional STARTTLS
+  (587-style submission); mode `smtps` is implicit TLS from the first
+  byte (port 465, requires `tls_enabled`). Sessions on `smtps` start in
+  the TLS state: AUTH available immediately, messages marked as received
+  over TLS. Defaults to no extra listeners (unchanged behaviour).
+- **Relay URLs with port, TLS mode and credentials** —
+  `camelmailer.smtp_relays` now understands `smtp://host:25`
+  (opportunistic STARTTLS), `smtp://host:587` (STARTTLS **enforced** —
+  soft failure instead of a plaintext fallback), `smtps://host:465`
+  (implicit TLS) and `smtp://user:pass@host:587` (AUTH PLAIN after the
+  TLS handshake, userinfo percent-decoded) — the smarthost path when the
+  provider blocks outbound port 25.
+
 ## [0.1.0] - 2026-07-11
 
 The first CamelMailer release — a transactional email platform in one

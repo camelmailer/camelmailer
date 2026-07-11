@@ -34,6 +34,17 @@ camelmailer:
   # smtp_relays: ["smtp://relay:25"] # deliver via relays instead of direct-to-MX
 ```
 
+**Relay URLs** express port, TLS mode and credentials. Direct MX delivery
+always uses port 25 — that is how the protocol works — so `smtp_relays`
+is the way to send when your provider blocks outbound port 25:
+
+| URL | Behaviour |
+|---|---|
+| `smtp://host:25` | plaintext + opportunistic STARTTLS |
+| `smtp://host:587` | submission — STARTTLS **enforced**, no plaintext fallback |
+| `smtps://host:465` | implicit TLS from the first byte |
+| `smtp://user:pass@host:587` | AUTH PLAIN after the TLS handshake (percent-encode special characters) |
+
 The **signing key** is one RSA private key used for DKIM signatures and
 webhook payload signing:
 
@@ -74,7 +85,18 @@ smtp_server:
   tls_certificate_path: $config-file-root/smtp.cert
   tls_private_key_path: $config-file-root/smtp.key
   proxy_protocol: false       # enable behind HAProxy/NLB
+  listeners:                  # additional ports (default: none)
+    - { port: 587, mode: smtp }
+    - { port: 465, mode: smtps }
 ```
+
+The server can listen on several ports at once. `default_port` always
+speaks plain SMTP with optional STARTTLS; each `listeners` entry adds a
+port in mode `smtp` (same behaviour) or `smtps` (implicit TLS from the
+first byte — the classic port 465, requires `tls_enabled` and a
+certificate). Ports must be distinct; the session behaves identically on
+every listener — on `smtps` it simply starts in the TLS state (AUTH
+available immediately, messages marked as received over TLS).
 
 ### `dns:` — the records you publish
 

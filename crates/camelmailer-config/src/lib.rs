@@ -334,6 +334,26 @@ impl Default for Logging {
     }
 }
 
+/// The TLS mode of an additional SMTP listener.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SmtpListenerMode {
+    /// Plaintext with optional STARTTLS — the behaviour of `default_port`.
+    #[default]
+    Smtp,
+    /// Implicit TLS from the first byte (the classic port 465).
+    Smtps,
+}
+
+/// An additional SMTP listener (`smtp_server.listeners`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmtpListener {
+    pub port: u16,
+    #[serde(default)]
+    pub mode: SmtpListenerMode,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SmtpServer {
@@ -352,6 +372,9 @@ pub struct SmtpServer {
     pub max_message_size: u64,
     /// A regular expression used to exclude connections from logging
     pub log_ip_address_exclusion_matcher: Option<String>,
+    /// Additional listeners beyond `default_port` (which always runs in
+    /// `smtp` mode). Empty by default: only `default_port` is bound.
+    pub listeners: Vec<SmtpListener>,
 }
 
 impl Default for SmtpServer {
@@ -370,6 +393,7 @@ impl Default for SmtpServer {
             log_connections: false,
             max_message_size: 14,
             log_ip_address_exclusion_matcher: None,
+            listeners: vec![],
         }
     }
 }
@@ -658,6 +682,24 @@ impl Config {
                 return Err(ConfigError::Invalid(
                     "smtp_server.log_ip_address_exclusion_matcher must not be empty".into(),
                 ));
+            }
+        }
+        let mut seen_ports = vec![self.smtp_server.default_port];
+        for listener in &self.smtp_server.listeners {
+            if seen_ports.contains(&listener.port) {
+                return Err(ConfigError::Invalid(format!(
+                    "smtp_server.listeners: port {} is configured more than once \
+                     (default_port and every listener must use distinct ports)",
+                    listener.port
+                )));
+            }
+            seen_ports.push(listener.port);
+            if listener.mode == SmtpListenerMode::Smtps && !self.smtp_server.tls_enabled {
+                return Err(ConfigError::Invalid(format!(
+                    "smtp_server.listeners: port {} uses mode smtps, which requires \
+                     smtp_server.tls_enabled with a certificate and private key",
+                    listener.port
+                )));
             }
         }
         if self.oidc.enabled {
@@ -978,6 +1020,78 @@ rspamd:
         )
         .unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn smtp_listeners_default_to_empty() {
+        let config = Config::default();
+        assert!(config.smtp_server.listeners.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn smtp_listeners_parse_from_yaml() {
+        let config = Config::from_yaml(
+            r#"
+smtp_server:
+  tls_enabled: true
+  listeners:
+    - { port: 587, mode: smtp }
+    - { port: 465, mode: smtps }
+    - { port: 2525 }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.smtp_server.listeners,
+            vec![
+                SmtpListener {
+                    port: 587,
+                    mode: SmtpListenerMode::Smtp
+                },
+                SmtpListener {
+                    port: 465,
+                    mode: SmtpListenerMode::Smtps
+                },
+                SmtpListener {
+                    port: 2525,
+                    mode: SmtpListenerMode::Smtp
+                },
+            ]
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn smtps_listener_requires_tls_enabled() {
+        let config =
+            Config::from_yaml("smtp_server:\n  listeners:\n    - { port: 465, mode: smtps }\n")
+                .unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("smtp_server.tls_enabled"));
+    }
+
+    #[test]
+    fn duplicate_listener_ports_are_rejected() {
+        // A listener duplicating another listener …
+        let config = Config::from_yaml(
+            "smtp_server:\n  listeners:\n    - { port: 587 }\n    - { port: 587 }\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+        // … and a listener duplicating default_port.
+        let config = Config::from_yaml(
+            "smtp_server:\n  default_port: 2525\n  listeners:\n    - { port: 2525 }\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_listener_mode_is_rejected() {
+        let result =
+            Config::from_yaml("smtp_server:\n  listeners:\n    - { port: 465, mode: tls }\n");
+        assert!(result.is_err());
     }
 
     #[test]

@@ -2,9 +2,11 @@
 //! with a self-signed certificate, and a full authenticated transaction
 //! over the encrypted stream.
 
+use camelmailer_config::SmtpListenerMode;
 use camelmailer_core::testing::Fixtures;
 use camelmailer_core::{CredentialType, MemorySink};
 use camelmailer_smtp::SmtpServer;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -121,7 +123,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> SmtpTestClient<S> {
 }
 
 async fn start_server(fixtures: &Fixtures, sink: Arc<MemorySink>) -> u16 {
-    let directory = std::env::temp_dir().join(format!("cm-starttls-{}", std::process::id()));
+    start_server_with_mode(fixtures, sink, SmtpListenerMode::Smtp).await
+}
+
+async fn start_server_with_mode(
+    fixtures: &Fixtures,
+    sink: Arc<MemorySink>,
+    mode: SmtpListenerMode,
+) -> u16 {
+    // Every server gets its own certificate directory: the tests in this
+    // file run concurrently in one process, and a shared path let one test
+    // overwrite another's cert/key mid-write, producing a mismatched pair
+    // and a flaky ConnectionReset during the handshake.
+    static CERT_DIR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "cm-starttls-{}-{}",
+        std::process::id(),
+        CERT_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&directory).unwrap();
     let (cert_path, key_path) = write_self_signed_cert(&directory);
 
@@ -135,7 +154,7 @@ async fn start_server(fixtures: &Fixtures, sink: Arc<MemorySink>) -> u16 {
     let port = listener.local_addr().unwrap().port();
     let server = SmtpServer::new(config, fixtures.store(), sink);
     tokio::spawn(async move {
-        server.serve(listener).await.ok();
+        server.serve_listeners(vec![(listener, mode)]).await.ok();
     });
     port
 }
@@ -205,6 +224,57 @@ async fn starttls_upgrades_the_session_and_delivers_authenticated_mail() {
     client.send("Subject: Over TLS").await;
     client.send("").await;
     client.send("Encrypted hello.").await;
+    let reply = client.command(".").await;
+    assert_eq!(reply, vec!["250 OK"]);
+    client.command("QUIT").await;
+
+    let messages = sink.messages();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].received_with_ssl, "message must be marked TLS");
+    assert_eq!(messages[0].rcpt_to, "user@elsewhere.example");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtps_listener_speaks_tls_from_the_first_byte() {
+    let fixtures = Fixtures::new();
+    fixtures.verified_server_domain("org.example");
+    let credential = fixtures.credential(CredentialType::Smtp, "smtps-test-key");
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_with_mode(&fixtures, sink.clone(), SmtpListenerMode::Smtps).await;
+
+    // The TLS handshake happens immediately on connect — before any SMTP
+    // byte; the banner arrives over the encrypted stream.
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let connector = tls_connector();
+    let server_name = rustls::pki_types::ServerName::try_from("postal.example.com").unwrap();
+    let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+    let mut client = SmtpTestClient::new(tls_stream);
+
+    let banner = client.read_line().await;
+    assert!(banner.starts_with("220 postal.example.com ESMTP CamelMailer/"));
+
+    // The session starts in the TLS state: AUTH is advertised right away
+    // and STARTTLS is not offered (exactly as after a STARTTLS upgrade).
+    let reply = client.command("EHLO client.example").await;
+    assert!(reply.iter().any(|l| l == "250 AUTH PLAIN LOGIN"));
+    assert!(!reply.iter().any(|l| l.contains("STARTTLS")));
+
+    use base64::Engine;
+    let auth =
+        base64::engine::general_purpose::STANDARD.encode(format!("\0XX\0{}", credential.key));
+    let reply = client.command(&format!("AUTH PLAIN {auth}")).await;
+    assert!(reply[0].starts_with("235 Granted for"));
+
+    let reply = client.command("MAIL FROM:<sender@org.example>").await;
+    assert_eq!(reply, vec!["250 OK"]);
+    let reply = client.command("RCPT TO:<user@elsewhere.example>").await;
+    assert_eq!(reply, vec!["250 OK"]);
+    let reply = client.command("DATA").await;
+    assert_eq!(reply, vec!["354 Go ahead"]);
+    client.send("From: sender@org.example").await;
+    client.send("Subject: Implicit TLS").await;
+    client.send("").await;
+    client.send("Hello over smtps.").await;
     let reply = client.command(".").await;
     assert_eq!(reply, vec!["250 OK"]);
     client.command("QUIT").await;

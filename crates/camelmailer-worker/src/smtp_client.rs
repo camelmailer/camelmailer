@@ -5,6 +5,12 @@
 //! the connection is upgraded before MAIL FROM (honoring
 //! `smtp.openssl_verify_mode`; `"none"` accepts any certificate). An
 //! optional source IP binds the local socket for IP-pool-aware delivery.
+//!
+//! Relay endpoints can additionally demand more than opportunism (see
+//! [`ConnectionSecurity`]): mandatory STARTTLS (submission, port 587 —
+//! failing instead of falling back to plaintext) or implicit TLS from the
+//! first byte (`smtps://`, port 465), and can authenticate with AUTH PLAIN
+//! once the connection is at its negotiated security level.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -54,6 +60,32 @@ impl TlsMode {
     }
 }
 
+/// The transport security an endpoint requires. `tls_mode` controls *how*
+/// certificates are verified; this controls *whether* TLS is optional,
+/// mandatory-by-upgrade, or implicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionSecurity {
+    /// Plaintext, upgraded via STARTTLS when the remote offers it (the
+    /// default for MX delivery and `smtp://` relays on port 25).
+    Opportunistic,
+    /// STARTTLS is mandatory: a soft failure instead of a plaintext
+    /// fallback when the remote does not offer or refuses it
+    /// (`smtp://` relays on the submission port 587).
+    RequireStartTls,
+    /// TLS from the first byte, before any SMTP exchange
+    /// (`smtps://` relays, classically port 465).
+    ImplicitTls,
+}
+
+/// AUTH PLAIN credentials for a relay, sent once the connection has reached
+/// its negotiated security level (i.e. after the TLS handshake when there
+/// is one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmtpAuth {
+    pub username: String,
+    pub password: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SendParams {
     pub host: String,
@@ -63,6 +95,9 @@ pub struct SendParams {
     pub rcpt_to: String,
     pub timeout: Duration,
     pub tls_mode: TlsMode,
+    pub security: ConnectionSecurity,
+    /// Relay credentials (AUTH PLAIN), if any.
+    pub auth: Option<SmtpAuth>,
     /// Local address to bind for the outgoing connection (IP pool source).
     pub source_ip: Option<IpAddr>,
 }
@@ -245,18 +280,29 @@ pub async fn send_message(params: &SendParams, raw_message: &[u8]) -> SendOutcom
 
 async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<SendOutcome> {
     let tcp = connect(params).await?;
+    let mut tls = false;
+    let stream: Stream = if params.security == ConnectionSecurity::ImplicitTls {
+        // smtps: the TLS handshake happens before any SMTP byte; the banner
+        // arrives over the encrypted stream.
+        let connector = tls_connector(effective_tls_mode(params));
+        let server_name = rustls::pki_types::ServerName::try_from(params.host.clone())
+            .map_err(|_| std::io::Error::other("invalid server name for TLS"))?;
+        tls = true;
+        Box::new(connector.connect(server_name, tcp).await?)
+    } else {
+        Box::new(tcp)
+    };
     let mut connection = SmtpConnection {
-        stream: Box::new(tcp),
+        stream,
         timeout: params.timeout,
         buffer: Vec::new(),
     };
 
     let (code, response) = connection.read_reply().await?;
     if code != 220 {
-        return Ok(classify(code, response, false));
+        return Ok(classify(code, response, tls));
     }
 
-    let mut tls = false;
     let (code, ehlo_response) = connection
         .command(&format!("EHLO {}", params.helo_hostname))
         .await?;
@@ -265,9 +311,11 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
             .command(&format!("HELO {}", params.helo_hostname))
             .await?;
         if !(200..=299).contains(&code) {
-            return Ok(classify(code, response, false));
+            return Ok(classify(code, response, tls));
         }
-    } else if params.tls_mode != TlsMode::Disabled
+    } else if !tls
+        && (params.tls_mode != TlsMode::Disabled
+            || params.security == ConnectionSecurity::RequireStartTls)
         && ehlo_response.to_uppercase().contains("STARTTLS")
     {
         let (code, response) = connection.command("STARTTLS").await?;
@@ -281,9 +329,37 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
             if !(200..=299).contains(&code) {
                 return Ok(classify(code, response, tls));
             }
+        } else if params.security == ConnectionSecurity::RequireStartTls {
+            return Ok(SendOutcome::SoftFail {
+                response: format!(
+                    "relay {}:{} refused mandatory STARTTLS: {response}",
+                    params.host, params.port
+                ),
+            });
         } else {
             // STARTTLS refused mid-session: fall through in plaintext
             let _ = response;
+        }
+    }
+
+    // Submission relays (:587) must never fall back to plaintext: fail
+    // (retryably) instead when the remote did not offer STARTTLS.
+    if params.security == ConnectionSecurity::RequireStartTls && !tls {
+        return Ok(SendOutcome::SoftFail {
+            response: format!(
+                "relay {}:{} does not offer STARTTLS, which is required for smtp:// relays on the submission port",
+                params.host, params.port
+            ),
+        });
+    }
+
+    if let Some(auth) = &params.auth {
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD
+            .encode(format!("\0{}\0{}", auth.username, auth.password));
+        let (code, response) = connection.command(&format!("AUTH PLAIN {token}")).await?;
+        if code != 235 {
+            return Ok(classify(code, response, tls));
         }
     }
 
@@ -327,6 +403,17 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
     Ok(outcome)
 }
 
+/// The certificate-verification mode actually used for a connection: when
+/// the endpoint *requires* TLS (mandatory STARTTLS or smtps) the configured
+/// `Disabled` cannot apply — verification falls back to `Verify`.
+fn effective_tls_mode(params: &SendParams) -> TlsMode {
+    match (params.tls_mode, params.security) {
+        (TlsMode::Disabled, ConnectionSecurity::RequireStartTls)
+        | (TlsMode::Disabled, ConnectionSecurity::ImplicitTls) => TlsMode::Verify,
+        (mode, _) => mode,
+    }
+}
+
 async fn upgrade(
     connection: SmtpConnection,
     params: &SendParams,
@@ -340,7 +427,7 @@ async fn upgrade(
         buffer,
     } = connection;
     debug_assert!(buffer.is_empty());
-    let connector = tls_connector(params.tls_mode);
+    let connector = tls_connector(effective_tls_mode(params));
     let server_name = rustls::pki_types::ServerName::try_from(params.host.clone())
         .map_err(|_| std::io::Error::other("invalid server name for TLS"))?;
     let tls_stream = connector.connect(server_name, stream).await?;

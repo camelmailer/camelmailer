@@ -70,6 +70,13 @@ services:
     command: smtp-server
     ports:
       - "${SMTP_PORT:-25}:25"
+      # Submission port — served once the config file lists it under
+      # smtp_server.listeners as { port: 587, mode: smtp } (works without
+      # a TLS certificate).
+      - "587:587"
+      # Implicit-TLS port — requires smtp_server.tls_enabled with a
+      # certificate, plus { port: 465, mode: smtps } under listeners:
+      # - "465:465"
     depends_on:
       migrate:
         condition: service_completed_successfully

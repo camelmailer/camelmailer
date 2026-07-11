@@ -20,7 +20,17 @@ camelmailer:
   # created with `camelmailer make-admin-api-key <name>`.
   # admin_api_key: change-me
 
-  # Deliver through fixed relays instead of direct-to-MX.
+  # Deliver through fixed relays instead of direct-to-MX. Direct MX
+  # delivery always uses port 25 (that is the protocol); smtp_relays is
+  # the way out when your host blocks outbound port 25 (Hetzner, AWS, …).
+  # Three URL forms:
+  #   smtp://host:25            plaintext + opportunistic STARTTLS
+  #   smtp://host:587           submission — STARTTLS enforced (no
+  #                             plaintext fallback)
+  #   smtps://host:465          implicit TLS from the first byte
+  # Credentials (AUTH PLAIN, sent after the TLS handshake) go in the URL;
+  # percent-encode special characters:
+  #   smtp://user:pass@smarthost.example.com:587
   # smtp_relays: ["smtp://relay.example.com:25"]
 
   use_ip_pools: false
@@ -44,6 +54,13 @@ smtp_server:
   # tls_certificate_path: $config-file-root/smtp.cert
   # tls_private_key_path: $config-file-root/smtp.key
   # proxy_protocol: true            # behind HAProxy etc.
+  # Additional listeners besides default_port (which always speaks plain
+  # SMTP with optional STARTTLS). mode "smtp" behaves like default_port;
+  # mode "smtps" is implicit TLS from the first byte (port 465) and
+  # requires tls_enabled with a certificate. Ports must be distinct.
+  # listeners:
+  #   - { port: 587, mode: smtp }
+  #   - { port: 465, mode: smtps }
 
 postgres:
   # The DATABASE_URL environment variable, when set, takes precedence

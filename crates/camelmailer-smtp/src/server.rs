@@ -1,8 +1,15 @@
 //! The TCP acceptor loop — the port of `app/lib/smtp_server/server.rb` and
 //! `script/smtp_server.rb`, on tokio instead of a thread-per-connection
 //! model, including STARTTLS termination via rustls.
+//!
+//! Besides `default_port` (always plaintext + optional STARTTLS), any number
+//! of additional listeners can be configured via `smtp_server.listeners`,
+//! each in mode `smtp` (like the default port) or `smtps` (implicit TLS from
+//! the first byte, the classic port 465). The session state machine is
+//! identical for all of them — only the I/O wrapper in front differs.
 
 use crate::session::{Reply, Session, SessionConfig};
+use camelmailer_config::SmtpListenerMode;
 use camelmailer_core::{MessageSink, Store};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -123,14 +130,42 @@ impl SmtpServer {
         let bind_address = std::env::var("BIND_ADDRESS")
             .unwrap_or_else(|_| self.config.smtp_server.default_bind_address.clone());
 
-        let listener = TcpListener::bind((bind_address.as_str(), port)).await?;
-        tracing::info!(%bind_address, port, "camelmailer SMTP server listening");
-        self.serve(listener).await
+        // The default port always speaks plain SMTP (with optional STARTTLS);
+        // additional listeners come from `smtp_server.listeners`.
+        let mut listeners = vec![(
+            TcpListener::bind((bind_address.as_str(), port)).await?,
+            SmtpListenerMode::Smtp,
+        )];
+        tracing::info!(%bind_address, port, mode = "smtp", "camelmailer SMTP server listening");
+        for listener in &self.config.smtp_server.listeners {
+            listeners.push((
+                TcpListener::bind((bind_address.as_str(), listener.port)).await?,
+                listener.mode,
+            ));
+            tracing::info!(
+                %bind_address,
+                port = listener.port,
+                mode = ?listener.mode,
+                "camelmailer SMTP server listening"
+            );
+        }
+        self.serve_listeners(listeners).await
     }
 
-    /// Accept connections on an existing listener (used by tests to bind an
-    /// ephemeral port).
+    /// Accept connections on an existing listener in plain-SMTP mode (used
+    /// by tests to bind an ephemeral port).
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
+        self.serve_listeners(vec![(listener, SmtpListenerMode::Smtp)])
+            .await
+    }
+
+    /// Accept connections on any number of existing listeners, each with its
+    /// own mode (`smtp` = plaintext + optional STARTTLS, `smtps` = implicit
+    /// TLS from the first byte).
+    pub async fn serve_listeners(
+        self,
+        listeners: Vec<(TcpListener, SmtpListenerMode)>,
+    ) -> std::io::Result<()> {
         let tls_acceptor = if self.config.smtp_server.tls_enabled {
             Some(load_tls_acceptor(
                 &self.config.smtp_server.tls_certificate_path,
@@ -139,17 +174,44 @@ impl SmtpServer {
         } else {
             None
         };
+        if tls_acceptor.is_none()
+            && listeners
+                .iter()
+                .any(|(_, mode)| *mode == SmtpListenerMode::Smtps)
+        {
+            // Config validation rejects this; kept as a defensive check for
+            // programmatic callers.
+            return Err(std::io::Error::other(
+                "smtps listeners require smtp_server.tls_enabled",
+            ));
+        }
 
         let this = Arc::new(self);
-        loop {
-            let (stream, peer) = listener.accept().await?;
+        let mut accept_loops = tokio::task::JoinSet::new();
+        for (listener, mode) in listeners {
             let this = this.clone();
             let tls_acceptor = tls_acceptor.clone();
-            tokio::spawn(async move {
-                if let Err(error) = this.handle_connection(stream, peer, tls_acceptor).await {
-                    tracing::debug!(%peer, %error, "connection ended with error");
+            accept_loops.spawn(async move {
+                loop {
+                    let (stream, peer) = listener.accept().await?;
+                    let this = this.clone();
+                    let tls_acceptor = tls_acceptor.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = this
+                            .handle_connection(stream, peer, tls_acceptor, mode)
+                            .await
+                        {
+                            tracing::debug!(%peer, %error, "connection ended with error");
+                        }
+                    });
                 }
             });
+        }
+        // The accept loops never return Ok; surface the first error.
+        match accept_loops.join_next().await {
+            Some(Ok(result)) => result,
+            Some(Err(join_error)) => Err(std::io::Error::other(join_error)),
+            None => Ok(()),
         }
     }
 
@@ -158,6 +220,7 @@ impl SmtpServer {
         stream: TcpStream,
         peer: SocketAddr,
         tls_acceptor: Option<TlsAcceptor>,
+        mode: SmtpListenerMode,
     ) -> std::io::Result<()> {
         let session_config = SessionConfig::from(&self.config);
         // With proxy_protocol enabled the client IP comes from the PROXY
@@ -175,6 +238,27 @@ impl SmtpServer {
             self.sink.clone(),
             ip_address,
         );
+
+        if mode == SmtpListenerMode::Smtps {
+            // Implicit TLS: handshake before the first SMTP byte, then run
+            // the same session over the encrypted stream. The session starts
+            // in the TLS state (messages marked `received_with_ssl`, AUTH
+            // advertised immediately — exactly as after a STARTTLS upgrade).
+            let Some(tls_acceptor) = tls_acceptor else {
+                // serve_listeners() refuses smtps without an acceptor — this
+                // is unreachable, kept as a defensive close.
+                return Ok(());
+            };
+            let tls_stream = tls_acceptor.accept(stream).await?;
+            session.set_tls(true);
+            let mut lines = LineStream::new(tls_stream);
+            if send_banner {
+                lines.write_line(&session.banner()).await?;
+            }
+            drive_session(&mut session, &mut lines).await?;
+            lines.stream.shutdown().await.ok();
+            return Ok(());
+        }
 
         let mut lines = LineStream::new(stream);
         if send_banner {
