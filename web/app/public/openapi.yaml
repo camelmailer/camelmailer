@@ -703,6 +703,75 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Success" }
 
+  /api/v2/admin/organizations/{org}/billing:
+    get:
+      tags: [Organizations]
+      summary: Billing status of an organization (admin)
+      description: |
+        Hosted cloud only. Always `200` for authorized callers:
+        `{ enabled: false, has_customer: false }` on installations without
+        billing (the default for self-hosted) — the dashboard hides all
+        billing UI in that case.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200":
+          description: Billing status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          enabled: { type: boolean }
+                          has_customer: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v2/admin/organizations/{org}/billing/portal:
+    post:
+      tags: [Organizations]
+      summary: Open the Stripe billing portal (admin)
+      description: |
+        Creates the Stripe customer for the organization on first use
+        (idempotent — an existing customer is reused, the customer id is
+        persisted only after Stripe reported success) and returns the URL
+        of a fresh billing-portal session. `403 BillingDisabled` when the
+        `billing` config group is off (self-hosted); `502
+        BillingUnavailable` when Stripe cannot be reached (details are
+        logged, never forwarded).
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200":
+          description: Portal session created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          url: { type: string, example: "https://billing.stripe.com/p/session/…" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Billing is not enabled on this installation (`BillingDisabled`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: The billing provider is unavailable (`BillingUnavailable`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
   /api/v2/admin/organizations/{org}/servers:
     get:
       tags: [Servers]

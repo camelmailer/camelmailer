@@ -198,6 +198,35 @@ impl Default for AppMail {
     }
 }
 
+/// Stripe billing for the hosted cloud offering. Self-hosted installations
+/// keep the default (`enabled: false`): no billing endpoints are active and
+/// the dashboard shows no billing UI at all.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Billing {
+    pub enabled: bool,
+    /// Stripe secret key (`sk_live_…` / `sk_test_…`). Required when
+    /// enabled. Never logged: the `Debug` impl redacts it.
+    pub stripe_secret_key: Option<String>,
+    /// Where Stripe's billing portal sends the user back to. Defaults to
+    /// `auth.frontend_url` when unset.
+    pub portal_return_url: Option<String>,
+}
+
+/// The secret key must never end up in logs, so `Debug` redacts it.
+impl std::fmt::Debug for Billing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Billing")
+            .field("enabled", &self.enabled)
+            .field(
+                "stripe_secret_key",
+                &self.stripe_secret_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("portal_return_url", &self.portal_return_url)
+            .finish()
+    }
+}
+
 /// OpenID Connect single sign-on. Field names match the upstream Postal
 /// `oidc` group so a legacy `postal.yml` loads unchanged.
 #[derive(Debug, Clone, Deserialize)]
@@ -591,6 +620,7 @@ pub struct Config {
     pub web_server: WebServer,
     pub auth: Auth,
     pub app_mail: AppMail,
+    pub billing: Billing,
     pub oidc: Oidc,
     pub worker: Worker,
     pub postgres: Postgres,
@@ -742,6 +772,18 @@ impl Config {
                     "app_mail.from_address is required when app_mail.enabled is true".into(),
                 ));
             }
+        }
+        if self.billing.enabled
+            && self
+                .billing
+                .stripe_secret_key
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "billing.stripe_secret_key is required when billing.enabled is true".into(),
+            ));
         }
         Ok(())
     }
@@ -1020,6 +1062,57 @@ rspamd:
         )
         .unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn billing_defaults_to_disabled() {
+        let config = Config::default();
+        assert!(!config.billing.enabled);
+        assert_eq!(config.billing.stripe_secret_key, None);
+        assert_eq!(config.billing.portal_return_url, None);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn billing_parses_from_yaml() {
+        let config = Config::from_yaml(
+            "billing:\n  enabled: true\n  stripe_secret_key: sk_test_123\n  portal_return_url: https://app.example.com/billing\n",
+        )
+        .unwrap();
+        assert!(config.billing.enabled);
+        assert_eq!(
+            config.billing.stripe_secret_key.as_deref(),
+            Some("sk_test_123")
+        );
+        assert_eq!(
+            config.billing.portal_return_url.as_deref(),
+            Some("https://app.example.com/billing")
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn enabled_billing_requires_the_stripe_secret_key() {
+        let config = Config::from_yaml("billing:\n  enabled: true\n").unwrap();
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("billing:\n  enabled: true\n  stripe_secret_key: \"\"\n").unwrap();
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("billing:\n  enabled: true\n  stripe_secret_key: sk_test_1\n")
+                .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn billing_debug_output_redacts_the_secret_key() {
+        let config = Config::from_yaml(
+            "billing:\n  enabled: true\n  stripe_secret_key: sk_live_supersecret\n",
+        )
+        .unwrap();
+        let debug = format!("{:?}", config.billing);
+        assert!(!debug.contains("sk_live_supersecret"));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

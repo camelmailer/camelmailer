@@ -504,6 +504,37 @@ impl AdminStore for PgStore {
         })
     }
 
+    async fn organization_billing_customer_id(
+        &self,
+        organization_id: Id,
+    ) -> Result<Option<String>, StoreError> {
+        sqlx::query("SELECT billing_customer_id FROM organizations WHERE id = $1")
+            .bind(organization_id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.and_then(|row| row.get::<Option<String>, _>("billing_customer_id")))
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn set_organization_billing_customer_id(
+        &self,
+        organization_id: Id,
+        customer_id: &str,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query("UPDATE organizations SET billing_customer_id = $2 WHERE id = $1")
+            .bind(organization_id as i64)
+            .bind(customer_id)
+            .execute(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::Other(format!(
+                "organization {organization_id} not found"
+            )));
+        }
+        Ok(())
+    }
+
     async fn delete_organization(&self, id: Id) -> Result<bool, StoreError> {
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(id as i64)

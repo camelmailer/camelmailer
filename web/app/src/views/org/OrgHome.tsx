@@ -490,40 +490,94 @@ export function OrgSettings({ org }: { org: string }) {
   const role = useOrgRole(org)
   const [confirmOpen, setConfirmOpen] = useState(false)
 
-  if (role !== "root" && role !== "owner") {
+  // Billing needs admin+; the danger zone stays owner-only.
+  const canBilling = role === "root" || role === "owner" || role === "admin"
+  const isOwner = role === "root" || role === "owner"
+
+  // `enabled: false` (the self-hosted default) hides billing entirely.
+  const billing = useQuery({
+    queryKey: ["billing", org],
+    queryFn: () => adminApi.billing(org).get(),
+    enabled: canBilling,
+  })
+  const showBilling = canBilling && billing.data?.enabled === true
+
+  const openPortal = useMutation({
+    mutationFn: () => adminApi.billing(org).portal(),
+    onSuccess: ({ url }) => {
+      window.location.href = url
+    },
+    onError: (err) =>
+      toast.error(
+        err instanceof ApiError && err.code === "BillingUnavailable"
+          ? "Billing is temporarily unavailable. Please try again in a few minutes."
+          : err instanceof ApiError
+            ? err.message
+            : "Could not open the billing portal",
+      ),
+  })
+
+  // Admins only see this page when billing is on (owners always do).
+  if (!isOwner && !showBilling) {
     return <EmptyState>Only owners can manage organization settings.</EmptyState>
   }
   return (
     <div className="max-w-lg space-y-4">
-      <PageHeader title="Danger zone" />
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Delete this organization</CardTitle>
-        </CardHeader>
-        <CardContent className="flex items-center justify-between gap-4">
-          <p className="text-sm text-muted-foreground">
-            Deletes the organization with all servers and their data.
-          </p>
-          <Button variant="destructive" onClick={() => setConfirmOpen(true)}>
-            Delete
-          </Button>
-        </CardContent>
-      </Card>
-      <ConfirmDialog
-        open={confirmOpen}
-        onOpenChange={setConfirmOpen}
-        title={`Delete ${org}?`}
-        description="This cannot be undone. All servers, domains, credentials and messages are removed."
-        onConfirm={async () => {
-          try {
-            await adminApi.organizations.delete(org)
-            await refresh()
-            router.push("/")
-          } catch (err) {
-            errorToast(err, "Could not delete the organization")
-          }
-        }}
-      />
+      {showBilling && (
+        <>
+          <PageHeader title="Billing" />
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Billing Portal</CardTitle>
+            </CardHeader>
+            <CardContent className="flex items-center justify-between gap-4">
+              <p className="text-sm text-muted-foreground">
+                Manage your subscription, payment methods and invoices in the
+                billing portal.
+              </p>
+              <Button
+                onClick={() => openPortal.mutate()}
+                disabled={openPortal.isPending}
+              >
+                {openPortal.isPending ? "Opening…" : "Billing Portal"}
+              </Button>
+            </CardContent>
+          </Card>
+        </>
+      )}
+      {isOwner && (
+        <>
+          <PageHeader title="Danger zone" />
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Delete this organization</CardTitle>
+            </CardHeader>
+            <CardContent className="flex items-center justify-between gap-4">
+              <p className="text-sm text-muted-foreground">
+                Deletes the organization with all servers and their data.
+              </p>
+              <Button variant="destructive" onClick={() => setConfirmOpen(true)}>
+                Delete
+              </Button>
+            </CardContent>
+          </Card>
+          <ConfirmDialog
+            open={confirmOpen}
+            onOpenChange={setConfirmOpen}
+            title={`Delete ${org}?`}
+            description="This cannot be undone. All servers, domains, credentials and messages are removed."
+            onConfirm={async () => {
+              try {
+                await adminApi.organizations.delete(org)
+                await refresh()
+                router.push("/")
+              } catch (err) {
+                errorToast(err, "Could not delete the organization")
+              }
+            }}
+          />
+        </>
+      )}
     </div>
   )
 }

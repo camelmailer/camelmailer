@@ -15,6 +15,23 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Stripe billing for the hosted cloud** — a new `billing` config group
+  (`enabled`, `stripe_secret_key`, `portal_return_url`; the secret is
+  never logged). When enabled, organization admins/owners get
+  `GET /api/v2/admin/organizations/{org}/billing` (billing status) and
+  `POST /api/v2/admin/organizations/{org}/billing/portal`, which lazily
+  creates the Stripe customer (idempotent — an existing customer is
+  reused; the id is stored in `organizations.billing_customer_id` only
+  after Stripe reported success) and returns a billing-portal URL the
+  dashboard redirects to ("Billing Portal" in the organization
+  settings). Stripe failures surface as the stable `BillingUnavailable`
+  error code; disabled billing answers `403 BillingDisabled`.
+  **Self-hosted installations are unaffected**: billing defaults to
+  disabled, the status endpoint reports `enabled: false` and the
+  dashboard shows no billing UI at all.
+
 ## [0.2.0] - 2026-07-11
 
 ### Added

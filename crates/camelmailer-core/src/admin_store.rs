@@ -220,6 +220,18 @@ pub trait AdminStore: Send + Sync {
         domain_name: &str,
     ) -> Result<Option<Id>, StoreError>;
 
+    // billing (hosted cloud): the Stripe customer attached to an
+    // organization (`organizations.billing_customer_id`, nullable)
+    async fn organization_billing_customer_id(
+        &self,
+        organization_id: Id,
+    ) -> Result<Option<String>, StoreError>;
+    async fn set_organization_billing_customer_id(
+        &self,
+        organization_id: Id,
+        customer_id: &str,
+    ) -> Result<(), StoreError>;
+
     // admin API key management (returns display records; never the secret)
     async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError>;
     async fn create_admin_api_key_record(
@@ -385,6 +397,36 @@ impl AdminStore for crate::store::MemoryStore {
                 DomainOwner::Organization(id) => id == server.organization_id,
             })
             .map(|d| d.id))
+    }
+
+    async fn organization_billing_customer_id(
+        &self,
+        organization_id: Id,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .billing_customer_ids
+            .get(&organization_id)
+            .cloned())
+    }
+
+    async fn set_organization_billing_customer_id(
+        &self,
+        organization_id: Id,
+        customer_id: &str,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if !inner.organizations.contains_key(&organization_id) {
+            return Err(StoreError::Other(format!(
+                "organization {organization_id} not found"
+            )));
+        }
+        inner
+            .billing_customer_ids
+            .insert(organization_id, customer_id.to_string());
+        Ok(())
     }
 
     async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError> {
@@ -855,5 +897,62 @@ mod tests {
             .await
             .expect_err("duplicate email must conflict");
         assert!(matches!(error, StoreError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn billing_customer_id_roundtrip() {
+        let store = MemoryStore::new();
+        let organization = store
+            .create_organization(NewOrganization {
+                name: "Acme".into(),
+                permalink: "acme".into(),
+            })
+            .await
+            .unwrap();
+
+        // Absent by default.
+        assert_eq!(
+            store
+                .organization_billing_customer_id(organization.id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Set, read back, overwrite.
+        store
+            .set_organization_billing_customer_id(organization.id, "cus_123")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .organization_billing_customer_id(organization.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cus_123")
+        );
+        store
+            .set_organization_billing_customer_id(organization.id, "cus_456")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .organization_billing_customer_id(organization.id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cus_456")
+        );
+
+        // Unknown organizations: get is None, set is an error.
+        assert_eq!(
+            store.organization_billing_customer_id(9999).await.unwrap(),
+            None
+        );
+        assert!(store
+            .set_organization_billing_customer_id(9999, "cus_x")
+            .await
+            .is_err());
     }
 }

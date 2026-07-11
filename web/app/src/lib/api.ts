@@ -101,6 +101,10 @@ export type Organization = {
 
 export type Role = "viewer" | "member" | "admin" | "owner"
 
+// Billing (hosted cloud). `enabled: false` on self-hosted installations —
+// the UI hides billing entirely in that case.
+export type BillingStatus = { enabled: boolean; has_customer: boolean }
+
 export type Membership = {
   role: Role
   created_at: string
@@ -362,6 +366,12 @@ export const adminApi = {
     delete: (permalink: string) =>
       api.delete<{ deleted: boolean }>(`/api/v2/admin/organizations/${permalink}`),
   },
+  billing: (org: string) => ({
+    // 200 with enabled=false when billing is off (self-hosted) — never an error.
+    get: () => api.get<BillingStatus>(`/api/v2/admin/organizations/${org}/billing`),
+    // 403 BillingDisabled when off; 502 BillingUnavailable when Stripe is down.
+    portal: () => api.post<{ url: string }>(`/api/v2/admin/organizations/${org}/billing/portal`),
+  }),
   members: (org: string) => ({
     list: () => api.get<{ members: Membership[] }>(`/api/v2/admin/organizations/${org}/members`),
     add: (email_address: string, role: Role) =>

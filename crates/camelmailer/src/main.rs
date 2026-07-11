@@ -169,28 +169,47 @@ async fn web_server() -> std::io::Result<()> {
     let config = load_config();
     let global_key = config.camelmailer.admin_api_key.clone();
 
+    // Billing (hosted cloud only): with `billing.enabled` and a Stripe
+    // secret key, organizations get the billing endpoints; self-hosted
+    // installations keep the default (disabled, no provider, no UI).
+    let billing: Option<Arc<dyn camelmailer_api::BillingProvider>> = if config.billing.enabled {
+        config
+            .billing
+            .stripe_secret_key
+            .clone()
+            .filter(|key| !key.is_empty())
+            .map(|key| {
+                tracing::info!("billing enabled (Stripe)");
+                Arc::new(camelmailer_api::StripeBilling::new(key)) as _
+            })
+    } else {
+        None
+    };
+
     let (state, tracking) = if postgres_enabled(&config) {
         // One Postgres store, shared as the admin store, the tenant-scoped
         // server store, the account store, and the tracking store.
         let pg = Arc::new(connect_pg(&config).await?);
-        let state = ApiState::full(
+        let state = ApiState::full_with_billing(
             pg.clone(),
             Some(pg.clone()),
             Some(pg.clone()),
             global_key,
             config.clone(),
+            billing,
         );
         let tracking: Arc<dyn TrackingStore> = pg;
         (state, Some(tracking))
     } else {
         tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
         let memory = Arc::new(MemoryStore::new());
-        let state = ApiState::full(
+        let state = ApiState::full_with_billing(
             memory.clone(),
             Some(memory.clone()),
             Some(memory),
             global_key,
             config.clone(),
+            billing,
         );
         (state, None)
     };

@@ -2,6 +2,7 @@
 pub mod app;
 mod app_mailer;
 pub mod auth_api;
+pub mod billing;
 pub mod cors;
 mod memberships;
 pub mod oidc;
@@ -11,6 +12,7 @@ pub mod tracking;
 
 pub use app::{build_router, ApiState};
 pub use auth_api::build_auth_router;
+pub use billing::{BillingError, BillingProvider, MockBilling, StripeBilling};
 pub use cors::cors_layer;
 pub use oidc::build_oidc_router;
 pub use server_api::build_server_router;

@@ -130,6 +130,17 @@ app_mail:
   # from_address: no-reply@example.com   # domain must be verified on that server
   # from_name: CamelMailer
 
+# Stripe billing — for the hosted cloud offering only. Self-hosted
+# installations leave this off (the default): no billing endpoints, no
+# billing UI in the dashboard. When enabled, stripe_secret_key is
+# required; the key is never logged.
+billing:
+  enabled: false
+  # stripe_secret_key: sk_live_…
+  # Where the Stripe billing portal returns the user to; defaults to
+  # auth.frontend_url when unset.
+  # portal_return_url: https://mail-admin.example.com
+
 # OpenID Connect single sign-on (Okta, Entra ID, Google, Keycloak, …).
 # Register the redirect URI:
 #   {web_protocol}://{web_hostname}/api/v2/auth/oidc/callback
