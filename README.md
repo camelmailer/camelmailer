@@ -13,14 +13,13 @@ audit log and CORS make it frontend- and enterprise-ready out of the box.
 One small binary runs every process role. MIT licensed; born as a full
 Rust rewrite of [Postal](https://github.com/postalserver/postal).
 
-**Web frontend included:** `web/app` is a Next.js application serving
-both the marketing site (landing, cloud pricing, open-source + legal
-pages, API/self-hosting guides, the public
-[OpenAPI spec](web/app/public/openapi.yaml)) and the shadcn/ui admin app
-covering the entire API — login with 2FA/SSO, organizations and roles,
-servers with all resources, sending and message browsing. See
-[web/README.md](web/README.md). A library of 20 ready-to-clone
-transactional email templates lives in [templates/](templates/README.md).
+**Web dashboard included:** `web/app` is a Next.js (shadcn/ui) admin app
+covering the entire API — registration and login with 2FA/SSO,
+organizations and roles, servers with all resources, sending and message
+browsing. The public [OpenAPI spec](web/app/public/openapi.yaml) documents
+all 74 endpoints. A library of 20 ready-to-clone transactional email
+templates lives in [templates/](templates/README.md). See
+[web/README.md](web/README.md).
 
 ## Install
 
@@ -45,9 +44,8 @@ docker compose exec web camelmailer make-user you@example.com Ada Ops --admin
 ```
 
 Multi-arch (amd64 + arm64); pin a release with `CAMELMAILER_VERSION=vX.Y.Z`
-in `.env`. *(Maintainers: after the very first image publish, set the GHCR
-package to public once — org → Packages → camelmailer → Package settings →
-Change visibility — or anonymous pulls fail.)*
+in `.env`.
+`latest` is the latest tagged release; `edge` follows `main`.
 
 ### Debian / Ubuntu (.deb)
 
@@ -83,29 +81,31 @@ TLS, and the production checklist. Accounts, roles and SSO are covered in
 
 ## How it's built
 
-CamelMailer was developed as an incremental, test-driven Rust rewrite of a
-Postal fork: every ported behaviour is covered by Rust tests translated from
-the corresponding RSpec suite before/alongside the implementation.
+Test-first, throughout: protocol state machines, storage traits with
+in-memory and PostgreSQL implementations kept in behavioural lockstep,
+router tests for every endpoint, and PostgreSQL integration tests for the
+row-level-security tenant isolation. CI enforces `cargo fmt`,
+`clippy -D warnings` and the full suite; releases are cut from tags and
+refuse to publish unless everything is green (see
+[CHANGELOG.md](CHANGELOG.md)).
 
 ## Workspace layout
 
-| Crate | Ports | Status |
-|---|---|---|
-| `camelmailer-config` | `lib/postal/config_schema.rb`, `lib/postal/config.rb` | ✅ complete (all defaults, YAML loading, `$config-file-root` substitution, legacy `postal:` group alias, `POSTAL_CONFIG_FILE_PATH` fallback) + new `postgres` group |
-| `camelmailer-core` | `app/models` (domain model), `app/lib/received_header.rb`, `Postal::Helpers`, token generation | ✅ domain model + storage traits (`Store` for SMTP, async `AdminStore` for the API, `MessageSink`) with in-memory implementations |
-| `camelmailer-db` | `lib/postal/message_db/` + the ActiveRecord persistence | ✅ PostgreSQL with row-level security (see below); embedded migrations; message metadata parity (status, spam, deliveries, links/clicks, loads/opens); delivery queue |
-| `camelmailer-smtp` | `app/lib/smtp_server/client.rb` + `server.rb`, `script/smtp_server.rb` | ✅ full protocol state machine (see below), tokio TCP server, STARTTLS termination via rustls |
-| `camelmailer-worker` | `script/worker.rb`, `app/lib/message_dequeuer`, `app/senders`, `app/lib/postal/message_inspectors`, `dkim_header.rb`, `signer.rb` | ✅ queue dequeuer (SKIP LOCKED), SMTP sending (relays/MX) with opportunistic outbound STARTTLS and IP-pool source addresses, suppression holds, rspamd/ClamAV inspection, DKIM signing, open/click tracking rewrite, HTTP endpoint delivery, webhook queue with retries + RSA signing, delivery recording |
-| `camelmailer-api` | `app/controllers/admin_api/` + a native Server API | ✅ **Account API** (`/api/v2/admin`, `X-Admin-API-Key`): auth (incl. DB-backed keys), envelope, pagination, errors; organizations, servers (full config + IP-pool + admin-key management), domains, credentials, routes, webhooks, suppressions, users, IP pools. ✅ **Server API** (`/api/v2/server`, `X-Server-API-Key`): HTTP send, message/delivery/open/click reads, stats + bounces + queue stats, message streams, inbound search/bypass/retry, templates + rendering. ✅ public click/open tracking endpoints. ✅ **Auth API** (`/api/v2/auth`, Bearer sessions): login with lockout + TOTP 2FA, password change/reset, profile, invitations accept, OIDC SSO (code flow + PKCE); RBAC (viewer/member/admin/owner + global admins) enforced across the admin API; members + invitations management; auth audit log; CORS |
-| `camelmailer` (bin) | `bin/postal` | ✅ CLI dispatcher: `smtp-server`, `web-server`, `worker`, `initialize` (migrations), `make-admin-api-key`, `make-user` (accounts bootstrap), `version` |
+| Crate | What |
+|---|---|
+| `camelmailer-config` | YAML configuration with validated schema and full defaults; `$config-file-root` substitution; Postal-compatible config files load unchanged |
+| `camelmailer-core` | Domain model + storage traits (`Store` for SMTP, async `AdminStore`, `ServerStore`, `AuthStore`, `MessageSink`) with in-memory implementations for tests; auth primitives (argon2, TOTP, tokens); safe Mustache-subset template renderer |
+| `camelmailer-db` | PostgreSQL implementations of all traits; embedded sqlx migrations; row-level-security tenant isolation (see below); delivery queue |
+| `camelmailer-smtp` | SMTP server: pure protocol state machine (no I/O in the session), tokio TCP listener, STARTTLS termination via rustls |
+| `camelmailer-worker` | Delivery worker: `SKIP LOCKED` dequeuer, SMTP sending (relays/MX) with opportunistic outbound STARTTLS and IP-pool source addresses, suppression holds, rspamd/ClamAV inspection, DKIM signing, open/click tracking rewrite, HTTP endpoint delivery, webhook queue with retries + RSA signing |
+| `camelmailer-api` | axum HTTP API: **Server API** (`/api/v2/server`, sending + message data), **Management API** (`/api/v2/admin`, all resources, RBAC-scoped for user sessions), **Accounts API** (`/api/v2/auth`, login/2FA/registration/resets/invitations/OIDC), public tracking endpoints, platform app-mail |
+| `camelmailer` (bin) | The single binary/CLI: `web-server`, `smtp-server`, `worker`, `initialize`, `make-user`, `make-admin-api-key`, `version` |
 
 ## Storage: single PostgreSQL database with row-level security
 
-The Ruby application used MariaDB with a main database plus **one dedicated
-database per mail server** for message storage. CamelMailer replaces that
-with a **single PostgreSQL database**; tenant (mail-server) isolation on the
-shared `messages` table is enforced by the database itself via row-level
-security:
+CamelMailer uses a **single PostgreSQL database**; tenant (mail-server)
+isolation on the shared `messages` table is enforced by the database
+itself via row-level security:
 
 - Every message read/write runs inside a transaction that establishes the
   tenant context first: `set_config('camelmailer.server_id', $1, true)`.
@@ -125,16 +125,15 @@ full SMTP session into Postgres. Set `CAMELMAILER_TEST_DATABASE_URL` (a role
 with CREATEDB) to run them; they skip otherwise. Each test creates its own
 throwaway database and runs the embedded migrations.
 
-The SMTP session state machine is a line-for-line port of the Ruby client:
-PROXY protocol, HELO/EHLO capability framing, STARTTLS gating of AUTH,
+The SMTP session is a pure protocol state machine covering PROXY protocol,
+HELO/EHLO capability framing, STARTTLS gating of AUTH,
 AUTH PLAIN / LOGIN / CRAM-MD5, MAIL FROM (AUTH= stripping), RCPT TO with all
 five routing branches (return-path, custom return-path prefix, route domain,
 authenticated relay, route match, SMTP-IP fallback with longest-prefix
 matching), DATA with dot-unstuffing, header capture with continuation lines,
 bare-LF `.` rejection, maximum message size, mail-loop detection, and
-From/Sender domain authentication. The Ruby specs in
-`spec/lib/smtp_server/client/` are ported to
-`crates/camelmailer-smtp/tests/session_tests.rs`.
+From/Sender domain authentication — backed by an extensive session test
+suite (`crates/camelmailer-smtp/tests/session_tests.rs`).
 
 ## Build, test, run
 
@@ -154,21 +153,18 @@ With `postgres.enabled: true` (or `DATABASE_URL` set) both servers run
 against PostgreSQL; otherwise they fall back to non-persistent in-memory
 storage and log a warning.
 
-Configuration is YAML with the same schema and defaults as the Ruby
-`Postal::Config`; an existing `postal.yml` loads unchanged (the `postal:`
-group is accepted as an alias for `camelmailer:`, and
-`POSTAL_CONFIG_FILE_PATH` still works).
+Configuration is one YAML file — `config/camelmailer.example.yml`
+documents every group. For migrations, Postal-compatible config files load
+unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
 ## Architecture notes
 
 - **Pure state machine + trait-backed storage.** The SMTP session performs no
   I/O and no database access; lookups go through the `Store` trait and
   accepted messages through the `MessageSink` trait (`camelmailer-core`).
-  `MemoryStore`/`MemorySink` back the tests; the MariaDB implementations are
-  the next phase and slot in without touching protocol code.
-- **Rebranding.** The SMTP banner reads `ESMTP CamelMailer/<trace-id>`.
-  Response texts and status codes are otherwise kept byte-identical to the
-  Ruby implementation so existing clients and tests keep matching.
+  `MemoryStore`/`MemorySink` back the tests; the PostgreSQL implementations
+  in `camelmailer-db` implement the same traits, so protocol code never
+  touches persistence details.
 - **STARTTLS termination.** With `smtp_server.tls_enabled: true` the server
   loads the configured certificate/key, advertises STARTTLS (and withholds
   AUTH) on plaintext sessions, upgrades the socket via rustls on request and
@@ -181,8 +177,7 @@ group is accepted as an alias for `camelmailer:`, and
   configured relays or MX lookup, retries soft failures with exponential
   backoff, records every attempt in `deliveries`, and fires webhooks
   (MessageSent/MessageDelayed/MessageDeliveryFailed/MessageHeld). Incoming
-  route mail is POSTed to the route's HTTP endpoint (`routes.endpoint_url`,
-  a deliberate simplification of Postal's polymorphic endpoints).
+  route mail is POSTed to the route's HTTP endpoint (`routes.endpoint_url`).
 
 ## Delivery, inspection and signing
 
@@ -245,17 +240,19 @@ untrusted end-user data. Tenant isolation is enforced everywhere — a token
 for server A can never read or mutate server B's data — and is covered by
 both router tests and Postgres RLS tests.
 
-## Not yet ported
+## Roadmap / deliberate gaps
 
-**Web UI** — the management interface remains the Rails app, explicitly out
-of scope for the Rust port. Everything else Postal does at the MTA and API
-layer is covered here.
+Everything above ships today, including the web dashboard. Deliberately
+deferred (documented so integrators know what not to expect yet):
 
-**Deferred API capabilities** (documented so a frontend knows they are not
-yet available): per-domain DKIM key generation + DNS records and Return-Path
-domains (DKIM currently uses one installation key + `dns.dkim_identifier`),
-per-address sender signatures, real DNS-based domain verification, webhook
-trigger granularity / HTTP auth headers, and template *push* between servers.
+- **Per-domain DKIM keys** — signing currently uses one installation key
+  with the `dns.dkim_identifier` selector.
+- **DNS-based domain verification** — verifying a sending domain is an
+  explicit admin action today; automated record probing is planned.
+- **Webhook trigger granularity and custom HTTP auth headers.**
+- **Per-address sender signatures** and **template push between servers**.
+- **SAML / SCIM** (OIDC is the SSO path) and **WebAuthn**.
+- **Billing** — planned separately for the hosted cloud.
 
 ## License
 

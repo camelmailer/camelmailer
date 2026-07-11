@@ -23,7 +23,7 @@ attribution, but is an independent project — there is no upstream to track.
 | `crates/camelmailer-worker` | Delivery worker: queue dequeuer (SKIP LOCKED), MX/relay SMTP client, DKIM, tracking rewrite, rspamd/ClamAV, webhook queue with RSA signing |
 | `crates/camelmailer-api` | axum HTTP API — see surfaces below |
 | `crates/camelmailer` | The single binary/CLI: `web-server`, `smtp-server`, `worker`, `initialize`, `make-user`, `make-admin-api-key`, `version` |
-| `web/app` | Next.js (App Router): marketing site (statically prerendered `(marketing)` group) + admin app (`(app)` group, shadcn/ui + TanStack Query); Next proxies `/api` to the backend (`API_PROXY_URL`) |
+| `web/app` | Next.js (App Router) dashboard (`(app)` group, shadcn/ui + TanStack Query); `/` redirects to `/login`; Next proxies `/api` to the backend (`API_PROXY_URL`) |
 | `templates/` | 20 ready-to-clone transactional email templates (JSON) + `import.sh` |
 | `docs/` | quickstart, configuration, authentication (accounts/RBAC/SSO) |
 | `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 74 endpoints) |
@@ -83,15 +83,15 @@ Other conventions:
 - Secrets are shown exactly once at creation (keys, invite tokens) and
   stored hashed where applicable (sessions, invitations, resets).
 - Frontend pages live in `web/app/src/views/` (client components); route
-  files under `src/app/` are thin wrappers. Marketing content is
-  generated HTML in `(marketing)/content.ts`.
+  files under `src/app/` are thin wrappers. The marketing site lives in a
+  separate (private) repository, not here.
 
 ## Known deliberate gaps
 
 SAML and SCIM (OIDC is the SSO path), WebAuthn, per-domain DKIM keys
 (one installation key + selector), billing (planned separately). Legal
-pages under the marketing site are placeholder templates and marked as
-such. App-mail delivery of reset/invitation/welcome mail is no longer a
+pages of the (separately hosted) marketing site are placeholder
+templates and marked as such. App-mail delivery of reset/invitation/welcome mail is no longer a
 gap: the `app_mail` config group (`enabled`, `server_api_key`,
 `from_address`, `from_name`) sends platform mail through the
 installation's own pipeline; when disabled, tokens are surfaced to the

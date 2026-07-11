@@ -42,7 +42,6 @@ the proxy, set `NEXT_PUBLIC_API_URL` at build time and configure CORS.)
 
 ```
 src/app/            routes (App Router)
-  (marketing)/      static pages + scoped marketing.css + content.ts
   (app)/            signed-in area (layout = session gate + sidebar shell)
   login/, reset-password/, invitations/accept/, auth/callback/
 src/views/          the page components (client), shared by the routes
@@ -54,7 +53,7 @@ public/openapi.yaml the public OpenAPI spec
 ## End-to-end smoke test
 
 `app/e2e/smoke.mjs` (Playwright) drives the real UI against the Docker
-backend: marketing landing → login → org/server/domain/credential →
+backend: login → org/server/domain/credential →
 send → message detail → stats → invitation → audit log.
 
 ```bash

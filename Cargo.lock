@@ -181,7 +181,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "camelmailer"
-version = "3.3.4"
+version = "0.1.0"
 dependencies = [
  "axum",
  "camelmailer-api",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-api"
-version = "3.3.4"
+version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-config"
-version = "3.3.4"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-core"
-version = "3.3.4"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-db"
-version = "3.3.4"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-smtp"
-version = "3.3.4"
+version = "0.1.0"
 dependencies = [
  "base64",
  "camelmailer-config",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-worker"
-version = "3.3.4"
+version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
