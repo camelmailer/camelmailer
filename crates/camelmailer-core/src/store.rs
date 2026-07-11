@@ -105,6 +105,9 @@ pub fn match_ip_credential(credentials: Vec<Credential>, ip: IpAddr) -> Option<C
 #[derive(Default)]
 pub(crate) struct MemoryStoreInner {
     pub(crate) organizations: HashMap<Id, Organization>,
+    /// Stripe customer ids keyed by organization id (the
+    /// `organizations.billing_customer_id` column in Postgres).
+    pub(crate) billing_customer_ids: HashMap<Id, String>,
     pub(crate) servers: HashMap<Id, Server>,
     pub(crate) domains: HashMap<Id, Domain>,
     pub(crate) routes: HashMap<Id, Route>,
@@ -198,12 +201,9 @@ impl MemoryStore {
     }
 
     pub fn delete_organization(&self, id: Id) -> bool {
-        self.inner
-            .write()
-            .unwrap()
-            .organizations
-            .remove(&id)
-            .is_some()
+        let mut inner = self.inner.write().unwrap();
+        inner.billing_customer_ids.remove(&id);
+        inner.organizations.remove(&id).is_some()
     }
 
     pub fn delete_server(&self, id: Id) -> bool {

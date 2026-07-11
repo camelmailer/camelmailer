@@ -39,6 +39,9 @@ pub struct ApiState {
     pub global_admin_api_key: Option<String>,
     /// The full configuration (auth policy, OIDC, hostnames).
     pub config: camelmailer_config::Config,
+    /// Billing backend (hosted cloud only). `None` on self-hosted
+    /// installations: billing endpoints then report disabled.
+    pub billing: Option<Arc<dyn crate::billing::BillingProvider>>,
 }
 
 impl ApiState {
@@ -49,6 +52,7 @@ impl ApiState {
             auth_store: None,
             global_admin_api_key,
             config: camelmailer_config::Config::default(),
+            billing: None,
         })
     }
 
@@ -64,6 +68,7 @@ impl ApiState {
             auth_store: None,
             global_admin_api_key,
             config: camelmailer_config::Config::default(),
+            billing: None,
         })
     }
 
@@ -76,12 +81,32 @@ impl ApiState {
         global_admin_api_key: Option<String>,
         config: camelmailer_config::Config,
     ) -> Arc<Self> {
+        Self::full_with_billing(
+            store,
+            server_store,
+            auth_store,
+            global_admin_api_key,
+            config,
+            None,
+        )
+    }
+
+    /// [`ApiState::full`] plus a billing backend (hosted cloud).
+    pub fn full_with_billing(
+        store: Arc<dyn AdminStore>,
+        server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
+        auth_store: Option<Arc<dyn camelmailer_core::AuthStore>>,
+        global_admin_api_key: Option<String>,
+        config: camelmailer_config::Config,
+        billing: Option<Arc<dyn crate::billing::BillingProvider>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             server_store,
             auth_store,
             global_admin_api_key,
             config,
+            billing,
         })
     }
 
@@ -262,6 +287,8 @@ fn required_role(rest: &[&str], method: &axum::http::Method) -> camelmailer_core
                 Role::Admin
             }
         }
+        // billing (hosted cloud): reads and the portal are both admin+
+        Some(&"billing") => Role::Admin,
         Some(&"servers") => match rest.get(2) {
             // server lifecycle (create/update/delete/suspend/ip_pool)
             None | Some(&"suspend") | Some(&"unsuspend") | Some(&"ip_pool") => {
@@ -1143,6 +1170,14 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/suppressions/{address}",
             axum::routing::delete(resources::suppressions_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/billing",
+            get(crate::billing::billing_show),
+        )
+        .route(
+            "/organizations/{permalink}/billing/portal",
+            axum::routing::post(crate::billing::billing_portal),
         )
         .route(
             "/organizations/{permalink}/members",

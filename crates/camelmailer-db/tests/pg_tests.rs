@@ -1733,3 +1733,62 @@ async fn pg_auth_resets_oidc_and_audit() {
     assert_eq!(events[0].event, "logout");
     assert_eq!(events[1].event, "login.success");
 }
+
+// ------------------------------------------------------------ billing
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn billing_customer_id_roundtrip() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    // Absent by default (nullable column).
+    assert_eq!(
+        f.store
+            .organization_billing_customer_id(f.organization.id)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Set, read back, overwrite (idempotent customer reuse).
+    f.store
+        .set_organization_billing_customer_id(f.organization.id, "cus_123")
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .organization_billing_customer_id(f.organization.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("cus_123")
+    );
+    f.store
+        .set_organization_billing_customer_id(f.organization.id, "cus_456")
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .organization_billing_customer_id(f.organization.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("cus_456")
+    );
+
+    // Unknown organizations: get is None, set is an error — the same
+    // behaviour as MemoryStore.
+    assert_eq!(
+        f.store
+            .organization_billing_customer_id(9999)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(f
+        .store
+        .set_organization_billing_customer_id(9999, "cus_x")
+        .await
+        .is_err());
+}

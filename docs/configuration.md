@@ -134,6 +134,27 @@ web_server:
   cors_origins: []                   # browser origins allowed to call the APIs
 ```
 
+### `billing:` — Stripe billing (hosted cloud)
+
+For the hosted cloud offering only. **Self-hosted installations stay
+completely billing-free**: the group defaults to `enabled: false`, the
+billing endpoints report `enabled: false` / answer `403 BillingDisabled`,
+and the dashboard shows no billing UI at all.
+
+```yaml
+billing:
+  enabled: false                     # cloud only; requires stripe_secret_key
+  # stripe_secret_key: sk_live_…     # never logged
+  # portal_return_url: https://mail-admin.example.com   # default: auth.frontend_url
+```
+
+When enabled, organization admins/owners get a **Billing Portal** entry in
+the organization settings. The backend creates the Stripe customer lazily
+on first use (`POST /api/v2/admin/organizations/{org}/billing/portal`,
+idempotent — an existing customer is reused) and redirects into Stripe's
+billing portal. Stripe outages surface as the stable error code
+`BillingUnavailable`; Stripe error details are only ever logged.
+
 ## Production checklist
 
 - [ ] `POSTGRES_PASSWORD` strong; database backed up (it holds config *and* mail)
