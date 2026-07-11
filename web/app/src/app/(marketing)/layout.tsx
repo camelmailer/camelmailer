@@ -23,7 +23,7 @@ const FOOTER: [string, [string, string][]][] = [
     ["/docs/api", "API guide"],
     ["/docs/self-hosting", "Self-hosting guide"],
     ["/open-source", "Open source"],
-    ["https://github.com/relationsoftware/postal", "GitHub"],
+    ["https://github.com/camelmailer/camelmailer", "GitHub"],
   ]],
   ["Legal", [
     ["/legal/imprint", "Imprint"],
