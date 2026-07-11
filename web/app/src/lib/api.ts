@@ -7,14 +7,16 @@
 // Auth: user sessions send `Authorization: Bearer <token>`; the messaging
 // endpoints of a mail server send `X-Server-API-Key` instead.
 
-const BASE_URL: string = import.meta.env.VITE_API_URL ?? ""
+const BASE_URL: string = process.env.NEXT_PUBLIC_API_URL ?? ""
 
 const TOKEN_KEY = "camelmailer.session_token"
 
 export function getToken(): string | null {
+  if (typeof window === "undefined") return null
   return localStorage.getItem(TOKEN_KEY)
 }
 export function setToken(token: string | null) {
+  if (typeof window === "undefined") return
   if (token === null) localStorage.removeItem(TOKEN_KEY)
   else localStorage.setItem(TOKEN_KEY, token)
 }

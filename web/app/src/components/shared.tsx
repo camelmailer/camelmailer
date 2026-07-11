@@ -1,3 +1,5 @@
+"use client"
+
 // Small shared building blocks used across the CRUD pages.
 
 import { useState, type ReactNode } from "react"

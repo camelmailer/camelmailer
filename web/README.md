@@ -1,65 +1,66 @@
 # CamelMailer web
 
-Two frontends live here:
+One **Next.js** application (App Router) serves both faces of the product:
 
-- **`app/`** — the admin application: React + TypeScript (Vite),
-  [shadcn/ui](https://ui.shadcn.com) on Tailwind CSS v4, TanStack Query and
-  React Router. Covers the full API surface: login (password + TOTP + SSO),
-  organizations, RBAC member management, invitations, servers with all
-  resources (domains, credentials, routes, webhooks, suppressions), and
-  messaging via the per-server API (send, messages, inbound queue, stats,
-  streams, templates), plus the instance-admin area (users, IP pools,
-  admin API keys, audit log) and account security (password, 2FA with QR
-  enrollment).
-- **`marketing/`** — the dependency-free static marketing site: landing
-  page, cloud pricing, open-source page, legal pages (imprint, privacy,
-  terms, DPA, AUP, sub-processors — placeholder templates for counsel
-  review), API + self-hosting guides, and the public `openapi.yaml`.
-  Pages are generated from a shared layout: edit `build.py` /
-  `content_docs.py`, run `python3 build.py`, commit the output. Host the
-  directory anywhere static.
+- **Marketing** — `/`, `/pricing`, `/templates`, `/open-source`,
+  `/docs/api`, `/docs/self-hosting`, `/legal/*` and the public
+  `/openapi.yaml`: statically prerendered, scoped styles, no client JS
+  beyond Next itself.
+- **App** — `/login` (+ password reset, invitation accept, SSO callback)
+  and the signed-in area under `/dashboard`, `/orgs/[org]`,
+  `/orgs/[org]/servers/[server]` (settings, domains, credentials, routes,
+  webhooks, suppressions, messaging), `/account`, `/admin/*`: client
+  components built on shadcn/ui (Tailwind v4), TanStack Query and the
+  typed API client in `src/lib/api.ts`.
 
 ## Development
 
 ```bash
 cd web/app
 pnpm install
-pnpm run dev        # http://localhost:5173, proxies /api -> localhost:5000
+pnpm run dev        # http://localhost:3000
 ```
 
-The Vite dev server proxies the API, so no CORS setup is needed during
-development — just have the backend running (`docker compose up -d` in the
-repo root).
+The Next server proxies `/api` and `/health` to the backend
+(`API_PROXY_URL`, default `http://localhost:5000`) — no CORS setup needed.
+Have the backend running: `docker compose up -d` in the repo root.
 
-## Production build
+## Production
 
 ```bash
-pnpm run build      # -> dist/
+pnpm run build
+API_PROXY_URL=https://mail.internal:5000 pnpm run start
 ```
 
-Serve `dist/` from any static host. Two backend settings make it work:
+Because the Next server proxies the API, the app is same-origin in
+production too — `web_server.cors_origins` stays empty. Set
+`auth.frontend_url` on the backend to this app's public URL so
+invitation/reset links and the SSO handoff point here. (Alternative: skip
+the proxy, set `NEXT_PUBLIC_API_URL` at build time and configure CORS.)
 
-```yaml
-auth:
-  frontend_url: https://app.your-domain.com   # invite/reset/SSO links
-web_server:
-  cors_origins:
-    - https://app.your-domain.com             # unless served same-origin
+## Layout
+
 ```
-
-Set `VITE_API_URL` at build time when the API lives on another origin
-(default: same origin).
+src/app/            routes (App Router)
+  (marketing)/      static pages + scoped marketing.css + content.ts
+  (app)/            signed-in area (layout = session gate + sidebar shell)
+  login/, reset-password/, invitations/accept/, auth/callback/
+src/views/          the page components (client), shared by the routes
+src/components/     shadcn/ui + shared building blocks
+src/lib/            api client, auth context, params helper
+public/openapi.yaml the public OpenAPI spec
+```
 
 ## End-to-end smoke test
 
-`app/e2e/smoke.mjs` drives the real UI (Playwright) against the Docker
-backend: login → create org/server/domain/credential → send a message →
-messages/stats → invitation → audit log.
+`app/e2e/smoke.mjs` (Playwright) drives the real UI against the Docker
+backend: marketing landing → login → org/server/domain/credential →
+send → message detail → stats → invitation → audit log.
 
 ```bash
-docker compose up -d                # backend on :5000 (fresh database)
+docker compose up -d
 docker compose exec -e CAMELMAILER_USER_PASSWORD=e2e-test-password-1 \
   web camelmailer make-user e2e@example.com E2E Tester --admin
-pnpm run dev &                      # frontend on :5173
+pnpm run dev &
 node e2e/smoke.mjs
 ```

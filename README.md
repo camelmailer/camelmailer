@@ -9,12 +9,12 @@ audit log and CORS make it frontend- and enterprise-ready out of the box.
 One small binary runs every process role. MIT licensed; born as a full
 Rust rewrite of [Postal](https://github.com/postalserver/postal).
 
-**Web frontend included:** `web/app` is a React (shadcn/ui) admin
-application covering the entire API — login with 2FA/SSO, organizations
-and roles, servers with all resources, sending and message browsing —
-and `web/marketing` is the dependency-free marketing site (landing,
-cloud pricing, open-source and legal pages, API + self-hosting guides,
-and the public [OpenAPI spec](web/marketing/openapi.yaml)). See
+**Web frontend included:** `web/app` is a Next.js application serving
+both the marketing site (landing, cloud pricing, open-source + legal
+pages, API/self-hosting guides, the public
+[OpenAPI spec](web/app/public/openapi.yaml)) and the shadcn/ui admin app
+covering the entire API — login with 2FA/SSO, organizations and roles,
+servers with all resources, sending and message browsing. See
 [web/README.md](web/README.md). A library of 20 ready-to-clone
 transactional email templates lives in [templates/](templates/README.md).
 

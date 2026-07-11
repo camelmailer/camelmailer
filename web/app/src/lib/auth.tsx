@@ -1,3 +1,5 @@
+"use client"
+
 // Session state: holds the Bearer token + the /me payload and exposes
 // login/logout. Pages consume it via useAuth().
 
@@ -25,9 +27,11 @@ type AuthContextValue = {
 const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [token, setTokenState] = useState<string | null>(getToken())
+  // Initialized in an effect (not from localStorage directly) so server
+  // rendering and hydration agree on the initial markup.
+  const [token, setTokenState] = useState<string | null>(null)
   const [me, setMe] = useState<MeResponse | null>(null)
-  const [loading, setLoading] = useState<boolean>(Boolean(getToken()))
+  const [loading, setLoading] = useState<boolean>(true)
 
   const refresh = useCallback(async () => {
     if (!getToken()) {
@@ -45,7 +49,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
-    if (token) {
+    const stored = getToken()
+    setTokenState(stored)
+    if (stored) {
       refresh().finally(() => setLoading(false))
     } else {
       setLoading(false)
