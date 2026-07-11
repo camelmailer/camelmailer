@@ -53,6 +53,37 @@ pub struct NewWebhook {
     pub url: String,
     pub all_events: bool,
     pub sign: bool,
+    /// Subscribed event names (see [`crate::model::WEBHOOK_EVENTS`]);
+    /// empty = all events.
+    pub events: Vec<String>,
+    /// Extra HTTP headers for every delivery request. Values are
+    /// secrets — never log them.
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+impl NewWebhook {
+    /// A webhook subscribed to everything, without custom headers — the
+    /// pre-events construction shape, kept for tests and callers that
+    /// don't care about filtering.
+    pub fn all(server_id: Id, name: &str, url: &str, sign: bool) -> Self {
+        Self {
+            server_id,
+            name: name.into(),
+            url: url.into(),
+            all_events: true,
+            sign,
+            events: Vec::new(),
+            headers: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NewSenderAddress {
+    pub server_id: Id,
+    pub email_address: String,
+    /// Hash of the verification token mailed to the address.
+    pub verification_token_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +203,34 @@ pub trait AdminStore: Send + Sync {
     async fn create_webhook(&self, new: NewWebhook) -> Result<Webhook, StoreError>;
     async fn update_webhook(&self, webhook: Webhook) -> Result<Webhook, StoreError>;
     async fn delete_webhook(&self, id: Id) -> Result<bool, StoreError>;
+
+    // sender addresses (server-scoped; per-address From authorization)
+    async fn list_sender_addresses(&self, server_id: Id) -> Result<Vec<SenderAddress>, StoreError>;
+    async fn sender_address_by_id(
+        &self,
+        server_id: Id,
+        id: Id,
+    ) -> Result<Option<SenderAddress>, StoreError>;
+    async fn create_sender_address(
+        &self,
+        new: NewSenderAddress,
+    ) -> Result<SenderAddress, StoreError>;
+    /// Confirm the sender address holding this verification-token hash:
+    /// marks it verified, clears the token, and returns it. `None` when no
+    /// unconfirmed address carries the hash (invalid or already used).
+    async fn confirm_sender_address(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<SenderAddress>, StoreError>;
+    async fn delete_sender_address(&self, id: Id) -> Result<bool, StoreError>;
+    /// Is `email` (case-insensitive, exact match) a confirmed sender
+    /// address of the server? The per-address half of the From
+    /// authorization used by the HTTP send path.
+    async fn confirmed_sender_address(
+        &self,
+        server_id: Id,
+        email: &str,
+    ) -> Result<bool, StoreError>;
 
     // suppressions (tenant-scoped)
     async fn list_suppressions(&self, server_id: Id) -> Result<Vec<Suppression>, StoreError>;
@@ -594,6 +653,8 @@ impl AdminStore for crate::store::MemoryStore {
             all_events: new.all_events,
             enabled: true,
             sign: new.sign,
+            events: new.events,
+            headers: new.headers,
         };
         self.inner
             .write()
@@ -614,6 +675,110 @@ impl AdminStore for crate::store::MemoryStore {
 
     async fn delete_webhook(&self, id: Id) -> Result<bool, StoreError> {
         Ok(self.inner.write().unwrap().webhooks.remove(&id).is_some())
+    }
+
+    async fn list_sender_addresses(&self, server_id: Id) -> Result<Vec<SenderAddress>, StoreError> {
+        let mut addresses: Vec<SenderAddress> = self
+            .inner
+            .read()
+            .unwrap()
+            .sender_addresses
+            .values()
+            .filter(|a| a.server_id == server_id)
+            .cloned()
+            .collect();
+        addresses.sort_by_key(|a| a.id);
+        Ok(addresses)
+    }
+
+    async fn sender_address_by_id(
+        &self,
+        server_id: Id,
+        id: Id,
+    ) -> Result<Option<SenderAddress>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .sender_addresses
+            .get(&id)
+            .filter(|a| a.server_id == server_id)
+            .cloned())
+    }
+
+    async fn create_sender_address(
+        &self,
+        new: NewSenderAddress,
+    ) -> Result<SenderAddress, StoreError> {
+        {
+            let inner = self.inner.read().unwrap();
+            if inner.sender_addresses.values().any(|a| {
+                a.server_id == new.server_id
+                    && a.email_address.eq_ignore_ascii_case(&new.email_address)
+            }) {
+                return Err(StoreError::Conflict(
+                    "Email address has already been added".into(),
+                ));
+            }
+        }
+        let address = SenderAddress {
+            id: self.next_id(),
+            uuid: crate::token::generate_uuid(),
+            server_id: new.server_id,
+            email_address: new.email_address,
+            verified: false,
+            verification_token_hash: Some(new.verification_token_hash),
+        };
+        self.inner
+            .write()
+            .unwrap()
+            .sender_addresses
+            .insert(address.id, address.clone());
+        Ok(address)
+    }
+
+    async fn confirm_sender_address(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<SenderAddress>, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let address = inner
+            .sender_addresses
+            .values_mut()
+            .find(|a| !a.verified && a.verification_token_hash.as_deref() == Some(token_hash));
+        Ok(address.map(|address| {
+            address.verified = true;
+            address.verification_token_hash = None;
+            address.clone()
+        }))
+    }
+
+    async fn delete_sender_address(&self, id: Id) -> Result<bool, StoreError> {
+        Ok(self
+            .inner
+            .write()
+            .unwrap()
+            .sender_addresses
+            .remove(&id)
+            .is_some())
+    }
+
+    async fn confirmed_sender_address(
+        &self,
+        server_id: Id,
+        email: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .sender_addresses
+            .values()
+            .any(|a| {
+                a.server_id == server_id
+                    && a.verified
+                    && a.email_address.eq_ignore_ascii_case(email)
+            }))
     }
 
     async fn list_suppressions(&self, server_id: Id) -> Result<Vec<Suppression>, StoreError> {
@@ -837,6 +1002,158 @@ impl AdminStore for crate::store::MemoryStore {
 mod tests {
     use super::*;
     use crate::store::MemoryStore;
+
+    #[tokio::test]
+    async fn webhooks_persist_events_and_headers() {
+        let store = MemoryStore::new();
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer secret".to_string());
+        let webhook = store
+            .create_webhook(NewWebhook {
+                server_id: 1,
+                name: "hook".into(),
+                url: "https://example.com/hook".into(),
+                all_events: false,
+                sign: true,
+                events: vec!["MessageSent".into()],
+                headers: headers.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(webhook.events, vec!["MessageSent".to_string()]);
+        assert_eq!(webhook.headers, headers);
+        assert!(webhook.subscribes_to("MessageSent"));
+        assert!(!webhook.subscribes_to("MessageHeld"));
+
+        let listed = store.list_webhooks(1).await.unwrap();
+        assert_eq!(listed[0].events, vec!["MessageSent".to_string()]);
+        assert_eq!(listed[0].headers, headers);
+
+        // empty events = all events (backwards compatible)
+        let broad = store
+            .create_webhook(NewWebhook::all(1, "all", "https://example.com/all", false))
+            .await
+            .unwrap();
+        for event in crate::model::WEBHOOK_EVENTS {
+            assert!(broad.subscribes_to(event));
+        }
+
+        // update round-trips the new fields
+        let mut updated = webhook.clone();
+        updated.events = vec!["MessageHeld".into()];
+        updated.headers.insert("X-Extra".into(), "1".into());
+        let updated = store.update_webhook(updated).await.unwrap();
+        let fetched = store.webhook_by_id(1, updated.id).await.unwrap().unwrap();
+        assert_eq!(fetched.events, vec!["MessageHeld".to_string()]);
+        assert_eq!(
+            fetched.headers.get("X-Extra").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_webhooks_do_not_subscribe() {
+        let store = MemoryStore::new();
+        let mut webhook = store
+            .create_webhook(NewWebhook::all(1, "hook", "https://example.com", false))
+            .await
+            .unwrap();
+        webhook.enabled = false;
+        let webhook = store.update_webhook(webhook).await.unwrap();
+        assert!(!webhook.subscribes_to("MessageSent"));
+    }
+
+    #[tokio::test]
+    async fn sender_addresses_are_created_confirmed_and_authorize_sends() {
+        let store = MemoryStore::new();
+        let created = store
+            .create_sender_address(NewSenderAddress {
+                server_id: 1,
+                email_address: "ada@external.example".into(),
+                verification_token_hash: "hash-1".into(),
+            })
+            .await
+            .unwrap();
+        assert!(!created.verified);
+        assert_eq!(created.email_address, "ada@external.example");
+
+        // pending addresses do not authorize
+        assert!(!store
+            .confirmed_sender_address(1, "ada@external.example")
+            .await
+            .unwrap());
+
+        // an unknown token confirms nothing
+        assert!(store
+            .confirm_sender_address("wrong-hash")
+            .await
+            .unwrap()
+            .is_none());
+
+        let confirmed = store
+            .confirm_sender_address("hash-1")
+            .await
+            .unwrap()
+            .expect("token must confirm");
+        assert!(confirmed.verified);
+        assert!(confirmed.verification_token_hash.is_none());
+
+        // the token is single-use
+        assert!(store
+            .confirm_sender_address("hash-1")
+            .await
+            .unwrap()
+            .is_none());
+
+        // confirmed addresses authorize, case-insensitively, per server
+        assert!(store
+            .confirmed_sender_address(1, "Ada@External.Example")
+            .await
+            .unwrap());
+        assert!(!store
+            .confirmed_sender_address(2, "ada@external.example")
+            .await
+            .unwrap());
+        assert!(!store
+            .confirmed_sender_address(1, "other@external.example")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn sender_addresses_reject_duplicates_and_delete() {
+        let store = MemoryStore::new();
+        let new = |email: &str| NewSenderAddress {
+            server_id: 1,
+            email_address: email.into(),
+            verification_token_hash: crate::token::generate_token(8),
+        };
+        let address = store
+            .create_sender_address(new("ada@external.example"))
+            .await
+            .unwrap();
+        let error = store
+            .create_sender_address(new("ADA@external.example"))
+            .await
+            .expect_err("duplicate address must conflict");
+        assert!(matches!(error, StoreError::Conflict(_)));
+
+        assert!(store
+            .sender_address_by_id(1, address.id)
+            .await
+            .unwrap()
+            .is_some());
+        // scoping: another server does not see it
+        assert!(store
+            .sender_address_by_id(2, address.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        assert!(store.delete_sender_address(address.id).await.unwrap());
+        assert!(!store.delete_sender_address(address.id).await.unwrap());
+        assert!(store.list_sender_addresses(1).await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn create_user_rejects_a_duplicate_email_address() {

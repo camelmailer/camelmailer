@@ -267,6 +267,7 @@ const TABS = [
   { value: "credentials", label: "Credentials" },
   { value: "routes", label: "Routes" },
   { value: "webhooks", label: "Webhooks" },
+  { value: "sender-addresses", label: "Senders" },
   { value: "suppressions", label: "Suppressions" },
   { value: "messaging", label: "Messaging" },
 ]

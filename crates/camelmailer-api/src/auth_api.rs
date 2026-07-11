@@ -1131,6 +1131,47 @@ async fn invitation_accept(
     render_success(Some(&start.0), StatusCode::OK, data)
 }
 
+// ------------------------------------------------- sender addresses
+
+#[derive(Debug, Deserialize)]
+struct ConfirmSenderAddress {
+    token: Option<String>,
+}
+
+/// `POST /api/v2/auth/sender-addresses/confirm` — confirm a sender
+/// address via the emailed verification token. Public: the token is the
+/// secret (single-use, stored hashed).
+async fn sender_address_confirm(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Json(body): Json<ConfirmSenderAddress>,
+) -> ApiResponse {
+    let Some(token) = body.token.filter(|t| !t.is_empty()) else {
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: token",
+        );
+    };
+    match state
+        .store
+        .confirm_sender_address(&auth::hash_token(&token))
+        .await
+    {
+        Ok(Some(address)) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "confirmed": true, "email_address": address.email_address }),
+        ),
+        Ok(None) => render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "InvalidToken",
+            "The confirmation token is invalid or has already been used",
+        ),
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
 /// Build the `/api/v2/auth` router.
 pub fn build_auth_router(state: Arc<ApiState>) -> Router {
     let public = Router::new()
@@ -1139,7 +1180,8 @@ pub fn build_auth_router(state: Arc<ApiState>) -> Router {
         .route("/password-reset", post(password_reset_request))
         .route("/password-reset/complete", post(password_reset_complete))
         .route("/invitations/accept", post(invitation_accept))
-        .route("/invitations/{token}", get(invitation_preview));
+        .route("/invitations/{token}", get(invitation_preview))
+        .route("/sender-addresses/confirm", post(sender_address_confirm));
 
     let protected = Router::new()
         .route("/logout", post(logout))

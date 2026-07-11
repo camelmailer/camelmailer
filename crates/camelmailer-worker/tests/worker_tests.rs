@@ -230,13 +230,7 @@ async fn outgoing_messages_are_delivered_via_the_relay_and_webhooked() {
     let hook = mock_http(axum::http::StatusCode::OK).await;
 
     s.store
-        .create_webhook(NewWebhook {
-            server_id: s.server.id,
-            name: "hook".into(),
-            url: hook.url.clone(),
-            all_events: true,
-            sign: false,
-        })
+        .create_webhook(NewWebhook::all(s.server.id, "hook", &hook.url, false))
         .await
         .unwrap();
 
@@ -275,13 +269,7 @@ async fn soft_failures_are_requeued_with_backoff_and_delayed_webhook() {
     let smtp = mock_smtp("421 Try again later").await;
     let hook = mock_http(axum::http::StatusCode::OK).await;
     s.store
-        .create_webhook(NewWebhook {
-            server_id: s.server.id,
-            name: "hook".into(),
-            url: hook.url.clone(),
-            all_events: true,
-            sign: false,
-        })
+        .create_webhook(NewWebhook::all(s.server.id, "hook", &hook.url, false))
         .await
         .unwrap();
 
@@ -323,13 +311,7 @@ async fn hard_failures_leave_the_queue_and_fire_failure_webhook() {
     let smtp = mock_smtp("550 No such user").await;
     let hook = mock_http(axum::http::StatusCode::OK).await;
     s.store
-        .create_webhook(NewWebhook {
-            server_id: s.server.id,
-            name: "hook".into(),
-            url: hook.url.clone(),
-            all_events: true,
-            sign: false,
-        })
+        .create_webhook(NewWebhook::all(s.server.id, "hook", &hook.url, false))
         .await
         .unwrap();
 
@@ -345,6 +327,93 @@ async fn hard_failures_leave_the_queue_and_fire_failure_webhook() {
     worker.drain_webhooks().await.unwrap();
     let hooks = hook.requests.lock().unwrap().clone();
     assert_eq!(hooks[0]["event"], "MessageDeliveryFailed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhooks_fire_only_for_subscribed_events() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let failures_hook = mock_http(axum::http::StatusCode::OK).await;
+    let all_hook = mock_http(axum::http::StatusCode::OK).await;
+
+    // subscribed to failures only — must NOT fire for MessageSent
+    s.store
+        .create_webhook(NewWebhook {
+            server_id: s.server.id,
+            name: "failures".into(),
+            url: failures_hook.url.clone(),
+            all_events: false,
+            sign: false,
+            events: vec!["MessageDeliveryFailed".into(), "MessageHeld".into()],
+            headers: Default::default(),
+        })
+        .await
+        .unwrap();
+    // empty events = all events (backwards compatible)
+    s.store
+        .create_webhook(NewWebhook::all(s.server.id, "all", &all_hook.url, false))
+        .await
+        .unwrap();
+
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
+    worker.drain_webhooks().await.unwrap();
+
+    assert_eq!(failures_hook.requests.lock().unwrap().len(), 0);
+    let all = all_hook.requests.lock().unwrap().clone();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0]["event"], "MessageSent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_requests_carry_the_configured_custom_headers() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let hook = mock_http_full(axum::http::StatusCode::OK).await;
+
+    let mut custom_headers = std::collections::BTreeMap::new();
+    custom_headers.insert("Authorization".to_string(), "Bearer hunter2".to_string());
+    custom_headers.insert("X-Custom".to_string(), "camel".to_string());
+    s.store
+        .create_webhook(NewWebhook {
+            server_id: s.server.id,
+            name: "hook".into(),
+            url: hook.url.clone(),
+            all_events: false,
+            sign: false,
+            events: vec!["MessageSent".into()],
+            headers: custom_headers,
+        })
+        .await
+        .unwrap();
+
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+    assert_eq!(worker.drain_webhooks().await.unwrap(), 1);
+
+    let requests = hook.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    let (headers, _body) = &requests[0];
+    // custom headers arrive alongside the platform headers
+    assert_eq!(headers["authorization"], "Bearer hunter2");
+    assert_eq!(headers["x-custom"], "camel");
+    assert_eq!(headers["x-camelmailer-event"], "MessageSent");
+    assert!(headers["x-camelmailer-uuid"].is_string());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -565,13 +634,7 @@ async fn webhook_payloads_are_signed_and_verifiable() {
     let hook = mock_http_full(axum::http::StatusCode::OK).await;
 
     s.store
-        .create_webhook(NewWebhook {
-            server_id: s.server.id,
-            name: "signed".into(),
-            url: hook.url.clone(),
-            all_events: true,
-            sign: true,
-        })
+        .create_webhook(NewWebhook::all(s.server.id, "signed", &hook.url, true))
         .await
         .unwrap();
     s.sink
@@ -622,13 +685,7 @@ async fn failing_webhooks_are_retried_with_backoff_and_logged() {
     let hook = mock_http(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
 
     s.store
-        .create_webhook(NewWebhook {
-            server_id: s.server.id,
-            name: "flaky".into(),
-            url: hook.url.clone(),
-            all_events: true,
-            sign: false,
-        })
+        .create_webhook(NewWebhook::all(s.server.id, "flaky", &hook.url, false))
         .await
         .unwrap();
     s.sink

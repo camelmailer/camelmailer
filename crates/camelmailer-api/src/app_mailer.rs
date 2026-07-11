@@ -91,6 +91,35 @@ pub(crate) fn invitation_mail(
     }
 }
 
+/// The sender-address confirmation mail: sent to exactly the address
+/// being added, carrying the frontend confirm link
+/// (`{frontend_url}/sender-addresses/confirm?token=…`).
+pub(crate) fn sender_address_confirmation_mail(to: &str, link: &str) -> AppMail {
+    AppMail {
+        to: to.to_string(),
+        subject: "Confirm your sender address on CamelMailer".into(),
+        text_body: format!(
+            "Hello,\n\n\
+             This email address was added as a sender address on a \
+             CamelMailer mail server. Confirm that you own it using this \
+             link:\n\n\
+             {link}\n\n\
+             If you did not expect this email, you can ignore it — the \
+             address will stay unconfirmed.\n"
+        ),
+        html_body: format!(
+            "<p>Hello,</p>\
+             <p>This email address was added as a sender address on a \
+             CamelMailer mail server. Confirm that you own it using this \
+             link:</p>\
+             <p><a href=\"{link}\">{link}</a></p>\
+             <p>If you did not expect this email, you can ignore it — the \
+             address will stay unconfirmed.</p>",
+            link = escape_html(link),
+        ),
+    }
+}
+
 /// The welcome mail after self-registration. Carries no token.
 pub(crate) fn welcome_mail(to: &str, first_name: &str, frontend_url: Option<&str>) -> AppMail {
     let greeting = if first_name.is_empty() {

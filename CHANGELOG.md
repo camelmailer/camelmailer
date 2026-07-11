@@ -15,6 +15,41 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Webhook trigger granularity + custom headers** — webhooks carry an
+  `events` list (any of `MessageSent`, `MessageDelayed`,
+  `MessageDeliveryFailed`, `MessageHeld`; empty = all events, so existing
+  webhooks keep firing unchanged) and a `headers` map of extra HTTP
+  headers (e.g. `Authorization`) set on every delivery request alongside
+  the signature headers. The worker filters events at enqueue time;
+  create/update via the management API validates event names (unknown
+  name → `ValidationError` listing the valid ones) and header syntax
+  (values are never logged or echoed). New `PATCH …/webhooks/{id}`;
+  the dashboard's webhook form gained event checkboxes and a header
+  key/value list.
+- **Per-address sender signatures** — `sender_addresses`: a server may
+  send From an exact address once its owner confirms it, without a
+  verified sending domain. `POST/GET/DELETE
+  /api/v2/admin/organizations/{org}/servers/{server}/sender_addresses`
+  creates the address with a hashed verification token and (with
+  `app_mail` enabled) emails a confirmation link
+  (`{frontend_url}/sender-addresses/confirm?token=…`) to exactly that
+  address — otherwise the token is returned to the operator once.
+  Public `POST /api/v2/auth/sender-addresses/confirm` redeems the
+  single-use token. From-authorization on both the HTTP and SMTP send
+  paths now accepts a verified sending domain OR a confirmed sender
+  address (exact, case-insensitive match). Dashboard: a "Senders" tab
+  per server plus a public confirm page.
+- **Template push between servers** — `POST
+  /api/v2/admin/organizations/{org}/servers/{server}/templates/{permalink}/copy_to`
+  with `{ "target_server": "<permalink>" }` copies a template to another
+  server of the same organization (member role or above; a target
+  outside the organization is an indistinguishable 404). An existing
+  permalink on the target is a 422 `ValidationError` unless
+  `{ "overwrite": true }` is passed. Dashboard: a "Copy to server…"
+  action in the Templates view.
+
 ## [0.2.0] - 2026-07-11
 
 ### Added

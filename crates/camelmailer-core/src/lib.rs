@@ -18,8 +18,8 @@ pub mod testing;
 pub mod token;
 
 pub use admin_store::{
-    AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewServer, NewSuppression,
-    NewUser, NewWebhook, StoreError, TrackingStore, TrackingTarget,
+    AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewSenderAddress,
+    NewServer, NewSuppression, NewUser, NewWebhook, StoreError, TrackingStore, TrackingTarget,
 };
 pub use auth::{
     AuthEvent, AuthSession, Invitation, NewAuthEvent, NewAuthSession, NewInvitation,

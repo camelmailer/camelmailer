@@ -46,6 +46,7 @@ tags:
   - name: Credentials
   - name: Routes
   - name: Webhooks
+  - name: Sender addresses
   - name: Suppressions
   - name: People
   - name: Instance
@@ -434,6 +435,26 @@ paths:
               type: object
               properties:
                 template_model: { type: object, additionalProperties: true }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/auth/sender-addresses/confirm:
+    post:
+      tags: [Sender addresses]
+      summary: Confirm a sender address via its verification token
+      description: |
+        Public — the single-use token from the confirmation email is the
+        secret. An unknown or already-used token is an `InvalidToken`
+        error (422).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string }
       responses:
         "200": { $ref: "#/components/responses/Success" }
 
@@ -944,10 +965,20 @@ paths:
     post:
       tags: [Webhooks]
       summary: Create a webhook
+      description: |
+        `events` restricts the webhook to the listed event names (an empty
+        or omitted list subscribes to everything); an unknown name is a
+        `ValidationError` listing the valid ones. `headers` are extra HTTP
+        headers (e.g. `Authorization`) set on every delivery request —
+        values are treated as secrets and never logged.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters:
         - { $ref: "#/components/parameters/Org" }
         - { $ref: "#/components/parameters/ServerPermalink" }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookInput" }
       responses:
         "201": { $ref: "#/components/responses/Success" }
   /api/v2/admin/organizations/{org}/servers/{server}/webhooks/{id}:
@@ -959,6 +990,20 @@ paths:
         - { $ref: "#/components/parameters/Org" }
         - { $ref: "#/components/parameters/ServerPermalink" }
         - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Webhooks]
+      summary: Update a webhook (name, URL, sign, enabled, events, headers)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebhookInput" }
       responses:
         "200": { $ref: "#/components/responses/Success" }
     delete:
@@ -992,6 +1037,85 @@ paths:
         - { $ref: "#/components/parameters/ServerPermalink" }
         - { $ref: "#/components/parameters/Id" }
       responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/organizations/{org}/servers/{server}/sender_addresses:
+    get:
+      tags: [Sender addresses]
+      summary: List sender addresses
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Sender addresses]
+      summary: Add a sender address (sends a confirmation email)
+      description: |
+        Adds a single sender address in `pending` state and generates a
+        verification token (stored hashed). When platform mail (`app_mail`)
+        is enabled, a confirmation link
+        (`{frontend_url}/sender-addresses/confirm?token=…`) is emailed to
+        exactly this address; otherwise the response carries the token
+        once, as `verification_token`, for the operator to relay.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/sender_addresses/{id}:
+    delete:
+      tags: [Sender addresses]
+      summary: Delete a sender address (revokes its authorization)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/organizations/{org}/servers/{server}/templates/{permalink}/copy_to:
+    post:
+      tags: [Templates]
+      summary: Copy a template to another server of the same organization
+      description: |
+        Copies the template to the server named by `target_server` (a
+        server permalink of the SAME organization — anything else is a
+        404). If the permalink already exists on the target, the request
+        is a `ValidationError` (422) unless `overwrite: true` is passed.
+        Requires the `member` role or above.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Permalink" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_server]
+              properties:
+                target_server:
+                  type: string
+                  description: Permalink of the target server (same organization)
+                overwrite:
+                  type: boolean
+                  default: false
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
         "200": { $ref: "#/components/responses/Success" }
 
   /api/v2/admin/organizations/{org}/servers/{server}/suppressions:
@@ -1353,6 +1477,26 @@ components:
         subject: { type: string, description: "May contain {{ variables }}" }
         html_body: { type: string }
         text_body: { type: string }
+
+    WebhookInput:
+      type: object
+      properties:
+        name: { type: string }
+        url: { type: string, format: uri }
+        sign: { type: boolean, default: true, description: RSA-sign delivery payloads }
+        enabled: { type: boolean, description: Update only }
+        events:
+          type: array
+          description: Subscribed event names; empty = all events.
+          items:
+            type: string
+            enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld]
+        headers:
+          type: object
+          description: |
+            Extra HTTP headers set on every delivery request (e.g.
+            Authorization). Values are secrets — never logged.
+          additionalProperties: { type: string }
 
     User:
       type: object

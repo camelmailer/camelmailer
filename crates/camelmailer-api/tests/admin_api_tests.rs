@@ -982,3 +982,265 @@ async fn health_is_public_and_reports_the_version() {
     assert_eq!(body["status"], "ok");
     assert!(body["version"].is_string());
 }
+
+// ------------------------------------- webhook events + custom headers
+
+#[tokio::test]
+async fn webhooks_accept_subscribed_events_and_custom_headers() {
+    let app = build_app_with_server().await;
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/webhooks"),
+        Some(GLOBAL_KEY),
+        Some(json!({
+            "name": "Filtered",
+            "url": "https://hooks.example/cb",
+            "events": ["MessageSent", "MessageDeliveryFailed"],
+            "headers": { "Authorization": "Bearer hunter2", "X-Custom": "1" },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let webhook = &body["data"]["webhook"];
+    assert_eq!(
+        webhook["events"],
+        json!(["MessageSent", "MessageDeliveryFailed"])
+    );
+    assert_eq!(webhook["headers"]["Authorization"], "Bearer hunter2");
+    assert_eq!(webhook["headers"]["X-Custom"], "1");
+    // a non-empty subscription is not "all events"
+    assert_eq!(webhook["all_events"], false);
+    let id = webhook["id"].as_u64().unwrap();
+
+    // GET returns both fields
+    let (status, body) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/webhooks/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["webhook"]["events"],
+        json!(["MessageSent", "MessageDeliveryFailed"])
+    );
+    assert_eq!(
+        body["data"]["webhook"]["headers"]["Authorization"],
+        "Bearer hunter2"
+    );
+
+    // PATCH updates events and headers; clearing events = all events again
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &format!("{BASE}/webhooks/{id}"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "events": [], "headers": {} })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["webhook"]["events"], json!([]));
+    assert_eq!(body["data"]["webhook"]["headers"], json!({}));
+    assert_eq!(body["data"]["webhook"]["all_events"], true);
+}
+
+#[tokio::test]
+async fn webhooks_default_to_all_events_without_headers() {
+    let app = build_app_with_server().await;
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/webhooks"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Hook", "url": "https://hooks.example/cb" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["webhook"]["events"], json!([]));
+    assert_eq!(body["data"]["webhook"]["headers"], json!({}));
+    assert_eq!(body["data"]["webhook"]["all_events"], true);
+}
+
+#[tokio::test]
+async fn webhooks_reject_unknown_event_names_listing_the_valid_ones() {
+    let app = build_app_with_server().await;
+    for (method, path, body) in [(
+        "POST",
+        format!("{BASE}/webhooks"),
+        json!({ "name": "Hook", "url": "https://hooks.example/cb", "events": ["MessageOpened"] }),
+    )] {
+        let (status, response) = request(&app, method, &path, Some(GLOBAL_KEY), Some(body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response["error"]["code"], "ValidationError");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("\"MessageOpened\""), "{message}");
+        for valid in [
+            "MessageSent",
+            "MessageDelayed",
+            "MessageDeliveryFailed",
+            "MessageHeld",
+        ] {
+            assert!(message.contains(valid), "{message} should list {valid}");
+        }
+    }
+
+    // the same validation applies on update
+    let (_, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/webhooks"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Hook", "url": "https://hooks.example/cb" })),
+    )
+    .await;
+    let id = body["data"]["webhook"]["id"].as_u64().unwrap();
+    let (status, response) = request(
+        &app,
+        "PATCH",
+        &format!("{BASE}/webhooks/{id}"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "events": ["Nonsense"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response["error"]["code"], "ValidationError");
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("MessageHeld"));
+}
+
+#[tokio::test]
+async fn webhooks_reject_invalid_header_names_without_echoing_values() {
+    let app = build_app_with_server().await;
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/webhooks"),
+        Some(GLOBAL_KEY),
+        Some(json!({
+            "name": "Hook",
+            "url": "https://hooks.example/cb",
+            "headers": { "bad header name": "top-secret-value" },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("bad header name"), "{message}");
+    // the header VALUE must never appear in an error (or a log)
+    assert!(!message.contains("top-secret-value"), "{message}");
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/webhooks"),
+        Some(GLOBAL_KEY),
+        Some(json!({
+            "name": "Hook",
+            "url": "https://hooks.example/cb",
+            "headers": { "X-Ok": "bad\nvalue-top-secret" },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("X-Ok"), "{message}");
+    assert!(!message.contains("top-secret"), "{message}");
+}
+
+// -------------------------------------------------- sender addresses
+
+#[tokio::test]
+async fn sender_addresses_create_list_delete() {
+    let app = build_app_with_server().await;
+
+    // missing / invalid email
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/sender_addresses"),
+        Some(GLOBAL_KEY),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/sender_addresses"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "email": "not-an-email" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+
+    // create: pending, and (app_mail disabled) the one-time token is returned
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/sender_addresses"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "email": "Solo@External.example" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let address = &body["data"]["sender_address"];
+    assert_eq!(address["email_address"], "solo@external.example");
+    assert_eq!(address["verified"], false);
+    assert_eq!(address["status"], "pending");
+    assert!(body["data"]["verification_token"].is_string());
+    let id = address["id"].as_u64().unwrap();
+
+    // duplicates conflict (case-insensitive)
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/sender_addresses"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "email": "solo@external.example" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // list contains it — without any token material
+    let (status, body) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/sender_addresses"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = body["data"]["sender_addresses"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].get("verification_token").is_none());
+    assert!(listed[0].get("verification_token_hash").is_none());
+
+    // delete
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/sender_addresses/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/sender_addresses/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

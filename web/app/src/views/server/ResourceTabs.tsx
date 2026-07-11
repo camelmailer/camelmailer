@@ -41,7 +41,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { adminApi, ApiError } from "@/lib/api"
+import { adminApi, ApiError, WEBHOOK_EVENTS } from "@/lib/api"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -497,16 +497,39 @@ export function Webhooks({ org, server }: Scope) {
   const [name, setName] = useState("")
   const [url, setUrl] = useState("")
   const [sign, setSign] = useState(true)
+  const [events, setEvents] = useState<string[]>([])
+  const [headerRows, setHeaderRows] = useState<{ name: string; value: string }[]>([])
   const [deleteId, setDeleteId] = useState<number | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
 
+  const toggleEvent = (event: string, checked: boolean) =>
+    setEvents((current) =>
+      checked ? [...current, event] : current.filter((e) => e !== event),
+    )
+  const headersObject = () =>
+    Object.fromEntries(
+      headerRows
+        .filter((row) => row.name.trim())
+        .map((row) => [row.name.trim(), row.value]),
+    )
+
   const create = useMutation({
-    mutationFn: () => adminApi.webhooks(org, server).create({ name, url, all_events: true, sign }),
+    mutationFn: () =>
+      adminApi.webhooks(org, server).create({
+        name,
+        url,
+        sign,
+        // no selection = subscribe to everything
+        events,
+        headers: headersObject(),
+      }),
     onSuccess: () => {
       invalidate()
       setOpen(false)
       setName("")
       setUrl("")
+      setEvents([])
+      setHeaderRows([])
     },
     onError: (err) => errorToast(err, "Could not create the webhook"),
   })
@@ -515,7 +538,7 @@ export function Webhooks({ org, server }: Scope) {
     <div>
       <PageHeader
         title="Webhooks"
-        description="HTTP callbacks for message events (delivery, bounces, clicks…)."
+        description="HTTP callbacks for message events (sent, delayed, failed, held)."
         action={
           <Button size="sm" onClick={() => setOpen(true)}>
             <PlusIcon className="size-4" /> New webhook
@@ -530,6 +553,8 @@ export function Webhooks({ org, server }: Scope) {
             <TableRow>
               <TableHead>Name</TableHead>
               <TableHead>URL</TableHead>
+              <TableHead>Events</TableHead>
+              <TableHead>Headers</TableHead>
               <TableHead>Signed</TableHead>
               <TableHead>Enabled</TableHead>
               <TableHead />
@@ -541,6 +566,24 @@ export function Webhooks({ org, server }: Scope) {
                 <TableCell className="font-medium">{webhook.name}</TableCell>
                 <TableCell className="max-w-64 truncate text-muted-foreground">
                   {webhook.url}
+                </TableCell>
+                <TableCell>
+                  {webhook.events.length === 0 ? (
+                    <Badge variant="secondary">all events</Badge>
+                  ) : (
+                    <div className="flex max-w-56 flex-wrap gap-1">
+                      {webhook.events.map((event) => (
+                        <Badge key={event} variant="outline">
+                          {event}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                </TableCell>
+                <TableCell className="text-muted-foreground">
+                  {Object.keys(webhook.headers ?? {}).length === 0
+                    ? "—"
+                    : Object.keys(webhook.headers).join(", ")}
                 </TableCell>
                 <TableCell>{webhook.sign ? <Badge variant="outline">RSA</Badge> : "—"}</TableCell>
                 <TableCell>
@@ -580,6 +623,65 @@ export function Webhooks({ org, server }: Scope) {
             <div className="grid gap-2">
               <Label>URL</Label>
               <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://…" />
+            </div>
+            <div className="grid gap-2">
+              <Label>Events (none selected = all events)</Label>
+              <div className="grid gap-1">
+                {WEBHOOK_EVENTS.map((event) => (
+                  <label key={event} className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      className="size-4 accent-primary"
+                      checked={events.includes(event)}
+                      onChange={(e) => toggleEvent(event, e.target.checked)}
+                    />
+                    {event}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="grid gap-2">
+              <Label>Custom headers (e.g. Authorization)</Label>
+              {headerRows.map((row, index) => (
+                <div key={index} className="flex items-center gap-2">
+                  <Input
+                    className="w-2/5"
+                    placeholder="Header name"
+                    value={row.name}
+                    onChange={(e) =>
+                      setHeaderRows((rows) =>
+                        rows.map((r, i) => (i === index ? { ...r, name: e.target.value } : r)),
+                      )
+                    }
+                  />
+                  <Input
+                    placeholder="Value"
+                    value={row.value}
+                    onChange={(e) =>
+                      setHeaderRows((rows) =>
+                        rows.map((r, i) => (i === index ? { ...r, value: e.target.value } : r)),
+                      )
+                    }
+                  />
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() =>
+                      setHeaderRows((rows) => rows.filter((_, i) => i !== index))
+                    }
+                  >
+                    Remove
+                  </Button>
+                </div>
+              ))}
+              <Button
+                variant="outline"
+                size="sm"
+                className="justify-self-start"
+                onClick={() => setHeaderRows((rows) => [...rows, { name: "", value: "" }])}
+              >
+                <PlusIcon className="size-4" /> Add header
+              </Button>
             </div>
             <div className="flex items-center gap-2">
               <Switch checked={sign} onCheckedChange={setSign} id="sign" />
@@ -729,6 +831,142 @@ export function Suppressions({ org, server }: Scope) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  )
+}
+
+
+// ----------------------------------------------------- sender addresses
+
+export function SenderAddresses({ org, server }: Scope) {
+  const queryClient = useQueryClient()
+  const key = ["sender-addresses", org, server]
+  const addresses = useQuery({
+    queryKey: key,
+    queryFn: () => adminApi.senderAddresses(org, server).list(),
+  })
+  const [open, setOpen] = useState(false)
+  const [email, setEmail] = useState("")
+  const [issuedToken, setIssuedToken] = useState<string | null>(null)
+  const [deleteId, setDeleteId] = useState<number | null>(null)
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
+
+  const create = useMutation({
+    mutationFn: () => adminApi.senderAddresses(org, server).create(email),
+    onSuccess: ({ verification_token }) => {
+      invalidate()
+      setEmail("")
+      if (verification_token) {
+        // shown exactly once: this instance couldn't email the link
+        setIssuedToken(verification_token)
+      } else {
+        setOpen(false)
+        toast.success("Confirmation email sent")
+      }
+    },
+    onError: (err) => errorToast(err, "Could not add the sender address"),
+  })
+
+  return (
+    <div>
+      <PageHeader
+        title="Sender addresses"
+        description="Individual addresses this server may send from once their owner confirms them — no domain verification needed."
+        action={
+          <Button size="sm" onClick={() => { setIssuedToken(null); setOpen(true) }}>
+            <PlusIcon className="size-4" /> Add address
+          </Button>
+        }
+      />
+      {addresses.data?.sender_addresses.length === 0 ? (
+        <EmptyState>No sender addresses yet.</EmptyState>
+      ) : (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Email address</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {addresses.data?.sender_addresses.map((address) => (
+              <TableRow key={address.id}>
+                <TableCell className="font-medium">{address.email_address}</TableCell>
+                <TableCell>
+                  {address.verified ? (
+                    <Badge>confirmed</Badge>
+                  ) : (
+                    <Badge variant="secondary">pending</Badge>
+                  )}
+                </TableCell>
+                <TableCell className="text-right">
+                  <Button variant="ghost" size="sm" onClick={() => setDeleteId(address.id)}>
+                    Delete
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add sender address</DialogTitle>
+          </DialogHeader>
+          {issuedToken ? (
+            <div className="grid gap-2">
+              <p className="text-sm text-muted-foreground">
+                This instance can&apos;t email the confirmation link. Relay this one-time
+                token to the address owner — they confirm at
+                {" "}<code className="text-xs">/sender-addresses/confirm</code>.
+              </p>
+              <SecretReveal label="Verification token" value={issuedToken} />
+            </div>
+          ) : (
+            <div className="grid gap-2">
+              <Label>Email address</Label>
+              <Input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="person@partner.example"
+              />
+              <p className="text-xs text-muted-foreground">
+                A confirmation link is sent to exactly this address.
+              </p>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              {issuedToken ? "Done" : "Cancel"}
+            </Button>
+            {!issuedToken && (
+              <Button
+                onClick={() => create.mutate()}
+                disabled={create.isPending || !email.includes("@")}
+              >
+                Add
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <ConfirmDialog
+        open={deleteId !== null}
+        onOpenChange={(open) => !open && setDeleteId(null)}
+        title="Delete sender address"
+        description="Mail from this exact address will no longer be authorized."
+        onConfirm={async () => {
+          try {
+            await adminApi.senderAddresses(org, server).delete(deleteId!)
+            invalidate()
+          } catch (err) {
+            errorToast(err, "Could not delete the sender address")
+          }
+        }}
+      />
     </div>
   )
 }

@@ -1733,3 +1733,176 @@ async fn pg_auth_resets_oidc_and_audit() {
     assert_eq!(events[0].event, "logout");
     assert_eq!(events[1].event, "login.success");
 }
+
+// ------------------------------------- webhook events + custom headers
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_events_and_headers_roundtrip() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert("Authorization".to_string(), "Bearer hunter2".to_string());
+    let webhook = f
+        .store
+        .create_webhook(camelmailer_core::NewWebhook {
+            server_id: f.server.id,
+            name: "hook".into(),
+            url: "https://hooks.example/cb".into(),
+            all_events: false,
+            sign: true,
+            events: vec!["MessageSent".into(), "MessageHeld".into()],
+            headers: headers.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        webhook.events,
+        vec!["MessageSent".to_string(), "MessageHeld".to_string()]
+    );
+    assert_eq!(webhook.headers, headers);
+
+    let listed = f.store.list_webhooks(f.server.id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].events, webhook.events);
+    assert_eq!(listed[0].headers, headers);
+    assert!(listed[0].subscribes_to("MessageSent"));
+    assert!(!listed[0].subscribes_to("MessageDelayed"));
+
+    // update replaces both fields
+    let mut updated = webhook.clone();
+    updated.events = Vec::new();
+    updated.headers.insert("X-Extra".into(), "1".into());
+    f.store.update_webhook(updated).await.unwrap();
+    let fetched = f
+        .store
+        .webhook_by_id(f.server.id, webhook.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fetched.events.is_empty());
+    assert_eq!(
+        fetched.headers.get("X-Extra").map(String::as_str),
+        Some("1")
+    );
+    assert!(fetched.subscribes_to("MessageDelayed"));
+
+    // a pre-events webhook shape defaults to all events, no headers
+    let broad = f
+        .store
+        .create_webhook(camelmailer_core::NewWebhook::all(
+            f.server.id,
+            "all",
+            "https://hooks.example/all",
+            false,
+        ))
+        .await
+        .unwrap();
+    assert!(broad.events.is_empty());
+    assert!(broad.headers.is_empty());
+}
+
+// ---------------------------------------------------- sender addresses
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sender_addresses_create_confirm_and_authorize() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    let address = f
+        .store
+        .create_sender_address(camelmailer_core::NewSenderAddress {
+            server_id: f.server.id,
+            email_address: "solo@external.example".into(),
+            verification_token_hash: "hash-1".into(),
+        })
+        .await
+        .unwrap();
+    assert!(!address.verified);
+
+    // duplicates conflict
+    let error = f
+        .store
+        .create_sender_address(camelmailer_core::NewSenderAddress {
+            server_id: f.server.id,
+            email_address: "solo@external.example".into(),
+            verification_token_hash: "hash-2".into(),
+        })
+        .await
+        .expect_err("duplicate must conflict");
+    assert!(matches!(error, camelmailer_core::StoreError::Conflict(_)));
+
+    // pending addresses do not authorize (async and sync paths)
+    assert!(!f
+        .store
+        .confirmed_sender_address(f.server.id, "solo@external.example")
+        .await
+        .unwrap());
+    assert!(!f
+        .store
+        .find_confirmed_sender_address(f.server.id, &["solo@external.example"]));
+
+    // an unknown token confirms nothing; the right one is single-use
+    assert!(f
+        .store
+        .confirm_sender_address("wrong")
+        .await
+        .unwrap()
+        .is_none());
+    let confirmed = f
+        .store
+        .confirm_sender_address("hash-1")
+        .await
+        .unwrap()
+        .expect("token must confirm");
+    assert!(confirmed.verified);
+    assert!(confirmed.verification_token_hash.is_none());
+    assert!(f
+        .store
+        .confirm_sender_address("hash-1")
+        .await
+        .unwrap()
+        .is_none());
+
+    // confirmed: authorizes case-insensitively, exact address, per server
+    assert!(f
+        .store
+        .confirmed_sender_address(f.server.id, "Solo@External.example")
+        .await
+        .unwrap());
+    assert!(!f
+        .store
+        .confirmed_sender_address(f.server.id, "other@external.example")
+        .await
+        .unwrap());
+    assert!(f
+        .store
+        .find_confirmed_sender_address(f.server.id, &["Solo <solo@external.example>"]));
+    assert!(!f.store.find_confirmed_sender_address(f.server.id, &[]));
+
+    // list + scoped fetch + delete
+    let listed = f.store.list_sender_addresses(f.server.id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].verified);
+    assert!(f
+        .store
+        .sender_address_by_id(f.server.id, address.id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(f
+        .store
+        .sender_address_by_id(f.server.id + 1, address.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(f.store.delete_sender_address(address.id).await.unwrap());
+    assert!(!f.store.delete_sender_address(address.id).await.unwrap());
+    assert!(!f
+        .store
+        .confirmed_sender_address(f.server.id, "solo@external.example")
+        .await
+        .unwrap());
+}

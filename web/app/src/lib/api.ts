@@ -162,6 +162,25 @@ export type Webhook = {
   all_events: boolean
   enabled: boolean
   sign: boolean
+  /** Subscribed event names; empty = all events. */
+  events: string[]
+  /** Extra HTTP headers sent with every delivery request. */
+  headers: Record<string, string>
+}
+
+export const WEBHOOK_EVENTS = [
+  "MessageSent",
+  "MessageDelayed",
+  "MessageDeliveryFailed",
+  "MessageHeld",
+] as const
+
+export type SenderAddress = {
+  id: number
+  uuid: string
+  email_address: string
+  verified: boolean
+  status: "pending" | "confirmed"
 }
 
 export type Suppression = {
@@ -341,6 +360,11 @@ export const authApi = {
       user: User
       session_token?: string
     }>("/api/v2/auth/invitations/accept", fields),
+  confirmSenderAddress: (token: string) =>
+    api.post<{ confirmed: boolean; email_address: string }>(
+      "/api/v2/auth/sender-addresses/confirm",
+      { token },
+    ),
   // 404 SSODisabled when OIDC is off — used to decide whether to render
   // the SSO button.
   oidcStartUrl: () =>
@@ -459,11 +483,54 @@ export const adminApi = {
     return {
       list: () =>
         api.get<{ webhooks: Webhook[]; pagination: Pagination }>(`${base}?per_page=100`),
-      create: (fields: { name: string; url: string; all_events?: boolean; sign?: boolean }) =>
-        api.post<{ webhook: Webhook }>(base, fields),
+      create: (fields: {
+        name: string
+        url: string
+        all_events?: boolean
+        sign?: boolean
+        events?: string[]
+        headers?: Record<string, string>
+      }) => api.post<{ webhook: Webhook }>(base, fields),
+      update: (
+        id: number,
+        fields: {
+          name?: string
+          url?: string
+          sign?: boolean
+          enabled?: boolean
+          events?: string[]
+          headers?: Record<string, string>
+        },
+      ) => api.patch<{ webhook: Webhook }>(`${base}/${id}`, fields),
       enable: (id: number) => api.post<{ webhook: Webhook }>(`${base}/${id}/enable`),
       disable: (id: number) => api.post<{ webhook: Webhook }>(`${base}/${id}/disable`),
       delete: (id: number) => api.delete<{ deleted: boolean }>(`${base}/${id}`),
+    }
+  },
+  senderAddresses: (org: string, server: string) => {
+    const base = `/api/v2/admin/organizations/${org}/servers/${server}/sender_addresses`
+    return {
+      list: () =>
+        api.get<{ sender_addresses: SenderAddress[]; pagination: Pagination }>(
+          `${base}?per_page=100`,
+        ),
+      // When the instance cannot email the confirmation link, the response
+      // carries a one-time `verification_token` to relay manually.
+      create: (email: string) =>
+        api.post<{ sender_address: SenderAddress; verification_token?: string }>(base, {
+          email,
+        }),
+      delete: (id: number) => api.delete<{ deleted: boolean }>(`${base}/${id}`),
+    }
+  },
+  templates: (org: string, server: string) => {
+    const base = `/api/v2/admin/organizations/${org}/servers/${server}/templates`
+    return {
+      copyTo: (permalink: string, target_server: string, overwrite = false) =>
+        api.post<{ template: Template; overwritten: boolean }>(
+          `${base}/${permalink}/copy_to`,
+          { target_server, ...(overwrite ? { overwrite } : {}) },
+        ),
     }
   },
   suppressions: (org: string, server: string) => {
