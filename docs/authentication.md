@@ -146,6 +146,62 @@ The invitation flow for people **without** an account:
 Invitations expire after `auth.invitation_expiry_days` (default 7) and are
 single-use.
 
+## Passkeys (WebAuthn)
+
+With `auth.webauthn` enabled, users can register **passkeys** (Touch ID,
+Windows Hello, security keys, phone authenticators) on the Account →
+Security page and sign in with them instead of a password:
+
+```yaml
+auth:
+  webauthn:
+    enabled: true
+    rp_id: app.camelmailer.com          # the domain passkeys are scoped to
+    rp_origin: https://app.camelmailer.com   # the exact browser origin
+    rp_name: CamelMailer                # shown by the browser (optional)
+```
+
+`enabled` requires `rp_id` and `rp_origin`. Choose `rp_id` carefully:
+passkeys are cryptographically bound to it, so **changing it later
+invalidates every registered passkey**. `rp_origin` must be the exact
+origin the frontend is served from (scheme + host + port).
+
+The flow (all under `/api/v2/auth/webauthn`, JSON with binary fields as
+unpadded base64url, exactly as the browser WebAuthn API produces them):
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /webauthn/register/start` | Bearer | Creation options for `navigator.credentials.create()`; existing passkeys are excluded |
+| `POST /webauthn/register/finish` | Bearer | `{name, credential}` — verifies the attestation, stores the passkey |
+| `GET /webauthn/credentials` | Bearer | List passkeys (name, created, last used — never key material) |
+| `DELETE /webauthn/credentials/{id}` | Bearer | Remove a passkey (allowed even for the last one — the password remains) |
+| `POST /webauthn/login/start` | none | `{email_address}` → request options for `navigator.credentials.get()` |
+| `POST /webauthn/login/finish` | none | `{credential}` → session, same response as `POST /login` |
+
+Security properties:
+
+- While the feature is off, every endpoint answers `403 WebAuthnDisabled`.
+- `login/start` answers with the **same generic shape** for unknown
+  addresses (deterministic fake credential ids) — no user enumeration.
+- Every `login/finish` failure is a generic `401 InvalidCredentials`;
+  an account lockout (`AccountLocked`) applies to passkey logins too.
+- Ceremony state lives server-side (like the OIDC login state), expires
+  after five minutes and is strictly single-use.
+- Signature counters are verified and persisted on every login —
+  `webauthn-rs` rejects assertions from cloned authenticators.
+- Successful logins appear on the audit log as `webauthn.login`,
+  registrations as `webauthn.register`, removals as
+  `webauthn.credential.delete`.
+
+Frontends can discover whether to show the passkey button (plus the
+sign-up link and the SSO button) via the public feature endpoint:
+
+```bash
+curl http://localhost:5000/api/v2/auth/features
+# -> { "data": { "webauthn": true, "registration": false,
+#                "oidc": { "enabled": false, "name": "OIDC" } } }
+```
+
 ## Platform email delivery
 
 CamelMailer can send its own account mail through its own sending
@@ -346,6 +402,11 @@ auth:
   password_reset_expiry_hours: 2
   frontend_url: null              # e.g. https://mail-admin.example.com
   sso_providers: []               # social sign-in (see above)
+  webauthn:                       # passkeys (see above)
+    enabled: false
+    rp_id: null                   # required when enabled
+    rp_origin: null               # required when enabled
+    rp_name: CamelMailer
 
 app_mail:                         # platform email delivery (see above)
   enabled: false
@@ -357,4 +418,4 @@ app_mail:                         # platform email delivery (see above)
 ## Deliberately deferred
 
 SAML (OIDC is the supported enterprise SSO protocol — most IdPs speak
-both), SCIM provisioning, WebAuthn/passkeys, and per-user API scopes.
+both), SCIM provisioning, and per-user API scopes.

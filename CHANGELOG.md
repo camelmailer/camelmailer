@@ -102,6 +102,19 @@ integration tests) is green.
   (`{id, name, type}` — never secrets) and drives the new
   "Continue with {name}" / "Sign up with {name}" buttons on the login
   and registration pages.
+- **Passkeys (WebAuthn)** — users can register passkeys (Touch ID,
+  Windows Hello, security keys) on Account → Security and sign in with
+  them (`/api/v2/auth/webauthn/*`, built on `webauthn-rs`). Opt-in via
+  the `auth.webauthn` group (`enabled`, `rp_id`, `rp_origin`,
+  `rp_name`); while disabled the endpoints answer `403 WebAuthnDisabled`.
+  Login start/finish is enumeration-safe (generic response with
+  deterministic fake credential ids for unknown addresses), ceremony
+  state is server-side, short-lived and single-use, signature counters
+  are verified and persisted (clone detection), and passkey logins,
+  registrations and deletions land on the audit log.
+- **`GET /api/v2/auth/features`** — public discovery of the optional
+  sign-in features (`webauthn`, `registration`, `oidc {enabled, name}`);
+  the login page uses it to decide which buttons/links to render.
 
 ## [0.2.0] - 2026-07-11
 

@@ -18,13 +18,17 @@ chrono = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rand = { workspace = true }
 subtle = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
+webauthn-rs = { workspace = true }
+webauthn-rs-proto = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
 http-body-util = { workspace = true }
 serde_yaml = { workspace = true }
 tower = { workspace = true }
+webauthn-authenticator-rs = { workspace = true }

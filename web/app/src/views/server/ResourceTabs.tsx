@@ -41,8 +41,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { adminApi, ApiError, WEBHOOK_EVENTS } from "@/lib/api"
-import { adminApi, ApiError, type DnsRecord, type Domain } from "@/lib/api"
+import {
+  adminApi,
+  ApiError,
+  WEBHOOK_EVENTS,
+  type DnsRecord,
+  type Domain,
+} from "@/lib/api"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)

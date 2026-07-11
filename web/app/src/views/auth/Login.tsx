@@ -14,8 +14,15 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { ApiError, authApi, ssoStartUrl, type SsoProviderInfo } from "@/lib/api"
+import {
+  ApiError,
+  authApi,
+  ssoStartUrl,
+  type Features,
+  type SsoProviderInfo,
+} from "@/lib/api"
 import { useAuth } from "@/lib/auth"
+import { getPasskeyAssertion, webAuthnSupported, type RequestOptionsJSON } from "@/lib/webauthn"
 
 export default function Login() {
   const { adopt } = useAuth()
@@ -28,23 +35,58 @@ export default function Login() {
   const [busy, setBusy] = useState(false)
   const [ssoUrl, setSsoUrl] = useState<string | null>(null)
   const [ssoProviders, setSsoProviders] = useState<SsoProviderInfo[]>([])
+  const [features, setFeatures] = useState<Features | null>(null)
 
-  // The SSO button only renders when OIDC is enabled on the instance.
-  useEffect(() => {
-    authApi
-      .oidcStartUrl()
-      .then((data) => setSsoUrl(data.authorization_url))
-      .catch(() => setSsoUrl(null))
-  }, [])
-
-  // Social sign-in buttons (Google, Microsoft, GitHub, …) come from the
-  // instance's feature discovery.
+  // /features says which optional sign-in paths this instance exposes
+  // (passkeys, self-registration, SSO); the SSO URL is fetched only when
+  // OIDC is actually enabled.
   useEffect(() => {
     authApi
       .features()
-      .then((data) => setSsoProviders(data.sso))
-      .catch(() => setSsoProviders([]))
+      .then((loaded) => {
+        setFeatures(loaded)
+        setSsoProviders(loaded.sso ?? [])
+        if (loaded.oidc.enabled) {
+          authApi
+            .oidcStartUrl()
+            .then((data) => setSsoUrl(data.authorization_url))
+            .catch(() => setSsoUrl(null))
+        }
+      })
+      .catch(() => setFeatures(null))
   }, [])
+
+  async function passkeyLogin() {
+    if (!email) {
+      setError("Enter your email address first, then use your passkey.")
+      return
+    }
+    if (!webAuthnSupported()) {
+      setError("This browser does not support passkeys.")
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      const options = await authApi.webauthnLoginStart(email)
+      const assertion = await getPasskeyAssertion(options as unknown as RequestOptionsJSON)
+      const result = await authApi.webauthnLoginFinish(assertion)
+      await adopt(result.session_token)
+      router.push("/dashboard")
+    } catch (err) {
+      if (err instanceof ApiError) {
+        if (err.code === "AccountLocked") {
+          setError("Account temporarily locked after repeated failures. Try again later.")
+        } else {
+          setError("The passkey sign-in did not succeed.")
+        }
+      } else {
+        setError("The passkey sign-in did not succeed.")
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
@@ -141,6 +183,16 @@ export default function Login() {
             <Button type="submit" disabled={busy}>
               {busy ? "Signing in…" : "Sign in"}
             </Button>
+            {features?.webauthn && (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={passkeyLogin}
+                disabled={busy}
+              >
+                Sign in with passkey
+              </Button>
+            )}
             {ssoUrl && (
               <Button
                 type="button"
@@ -160,12 +212,14 @@ export default function Login() {
                 Continue with {provider.name}
               </Button>
             ))}
-            <p className="text-center text-sm text-muted-foreground">
-              Don&apos;t have an account?{" "}
-              <Link href="/register" className="hover:underline">
-                Create account
-              </Link>
-            </p>
+            {features?.registration && (
+              <p className="text-center text-sm text-muted-foreground">
+                Don&apos;t have an account?{" "}
+                <Link href="/register" className="hover:underline">
+                  Create account
+                </Link>
+              </p>
+            )}
           </form>
         </CardContent>
       </Card>

@@ -130,6 +130,14 @@ auth:
   #       client_id: "…", client_secret: "…" }
   #   - { id: github,    type: github, name: GitHub,
   #       client_id: "…", client_secret: "…" }
+  # Passkeys (WebAuthn) — sign in with Touch ID / Windows Hello / security
+  # keys. rp_id is the domain passkeys are bound to (changing it later
+  # invalidates them all); rp_origin is the exact origin of the frontend.
+  webauthn:
+    enabled: false
+    # rp_id: app.camelmailer.com
+    # rp_origin: https://app.camelmailer.com
+    # rp_name: CamelMailer
 
 # Platform email delivery — the installation sends its own account mail
 # (password resets, invitations, welcome mail) through its own sending

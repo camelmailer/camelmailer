@@ -703,30 +703,6 @@ async fn resolve_user(
     Ok(user)
 }
 
-// ------------------------------------------------------------ /features
-
-/// `GET /api/v2/auth/features` — what the login/registration pages should
-/// render. Only public fields, never secrets.
-async fn auth_features(
-    State(state): State<Arc<ApiState>>,
-    start: axum::Extension<RequestStart>,
-) -> Response {
-    let sso: Vec<Value> = state
-        .config
-        .auth
-        .sso_providers
-        .iter()
-        .map(|provider| {
-            json!({
-                "id": provider.id,
-                "name": provider.name,
-                "type": provider.provider_type,
-            })
-        })
-        .collect();
-    render_success(Some(&start.0), StatusCode::OK, json!({ "sso": sso })).into_response()
-}
-
 /// Build the public social-SSO router (`/api/v2/auth/sso/{id}/*` plus the
 /// `/api/v2/auth/features` discovery endpoint).
 pub fn build_sso_router(state: Arc<ApiState>) -> Router {
@@ -734,7 +710,6 @@ pub fn build_sso_router(state: Arc<ApiState>) -> Router {
         .nest(
             "/api/v2/auth",
             Router::new()
-                .route("/features", get(auth_features))
                 .route("/sso/{id}/start", get(sso_start))
                 .route("/sso/{id}/callback", get(sso_callback))
                 .with_state(state),

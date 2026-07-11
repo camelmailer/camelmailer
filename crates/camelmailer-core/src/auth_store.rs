@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use crate::admin_store::StoreError;
 use crate::auth::{
     AuthEvent, AuthSession, Invitation, NewAuthEvent, NewAuthSession, NewInvitation,
-    OrganizationMembership, Role, UserAuth,
+    NewWebAuthnCredential, OrganizationMembership, Role, UserAuth, WebAuthnCredential,
 };
 use crate::model::{Id, Organization, User};
 
@@ -140,6 +140,58 @@ pub trait AuthStore: Send + Sync {
         state: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<(String, String)>, StoreError>;
+
+    // -- WebAuthn (passkeys)
+    /// Register a passkey. A `credential_id` that is already registered
+    /// (on any account) returns [`StoreError::Conflict`].
+    async fn add_webauthn_credential(
+        &self,
+        new: NewWebAuthnCredential,
+    ) -> Result<WebAuthnCredential, StoreError>;
+    /// A user's passkeys, oldest first.
+    async fn list_webauthn_credentials(
+        &self,
+        user_id: Id,
+    ) -> Result<Vec<WebAuthnCredential>, StoreError>;
+    /// Look up a passkey by its (base64url) credential id — the login path.
+    async fn webauthn_credential_by_credential_id(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<WebAuthnCredential>, StoreError>;
+    /// Persist post-authentication updates (signature counter / backup
+    /// flags inside `credential_json`) and stamp `last_used_at`.
+    async fn update_webauthn_credential(
+        &self,
+        credential_id: Id,
+        credential_json: &str,
+        last_used_at: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+    /// Delete one of `user_id`'s passkeys; `false` when it does not exist
+    /// or belongs to someone else.
+    async fn delete_webauthn_credential(
+        &self,
+        user_id: Id,
+        credential_id: Id,
+    ) -> Result<bool, StoreError>;
+    /// Persist an in-flight WebAuthn ceremony (challenge key → serialized
+    /// registration/authentication state) — the same server-side,
+    /// short-lived, single-use mechanism as
+    /// [`create_oidc_state`](AuthStore::create_oidc_state). Re-using a key
+    /// replaces the previous state.
+    async fn create_webauthn_state(
+        &self,
+        key: &str,
+        user_id: Option<Id>,
+        state_json: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+    /// Redeem a WebAuthn ceremony state: returns `(user_id, state_json)`
+    /// and removes it. Expired or unknown keys return `None`.
+    async fn consume_webauthn_state(
+        &self,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(Option<Id>, String)>, StoreError>;
 
     // -- audit log
     async fn record_auth_event(&self, event: NewAuthEvent) -> Result<(), StoreError>;
@@ -593,6 +645,125 @@ impl AuthStore for MemoryStore {
         Ok(Some((verifier, nonce)))
     }
 
+    async fn add_webauthn_credential(
+        &self,
+        new: NewWebAuthnCredential,
+    ) -> Result<WebAuthnCredential, StoreError> {
+        {
+            let inner = self.inner.read().unwrap();
+            let duplicate = inner
+                .webauthn_credentials
+                .values()
+                .any(|credential| credential.credential_id == new.credential_id);
+            if duplicate {
+                return Err(StoreError::Conflict(
+                    "This passkey is already registered".into(),
+                ));
+            }
+        }
+        let id = self.next_id();
+        let credential = WebAuthnCredential {
+            id,
+            user_id: new.user_id,
+            name: new.name,
+            credential_id: new.credential_id,
+            credential_json: new.credential_json,
+            created_at: Utc::now(),
+            last_used_at: None,
+        };
+        self.inner
+            .write()
+            .unwrap()
+            .webauthn_credentials
+            .insert(id, credential.clone());
+        Ok(credential)
+    }
+
+    async fn list_webauthn_credentials(
+        &self,
+        user_id: Id,
+    ) -> Result<Vec<WebAuthnCredential>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let mut result: Vec<_> = inner
+            .webauthn_credentials
+            .values()
+            .filter(|credential| credential.user_id == user_id)
+            .cloned()
+            .collect();
+        result.sort_by_key(|credential| credential.id);
+        Ok(result)
+    }
+
+    async fn webauthn_credential_by_credential_id(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<WebAuthnCredential>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        Ok(inner
+            .webauthn_credentials
+            .values()
+            .find(|credential| credential.credential_id == credential_id)
+            .cloned())
+    }
+
+    async fn update_webauthn_credential(
+        &self,
+        credential_id: Id,
+        credential_json: &str,
+        last_used_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(credential) = inner.webauthn_credentials.get_mut(&credential_id) {
+            credential.credential_json = credential_json.to_string();
+            credential.last_used_at = Some(last_used_at);
+        }
+        Ok(())
+    }
+
+    async fn delete_webauthn_credential(
+        &self,
+        user_id: Id,
+        credential_id: Id,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        match inner.webauthn_credentials.get(&credential_id) {
+            Some(credential) if credential.user_id == user_id => {
+                inner.webauthn_credentials.remove(&credential_id);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn create_webauthn_state(
+        &self,
+        key: &str,
+        user_id: Option<Id>,
+        state_json: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.inner.write().unwrap().webauthn_states.insert(
+            key.to_string(),
+            (user_id, state_json.to_string(), expires_at),
+        );
+        Ok(())
+    }
+
+    async fn consume_webauthn_state(
+        &self,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(Option<Id>, String)>, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let Some((user_id, state_json, expires_at)) = inner.webauthn_states.remove(key) else {
+            return Ok(None);
+        };
+        if expires_at < now {
+            return Ok(None);
+        }
+        Ok(Some((user_id, state_json)))
+    }
+
     async fn record_auth_event(&self, event: NewAuthEvent) -> Result<(), StoreError> {
         let id = self.next_id();
         self.inner.write().unwrap().auth_events.push(AuthEvent {
@@ -950,6 +1121,159 @@ mod tests {
         assert_eq!(
             store
                 .consume_oidc_state("state-1", Utc::now())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn webauthn_credentials_add_list_lookup_update_delete() {
+        let (store, user) = store_with_user("a@example.com");
+        let other = {
+            let id = store.next_id();
+            let other = User {
+                id,
+                uuid: crate::token::generate_uuid(),
+                email_address: "b@example.com".into(),
+                first_name: "Grace".into(),
+                last_name: "Hopper".into(),
+                admin: false,
+            };
+            store.inner.write().unwrap().users.insert(id, other.clone());
+            other
+        };
+        let new = |user_id, name: &str, credential_id: &str| NewWebAuthnCredential {
+            user_id,
+            name: name.to_string(),
+            credential_id: credential_id.to_string(),
+            credential_json: "{\"cred\":\"data\"}".to_string(),
+        };
+
+        let credential = store
+            .add_webauthn_credential(new(user.id, "MacBook", "cred-a"))
+            .await
+            .unwrap();
+        assert_eq!(credential.user_id, user.id);
+        assert_eq!(credential.name, "MacBook");
+        assert_eq!(credential.last_used_at, None);
+        store
+            .add_webauthn_credential(new(user.id, "YubiKey", "cred-b"))
+            .await
+            .unwrap();
+        // duplicate credential id (even on another user) conflicts
+        assert!(matches!(
+            store
+                .add_webauthn_credential(new(other.id, "Clone", "cred-a"))
+                .await,
+            Err(StoreError::Conflict(_))
+        ));
+
+        let mine = store.list_webauthn_credentials(user.id).await.unwrap();
+        assert_eq!(mine.len(), 2);
+        assert_eq!(mine[0].name, "MacBook");
+        assert_eq!(mine[1].name, "YubiKey");
+        assert!(store
+            .list_webauthn_credentials(other.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let found = store
+            .webauthn_credential_by_credential_id("cred-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, credential.id);
+        assert_eq!(
+            store
+                .webauthn_credential_by_credential_id("nope")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let used_at = Utc::now();
+        store
+            .update_webauthn_credential(credential.id, "{\"cred\":\"updated\"}", used_at)
+            .await
+            .unwrap();
+        let found = store
+            .webauthn_credential_by_credential_id("cred-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.credential_json, "{\"cred\":\"updated\"}");
+        assert_eq!(found.last_used_at, Some(used_at));
+
+        // deletion is scoped to the owner
+        assert!(!store
+            .delete_webauthn_credential(other.id, credential.id)
+            .await
+            .unwrap());
+        assert!(store
+            .delete_webauthn_credential(user.id, credential.id)
+            .await
+            .unwrap());
+        assert!(!store
+            .delete_webauthn_credential(user.id, credential.id)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .list_webauthn_credentials(user.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn webauthn_states_are_single_use_expiring_and_replaceable() {
+        let (store, user) = store_with_user("a@example.com");
+        store
+            .create_webauthn_state(
+                "login:chal-1",
+                Some(user.id),
+                "{\"state\":1}",
+                Utc::now() + Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+        // re-using the key replaces the state
+        store
+            .create_webauthn_state(
+                "login:chal-1",
+                Some(user.id),
+                "{\"state\":2}",
+                Utc::now() + Duration::minutes(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .consume_webauthn_state("login:chal-1", Utc::now())
+                .await
+                .unwrap(),
+            Some((Some(user.id), "{\"state\":2}".into()))
+        );
+        // single use
+        assert_eq!(
+            store
+                .consume_webauthn_state("login:chal-1", Utc::now())
+                .await
+                .unwrap(),
+            None
+        );
+        // expired
+        store
+            .create_webauthn_state("reg:chal-2", None, "{}", Utc::now() - Duration::minutes(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .consume_webauthn_state("reg:chal-2", Utc::now())
                 .await
                 .unwrap(),
             None

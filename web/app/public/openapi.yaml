@@ -22,7 +22,8 @@ info:
 
     Error codes worth branching on: `Unauthorized`, `Forbidden`, `NotFound`,
     `ValidationError`, `ParameterMissing`, `InvalidCredentials`, `TOTPRequired`,
-    `InvalidTOTPCode`, `AccountLocked`, `InvalidToken`, `SSOError`.
+    `InvalidTOTPCode`, `AccountLocked`, `InvalidToken`, `SSOError`,
+    `WebAuthnDisabled`, `WebAuthnError`.
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -661,6 +662,173 @@ paths:
         "307": { description: Redirect to the frontend with the token in the fragment }
         "404": { description: SSOProviderNotFound }
         "422": { $ref: "#/components/responses/ValidationError" }
+      summary: Which optional sign-in features this instance exposes (public)
+      description: |
+        Lets login pages decide what to render — the passkey button, the
+        sign-up link and the SSO button.
+      responses:
+        "200":
+          description: Feature flags
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          webauthn: { type: boolean }
+                          registration: { type: boolean }
+                          oidc:
+                            type: object
+                            properties:
+                              enabled: { type: boolean }
+                              name: { type: string }
+  /api/v2/auth/webauthn/register/start:
+    post:
+      tags: [Auth]
+      summary: Begin passkey registration (returns WebAuthn creation options)
+      description: |
+        The response `data` is the JSON form of a WebAuthn
+        `CredentialCreationOptions` (`{ "publicKey": { … } }`, binary
+        fields as unpadded base64url) — pass it to
+        `navigator.credentials.create()`. Already-registered passkeys are
+        listed in `excludeCredentials`. `403 WebAuthnDisabled` while
+        `auth.webauthn` is off.
+      security: [{ SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { description: WebAuthnDisabled }
+  /api/v2/auth/webauthn/register/finish:
+    post:
+      tags: [Auth]
+      summary: Store the new passkey
+      security: [{ SessionToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, credential]
+              properties:
+                name: { type: string, description: "Display label, e.g. \"MacBook Touch ID\"" }
+                credential:
+                  type: object
+                  description: The JSON-serialized result of navigator.credentials.create()
+      responses:
+        "201":
+          description: Passkey stored
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          credential: { $ref: "#/components/schemas/PasskeyCredential" }
+        "403": { description: WebAuthnDisabled }
+        "422": { description: WebAuthnError (invalid attestation or expired challenge) }
+  /api/v2/auth/webauthn/credentials:
+    get:
+      tags: [Auth]
+      summary: List the caller's passkeys
+      security: [{ SessionToken: [] }]
+      responses:
+        "200":
+          description: Passkeys (never includes key material)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          credentials:
+                            type: array
+                            items: { $ref: "#/components/schemas/PasskeyCredential" }
+        "403": { description: WebAuthnDisabled }
+  /api/v2/auth/webauthn/credentials/{id}:
+    delete:
+      tags: [Auth]
+      summary: Delete one of the caller's passkeys
+      description: |
+        Requires a valid session. The password always remains as a login
+        factor, so even the last passkey may be deleted.
+      security: [{ SessionToken: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { description: WebAuthnDisabled }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v2/auth/webauthn/login/start:
+    post:
+      tags: [Auth]
+      summary: Begin a passkey login (returns WebAuthn request options)
+      description: |
+        The response `data` is the JSON form of a WebAuthn
+        `CredentialRequestOptions` — pass it to
+        `navigator.credentials.get()`. Unknown addresses receive the same
+        generic response shape (with deterministic fake credential ids),
+        so the endpoint cannot be used to enumerate accounts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email_address]
+              properties:
+                email_address: { type: string, format: email }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { description: WebAuthnDisabled }
+  /api/v2/auth/webauthn/login/finish:
+    post:
+      tags: [Auth]
+      summary: Complete a passkey login (issues a session like /login)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [credential]
+              properties:
+                credential:
+                  type: object
+                  description: The JSON-serialized result of navigator.credentials.get()
+      responses:
+        "201":
+          description: Session created — same structure as a password login
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          session_token: { type: string }
+                          expires_at: { type: string, format: date-time }
+                          user: { $ref: "#/components/schemas/User" }
+        "401":
+          description: InvalidCredentials (generic for every failure mode)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "403": { description: WebAuthnDisabled / AccountLocked }
 
   # ------------------------------------------------------------- admin
   /api/v2/admin/organizations:
@@ -1649,6 +1817,14 @@ components:
         first_name: { type: string }
         last_name: { type: string }
         admin: { type: boolean }
+
+    PasskeyCredential:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time, nullable: true }
 
     Pagination:
       type: object

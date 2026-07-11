@@ -24,7 +24,7 @@ pub use admin_store::{
 };
 pub use auth::{
     AuthEvent, AuthSession, Invitation, NewAuthEvent, NewAuthSession, NewInvitation,
-    OrganizationMembership, Role, UserAuth,
+    NewWebAuthnCredential, OrganizationMembership, Role, UserAuth, WebAuthnCredential,
 };
 pub use auth_store::AuthStore;
 pub use dns::{DnsError, DnsResolver, StaticDnsResolver};

@@ -26,7 +26,7 @@ attribution, but is an independent project — there is no upstream to track.
 | `web/app` | Next.js (App Router) dashboard (`(app)` group, shadcn/ui + TanStack Query); `/` redirects to `/login`; Next proxies `/api` to the backend (`API_PROXY_URL`) |
 | `templates/` | 20 ready-to-clone transactional email templates (JSON) + `import.sh` |
 | `docs/` | quickstart, configuration, authentication (accounts/RBAC/SSO) |
-| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 74 endpoints) |
+| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 81 endpoints) |
 
 ## The three API surfaces
 
@@ -90,6 +90,8 @@ Other conventions:
 
 SAML and SCIM (OIDC is the SSO path), WebAuthn, billing (planned
 separately). Legal
+SAML and SCIM (OIDC is the SSO path), per-domain DKIM keys
+(one installation key + selector), billing (planned separately). Legal
 pages of the (separately hosted) marketing site are placeholder
 templates and marked as such. App-mail delivery of reset/invitation/welcome mail is no longer a
 gap: the `app_mail` config group (`enabled`, `server_api_key`,

@@ -287,6 +287,33 @@ pub struct NewInvitation {
     pub expires_at: DateTime<Utc>,
 }
 
+/// A registered WebAuthn credential (passkey). The public-key material
+/// lives opaquely in `credential_json` (a serialized `webauthn-rs`
+/// `Passkey`); `credential_id` duplicates the credential id in unpadded
+/// base64url as the lookup key during authentication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebAuthnCredential {
+    pub id: Id,
+    pub user_id: Id,
+    /// User-chosen label ("MacBook Touch ID", "YubiKey #1", …).
+    pub name: String,
+    /// Unpadded base64url of the raw credential id.
+    pub credential_id: String,
+    /// The serialized `webauthn-rs` `Passkey` (public key, signature
+    /// counter, backup flags). Contains no secrets.
+    pub credential_json: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewWebAuthnCredential {
+    pub user_id: Id,
+    pub name: String,
+    pub credential_id: String,
+    pub credential_json: String,
+}
+
 /// An authentication audit record (logins, failures, lockouts, password
 /// and membership changes, SSO sign-ins).
 #[derive(Debug, Clone, PartialEq, Eq)]

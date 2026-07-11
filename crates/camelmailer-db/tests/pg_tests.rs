@@ -2097,3 +2097,164 @@ async fn billing_customer_id_roundtrip() {
         .await
         .is_err());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_webauthn_credentials_and_states() {
+    use camelmailer_core::{AuthStore, NewUser, NewWebAuthnCredential, StoreError};
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+    let user = f
+        .store
+        .create_user(NewUser {
+            email_address: "w@example.com".into(),
+            first_name: "W".into(),
+            last_name: "U".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+    let other = f
+        .store
+        .create_user(NewUser {
+            email_address: "o@example.com".into(),
+            first_name: "O".into(),
+            last_name: "U".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+    let new = |user_id, name: &str, credential_id: &str| NewWebAuthnCredential {
+        user_id,
+        name: name.to_string(),
+        credential_id: credential_id.to_string(),
+        credential_json: "{\"cred\":\"data\"}".to_string(),
+    };
+
+    // add + duplicate credential id conflicts (also across users)
+    let credential = f
+        .store
+        .add_webauthn_credential(new(user.id, "MacBook", "cred-a"))
+        .await
+        .unwrap();
+    assert_eq!(credential.user_id, user.id);
+    assert_eq!(credential.name, "MacBook");
+    assert_eq!(credential.last_used_at, None);
+    f.store
+        .add_webauthn_credential(new(user.id, "YubiKey", "cred-b"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.store
+            .add_webauthn_credential(new(other.id, "Clone", "cred-a"))
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    // list is per-user, oldest first
+    let mine = f.store.list_webauthn_credentials(user.id).await.unwrap();
+    assert_eq!(mine.len(), 2);
+    assert_eq!(mine[0].name, "MacBook");
+    assert_eq!(mine[1].name, "YubiKey");
+    assert!(f
+        .store
+        .list_webauthn_credentials(other.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // lookup by credential id
+    let found = f
+        .store
+        .webauthn_credential_by_credential_id("cred-a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, credential.id);
+    assert!(f
+        .store
+        .webauthn_credential_by_credential_id("nope")
+        .await
+        .unwrap()
+        .is_none());
+
+    // counter/backup-flag update stamps last_used_at
+    f.store
+        .update_webauthn_credential(credential.id, "{\"cred\":\"updated\"}", chrono::Utc::now())
+        .await
+        .unwrap();
+    let found = f
+        .store
+        .webauthn_credential_by_credential_id("cred-a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.credential_json, "{\"cred\":\"updated\"}");
+    assert!(found.last_used_at.is_some());
+
+    // deletion is scoped to the owner
+    assert!(!f
+        .store
+        .delete_webauthn_credential(other.id, credential.id)
+        .await
+        .unwrap());
+    assert!(f
+        .store
+        .delete_webauthn_credential(user.id, credential.id)
+        .await
+        .unwrap());
+    assert!(!f
+        .store
+        .delete_webauthn_credential(user.id, credential.id)
+        .await
+        .unwrap());
+
+    // ceremony states: upsert on the same key, single use, expiring
+    f.store
+        .create_webauthn_state(
+            "login:chal-1",
+            Some(user.id),
+            "{\"state\":1}",
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+    f.store
+        .create_webauthn_state(
+            "login:chal-1",
+            Some(user.id),
+            "{\"state\":2}",
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .consume_webauthn_state("login:chal-1", chrono::Utc::now())
+            .await
+            .unwrap(),
+        Some((Some(user.id), "{\"state\":2}".into()))
+    );
+    assert_eq!(
+        f.store
+            .consume_webauthn_state("login:chal-1", chrono::Utc::now())
+            .await
+            .unwrap(),
+        None
+    );
+    f.store
+        .create_webauthn_state(
+            "reg:chal-2",
+            None,
+            "{}",
+            chrono::Utc::now() - chrono::Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .consume_webauthn_state("reg:chal-2", chrono::Utc::now())
+            .await
+            .unwrap(),
+        None
+    );
+}

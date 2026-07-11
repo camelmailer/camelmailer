@@ -1,10 +1,12 @@
 //! The PostgreSQL implementation of [`AuthStore`] (accounts, sessions,
-//! RBAC memberships, invitations, password resets, OIDC state, audit log).
+//! RBAC memberships, invitations, password resets, OIDC state, WebAuthn
+//! credentials, audit log).
 
 use async_trait::async_trait;
 use camelmailer_core::{
     token, AuthEvent, AuthSession, AuthStore, Id, Invitation, NewAuthEvent, NewAuthSession,
-    NewInvitation, Organization, OrganizationMembership, Role, StoreError, User, UserAuth,
+    NewInvitation, NewWebAuthnCredential, Organization, OrganizationMembership, Role, StoreError,
+    User, UserAuth, WebAuthnCredential,
 };
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgRow;
@@ -24,6 +26,9 @@ fn sqlx_error(error: sqlx::Error) -> StoreError {
                 }
                 Some("user_auth_oidc_sub_key") | Some("sso_identities_pkey") => {
                     "This SSO identity is already linked to another user"
+                }
+                Some("webauthn_credentials_credential_id_key") => {
+                    "This passkey is already registered"
                 }
                 _ => "Record is not unique",
             };
@@ -83,6 +88,18 @@ fn invitation_from_row(row: &PgRow) -> Result<Invitation, StoreError> {
         expires_at: row.get("expires_at"),
         accepted_at: row.get("accepted_at"),
     })
+}
+
+fn webauthn_credential_from_row(row: &PgRow) -> WebAuthnCredential {
+    WebAuthnCredential {
+        id: row.get::<i64, _>("id") as Id,
+        user_id: row.get::<i64, _>("user_id") as Id,
+        name: row.get("name"),
+        credential_id: row.get("credential_id"),
+        credential_json: row.get("credential"),
+        created_at: row.get("created_at"),
+        last_used_at: row.get("last_used_at"),
+    }
 }
 
 #[async_trait]
@@ -596,6 +613,128 @@ impl AuthStore for PgStore {
                 return None;
             }
             Some((row.get("pkce_verifier"), row.get("nonce")))
+        }))
+    }
+
+    async fn add_webauthn_credential(
+        &self,
+        new: NewWebAuthnCredential,
+    ) -> Result<WebAuthnCredential, StoreError> {
+        sqlx::query(
+            "INSERT INTO webauthn_credentials (user_id, name, credential_id, credential)
+             VALUES ($1, $2, $3, $4) RETURNING *",
+        )
+        .bind(new.user_id as i64)
+        .bind(&new.name)
+        .bind(&new.credential_id)
+        .bind(&new.credential_json)
+        .fetch_one(self.pool())
+        .await
+        .map(|row| webauthn_credential_from_row(&row))
+        .map_err(sqlx_error)
+    }
+
+    async fn list_webauthn_credentials(
+        &self,
+        user_id: Id,
+    ) -> Result<Vec<WebAuthnCredential>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM webauthn_credentials WHERE user_id = $1 ORDER BY id")
+            .bind(user_id as i64)
+            .fetch_all(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        Ok(rows.iter().map(webauthn_credential_from_row).collect())
+    }
+
+    async fn webauthn_credential_by_credential_id(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<WebAuthnCredential>, StoreError> {
+        sqlx::query("SELECT * FROM webauthn_credentials WHERE credential_id = $1")
+            .bind(credential_id)
+            .fetch_optional(self.pool())
+            .await
+            .map(|row| row.as_ref().map(webauthn_credential_from_row))
+            .map_err(sqlx_error)
+    }
+
+    async fn update_webauthn_credential(
+        &self,
+        credential_id: Id,
+        credential_json: &str,
+        last_used_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE webauthn_credentials SET credential = $2, last_used_at = $3 WHERE id = $1",
+        )
+        .bind(credential_id as i64)
+        .bind(credential_json)
+        .bind(last_used_at)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(sqlx_error)
+    }
+
+    async fn delete_webauthn_credential(
+        &self,
+        user_id: Id,
+        credential_id: Id,
+    ) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM webauthn_credentials WHERE id = $1 AND user_id = $2")
+            .bind(credential_id as i64)
+            .bind(user_id as i64)
+            .execute(self.pool())
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(sqlx_error)
+    }
+
+    async fn create_webauthn_state(
+        &self,
+        key: &str,
+        user_id: Option<Id>,
+        state_json: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO webauthn_states (key, user_id, state, expires_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (key)
+             DO UPDATE SET user_id = $2, state = $3, expires_at = $4",
+        )
+        .bind(key)
+        .bind(user_id.map(|id| id as i64))
+        .bind(state_json)
+        .bind(expires_at)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(sqlx_error)
+    }
+
+    async fn consume_webauthn_state(
+        &self,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<(Option<Id>, String)>, StoreError> {
+        let row = sqlx::query(
+            "DELETE FROM webauthn_states WHERE key = $1
+             RETURNING user_id, state, expires_at",
+        )
+        .bind(key)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(row.and_then(|row| {
+            let expires_at: DateTime<Utc> = row.get("expires_at");
+            if expires_at < now {
+                return None;
+            }
+            Some((
+                row.get::<Option<i64>, _>("user_id").map(|id| id as Id),
+                row.get("state"),
+            ))
         }))
     }
 
