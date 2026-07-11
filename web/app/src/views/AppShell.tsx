@@ -1,25 +1,25 @@
 "use client"
 
 // The signed-in application frame, following the shadcn "dashboard-01"
-// block: a collapsible icon sidebar (organizations, servers of the active
-// organization, instance admin), a header with the sidebar trigger and
-// route breadcrumbs, and the page content in the inset.
+// block: a collapsible icon sidebar (org switcher, servers of the
+// active organization, org areas, instance admin), a header with the
+// sidebar trigger, route breadcrumbs and the ⌘K hint, and the page
+// content in the inset. Also hosts the global command palette.
 
-import { Fragment, useState } from "react"
+import { Fragment, useEffect, useState, useSyncExternalStore } from "react"
 import Link from "next/link"
 import { useParams, usePathname, useRouter } from "next/navigation"
 import { useQuery } from "@tanstack/react-query"
 import {
   BadgeCheckIcon,
-  BuildingIcon,
-  ChevronsUpDownIcon,
+  CreditCardIcon,
   KeyRoundIcon,
-  ListIcon,
+  LayoutDashboardIcon,
   LogOutIcon,
   NetworkIcon,
-  PlusIcon,
   ScrollTextIcon,
-  ServerIcon,
+  SearchIcon,
+  SettingsIcon,
   UsersIcon,
 } from "lucide-react"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
@@ -32,13 +32,6 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb"
 import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -55,13 +48,11 @@ import {
   SidebarContent,
   SidebarFooter,
   SidebarGroup,
-  SidebarGroupAction,
   SidebarGroupContent,
   SidebarGroupLabel,
   SidebarHeader,
   SidebarInset,
   SidebarMenu,
-  SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSkeleton,
@@ -69,7 +60,17 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { CommandPalette } from "@/components/command-palette"
+import { FormDialog, Kbd } from "@/components/form-dialog"
+import { NEW_ORG_EVENT, OrgSwitcher } from "@/components/org-switcher"
+import { ThemeSubMenu } from "@/components/theme"
 import { adminApi, ApiError } from "@/lib/api"
+import {
+  getLastActiveOrg,
+  serverDotColor,
+  setLastActiveOrg,
+  subscribeLastActiveOrg,
+} from "@/lib/api-extras"
 import { useAuth } from "@/lib/auth"
 import { toast } from "sonner"
 
@@ -121,6 +122,30 @@ function useActiveParams() {
     org: typeof params?.org === "string" ? params.org : undefined,
     server: typeof params?.server === "string" ? params.server : undefined,
   }
+}
+
+/// The organization the sidebar works against: the routed one, else the
+/// last one used (localStorage), else the first membership.
+function useActiveOrg(): string | undefined {
+  const { me } = useAuth()
+  const { org } = useActiveParams()
+  const stored = useSyncExternalStore(
+    subscribeLastActiveOrg,
+    getLastActiveOrg,
+    () => null,
+  )
+
+  // Remember the routed org as "last active".
+  useEffect(() => {
+    if (org) setLastActiveOrg(org)
+  }, [org])
+
+  if (org) return org
+  const memberships = me?.memberships ?? []
+  if (stored && memberships.some((m) => m.organization.permalink === stored)) {
+    return stored
+  }
+  return memberships[0]?.organization.permalink
 }
 
 function AppBreadcrumbs() {
@@ -223,7 +248,6 @@ function NavUser() {
                   {me?.user.email_address}
                 </span>
               </div>
-              <ChevronsUpDownIcon className="ml-auto size-4" />
             </SidebarMenuButton>
           </DropdownMenuTrigger>
           <DropdownMenuContent
@@ -240,6 +264,8 @@ function NavUser() {
             <DropdownMenuItem onClick={() => router.push("/account")}>
               <BadgeCheckIcon /> Account & security
             </DropdownMenuItem>
+            <ThemeSubMenu />
+            <DropdownMenuSeparator />
             <DropdownMenuItem
               onClick={async () => {
                 await logout()
@@ -255,16 +281,50 @@ function NavUser() {
   )
 }
 
-function AppSidebar({ onNewOrganization }: { onNewOrganization: () => void }) {
+function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
   const { me } = useAuth()
   const pathname = usePathname() ?? ""
-  const { org } = useActiveParams()
-  const servers = useOrgServers(org)
+  const servers = useOrgServers(activeOrg)
 
-  const memberships = me?.memberships ?? []
   const isAdmin = me?.user.admin ?? false
-  const activeOrgName =
-    memberships.find((m) => m.organization.permalink === org)?.organization.name ?? org
+  const role = me?.memberships.find(
+    (m) => m.organization.permalink === activeOrg,
+  )?.role
+  const canBilling = isAdmin || role === "owner" || role === "admin"
+
+  // `enabled: false` (the self-hosted default) hides the Billing entry.
+  const billing = useQuery({
+    queryKey: ["billing", activeOrg],
+    queryFn: () => adminApi.billing(activeOrg!).get(),
+    enabled: !!activeOrg && canBilling,
+    retry: false,
+  })
+  const showBilling = billing.data?.enabled === true
+
+  const orgBase = activeOrg ? `/orgs/${activeOrg}` : null
+  type OrgArea = {
+    href: string
+    label: string
+    icon: typeof UsersIcon
+    match: "exact" | "prefix" | "never"
+  }
+  const orgAreas: OrgArea[] = orgBase
+    ? [
+        { href: orgBase, label: "Overview", icon: LayoutDashboardIcon, match: "exact" },
+        { href: `${orgBase}/members`, label: "Members", icon: UsersIcon, match: "prefix" },
+        { href: `${orgBase}/settings`, label: "Settings", icon: SettingsIcon, match: "prefix" },
+        ...(showBilling
+          ? [
+              {
+                href: `${orgBase}/settings`,
+                label: "Billing",
+                icon: CreditCardIcon,
+                match: "never" as const,
+              },
+            ]
+          : []),
+      ]
+    : []
 
   return (
     <Sidebar collapsible="icon">
@@ -282,61 +342,12 @@ function AppSidebar({ onNewOrganization }: { onNewOrganization: () => void }) {
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>
+        <OrgSwitcher activeOrg={activeOrg} />
       </SidebarHeader>
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupLabel>Organizations</SidebarGroupLabel>
-          <SidebarGroupAction title="New organization" onClick={onNewOrganization}>
-            <PlusIcon /> <span className="sr-only">New organization</span>
-          </SidebarGroupAction>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {memberships.map(({ organization, role }) => {
-                const href = `/orgs/${organization.permalink}`
-                const isActive =
-                  pathname === href ||
-                  (pathname.startsWith(`${href}/`) && !pathname.startsWith(`${href}/servers/`))
-                return (
-                  <SidebarMenuItem key={organization.id}>
-                    <SidebarMenuButton asChild isActive={isActive} tooltip={organization.name}>
-                      <Link href={href}>
-                        <BuildingIcon />
-                        <span className="truncate">{organization.name}</span>
-                      </Link>
-                    </SidebarMenuButton>
-                    <SidebarMenuBadge className="text-[10px] font-normal text-muted-foreground">
-                      {role}
-                    </SidebarMenuBadge>
-                  </SidebarMenuItem>
-                )
-              })}
-              {isAdmin && (
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={pathname === "/orgs"}
-                    tooltip="All organizations"
-                  >
-                    <Link href="/orgs">
-                      <ListIcon />
-                      <span className="text-muted-foreground">All organizations…</span>
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              )}
-              {memberships.length === 0 && !isAdmin && (
-                <p className="px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
-                  No memberships yet.
-                </p>
-              )}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-        {org && (
+        {activeOrg && (
           <SidebarGroup>
-            <SidebarGroupLabel className="truncate">
-              {activeOrgName} — servers
-            </SidebarGroupLabel>
+            <SidebarGroupLabel>Servers</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 {servers.isPending &&
@@ -346,7 +357,7 @@ function AppSidebar({ onNewOrganization }: { onNewOrganization: () => void }) {
                     </SidebarMenuItem>
                   ))}
                 {(servers.data?.servers ?? []).map((server) => {
-                  const href = `/orgs/${org}/servers/${server.permalink}`
+                  const href = `/orgs/${activeOrg}/servers/${server.permalink}`
                   return (
                     <SidebarMenuItem key={server.id}>
                       <SidebarMenuButton
@@ -355,7 +366,11 @@ function AppSidebar({ onNewOrganization }: { onNewOrganization: () => void }) {
                         tooltip={server.name}
                       >
                         <Link href={href}>
-                          <ServerIcon />
+                          <span
+                            aria-hidden
+                            className="ml-1 size-2 shrink-0 rounded-full"
+                            style={{ backgroundColor: serverDotColor(server) }}
+                          />
                           <span className="truncate">{server.name}</span>
                         </Link>
                       </SidebarMenuButton>
@@ -367,6 +382,35 @@ function AppSidebar({ onNewOrganization }: { onNewOrganization: () => void }) {
                     No servers yet.
                   </p>
                 )}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        )}
+        {activeOrg && (
+          <SidebarGroup>
+            <SidebarGroupLabel>Organization</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {orgAreas.map(({ href, label, icon: Icon, match }) => (
+                  <SidebarMenuItem key={label}>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={
+                        match === "exact"
+                          ? pathname === href
+                          : match === "prefix"
+                            ? pathname === href || pathname.startsWith(`${href}/`)
+                            : false
+                      }
+                      tooltip={label}
+                    >
+                      <Link href={href}>
+                        <Icon />
+                        <span>{label}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
@@ -409,9 +453,19 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const { refresh } = useAuth()
   const router = useRouter()
   const { org } = useActiveParams()
+  const activeOrg = useActiveOrg()
   const [newOrgOpen, setNewOrgOpen] = useState(false)
   const [newOrgName, setNewOrgName] = useState("")
   const [busy, setBusy] = useState(false)
+  const [paletteOpen, setPaletteOpen] = useState(false)
+
+  // Empty states and the command palette open the dialog via this event
+  // (see components/org-switcher.tsx).
+  useEffect(() => {
+    const onNewOrg = () => setNewOrgOpen(true)
+    window.addEventListener(NEW_ORG_EVENT, onNewOrg)
+    return () => window.removeEventListener(NEW_ORG_EVENT, onNewOrg)
+  }, [])
 
   async function createOrg() {
     setBusy(true)
@@ -420,6 +474,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       await refresh()
       setNewOrgOpen(false)
       setNewOrgName("")
+      setLastActiveOrg(organization.permalink)
       router.push(`/orgs/${organization.permalink}`)
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "Could not create the organization")
@@ -430,7 +485,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <SidebarProvider>
-      <AppSidebar onNewOrganization={() => setNewOrgOpen(true)} />
+      <AppSidebar activeOrg={activeOrg} />
       <SidebarInset>
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />
@@ -439,36 +494,50 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             className="mr-2 data-[orientation=vertical]:h-4"
           />
           <AppBreadcrumbs />
+          <div className="ml-auto flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-2 text-muted-foreground"
+              onClick={() => setPaletteOpen(true)}
+            >
+              <SearchIcon className="size-3.5" />
+              <span className="hidden sm:inline">Search…</span>
+              <Kbd>⌘K</Kbd>
+            </Button>
+          </div>
         </header>
         <main className="min-w-0 flex-1 p-6" key={org ?? "-"}>
           {children}
         </main>
       </SidebarInset>
 
-      <Dialog open={newOrgOpen} onOpenChange={setNewOrgOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>New organization</DialogTitle>
-          </DialogHeader>
-          <div className="grid gap-2">
-            <Label htmlFor="org-name">Name</Label>
-            <Input
-              id="org-name"
-              value={newOrgName}
-              onChange={(e) => setNewOrgName(e.target.value)}
-              placeholder="Acme Inc"
-            />
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setNewOrgOpen(false)}>
-              Cancel
-            </Button>
-            <Button onClick={createOrg} disabled={busy || !newOrgName.trim()}>
-              Create
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        activeOrg={activeOrg}
+        onCreateOrganization={() => setNewOrgOpen(true)}
+      />
+
+      <FormDialog
+        open={newOrgOpen}
+        onOpenChange={setNewOrgOpen}
+        title="New organization"
+        submitLabel="Create"
+        onSubmit={createOrg}
+        busy={busy}
+        submitDisabled={!newOrgName.trim()}
+      >
+        <div className="grid gap-2">
+          <Label htmlFor="org-name">Name</Label>
+          <Input
+            id="org-name"
+            value={newOrgName}
+            onChange={(e) => setNewOrgName(e.target.value)}
+            placeholder="Acme Inc"
+          />
+        </div>
+      </FormDialog>
     </SidebarProvider>
   )
 }

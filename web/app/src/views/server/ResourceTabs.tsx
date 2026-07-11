@@ -5,15 +5,24 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { PlusIcon } from "lucide-react"
+import {
+  AtSignIcon,
+  BanIcon,
+  GlobeIcon,
+  InboxIcon,
+  KeyRoundIcon,
+  PlusIcon,
+  WebhookIcon,
+} from "lucide-react"
 import { toast } from "sonner"
 import {
   ConfirmDialog,
   CopyButton,
-  EmptyState,
   PageHeader,
   SecretReveal,
 } from "@/components/shared"
+import { EmptyState } from "@/components/empty-state"
+import { FormDialog } from "@/components/form-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -112,7 +121,12 @@ export function Domains({ org, server }: Scope) {
         }
       />
       {domains.data?.domains.length === 0 ? (
-        <EmptyState>No domains yet — add one to start sending.</EmptyState>
+        <EmptyState
+          icon={GlobeIcon}
+          title="No domains yet"
+          description="Verify a domain so your mail authenticates with SPF and DKIM and lands in the inbox."
+          action={{ label: "Add domain", onClick: () => setOpen(true) }}
+        />
       ) : (
         <Table>
           <TableHeader>
@@ -162,25 +176,20 @@ export function Domains({ org, server }: Scope) {
           </TableBody>
         </Table>
       )}
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Add sending domain</DialogTitle>
-          </DialogHeader>
-          <div className="grid gap-2">
-            <Label>Domain name</Label>
-            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="mail.acme.com" />
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              Cancel
-            </Button>
-            <Button onClick={() => create.mutate()} disabled={create.isPending || !name.includes(".")}>
-              Add
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <FormDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="Add sending domain"
+        submitLabel="Add"
+        onSubmit={() => create.mutate()}
+        busy={create.isPending}
+        submitDisabled={!name.includes(".")}
+      >
+        <div className="grid gap-2">
+          <Label>Domain name</Label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="mail.acme.com" />
+        </div>
+      </FormDialog>
       <Dialog open={recordsFor !== null} onOpenChange={(open) => !open && setRecordsFor(null)}>
         <DialogContent className="sm:max-w-xl">
           <DialogHeader>
@@ -263,6 +272,14 @@ export function Credentials({ org, server }: Scope) {
           </Button>
         }
       />
+      {credentials.isSuccess && credentials.data.credentials.length === 0 ? (
+        <EmptyState
+          icon={KeyRoundIcon}
+          title="No credentials yet"
+          description="Create an API key or SMTP credential so your application can send through this server."
+          action={{ label: "New credential", onClick: () => { setIssued(null); setOpen(true) } }}
+        />
+      ) : (
       <Table>
         <TableHeader>
           <TableRow>
@@ -308,55 +325,47 @@ export function Credentials({ org, server }: Scope) {
           ))}
         </TableBody>
       </Table>
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>New credential</DialogTitle>
-          </DialogHeader>
-          {issued ? (
-            <SecretReveal label="Credential key" value={issued} />
-          ) : (
-            <div className="grid gap-4">
-              <div className="grid gap-2">
-                <Label>Name</Label>
-                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="backend" />
-              </div>
-              <div className="grid gap-2">
-                <Label>Type</Label>
-                <Select value={type} onValueChange={setType}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="API">API (HTTP)</SelectItem>
-                    <SelectItem value="SMTP">SMTP (password)</SelectItem>
-                    <SelectItem value="SMTP-IP">SMTP-IP (CIDR allowlist)</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              {type === "SMTP-IP" && (
-                <div className="grid gap-2">
-                  <Label>CIDR</Label>
-                  <Input value={cidr} onChange={(e) => setCidr(e.target.value)} placeholder="10.0.0.0/8" />
-                </div>
-              )}
+      )}
+      <FormDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="New credential"
+        onSubmit={() => create.mutate()}
+        busy={create.isPending}
+        submitDisabled={!name.trim() || (type === "SMTP-IP" && !cidr)}
+        showSubmit={!issued}
+        cancelLabel={issued ? "Done" : "Cancel"}
+      >
+        {issued ? (
+          <SecretReveal label="Credential key" value={issued} />
+        ) : (
+          <div className="grid gap-4">
+            <div className="grid gap-2">
+              <Label>Name</Label>
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="backend" />
             </div>
-          )}
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              {issued ? "Done" : "Cancel"}
-            </Button>
-            {!issued && (
-              <Button
-                onClick={() => create.mutate()}
-                disabled={create.isPending || !name.trim() || (type === "SMTP-IP" && !cidr)}
-              >
-                Create
-              </Button>
+            <div className="grid gap-2">
+              <Label>Type</Label>
+              <Select value={type} onValueChange={setType}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="API">API (HTTP)</SelectItem>
+                  <SelectItem value="SMTP">SMTP (password)</SelectItem>
+                  <SelectItem value="SMTP-IP">SMTP-IP (CIDR allowlist)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {type === "SMTP-IP" && (
+              <div className="grid gap-2">
+                <Label>CIDR</Label>
+                <Input value={cidr} onChange={(e) => setCidr(e.target.value)} placeholder="10.0.0.0/8" />
+              </div>
             )}
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          </div>
+        )}
+      </FormDialog>
       <ConfirmDialog
         open={deleteId !== null}
         onOpenChange={(open) => !open && setDeleteId(null)}
@@ -425,7 +434,12 @@ export function Routes({ org, server }: Scope) {
         }
       />
       {routes.data?.routes.length === 0 ? (
-        <EmptyState>No routes — inbound mail is rejected.</EmptyState>
+        <EmptyState
+          icon={InboxIcon}
+          title="No inbound routes yet"
+          description="Without a route, inbound mail to this server is rejected — add one to accept or forward it."
+          action={{ label: "New route", onClick: () => setOpen(true) }}
+        />
       ) : (
         <Table>
           <TableHeader>
@@ -599,7 +613,12 @@ export function Webhooks({ org, server }: Scope) {
         }
       />
       {webhooks.data?.webhooks.length === 0 ? (
-        <EmptyState>No webhooks configured.</EmptyState>
+        <EmptyState
+          icon={WebhookIcon}
+          title="No webhooks yet"
+          description="Get an HTTP callback the moment a message is sent, delayed, failed or held."
+          action={{ label: "New webhook", onClick: () => setOpen(true) }}
+        />
       ) : (
         <Table>
           <TableHeader>
@@ -663,11 +682,14 @@ export function Webhooks({ org, server }: Scope) {
           </TableBody>
         </Table>
       )}
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>New webhook</DialogTitle>
-          </DialogHeader>
+      <FormDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="New webhook"
+        onSubmit={() => create.mutate()}
+        busy={create.isPending}
+        submitDisabled={!name.trim() || !url.startsWith("http")}
+      >
           <div className="grid gap-4">
             <div className="grid gap-2">
               <Label>Name</Label>
@@ -741,19 +763,7 @@ export function Webhooks({ org, server }: Scope) {
               <Label htmlFor="sign">Sign payloads (RSA)</Label>
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={() => create.mutate()}
-              disabled={create.isPending || !name.trim() || !url.startsWith("http")}
-            >
-              Create
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      </FormDialog>
       <ConfirmDialog
         open={deleteId !== null}
         onOpenChange={(open) => !open && setDeleteId(null)}
@@ -814,7 +824,12 @@ export function Suppressions({ org, server }: Scope) {
         }
       />
       {suppressions.data?.suppressions.length === 0 ? (
-        <EmptyState>The suppression list is empty.</EmptyState>
+        <EmptyState
+          icon={BanIcon}
+          title="No suppressions yet"
+          description="Hard-bouncing addresses land here automatically; you can also suppress addresses by hand."
+          action={{ label: "Suppress address", onClick: () => setOpen(true) }}
+        />
       ) : (
         <Table>
           <TableHeader>
@@ -856,34 +871,26 @@ export function Suppressions({ org, server }: Scope) {
           </TableBody>
         </Table>
       )}
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Suppress an address</DialogTitle>
-          </DialogHeader>
-          <div className="grid gap-4">
-            <div className="grid gap-2">
-              <Label>Email address</Label>
-              <Input value={address} onChange={(e) => setAddress(e.target.value)} />
-            </div>
-            <div className="grid gap-2">
-              <Label>Reason (optional)</Label>
-              <Input value={reason} onChange={(e) => setReason(e.target.value)} />
-            </div>
+      <FormDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="Suppress an address"
+        submitLabel="Suppress"
+        onSubmit={() => create.mutate()}
+        busy={create.isPending}
+        submitDisabled={!address.includes("@")}
+      >
+        <div className="grid gap-4">
+          <div className="grid gap-2">
+            <Label>Email address</Label>
+            <Input value={address} onChange={(e) => setAddress(e.target.value)} />
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={() => create.mutate()}
-              disabled={create.isPending || !address.includes("@")}
-            >
-              Suppress
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          <div className="grid gap-2">
+            <Label>Reason (optional)</Label>
+            <Input value={reason} onChange={(e) => setReason(e.target.value)} />
+          </div>
+        </div>
+      </FormDialog>
     </div>
   )
 }
@@ -932,7 +939,12 @@ export function SenderAddresses({ org, server }: Scope) {
         }
       />
       {addresses.data?.sender_addresses.length === 0 ? (
-        <EmptyState>No sender addresses yet.</EmptyState>
+        <EmptyState
+          icon={AtSignIcon}
+          title="No sender addresses yet"
+          description="Authorize a single address to send from — no domain verification required."
+          action={{ label: "Add address", onClick: () => { setIssuedToken(null); setOpen(true) } }}
+        />
       ) : (
         <Table>
           <TableHeader>
