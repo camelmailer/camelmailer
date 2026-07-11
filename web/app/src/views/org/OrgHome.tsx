@@ -7,15 +7,18 @@ import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { PlusIcon, ServerIcon } from "lucide-react"
+import { MailPlusIcon, PlusIcon, ServerIcon, UsersIcon } from "lucide-react"
 import { toast } from "sonner"
 import {
   ConfirmDialog,
-  EmptyState,
+  EmptyState as SimpleEmptyState,
   formatDate,
   PageHeader,
   SecretReveal,
 } from "@/components/shared"
+import { EmptyState } from "@/components/empty-state"
+import { FormDialog } from "@/components/form-dialog"
+import { OnboardingChecklist } from "@/components/onboarding-checklist"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -88,6 +91,7 @@ export function Servers({ org }: { org: string }) {
 
   return (
     <div>
+      <OnboardingChecklist org={org} />
       <PageHeader
         title="Mail servers"
         action={
@@ -99,7 +103,14 @@ export function Servers({ org }: { org: string }) {
         }
       />
       {servers.data?.servers.length === 0 ? (
-        <EmptyState>No servers yet.</EmptyState>
+        <EmptyState
+          icon={ServerIcon}
+          title="No servers yet"
+          description="A mail server holds your domains, credentials and messages — create one to start sending."
+          action={
+            canManage ? { label: "New server", onClick: () => setOpen(true) } : undefined
+          }
+        />
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {servers.data?.servers.map((server) => (
@@ -129,39 +140,33 @@ export function Servers({ org }: { org: string }) {
           ))}
         </div>
       )}
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>New mail server</DialogTitle>
-          </DialogHeader>
-          <div className="grid gap-4">
-            <div className="grid gap-2">
-              <Label>Name</Label>
-              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Production" />
-            </div>
-            <div className="grid gap-2">
-              <Label>Mode</Label>
-              <Select value={mode} onValueChange={setMode}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="Live">Live</SelectItem>
-                  <SelectItem value="Development">Development</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
+      <FormDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="New mail server"
+        onSubmit={() => create.mutate()}
+        busy={create.isPending}
+        submitDisabled={!name.trim()}
+      >
+        <div className="grid gap-4">
+          <div className="grid gap-2">
+            <Label>Name</Label>
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Production" />
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              Cancel
-            </Button>
-            <Button onClick={() => create.mutate()} disabled={create.isPending || !name.trim()}>
-              Create
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          <div className="grid gap-2">
+            <Label>Mode</Label>
+            <Select value={mode} onValueChange={setMode}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="Live">Live</SelectItem>
+                <SelectItem value="Development">Development</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      </FormDialog>
     </div>
   )
 }
@@ -206,6 +211,14 @@ export function Members({ org }: { org: string }) {
           )
         }
       />
+      {members.isSuccess && members.data.members.length === 0 ? (
+        <EmptyState
+          icon={UsersIcon}
+          title="No members yet"
+          description="Invite teammates so alerts and mail operations never depend on a single person."
+          action={{ label: "Invite someone", href: `/orgs/${org}/invitations` }}
+        />
+      ) : (
       <Table>
         <TableHeader>
           <TableRow>
@@ -272,6 +285,7 @@ export function Members({ org }: { org: string }) {
           ))}
         </TableBody>
       </Table>
+      )}
 
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
         <DialogContent>
@@ -378,7 +392,16 @@ export function Invitations({ org }: { org: string }) {
         }
       />
       {invitations.data?.invitations.length === 0 ? (
-        <EmptyState>No invitations.</EmptyState>
+        <EmptyState
+          icon={MailPlusIcon}
+          title="No invitations yet"
+          description="Invite teammates by email — they get a one-time link to join this organization."
+          action={
+            canManage
+              ? { label: "Invite", onClick: () => { setIssued(null); setOpen(true) } }
+              : undefined
+          }
+        />
       ) : (
         <Table>
           <TableHeader>
@@ -519,7 +542,7 @@ export function OrgSettings({ org }: { org: string }) {
 
   // Admins only see this page when billing is on (owners always do).
   if (!isOwner && !showBilling) {
-    return <EmptyState>Only owners can manage organization settings.</EmptyState>
+    return <SimpleEmptyState>Only owners can manage organization settings.</SimpleEmptyState>
   }
   return (
     <div className="max-w-lg space-y-4">

@@ -7,9 +7,21 @@
 import { createContext, useContext, useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { usePathname, useRouter } from "next/navigation"
-import { PlusIcon, RefreshCwIcon } from "lucide-react"
+import {
+  CircleCheckIcon,
+  FileTextIcon,
+  InboxIcon,
+  KeyRoundIcon,
+  LayersIcon,
+  MailIcon,
+  PlusIcon,
+  RefreshCwIcon,
+  SearchIcon,
+} from "lucide-react"
 import { toast } from "sonner"
-import { EmptyState, formatDate, PageHeader } from "@/components/shared"
+import { formatDate, PageHeader } from "@/components/shared"
+import { EmptyState } from "@/components/empty-state"
+import { FormDialog } from "@/components/form-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -257,6 +269,8 @@ function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: ()
 }
 
 export function Messages({ api }: { api: Api }) {
+  const pathname = usePathname() ?? ""
+  const messagingBase = pathname.replace(/\/messages$/, "")
   const [scope, setScope] = useState("outgoing")
   const [query, setQuery] = useState("")
   const [selected, setSelected] = useState<number | null>(null)
@@ -291,7 +305,20 @@ export function Messages({ api }: { api: Api }) {
         </Button>
       </div>
       {messages.data?.messages.length === 0 ? (
-        <EmptyState>No messages match.</EmptyState>
+        query ? (
+          <EmptyState
+            icon={SearchIcon}
+            title="No messages match"
+            description="Try a different search term or switch the scope."
+          />
+        ) : (
+          <EmptyState
+            icon={MailIcon}
+            title="No messages yet"
+            description="Send your first message and watch its delivery here in real time."
+            action={{ label: "Send a message", href: messagingBase }}
+          />
+        )
       ) : (
         <Table>
           <TableHeader>
@@ -346,7 +373,11 @@ export function InboundQueue({ api }: { api: Api }) {
         description="Retry failed inbound deliveries or bypass holds."
       />
       {inbound.data?.messages.length === 0 ? (
-        <EmptyState>Nothing waiting.</EmptyState>
+        <EmptyState
+          icon={InboxIcon}
+          title="Nothing waiting"
+          description="Failed inbound deliveries and held messages show up here for retry or bypass."
+        />
       ) : (
         <Table>
           <TableHeader>
@@ -444,7 +475,11 @@ export function StatsView({ api }: { api: Api }) {
       <div>
         <h3 className="mb-2 font-medium">Recent bounces</h3>
         {bounces.data?.bounces.length === 0 ? (
-          <EmptyState>No bounces recorded.</EmptyState>
+          <EmptyState
+            icon={CircleCheckIcon}
+            title="No bounces recorded"
+            description="Your bounce list is clean — deliverability is looking good."
+          />
         ) : (
           <Table>
             <TableHeader>
@@ -503,6 +538,14 @@ export function Streams({ api }: { api: Api }) {
           </Button>
         }
       />
+      {streams.isSuccess && streams.data.streams.length === 0 ? (
+        <EmptyState
+          icon={LayersIcon}
+          title="No streams yet"
+          description="Streams separate transactional from broadcast mail for cleaner stats and policies."
+          action={{ label: "New stream", onClick: () => setOpen(true) }}
+        />
+      ) : (
       <Table>
         <TableHeader>
           <TableRow>
@@ -548,39 +591,34 @@ export function Streams({ api }: { api: Api }) {
           ))}
         </TableBody>
       </Table>
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>New stream</DialogTitle>
-          </DialogHeader>
-          <div className="grid gap-4">
-            <div className="grid gap-2">
-              <Label>Name</Label>
-              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Newsletter" />
-            </div>
-            <div className="grid gap-2">
-              <Label>Type</Label>
-              <Select value={type} onValueChange={setType}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="transactional">transactional</SelectItem>
-                  <SelectItem value="broadcast">broadcast</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
+      )}
+      <FormDialog
+        open={open}
+        onOpenChange={setOpen}
+        title="New stream"
+        onSubmit={() => create.mutate()}
+        busy={create.isPending}
+        submitDisabled={!name.trim()}
+      >
+        <div className="grid gap-4">
+          <div className="grid gap-2">
+            <Label>Name</Label>
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Newsletter" />
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              Cancel
-            </Button>
-            <Button onClick={() => create.mutate()} disabled={create.isPending || !name.trim()}>
-              Create
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          <div className="grid gap-2">
+            <Label>Type</Label>
+            <Select value={type} onValueChange={setType}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="transactional">transactional</SelectItem>
+                <SelectItem value="broadcast">broadcast</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      </FormDialog>
     </div>
   )
 }
@@ -643,11 +681,15 @@ function TemplateEditor({
   }
 
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>{template ? `Edit ${template.name}` : "New template"}</DialogTitle>
-        </DialogHeader>
+    <FormDialog
+      open
+      onOpenChange={(open) => !open && onClose()}
+      title={template ? `Edit ${template.name}` : "New template"}
+      submitLabel="Save"
+      onSubmit={save}
+      submitDisabled={!name.trim()}
+      wide
+    >
         <div className="grid max-h-[70svh] gap-4 overflow-y-auto pr-1">
           <div className="grid grid-cols-2 gap-2">
             <div className="grid gap-2">
@@ -690,16 +732,7 @@ function TemplateEditor({
             </div>
           )}
         </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button onClick={save} disabled={!name.trim()}>
-            Save
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    </FormDialog>
   )
 }
 
@@ -816,7 +849,12 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
         }
       />
       {templates.data?.templates.length === 0 ? (
-        <EmptyState>No templates yet.</EmptyState>
+        <EmptyState
+          icon={FileTextIcon}
+          title="No templates yet"
+          description="Write a Mustache-style template once and render it with fresh data on every send."
+          action={{ label: "New template", onClick: () => setEditor({ open: true, template: null }) }}
+        />
       ) : (
         <Table>
           <TableHeader>
@@ -947,10 +985,15 @@ export function MessagingShell({
   }
   if (!api) {
     return (
-      <EmptyState>
-        Messaging uses the server&apos;s API — create an <strong>API credential</strong> in the
-        Credentials tab first.
-      </EmptyState>
+      <EmptyState
+        icon={KeyRoundIcon}
+        title="Connect an API credential"
+        description="Messaging talks to the server's own API — create an API credential first, then come back here."
+        action={{
+          label: "Create API credential",
+          href: `/orgs/${org}/servers/${server}/credentials`,
+        }}
+      />
     )
   }
   return (

@@ -1,7 +1,9 @@
 "use client"
 
+import { useEffect } from "react"
 import { useQueries, useQuery } from "@tanstack/react-query"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { BuildingIcon } from "lucide-react"
 import {
   Card,
@@ -11,19 +13,35 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { EmptyState, PageHeader } from "@/components/shared"
+import { PageHeader } from "@/components/shared"
+import { EmptyState } from "@/components/empty-state"
+import { OnboardingChecklist } from "@/components/onboarding-checklist"
+import { requestNewOrganization } from "@/components/org-switcher"
 import { adminApi } from "@/lib/api"
+import { getLastActiveOrg } from "@/lib/api-extras"
 import { useAuth } from "@/lib/auth"
 
 /// The landing page: the user's organizations. With `all` (global admins
 /// via "All organizations…") every organization on the instance.
+/// When the user has a remembered "last active" organization, /dashboard
+/// forwards straight to its overview.
 export default function Dashboard({ all = false }: { all?: boolean }) {
   const { me } = useAuth()
+  const router = useRouter()
   const allOrgs = useQuery({
     queryKey: ["organizations", "all"],
     queryFn: adminApi.organizations.list,
     enabled: all,
   })
+
+  // Forward to the last active organization, if it still exists.
+  useEffect(() => {
+    if (all || !me) return
+    const last = getLastActiveOrg()
+    if (last && me.memberships.some((m) => m.organization.permalink === last)) {
+      router.replace(`/orgs/${last}`)
+    }
+  }, [all, me, router])
 
   const items = all
     ? (allOrgs.data?.organizations ?? []).map((organization) => ({
@@ -46,8 +64,11 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
       ? serverQueries.reduce((n, q) => n + (q.data?.servers.length ?? 0), 0)
       : null
 
+  const defaultOrg = all ? undefined : items[0]?.organization.permalink
+
   return (
     <div>
+      {!all && defaultOrg && <OnboardingChecklist org={defaultOrg} />}
       {!all && (
         <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <Card className="gap-2 py-5">
@@ -101,9 +122,12 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
         }
       />
       {items.length === 0 ? (
-        <EmptyState>
-          No organizations yet. Create one with the + button in the sidebar.
-        </EmptyState>
+        <EmptyState
+          icon={BuildingIcon}
+          title="No organizations yet"
+          description="An organization groups your mail servers, domains and team in one place."
+          action={{ label: "Create organization", onClick: requestNewOrganization }}
+        />
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {items.map(({ organization, role }) => (
