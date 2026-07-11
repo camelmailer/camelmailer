@@ -128,6 +128,45 @@ impl Default for WebServer {
     }
 }
 
+/// The protocol spoken by a social sign-in provider (`auth.sso_providers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SsoProviderType {
+    /// Standard OpenID Connect (Google, Microsoft, any spec-compliant IdP).
+    Oidc,
+    /// GitHub's OAuth2 flow (GitHub does not implement OIDC).
+    Github,
+}
+
+/// One social sign-in provider (`auth.sso_providers`). Unlike the single
+/// enterprise `oidc` group these are meant for public "Continue with …"
+/// buttons; several can be configured side by side.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SsoProvider {
+    /// URL-safe identifier; becomes part of the endpoints
+    /// (`/api/v2/auth/sso/{id}/start` and `…/callback`). Lowercase
+    /// letters, digits and hyphens only; must be unique.
+    pub id: String,
+    #[serde(rename = "type")]
+    pub provider_type: SsoProviderType,
+    /// Display name for the login/registration buttons.
+    pub name: String,
+    /// Issuer URL (`type: oidc` only);
+    /// `{issuer}/.well-known/openid-configuration` must resolve.
+    #[serde(default)]
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    /// When non-empty, only these email domains may sign in / provision.
+    #[serde(default)]
+    pub allowed_email_domains: Vec<String>,
+    /// Create accounts on first sign-in. When false, only users that
+    /// already exist (by email) may sign in via this provider.
+    #[serde(default = "default_true")]
+    pub auto_provision: bool,
+}
+
 /// User-account authentication (sessions, lockout, invitations).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -152,6 +191,10 @@ pub struct Auth {
     /// Base URL of the web frontend — used to build invitation/reset links
     /// and as the OIDC post-login redirect target.
     pub frontend_url: Option<String>,
+    /// Social sign-in providers (Google, Microsoft, GitHub, …), each
+    /// served under `/api/v2/auth/sso/{id}/…`. Independent of the single
+    /// enterprise `oidc` group, which keeps working unchanged.
+    pub sso_providers: Vec<SsoProvider>,
 }
 
 impl Default for Auth {
@@ -166,6 +209,7 @@ impl Default for Auth {
             invitation_expiry_days: 7,
             password_reset_expiry_hours: 2,
             frontend_url: None,
+            sso_providers: vec![],
         }
     }
 }
@@ -744,6 +788,36 @@ impl Config {
                 ));
             }
         }
+        let mut seen_sso_ids: Vec<&str> = vec![];
+        for provider in &self.auth.sso_providers {
+            let id = provider.id.as_str();
+            let valid_slug = !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            if !valid_slug {
+                return Err(ConfigError::Invalid(format!(
+                    "auth.sso_providers: id {id:?} is not a valid slug \
+                     (lowercase letters, digits and hyphens only)"
+                )));
+            }
+            if seen_sso_ids.contains(&id) {
+                return Err(ConfigError::Invalid(format!(
+                    "auth.sso_providers: id {id:?} is configured more than once"
+                )));
+            }
+            seen_sso_ids.push(id);
+            if provider.client_id.is_empty() || provider.client_secret.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "auth.sso_providers: provider {id:?} requires client_id and client_secret"
+                )));
+            }
+            if provider.provider_type == SsoProviderType::Oidc && provider.issuer.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "auth.sso_providers: provider {id:?} has type oidc and requires an issuer"
+                )));
+            }
+        }
         if self.auth.minimum_password_length < 8 {
             return Err(ConfigError::Invalid(
                 "auth.minimum_password_length must be at least 8".into(),
@@ -1019,6 +1093,107 @@ rspamd:
         assert!(config.validate().is_err());
         let config = Config::from_yaml("oidc:\n  enabled: true\n  issuer: https://x\n").unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn sso_providers_default_to_empty() {
+        let config = Config::default();
+        assert!(config.auth.sso_providers.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn sso_providers_parse_from_yaml() {
+        let config = Config::from_yaml(
+            r#"
+auth:
+  sso_providers:
+    - { id: google, type: oidc, name: Google, issuer: "https://accounts.google.com", client_id: cid-1, client_secret: cs-1 }
+    - { id: microsoft, type: oidc, name: Microsoft, issuer: "https://login.microsoftonline.com/common/v2.0", client_id: cid-2, client_secret: cs-2, allowed_email_domains: [corp.example] }
+    - { id: github, type: github, name: GitHub, client_id: cid-3, client_secret: cs-3, auto_provision: false }
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let providers = &config.auth.sso_providers;
+        assert_eq!(providers.len(), 3);
+        assert_eq!(providers[0].id, "google");
+        assert_eq!(providers[0].provider_type, SsoProviderType::Oidc);
+        assert_eq!(providers[0].name, "Google");
+        assert_eq!(providers[0].issuer, "https://accounts.google.com");
+        assert!(providers[0].auto_provision, "auto_provision defaults on");
+        assert!(providers[0].allowed_email_domains.is_empty());
+        assert_eq!(providers[1].allowed_email_domains, vec!["corp.example"]);
+        assert_eq!(providers[2].provider_type, SsoProviderType::Github);
+        assert!(providers[2].issuer.is_empty());
+        assert!(!providers[2].auto_provision);
+    }
+
+    #[test]
+    fn sso_provider_ids_must_be_unique_slugs() {
+        let config = Config::from_yaml(
+            "auth:\n  sso_providers:\n    - { id: google, type: oidc, name: A, issuer: 'https://a', client_id: c, client_secret: s }\n    - { id: google, type: github, name: B, client_id: c, client_secret: s }\n",
+        )
+        .unwrap();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("more than once"));
+
+        for bad_id in ["", "Google", "goo gle", "göögle", "a/b"] {
+            let config = Config::from_yaml(&format!(
+                "auth:\n  sso_providers:\n    - {{ id: {bad_id:?}, type: github, name: X, client_id: c, client_secret: s }}\n",
+            ))
+            .unwrap();
+            assert!(
+                config.validate().unwrap_err().to_string().contains("slug"),
+                "id {bad_id:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sso_oidc_provider_requires_an_issuer() {
+        let config = Config::from_yaml(
+            "auth:\n  sso_providers:\n    - { id: google, type: oidc, name: Google, client_id: c, client_secret: s }\n",
+        )
+        .unwrap();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("issuer"));
+        // github providers do not need one
+        let config = Config::from_yaml(
+            "auth:\n  sso_providers:\n    - { id: github, type: github, name: GitHub, client_id: c, client_secret: s }\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn sso_providers_require_client_id_and_secret() {
+        for missing in [
+            "{ id: x, type: github, name: X, client_id: '', client_secret: s }",
+            "{ id: x, type: github, name: X, client_id: c, client_secret: '' }",
+        ] {
+            let config =
+                Config::from_yaml(&format!("auth:\n  sso_providers:\n    - {missing}\n")).unwrap();
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("client_id and client_secret"));
+        }
+    }
+
+    #[test]
+    fn unknown_sso_provider_type_is_rejected() {
+        let result = Config::from_yaml(
+            "auth:\n  sso_providers:\n    - { id: x, type: saml, name: X, client_id: c, client_secret: s }\n",
+        );
+        assert!(result.is_err());
     }
 
     #[test]

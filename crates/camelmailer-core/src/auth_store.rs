@@ -107,6 +107,24 @@ pub trait AuthStore: Send + Sync {
     // -- SSO (OIDC)
     async fn user_by_oidc_sub(&self, sub: &str) -> Result<Option<User>, StoreError>;
     async fn set_oidc_sub(&self, user_id: Id, sub: &str) -> Result<(), StoreError>;
+
+    // -- social SSO identities. One account may hold several (at most one
+    // -- per provider); independent of the enterprise `oidc_sub` link.
+    async fn user_by_sso_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<User>, StoreError>;
+    /// Link `(provider, subject)` to an account. Upserts per provider: a
+    /// user re-linking the same provider replaces the previous subject. A
+    /// subject already linked to a *different* user is a conflict.
+    async fn link_sso_identity(
+        &self,
+        user_id: Id,
+        provider: &str,
+        subject: &str,
+    ) -> Result<(), StoreError>;
+
     /// Persist an in-flight OIDC login (state → PKCE verifier + nonce).
     async fn create_oidc_state(
         &self,
@@ -511,6 +529,41 @@ impl AuthStore for MemoryStore {
         Ok(())
     }
 
+    async fn user_by_sso_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<User>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        Ok(inner
+            .sso_identities
+            .get(&(provider.to_string(), subject.to_string()))
+            .and_then(|user_id| inner.users.get(user_id).cloned()))
+    }
+
+    async fn link_sso_identity(
+        &self,
+        user_id: Id,
+        provider: &str,
+        subject: &str,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let key = (provider.to_string(), subject.to_string());
+        if matches!(inner.sso_identities.get(&key), Some(other) if *other != user_id) {
+            return Err(StoreError::Conflict(
+                "This SSO identity is already linked to another user".into(),
+            ));
+        }
+        // upsert per provider: drop the user's previous subject first
+        inner
+            .sso_identities
+            .retain(|(existing_provider, _), existing_user| {
+                !(*existing_user == user_id && existing_provider == provider)
+            });
+        inner.sso_identities.insert(key, user_id);
+        Ok(())
+    }
+
     async fn create_oidc_state(
         &self,
         state: &str,
@@ -602,6 +655,83 @@ mod tests {
             .organizations
             .insert(id, organization.clone());
         organization
+    }
+
+    #[tokio::test]
+    async fn sso_identities_link_look_up_and_upsert_per_provider() {
+        let (store, user) = store_with_user("ada@example.com");
+        assert!(store
+            .user_by_sso_identity("google", "g-1")
+            .await
+            .unwrap()
+            .is_none());
+
+        // one identity per provider, several providers per account
+        store
+            .link_sso_identity(user.id, "google", "g-1")
+            .await
+            .unwrap();
+        store
+            .link_sso_identity(user.id, "github", "h-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .user_by_sso_identity("google", "g-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            user.id
+        );
+        assert_eq!(
+            store
+                .user_by_sso_identity("github", "h-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            user.id
+        );
+        // providers are separate namespaces
+        assert!(store
+            .user_by_sso_identity("github", "g-1")
+            .await
+            .unwrap()
+            .is_none());
+
+        // re-linking the same provider replaces the old subject
+        store
+            .link_sso_identity(user.id, "google", "g-2")
+            .await
+            .unwrap();
+        assert!(store
+            .user_by_sso_identity("google", "g-1")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .user_by_sso_identity("google", "g-2")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            user.id
+        );
+        // linking is idempotent for the same pair
+        store
+            .link_sso_identity(user.id, "google", "g-2")
+            .await
+            .unwrap();
+
+        // a subject already linked to another account is a conflict
+        let other_id = store.next_id();
+        let error = store
+            .link_sso_identity(other_id, "google", "g-2")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Conflict(_)));
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ fn sqlx_error(error: sqlx::Error) -> StoreError {
                 Some("organization_memberships_organization_id_user_id_key") => {
                     "User is already a member of this organization"
                 }
-                Some("user_auth_oidc_sub_key") => {
+                Some("user_auth_oidc_sub_key") | Some("sso_identities_pkey") => {
                     "This SSO identity is already linked to another user"
                 }
                 _ => "Record is not unique",
@@ -510,6 +510,46 @@ impl AuthStore for PgStore {
         )
         .bind(user_id as i64)
         .bind(sub)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(sqlx_error)
+    }
+
+    async fn user_by_sso_identity(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Option<User>, StoreError> {
+        sqlx::query(
+            "SELECT u.* FROM users u JOIN sso_identities i ON i.user_id = u.id
+             WHERE i.provider = $1 AND i.subject = $2",
+        )
+        .bind(provider)
+        .bind(subject)
+        .fetch_optional(self.pool())
+        .await
+        .map(|row| row.as_ref().map(user_from_row))
+        .map_err(sqlx_error)
+    }
+
+    async fn link_sso_identity(
+        &self,
+        user_id: Id,
+        provider: &str,
+        subject: &str,
+    ) -> Result<(), StoreError> {
+        // Upsert per (provider, user): re-linking replaces the subject. A
+        // subject held by a *different* user trips the primary key and
+        // surfaces as a conflict.
+        sqlx::query(
+            "INSERT INTO sso_identities (provider, subject, user_id) VALUES ($1, $2, $3)
+             ON CONFLICT ON CONSTRAINT sso_identities_provider_user_key
+             DO UPDATE SET subject = $2",
+        )
+        .bind(provider)
+        .bind(subject)
+        .bind(user_id as i64)
         .execute(self.pool())
         .await
         .map(|_| ())

@@ -48,6 +48,9 @@ pub struct ApiState {
     /// base64(SubjectPublicKeyInfo) of the installation signing key — the
     /// DKIM `p=` value for domains without their own key.
     pub installation_dkim_public_key: Option<String>,
+    /// GitHub's OAuth surface for `auth.sso_providers` — the real client
+    /// in production, a mock in tests.
+    pub sso_github: Arc<dyn crate::sso::GithubOauth>,
 }
 
 impl ApiState {
@@ -74,6 +77,7 @@ impl ApiState {
             billing: None,
             dns_resolver,
             installation_dkim_public_key: None,
+            sso_github: Arc::new(crate::sso::HttpGithub::default()),
         })
     }
 
@@ -92,6 +96,7 @@ impl ApiState {
             billing: None,
             dns_resolver: Arc::new(crate::dns::HickoryDnsResolver),
             installation_dkim_public_key: None,
+            sso_github: Arc::new(crate::sso::HttpGithub::default()),
         })
     }
 
@@ -154,8 +159,30 @@ impl ApiState {
         )
     }
 
-    /// The common constructor behind [`ApiState::full_with_billing`] and
-    /// [`ApiState::full_with_resolver`].
+    /// [`ApiState::full`] with an explicit GitHub OAuth client — router
+    /// tests inject one pointing at a local mock GitHub.
+    pub fn full_with_github(
+        store: Arc<dyn AdminStore>,
+        server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
+        auth_store: Option<Arc<dyn camelmailer_core::AuthStore>>,
+        global_admin_api_key: Option<String>,
+        config: camelmailer_config::Config,
+        sso_github: Arc<dyn crate::sso::GithubOauth>,
+    ) -> Arc<Self> {
+        Self::full_with_all(
+            store,
+            server_store,
+            auth_store,
+            global_admin_api_key,
+            config,
+            None,
+            Arc::new(crate::dns::HickoryDnsResolver),
+            sso_github,
+        )
+    }
+
+    /// The common constructor behind [`ApiState::full_with_billing`],
+    /// [`ApiState::full_with_resolver`] and [`ApiState::full_with_github`].
     pub fn full_with(
         store: Arc<dyn AdminStore>,
         server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
@@ -164,6 +191,30 @@ impl ApiState {
         config: camelmailer_config::Config,
         billing: Option<Arc<dyn crate::billing::BillingProvider>>,
         dns_resolver: Arc<dyn camelmailer_core::DnsResolver>,
+    ) -> Arc<Self> {
+        Self::full_with_all(
+            store,
+            server_store,
+            auth_store,
+            global_admin_api_key,
+            config,
+            billing,
+            dns_resolver,
+            Arc::new(crate::sso::HttpGithub::default()),
+        )
+    }
+
+    /// The fully explicit constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn full_with_all(
+        store: Arc<dyn AdminStore>,
+        server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
+        auth_store: Option<Arc<dyn camelmailer_core::AuthStore>>,
+        global_admin_api_key: Option<String>,
+        config: camelmailer_config::Config,
+        billing: Option<Arc<dyn crate::billing::BillingProvider>>,
+        dns_resolver: Arc<dyn camelmailer_core::DnsResolver>,
+        sso_github: Arc<dyn crate::sso::GithubOauth>,
     ) -> Arc<Self> {
         // The DKIM fallback for domains without their own key: the public
         // half of the installation signing key, when it exists.
@@ -180,6 +231,7 @@ impl ApiState {
             billing,
             dns_resolver,
             installation_dkim_public_key,
+            sso_github,
         })
     }
 

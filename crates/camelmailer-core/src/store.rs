@@ -153,6 +153,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) password_resets: Vec<(Id, String, chrono::DateTime<chrono::Utc>)>,
     /// In-flight OIDC logins: state -> (pkce_verifier, nonce, expires_at).
     pub(crate) oidc_states: HashMap<String, (String, String, chrono::DateTime<chrono::Utc>)>,
+    /// Social SSO account links: (provider, subject) -> user id.
+    pub(crate) sso_identities: HashMap<(String, String), Id>,
     /// Authentication audit log, in insertion order.
     pub(crate) auth_events: Vec<crate::auth::AuthEvent>,
 }

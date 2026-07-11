@@ -386,6 +386,20 @@ export const authApi = {
     api.get<{ authorization_url: string }>("/api/v2/auth/oidc/start", {
       Accept: "application/json",
     }),
+  // Which social sign-in providers the login/registration pages should
+  // render as "Continue with …" buttons.
+  features: () => api.get<{ sso: SsoProviderInfo[] }>("/api/v2/auth/features"),
+}
+
+export type SsoProviderInfo = {
+  id: string
+  name: string
+  type: "oidc" | "github"
+}
+
+/** The browser-facing entry point of a social sign-in provider. */
+export function ssoStartUrl(providerId: string): string {
+  return `/api/v2/auth/sso/${providerId}/start`
 }
 
 // ------------------------------------------------------------- admin API

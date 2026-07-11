@@ -1779,6 +1779,74 @@ async fn pg_auth_resets_oidc_and_audit() {
         None
     );
 
+    // social SSO identities: several providers per account, upsert per
+    // provider, foreign subjects conflict
+    assert!(f
+        .store
+        .user_by_sso_identity("google", "g-1")
+        .await
+        .unwrap()
+        .is_none());
+    f.store
+        .link_sso_identity(user.id, "google", "g-1")
+        .await
+        .unwrap();
+    f.store
+        .link_sso_identity(user.id, "github", "h-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .user_by_sso_identity("google", "g-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        user.id
+    );
+    assert!(f
+        .store
+        .user_by_sso_identity("github", "g-1")
+        .await
+        .unwrap()
+        .is_none());
+    f.store
+        .link_sso_identity(user.id, "google", "g-2")
+        .await
+        .unwrap();
+    assert!(f
+        .store
+        .user_by_sso_identity("google", "g-1")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        f.store
+            .user_by_sso_identity("google", "g-2")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        user.id
+    );
+    let other = f
+        .store
+        .create_user(NewUser {
+            email_address: "other@example.com".into(),
+            first_name: "O".into(),
+            last_name: "U".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.store
+            .link_sso_identity(other.id, "google", "g-2")
+            .await
+            .unwrap_err(),
+        camelmailer_core::StoreError::Conflict(_)
+    ));
+
     // audit log, newest first
     for event in ["login.success", "logout"] {
         f.store

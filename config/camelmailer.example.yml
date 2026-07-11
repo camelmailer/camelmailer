@@ -115,6 +115,21 @@ auth:
   # Base URL of your web frontend — used for invitation/reset links and
   # the OIDC post-login redirect.
   # frontend_url: https://mail-admin.example.com
+  # Social sign-in providers ("Continue with …" buttons), each served
+  # under /api/v2/auth/sso/{id}/… — register the redirect URI
+  #   {web_protocol}://{web_hostname}/api/v2/auth/sso/{id}/callback
+  # with each provider. type is oidc or github; oidc requires an issuer.
+  # Optional per provider: allowed_email_domains, auto_provision (default
+  # true). Independent of the enterprise `oidc` group below.
+  # sso_providers:
+  #   - { id: google,    type: oidc,   name: Google,
+  #       issuer: "https://accounts.google.com",
+  #       client_id: "…", client_secret: "…" }
+  #   - { id: microsoft, type: oidc,   name: Microsoft,
+  #       issuer: "https://login.microsoftonline.com/common/v2.0",
+  #       client_id: "…", client_secret: "…" }
+  #   - { id: github,    type: github, name: GitHub,
+  #       client_id: "…", client_secret: "…" }
 
 # Platform email delivery — the installation sends its own account mail
 # (password resets, invitations, welcome mail) through its own sending

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { Alert, AlertDescription } from "@/components/ui/alert"
@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { ApiError, authApi } from "@/lib/api"
+import { ApiError, authApi, ssoStartUrl, type SsoProviderInfo } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
 
 export default function Register() {
@@ -27,6 +27,16 @@ export default function Register() {
   const [error, setError] = useState<string | null>(null)
   const [disabled, setDisabled] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [ssoProviders, setSsoProviders] = useState<SsoProviderInfo[]>([])
+
+  // Social sign-in provisions accounts automatically, so the same
+  // providers double as sign-up buttons.
+  useEffect(() => {
+    authApi
+      .features()
+      .then((data) => setSsoProviders(data.sso))
+      .catch(() => setSsoProviders([]))
+  }, [])
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
@@ -136,6 +146,16 @@ export default function Register() {
               <Button type="submit" disabled={busy}>
                 {busy ? "Creating account…" : "Create account"}
               </Button>
+              {ssoProviders.map((provider) => (
+                <Button
+                  key={provider.id}
+                  type="button"
+                  variant="outline"
+                  onClick={() => (window.location.href = ssoStartUrl(provider.id))}
+                >
+                  Sign up with {provider.name}
+                </Button>
+              ))}
               <p className="text-center text-sm text-muted-foreground">
                 Already have an account?{" "}
                 <Link href="/login" className="hover:underline">
