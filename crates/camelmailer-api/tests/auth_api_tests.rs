@@ -22,15 +22,21 @@ fn password_digest() -> &'static str {
 }
 
 async fn build_app() -> (Router, Arc<MemoryStore>, Arc<ApiState>) {
+    build_app_with(camelmailer_config::Config::default()).await
+}
+
+async fn build_app_with(
+    config: camelmailer_config::Config,
+) -> (Router, Arc<MemoryStore>, Arc<ApiState>) {
     let store = Arc::new(MemoryStore::new());
-    let state = ApiState::full(
-        store.clone(),
-        None,
-        Some(store.clone()),
-        None,
-        camelmailer_config::Config::default(),
-    );
+    let state = ApiState::full(store.clone(), None, Some(store.clone()), None, config);
     (build_auth_router(state.clone()), store, state)
+}
+
+fn registration_config() -> camelmailer_config::Config {
+    let mut config = camelmailer_config::Config::default();
+    config.auth.allow_registration = true;
+    config
 }
 
 async fn create_user(store: &Arc<MemoryStore>, email: &str, admin: bool) -> camelmailer_core::User {
@@ -196,6 +202,114 @@ async fn repeated_failures_lock_the_account() {
     store.set_login_state(user.id, 0, None, None).await.unwrap();
     let (status, _) = login(&app, "ada@example.com", PASSWORD).await;
     assert_eq!(status, StatusCode::CREATED);
+}
+
+// ------------------------------------------------------- registration
+
+async fn register(app: &Router, body: Value) -> (StatusCode, Value) {
+    request(app, "POST", "/api/v2/auth/register", None, Some(body)).await
+}
+
+fn registration_body() -> Value {
+    json!({
+        "email_address": "grace@example.com",
+        "first_name": "Grace",
+        "last_name": "Hopper",
+        "password": PASSWORD,
+    })
+}
+
+#[tokio::test]
+async fn registration_is_disabled_by_default() {
+    let (app, store, _) = build_app().await;
+    let (status, body) = register(&app, registration_body()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "RegistrationDisabled");
+    // no account was created
+    assert!(store
+        .user_by_email("grace@example.com")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn registration_requires_every_parameter() {
+    let (app, _, _) = build_app_with(registration_config()).await;
+    for field in ["email_address", "first_name", "last_name", "password"] {
+        let mut body = registration_body();
+        body.as_object_mut().unwrap().remove(field);
+        let (status, response) = register(&app, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "missing {field}");
+        assert_eq!(response["error"]["code"], "ParameterMissing");
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(field));
+    }
+}
+
+#[tokio::test]
+async fn registration_validates_email_format_and_password_length() {
+    let (app, _, _) = build_app_with(registration_config()).await;
+
+    let mut body = registration_body();
+    body["email_address"] = json!("not-an-email");
+    let (status, response) = register(&app, body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response["error"]["code"], "ValidationError");
+
+    let mut body = registration_body();
+    body["password"] = json!("short");
+    let (status, response) = register(&app, body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response["error"]["code"], "ValidationError");
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("at least 8 characters"));
+}
+
+#[tokio::test]
+async fn registration_rejects_a_taken_email_address() {
+    let (app, store, _) = build_app_with(registration_config()).await;
+    create_user(&store, "grace@example.com", false).await;
+    let (status, body) = register(&app, registration_body()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+    assert_eq!(
+        body["error"]["message"],
+        "Email address has already been taken"
+    );
+}
+
+#[tokio::test]
+async fn successful_registration_signs_the_new_account_in() {
+    let (app, store, _) = build_app_with(registration_config()).await;
+    let (status, body) = register(&app, registration_body()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["data"]["user"]["email_address"], "grace@example.com");
+    assert_eq!(body["data"]["user"]["first_name"], "Grace");
+    assert_eq!(body["data"]["user"]["last_name"], "Hopper");
+    // self-registration never grants admin
+    assert_eq!(body["data"]["user"]["admin"], false);
+    assert!(body["data"]["expires_at"].is_string());
+
+    // the returned session token works immediately
+    let token = body["data"]["session_token"].as_str().unwrap().to_string();
+    let (status, body) = request(&app, "GET", "/api/v2/auth/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["user"]["email_address"], "grace@example.com");
+    assert_eq!(body["data"]["user"]["totp_enabled"], false);
+
+    // the password was stored: a normal login works too
+    let (status, _) = login(&app, "grace@example.com", PASSWORD).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // and the registration is on the audit log
+    let events = store.list_auth_events(10).await.unwrap();
+    assert!(events.iter().any(|e| e.event == "registration.success"));
 }
 
 // ----------------------------------------------------------- sessions

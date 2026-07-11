@@ -1,10 +1,12 @@
 //! `/api/v2/auth` — user accounts: password + TOTP login, sessions
-//! (Bearer tokens), password change/reset, and 2FA enrollment.
+//! (Bearer tokens), password change/reset, 2FA enrollment, and (when
+//! `auth.allow_registration` is on) self-registration.
 //!
 //! Responses use the same `{ status, time, data | error }` envelope as the
 //! admin API. Error codes a frontend can branch on:
 //! `InvalidCredentials`, `AccountLocked`, `TOTPRequired`,
-//! `InvalidTOTPCode`, `InvalidToken`, `Unauthorized`.
+//! `InvalidTOTPCode`, `InvalidToken`, `Unauthorized`,
+//! `RegistrationDisabled`.
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -259,6 +261,117 @@ async fn login(
                 }),
             )
         }
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
+// --------------------------------------------------------- registration
+
+#[derive(Debug, Deserialize)]
+struct RegisterBody {
+    email_address: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    password: Option<String>,
+}
+
+/// `POST /api/v2/auth/register` — open self-registration. Gated behind
+/// `auth.allow_registration` (off by default); creates a regular
+/// (non-admin) account and signs it in, mirroring the login success
+/// response. A fresh account never has 2FA enabled.
+async fn register(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RegisterBody>,
+) -> ApiResponse {
+    let Some(store) = auth_store(&state) else {
+        return unavailable(Some(&start.0));
+    };
+    if !state.config.auth.allow_registration {
+        return render_error(
+            Some(&start.0),
+            StatusCode::FORBIDDEN,
+            "RegistrationDisabled",
+            "Self-registration is disabled on this instance",
+        );
+    }
+    let Some(email) = body.email_address.filter(|e| !e.is_empty()) else {
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: email_address",
+        );
+    };
+    let Some(first_name) = body.first_name.filter(|v| !v.is_empty()) else {
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: first_name",
+        );
+    };
+    let Some(last_name) = body.last_name.filter(|v| !v.is_empty()) else {
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: last_name",
+        );
+    };
+    let Some(password) = body.password.filter(|p| !p.is_empty()) else {
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: password",
+        );
+    };
+    if !email.contains('@') {
+        return render_validation_error(Some(&start.0), "Email address is invalid");
+    }
+    if (password.len() as u32) < state.config.auth.minimum_password_length {
+        return render_validation_error(
+            Some(&start.0),
+            &format!(
+                "Password must be at least {} characters",
+                state.config.auth.minimum_password_length
+            ),
+        );
+    }
+    // A duplicate address surfaces as StoreError::Conflict from the store
+    // ("Email address has already been taken") → 422 ValidationError.
+    let user = match state
+        .store
+        .create_user(camelmailer_core::NewUser {
+            email_address: email,
+            first_name,
+            last_name,
+            admin: false,
+        })
+        .await
+    {
+        Ok(user) => user,
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    let digest = match auth::hash_password(&password) {
+        Ok(digest) => digest,
+        Err(error) => return render_store_error(Some(&start.0), StoreError::Other(error)),
+    };
+    if let Err(error) = store.set_password_digest(user.id, &digest).await {
+        return render_store_error(Some(&start.0), error);
+    }
+    audit(
+        store,
+        Some(user.id),
+        Some(&user.email_address),
+        "registration.success",
+        &headers,
+    )
+    .await;
+    match issue_session(store, &state, &user, &headers).await {
+        Ok((token, session)) => render_success(
+            Some(&start.0),
+            StatusCode::CREATED,
+            json!({
+                "session_token": token,
+                "expires_at": session.expires_at,
+                "user": user_json(&user),
+            }),
+        ),
         Err(error) => render_store_error(Some(&start.0), error),
     }
 }
@@ -987,6 +1100,7 @@ async fn invitation_accept(
 pub fn build_auth_router(state: Arc<ApiState>) -> Router {
     let public = Router::new()
         .route("/login", post(login))
+        .route("/register", post(register))
         .route("/password-reset", post(password_reset_request))
         .route("/password-reset/complete", post(password_reset_complete))
         .route("/invitations/accept", post(invitation_accept))

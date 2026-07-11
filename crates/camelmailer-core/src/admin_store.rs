@@ -832,3 +832,28 @@ impl AdminStore for crate::store::MemoryStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::MemoryStore;
+
+    #[tokio::test]
+    async fn create_user_rejects_a_duplicate_email_address() {
+        let store = MemoryStore::new();
+        let new = || NewUser {
+            email_address: "ada@example.com".into(),
+            first_name: "Ada".into(),
+            last_name: "Lovelace".into(),
+            admin: false,
+        };
+        let user = store.create_user(new()).await.unwrap();
+        assert_eq!(user.email_address, "ada@example.com");
+        assert!(!user.admin);
+        let error = store
+            .create_user(new())
+            .await
+            .expect_err("duplicate email must conflict");
+        assert!(matches!(error, StoreError::Conflict(_)));
+    }
+}

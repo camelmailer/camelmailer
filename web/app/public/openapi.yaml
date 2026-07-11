@@ -479,6 +479,48 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /api/v2/auth/register:
+    post:
+      tags: [Auth]
+      summary: Self-registration (requires auth.allow_registration; signs the new account in)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email_address, first_name, last_name, password]
+              properties:
+                email_address: { type: string, format: email }
+                first_name: { type: string }
+                last_name: { type: string }
+                password: { type: string, description: At least auth.minimum_password_length characters }
+      responses:
+        "201":
+          description: Account created and session issued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          session_token: { type: string }
+                          expires_at: { type: string, format: date-time }
+                          user: { $ref: "#/components/schemas/User" }
+        "403":
+          description: RegistrationDisabled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "422":
+          description: ValidationError (invalid email, weak password, or address already taken)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
   /api/v2/auth/logout:
     post:
       tags: [Auth]

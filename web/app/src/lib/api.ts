@@ -286,6 +286,17 @@ export const authApi = {
       "/api/v2/auth/login",
       { email_address, password, ...(totp_code ? { totp_code } : {}) },
     ),
+  // 403 RegistrationDisabled unless auth.allow_registration is on.
+  register: (fields: {
+    email_address: string
+    first_name: string
+    last_name: string
+    password: string
+  }) =>
+    api.post<{ session_token: string; expires_at: string; user: User }>(
+      "/api/v2/auth/register",
+      fields,
+    ),
   logout: () => api.post<{ logged_out: boolean }>("/api/v2/auth/logout"),
   me: () => api.get<MeResponse>("/api/v2/auth/me"),
   updateMe: (fields: { first_name?: string; last_name?: string }) =>

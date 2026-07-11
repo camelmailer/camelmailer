@@ -26,7 +26,7 @@ attribution, but is an independent project — there is no upstream to track.
 | `web/app` | Next.js (App Router): marketing site (statically prerendered `(marketing)` group) + admin app (`(app)` group, shadcn/ui + TanStack Query); Next proxies `/api` to the backend (`API_PROXY_URL`) |
 | `templates/` | 20 ready-to-clone transactional email templates (JSON) + `import.sh` |
 | `docs/` | quickstart, configuration, authentication (accounts/RBAC/SSO) |
-| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 73 endpoints) |
+| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 74 endpoints) |
 
 ## The three API surfaces
 

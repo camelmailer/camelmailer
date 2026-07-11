@@ -66,6 +66,28 @@ compatible with Google Authenticator, 1Password, Authy, etc.
 > reset link in the web-server log (`password reset requested`). Set
 > `auth.frontend_url` so the log carries a clickable frontend link.
 
+## Self-registration
+
+Open sign-up is off by default. Set `auth.allow_registration: true`
+(meant for public cloud offerings — self-hosters typically keep it off
+and create accounts via invitations or `make-user`) and anyone can
+create a regular, non-admin account:
+
+```bash
+curl -X POST http://localhost:5000/api/v2/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email_address": "grace@example.com", "first_name": "Grace",
+       "last_name": "Hopper", "password": "…"}'
+# -> 201, same shape as a login: { "data": { "session_token": "…", … } }
+```
+
+The new account is signed in immediately (the response matches the login
+success response). While the flag is off the endpoint answers `403
+RegistrationDisabled`. Other error codes: `ParameterMissing`,
+`ValidationError` (invalid email, password shorter than
+`auth.minimum_password_length`, or address already taken). Registrations
+appear on the audit log as `registration.success`.
+
 ## RBAC
 
 A user's power inside an organization is its **membership role**:
@@ -205,6 +227,7 @@ auth:
   lockout_minutes: 15
   minimum_password_length: 8      # must be >= 8
   allow_organization_creation: true
+  allow_registration: false     # open self-registration (POST /api/v2/auth/register)
   invitation_expiry_days: 7
   password_reset_expiry_hours: 2
   frontend_url: null              # e.g. https://mail-admin.example.com

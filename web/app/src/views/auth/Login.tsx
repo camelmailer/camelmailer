@@ -140,6 +140,12 @@ export default function Login() {
                 Continue with SSO
               </Button>
             )}
+            <p className="text-center text-sm text-muted-foreground">
+              Don&apos;t have an account?{" "}
+              <Link href="/register" className="hover:underline">
+                Create account
+              </Link>
+            </p>
           </form>
         </CardContent>
       </Card>

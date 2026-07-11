@@ -1399,6 +1399,19 @@ async fn pg_auth_account_state_round_trips() {
         .await
         .unwrap();
 
+    // duplicate email → Conflict (same behaviour as MemoryStore)
+    let error = f
+        .store
+        .create_user(NewUser {
+            email_address: "Ada@Example.com".into(),
+            first_name: "Ada".into(),
+            last_name: "L".into(),
+            admin: false,
+        })
+        .await
+        .expect_err("duplicate email must conflict");
+    assert!(matches!(error, camelmailer_core::StoreError::Conflict(_)));
+
     // case-insensitive email lookup
     let found = f.store.user_by_email("ada@example.COM").await.unwrap();
     assert_eq!(found.unwrap().id, user.id);

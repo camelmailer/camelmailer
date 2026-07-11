@@ -142,6 +142,10 @@ pub struct Auth {
     /// May any signed-in user create an organization (becoming its owner)?
     /// When false only global admins can.
     pub allow_organization_creation: bool,
+    /// May anyone create an account via `POST /api/v2/auth/register`?
+    /// Off by default; meant for public cloud offerings. Self-hosters
+    /// typically keep this off and use invitations or `make-user`.
+    pub allow_registration: bool,
     pub invitation_expiry_days: u32,
     /// Password-reset link lifetime.
     pub password_reset_expiry_hours: u32,
@@ -158,6 +162,7 @@ impl Default for Auth {
             lockout_minutes: 15,
             minimum_password_length: 8,
             allow_organization_creation: true,
+            allow_registration: false,
             invitation_expiry_days: 7,
             password_reset_expiry_hours: 2,
             frontend_url: None,
@@ -848,6 +853,7 @@ rspamd:
         assert_eq!(config.auth.lockout_minutes, 15);
         assert_eq!(config.auth.minimum_password_length, 8);
         assert!(config.auth.allow_organization_creation);
+        assert!(!config.auth.allow_registration);
         assert_eq!(config.auth.invitation_expiry_days, 7);
         assert_eq!(config.auth.password_reset_expiry_hours, 2);
         assert_eq!(config.auth.frontend_url, None);

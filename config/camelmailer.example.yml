@@ -89,6 +89,10 @@ auth:
   # Any signed-in user may create an organization (becoming its owner);
   # set to false to restrict creation to global admins.
   allow_organization_creation: true
+  # Open self-registration (POST /api/v2/auth/register) — enable for public
+  # cloud offerings; self-hosters typically leave this off and create
+  # accounts via invitations or make-user.
+  allow_registration: false
   invitation_expiry_days: 7
   password_reset_expiry_hours: 2
   # Base URL of your web frontend — used for invitation/reset links and
