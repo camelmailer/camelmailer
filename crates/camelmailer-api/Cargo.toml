@@ -11,6 +11,9 @@ hickory-resolver = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 rsa = { workspace = true }
+roxmltree = { workspace = true }
+flate2 = { workspace = true }
+x509-cert = { workspace = true }
 camelmailer-config = { workspace = true }
 camelmailer-core = { workspace = true }
 base64 = { workspace = true }
@@ -28,6 +31,7 @@ webauthn-rs-proto = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+rcgen = { workspace = true }
 http-body-util = { workspace = true }
 serde_yaml = { workspace = true }
 tower = { workspace = true }

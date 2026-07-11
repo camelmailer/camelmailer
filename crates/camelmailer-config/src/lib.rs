@@ -351,6 +351,57 @@ impl Default for Oidc {
     }
 }
 
+/// SAML 2.0 single sign-on (service-provider role). CamelMailer speaks
+/// the HTTP-Redirect binding for the AuthnRequest and the HTTP-POST
+/// binding for the response; assertions must be signed with the
+/// configured IdP certificate.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Saml {
+    pub enabled: bool,
+    /// Display name for the identity provider (shown on the login page).
+    pub name: String,
+    /// The IdP single-sign-on URL the AuthnRequest is redirected to
+    /// (`SingleSignOnService` with the HTTP-Redirect binding).
+    pub idp_sso_url: String,
+    /// The IdP signing certificate: either inline PEM (starts with
+    /// `-----BEGIN CERTIFICATE-----`) or a path to a PEM file.
+    pub idp_certificate: Option<String>,
+    /// Our SP entity id. Defaults to
+    /// `{camelmailer.web_protocol}://{camelmailer.web_hostname}`.
+    pub sp_entity_id: Option<String>,
+    /// Create accounts on first SSO login. When false, only users that
+    /// already exist (by email) may sign in via SAML.
+    pub auto_provision: bool,
+    /// When non-empty, only these email domains may sign in / provision.
+    pub allowed_email_domains: Vec<String>,
+}
+
+impl Default for Saml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            name: "SAML".into(),
+            idp_sso_url: String::new(),
+            idp_certificate: None,
+            sp_entity_id: None,
+            auto_provision: true,
+            allowed_email_domains: vec![],
+        }
+    }
+}
+
+/// SCIM 2.0 provisioning (RFC 7643/7644) under `/scim/v2`, authenticated
+/// with a static bearer token.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Scim {
+    pub enabled: bool,
+    /// The bearer token IdPs present as `Authorization: Bearer <token>`.
+    /// Required when enabled; compared in constant time.
+    pub bearer_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Worker {
@@ -699,6 +750,8 @@ pub struct Config {
     pub app_mail: AppMail,
     pub billing: Billing,
     pub oidc: Oidc,
+    pub saml: Saml,
+    pub scim: Scim,
     pub worker: Worker,
     pub postgres: Postgres,
     /// Legacy MariaDB settings, accepted for config-file compatibility only.
@@ -777,6 +830,18 @@ impl Config {
         }
     }
 
+    /// The effective SAML SP entity id: `saml.sp_entity_id`, defaulting
+    /// to `{camelmailer.web_protocol}://{camelmailer.web_hostname}`.
+    pub fn saml_sp_entity_id(&self) -> String {
+        match self.saml.sp_entity_id.as_deref().filter(|v| !v.is_empty()) {
+            Some(value) => value.to_string(),
+            None => format!(
+                "{}://{}",
+                self.camelmailer.web_protocol, self.camelmailer.web_hostname
+            ),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !matches!(self.camelmailer.web_protocol.as_str(), "http" | "https") {
             return Err(ConfigError::Invalid(format!(
@@ -850,6 +915,29 @@ impl Config {
                     "auth.sso_providers: provider {id:?} has type oidc and requires an issuer"
                 )));
             }
+        }
+        if self.saml.enabled {
+            if self.saml.idp_sso_url.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "saml.idp_sso_url is required when saml.enabled is true".into(),
+                ));
+            }
+            if self
+                .saml
+                .idp_certificate
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "saml.idp_certificate is required when saml.enabled is true".into(),
+                ));
+            }
+        }
+        if self.scim.enabled && self.scim.bearer_token.as_deref().unwrap_or("").is_empty() {
+            return Err(ConfigError::Invalid(
+                "scim.bearer_token is required when scim.enabled is true".into(),
+            ));
         }
         if self.auth.minimum_password_length < 8 {
             return Err(ConfigError::Invalid(
@@ -1148,6 +1236,29 @@ rspamd:
     fn sso_providers_default_to_empty() {
         let config = Config::default();
         assert!(config.auth.sso_providers.is_empty());
+    }
+
+    #[test]
+    fn saml_defaults_and_sp_entity_id() {
+        let config = Config::default();
+        assert!(!config.saml.enabled);
+        assert_eq!(config.saml.name, "SAML");
+        assert!(config.saml.auto_provision);
+        assert!(config.saml.allowed_email_domains.is_empty());
+        // sp_entity_id defaults to the web origin
+        assert_eq!(config.saml_sp_entity_id(), "https://postal.example.com");
+        config.validate().unwrap();
+
+        let config = Config::from_yaml(
+            "saml:\n  enabled: true\n  name: Okta\n  idp_sso_url: https://idp.example.com/sso\n  idp_certificate: |\n    -----BEGIN CERTIFICATE-----\n    MIIB\n    -----END CERTIFICATE-----\n  sp_entity_id: https://mail.example.com/saml\n  auto_provision: false\n  allowed_email_domains: [corp.example]\n",
+        )
+        .unwrap();
+        assert!(config.saml.enabled);
+        assert_eq!(config.saml.name, "Okta");
+        assert_eq!(config.saml.idp_sso_url, "https://idp.example.com/sso");
+        assert_eq!(config.saml_sp_entity_id(), "https://mail.example.com/saml");
+        assert!(!config.saml.auto_provision);
+        assert_eq!(config.saml.allowed_email_domains, vec!["corp.example"]);
         config.validate().unwrap();
     }
 
@@ -1222,6 +1333,20 @@ auth:
     }
 
     #[test]
+    fn enabled_saml_requires_sso_url_and_certificate() {
+        let config = Config::from_yaml("saml:\n  enabled: true\n").unwrap();
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("saml:\n  enabled: true\n  idp_sso_url: https://idp/sso\n").unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::from_yaml(
+            "saml:\n  enabled: true\n  idp_sso_url: https://idp/sso\n  idp_certificate: /etc/camelmailer/idp.pem\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
     fn sso_providers_require_client_id_and_secret() {
         for missing in [
             "{ id: x, type: github, name: X, client_id: '', client_secret: s }",
@@ -1243,6 +1368,23 @@ auth:
             "auth:\n  sso_providers:\n    - { id: x, type: saml, name: X, client_id: c, client_secret: s }\n",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn scim_defaults_and_token_requirement() {
+        let config = Config::default();
+        assert!(!config.scim.enabled);
+        assert_eq!(config.scim.bearer_token, None);
+        config.validate().unwrap();
+
+        let config = Config::from_yaml("scim:\n  enabled: true\n").unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::from_yaml("scim:\n  enabled: true\n  bearer_token: \"\"\n").unwrap();
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("scim:\n  enabled: true\n  bearer_token: secret-token\n").unwrap();
+        assert_eq!(config.scim.bearer_token.as_deref(), Some("secret-token"));
+        config.validate().unwrap();
     }
 
     #[test]

@@ -176,3 +176,24 @@ oidc:
   # scopes: [openid, email, profile]
   # auto_provision: true
   # allowed_email_domains: [acme.com]
+
+# SAML 2.0 single sign-on (for IdPs where SAML is the paved path).
+# Register the SP with your IdP using the metadata from:
+#   {web_protocol}://{web_hostname}/api/v2/auth/saml/metadata
+# ACS (response) URL: {web_protocol}://{web_hostname}/api/v2/auth/saml/acs
+# Assertions must be signed with idp_certificate (rsa-sha256).
+saml:
+  enabled: false
+  # name: Okta                          # login-page button label
+  # idp_sso_url: https://acme.okta.com/app/.../sso/saml
+  # idp_certificate: /etc/camelmailer/idp.pem   # or inline PEM
+  # sp_entity_id: https://mail.example.com      # default {web_protocol}://{web_hostname}
+  # auto_provision: true
+  # allowed_email_domains: [acme.com]
+
+# SCIM 2.0 provisioning (RFC 7643/7644) under /scim/v2. IdPs create,
+# update and deactivate accounts with Authorization: Bearer <token>.
+# DELETE deactivates (never hard-deletes); active: false blocks login.
+scim:
+  enabled: false
+  # bearer_token: "<long random secret>"   # required when enabled

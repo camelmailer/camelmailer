@@ -381,9 +381,22 @@ async fn resolve_user(
     claims: &serde_json::Map<String, Value>,
 ) -> Result<camelmailer_core::User, ApiResponse> {
     let map_store_error = |error: StoreError| crate::app::render_store_error(None, error);
+    let ensure_enabled = |user_auth: Option<camelmailer_core::UserAuth>| {
+        if user_auth.map(|auth| auth.disabled).unwrap_or(false) {
+            Err(crate::app::render_error(
+                None,
+                axum::http::StatusCode::FORBIDDEN,
+                "AccountDisabled",
+                "This account has been deactivated",
+            ))
+        } else {
+            Ok(())
+        }
+    };
 
     // 1. already linked
     if let Some(user) = store.user_by_oidc_sub(uid).await.map_err(map_store_error)? {
+        ensure_enabled(store.user_auth(user.id).await.map_err(map_store_error)?)?;
         return Ok(user);
     }
 
@@ -410,6 +423,7 @@ async fn resolve_user(
 
     // 2. link an existing account by email
     if let Some(user) = store.user_by_email(email).await.map_err(map_store_error)? {
+        ensure_enabled(store.user_auth(user.id).await.map_err(map_store_error)?)?;
         store
             .set_oidc_sub(user.id, uid)
             .await

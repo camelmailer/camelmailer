@@ -12,6 +12,9 @@
 //! mounted into this router; `GET /features` lets frontends discover
 //! which optional login features (passkeys, self-registration, OIDC)
 //! this instance exposes.
+//! `InvalidCredentials`, `AccountLocked`, `AccountDisabled`,
+//! `TOTPRequired`, `InvalidTOTPCode`, `InvalidToken`, `Unauthorized`,
+//! `RegistrationDisabled`.
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -172,6 +175,23 @@ async fn login(
         Ok(None) => return invalid(&start.0),
         Err(error) => return render_store_error(Some(&start.0), error),
     };
+
+    if user_auth.disabled {
+        audit(
+            store,
+            Some(user.id),
+            Some(&email),
+            "login.disabled",
+            &headers,
+        )
+        .await;
+        return render_error(
+            Some(&start.0),
+            StatusCode::FORBIDDEN,
+            "AccountDisabled",
+            "This account has been deactivated",
+        );
+    }
 
     let now = Utc::now();
     if let Some(locked_until) = user_auth.locked_until {
@@ -688,8 +708,20 @@ async fn password_reset_request(
             "param is missing or the value is empty: email_address",
         );
     };
-    // Deliberately identical response whether or not the account exists.
+    // Deliberately identical response whether or not the account exists
+    // (or has been deactivated — no token is issued for disabled ones).
     if let Ok(Some(user)) = store.user_by_email(&email).await {
+        let disabled = matches!(
+            store.user_auth(user.id).await,
+            Ok(Some(user_auth)) if user_auth.disabled
+        );
+        if disabled {
+            return render_success(
+                Some(&start.0),
+                StatusCode::OK,
+                json!({ "reset_requested": true }),
+            );
+        }
         let token = auth::generate_auth_token();
         let expires_at =
             Utc::now() + Duration::hours(state.config.auth.password_reset_expiry_hours as i64);
@@ -802,6 +834,20 @@ async fn password_reset_complete(
         }
         Err(error) => return render_store_error(Some(&start.0), error),
     };
+    // A deactivated account cannot regain access through a reset link
+    // issued before the deactivation.
+    let disabled = matches!(
+        store.user_auth(user_id).await,
+        Ok(Some(user_auth)) if user_auth.disabled
+    );
+    if disabled {
+        return render_error(
+            Some(&start.0),
+            StatusCode::FORBIDDEN,
+            "AccountDisabled",
+            "This account has been deactivated",
+        );
+    }
     let digest = match auth::hash_password(&new_password) {
         Ok(digest) => digest,
         Err(error) => return render_store_error(Some(&start.0), StoreError::Other(error)),

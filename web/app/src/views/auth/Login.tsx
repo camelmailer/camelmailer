@@ -56,6 +56,23 @@ export default function Login() {
       .catch(() => setFeatures(null))
   }, [])
 
+  const [saml, setSaml] = useState<{ url: string; name: string } | null>(null)
+
+  // The SSO buttons only render when OIDC/SAML are enabled on the
+  // instance (the start endpoints 404 otherwise).
+  useEffect(() => {
+    authApi
+      .oidcStartUrl()
+      .then((data) => setSsoUrl(data.authorization_url))
+      .catch(() => setSsoUrl(null))
+    authApi
+      .samlStartUrl()
+      .then((data) =>
+        setSaml({ url: data.authorization_url, name: data.name || "SAML" }),
+      )
+      .catch(() => setSaml(null))
+  }, [])
+
   async function passkeyLogin() {
     if (!email) {
       setError("Enter your email address first, then use your passkey.")
@@ -219,6 +236,15 @@ export default function Login() {
                   Create account
                 </Link>
               </p>
+            )}
+            {saml && (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => (window.location.href = saml.url)}
+              >
+                Sign in with {saml.name}
+              </Button>
             )}
           </form>
         </CardContent>

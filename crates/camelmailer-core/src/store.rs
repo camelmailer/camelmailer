@@ -161,6 +161,10 @@ pub(crate) struct MemoryStoreInner {
     /// (user_id, state_json, expires_at).
     pub(crate) webauthn_states:
         HashMap<String, (Option<Id>, String, chrono::DateTime<chrono::Utc>)>,
+    /// In-flight SAML logins: AuthnRequest id -> expires_at.
+    pub(crate) saml_requests: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// Replay cache of consumed SAML assertion ids -> expires_at.
+    pub(crate) saml_assertions: HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// Authentication audit log, in insertion order.
     pub(crate) auth_events: Vec<crate::auth::AuthEvent>,
 }

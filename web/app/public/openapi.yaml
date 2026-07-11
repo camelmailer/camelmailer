@@ -24,6 +24,16 @@ info:
     `ValidationError`, `ParameterMissing`, `InvalidCredentials`, `TOTPRequired`,
     `InvalidTOTPCode`, `AccountLocked`, `InvalidToken`, `SSOError`,
     `WebAuthnDisabled`, `WebAuthnError`.
+    `InvalidTOTPCode`, `AccountLocked`, `AccountDisabled`, `InvalidToken`,
+    `SSOError`.
+
+    **SCIM 2.0 provisioning** (RFC 7643/7644) is a fourth, self-describing
+    surface under `/scim/v2` (Users core: `ServiceProviderConfig`,
+    `ResourceTypes`, `Schemas`, `Users` CRUD with `filter`/`startIndex`/
+    `count`, PATCH `active`). It authenticates with `Authorization: Bearer
+    <scim.bearer_token>`, speaks `application/scim+json`, and uses the SCIM
+    error format instead of the envelope above — so it is documented in
+    docs/authentication.md rather than duplicated in this spec.
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -829,6 +839,44 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorEnvelope" }
         "403": { description: WebAuthnDisabled / AccountLocked }
+  /api/v2/auth/saml/metadata:
+    get:
+      tags: [Auth]
+      summary: SAML SP metadata XML (entity id + ACS, for IdP registration)
+      responses:
+        "200":
+          description: SP metadata
+          content:
+            application/samlmetadata+xml:
+              schema: { type: string }
+        "404": { description: SAMLDisabled }
+  /api/v2/auth/saml/start:
+    get:
+      tags: [Auth]
+      summary: Begin SAML SSO (redirect with SAMLRequest, or JSON with Accept application/json)
+      responses:
+        "307": { description: Redirect to the IdP single-sign-on URL }
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { description: SAMLDisabled }
+  /api/v2/auth/saml/acs:
+    post:
+      tags: [Auth]
+      summary: SAML assertion consumer service (the IdP posts the signed response here)
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [SAMLResponse]
+              properties:
+                SAMLResponse: { type: string, description: base64-encoded SAML response }
+                RelayState: { type: string }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+        "307": { description: Redirect to the frontend with the token in the fragment }
+        "422": { description: "SSOError — the response failed validation (signature, audience, InResponseTo, validity window, or replay)" }
+        "404": { description: SAMLDisabled }
 
   # ------------------------------------------------------------- admin
   /api/v2/admin/organizations:

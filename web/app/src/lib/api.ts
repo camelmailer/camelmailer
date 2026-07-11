@@ -404,6 +404,13 @@ export const authApi = {
   // self-registration, OIDC, social sign-in) — unauthenticated, drives
   // the login page.
   features: () => api.get<Features>("/api/v2/auth/features"),
+  // 404 SAMLDisabled when SAML is off — used to decide whether to render
+  // the "Sign in with <name>" button.
+  samlStartUrl: () =>
+    api.get<{ authorization_url: string; name: string }>(
+      "/api/v2/auth/saml/start",
+      { Accept: "application/json" },
+    ),
   // WebAuthn / passkeys. Binary fields inside the options/credential
   // payloads are unpadded base64url — see src/lib/webauthn.ts for the
   // browser-API conversion. 403 WebAuthnDisabled while the feature is off.
