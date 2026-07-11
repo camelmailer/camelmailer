@@ -1,5 +1,6 @@
 //! CamelMailer Admin API v2 — the Rust port of `app/controllers/admin_api/`.
 pub mod app;
+mod app_mailer;
 pub mod auth_api;
 pub mod cors;
 mod memberships;

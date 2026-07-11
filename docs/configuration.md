@@ -93,16 +93,19 @@ For deliverability you publish, per installation:
 Both disabled by default; point them at running rspamd/ClamAV instances to
 spam-score and virus-scan inbound mail. Failing messages are held.
 
-### `auth:` / `oidc:` / `web_server.cors_origins` — accounts, SSO, browsers
+### `auth:` / `app_mail:` / `oidc:` / `web_server.cors_origins` — accounts, SSO, browsers
 
 User accounts (sessions, 2FA, lockout), organization RBAC, invitations,
-OIDC single sign-on and CORS are documented in
+platform email delivery, OIDC single sign-on and CORS are documented in
 **[authentication.md](authentication.md)**. Quick anchors:
 
 ```yaml
 auth:
   session_timeout_days: 14
   # frontend_url: https://mail-admin.example.com
+app_mail:
+  enabled: false                     # send reset/invitation/welcome mail
+                                     # through the installation's own pipeline
 oidc:
   enabled: false                     # Okta / Entra ID / Google / Keycloak …
 web_server:

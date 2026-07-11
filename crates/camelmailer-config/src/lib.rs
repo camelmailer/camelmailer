@@ -170,6 +170,34 @@ impl Default for Auth {
     }
 }
 
+/// Platform email delivery ("app mail") — the installation sends its own
+/// account emails (password resets, invitations, welcome mail) through its
+/// own sending pipeline, via a mail server of this installation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppMail {
+    pub enabled: bool,
+    /// API credential (`X-Server-API-Key`) of a mail server of THIS
+    /// installation through which platform mail is sent.
+    pub server_api_key: Option<String>,
+    /// From address for platform mail; its domain must be a verified
+    /// sending domain of the configured server.
+    pub from_address: Option<String>,
+    /// Display name used with `from_address`.
+    pub from_name: String,
+}
+
+impl Default for AppMail {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_api_key: None,
+            from_address: None,
+            from_name: "CamelMailer".into(),
+        }
+    }
+}
+
 /// OpenID Connect single sign-on. Field names match the upstream Postal
 /// `oidc` group so a legacy `postal.yml` loads unchanged.
 #[derive(Debug, Clone, Deserialize)]
@@ -538,6 +566,7 @@ pub struct Config {
     pub camelmailer: CamelMailer,
     pub web_server: WebServer,
     pub auth: Auth,
+    pub app_mail: AppMail,
     pub oidc: Oidc,
     pub worker: Worker,
     pub postgres: Postgres,
@@ -647,6 +676,30 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "auth.minimum_password_length must be at least 8".into(),
             ));
+        }
+        if self.app_mail.enabled {
+            if self
+                .app_mail
+                .server_api_key
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "app_mail.server_api_key is required when app_mail.enabled is true".into(),
+                ));
+            }
+            if self
+                .app_mail
+                .from_address
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "app_mail.from_address is required when app_mail.enabled is true".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -882,6 +935,49 @@ rspamd:
         assert!(config.validate().is_err());
         let config = Config::from_yaml("oidc:\n  enabled: true\n  issuer: https://x\n").unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn app_mail_defaults_to_disabled() {
+        let config = Config::default();
+        assert!(!config.app_mail.enabled);
+        assert_eq!(config.app_mail.server_api_key, None);
+        assert_eq!(config.app_mail.from_address, None);
+        assert_eq!(config.app_mail.from_name, "CamelMailer");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn app_mail_parses_from_yaml() {
+        let config = Config::from_yaml(
+            "app_mail:\n  enabled: true\n  server_api_key: key-123\n  from_address: no-reply@example.com\n  from_name: Example Mail\n",
+        )
+        .unwrap();
+        assert!(config.app_mail.enabled);
+        assert_eq!(config.app_mail.server_api_key.as_deref(), Some("key-123"));
+        assert_eq!(
+            config.app_mail.from_address.as_deref(),
+            Some("no-reply@example.com")
+        );
+        assert_eq!(config.app_mail.from_name, "Example Mail");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn enabled_app_mail_requires_key_and_from_address() {
+        let config = Config::from_yaml("app_mail:\n  enabled: true\n").unwrap();
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("app_mail:\n  enabled: true\n  server_api_key: k\n").unwrap();
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("app_mail:\n  enabled: true\n  from_address: a@b.c\n").unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::from_yaml(
+            "app_mail:\n  enabled: true\n  server_api_key: k\n  from_address: a@b.c\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
     }
 
     #[test]

@@ -401,15 +401,40 @@ pub(crate) async fn invitations_create(
             user_agent: None,
         })
         .await;
-    // The token is returned exactly once, for the frontend to deliver.
-    let mut data = invitation_json(&invitation);
-    data["invite_token"] = json!(token);
-    if let Some(base) = state.config.auth.frontend_url.as_deref() {
-        data["invite_url"] = json!(format!(
+    // The token is returned exactly once, for the frontend to deliver
+    // (it stays in the response even when the invitee is also emailed).
+    let invite_url = state.config.auth.frontend_url.as_deref().map(|base| {
+        format!(
             "{}/invitations/accept?token={}",
             base.trim_end_matches('/'),
             token
-        ));
+        )
+    });
+    let mut data = invitation_json(&invitation);
+    data["invite_token"] = json!(token);
+    if let Some(invite_url) = &invite_url {
+        data["invite_url"] = json!(invite_url);
+    }
+    // Email the accept link to the invitee — a no-op unless app_mail is
+    // enabled; a delivery failure is logged and never fails the request.
+    if state.config.app_mail.enabled {
+        match invite_url.as_deref() {
+            Some(link) => {
+                crate::app_mailer::deliver(
+                    &state,
+                    crate::app_mailer::invitation_mail(
+                        &invitation.email_address,
+                        &organization.name,
+                        link,
+                        state.config.auth.invitation_expiry_days,
+                    ),
+                )
+                .await;
+            }
+            None => tracing::warn!(
+                "app_mail is enabled but auth.frontend_url is not set; cannot email the invitation link"
+            ),
+        }
     }
     render_success(
         Some(&start.0),

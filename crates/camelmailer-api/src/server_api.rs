@@ -124,9 +124,9 @@ async fn ping(start: axum::Extension<RequestStart>, server: axum::Extension<Serv
 // ----------------------------------------------------------------- send
 
 #[derive(Debug, Deserialize)]
-struct AddressInput {
-    email: String,
-    name: Option<String>,
+pub(crate) struct AddressInput {
+    pub(crate) email: String,
+    pub(crate) name: Option<String>,
 }
 
 impl From<AddressInput> for Address {
@@ -141,7 +141,7 @@ impl From<AddressInput> for Address {
 /// Accept either `"a@b.c"` or `{email, name}` for an address field.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum AddressOrString {
+pub(crate) enum AddressOrString {
     String(String),
     Object(AddressInput),
 }
@@ -156,34 +156,34 @@ impl From<AddressOrString> for Address {
 }
 
 #[derive(Debug, Deserialize)]
-struct AttachmentInput {
+pub(crate) struct AttachmentInput {
     name: String,
     content_type: String,
     data_base64: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct SendMessage {
-    from: Option<AddressOrString>,
+pub(crate) struct SendMessage {
+    pub(crate) from: Option<AddressOrString>,
     #[serde(default)]
-    to: Vec<AddressOrString>,
+    pub(crate) to: Vec<AddressOrString>,
     #[serde(default)]
-    cc: Vec<AddressOrString>,
+    pub(crate) cc: Vec<AddressOrString>,
     #[serde(default)]
-    bcc: Vec<AddressOrString>,
+    pub(crate) bcc: Vec<AddressOrString>,
     #[serde(default)]
-    reply_to: Vec<AddressOrString>,
-    subject: Option<String>,
-    html_body: Option<String>,
-    text_body: Option<String>,
+    pub(crate) reply_to: Vec<AddressOrString>,
+    pub(crate) subject: Option<String>,
+    pub(crate) html_body: Option<String>,
+    pub(crate) text_body: Option<String>,
     #[serde(default)]
-    headers: std::collections::HashMap<String, String>,
+    pub(crate) headers: std::collections::HashMap<String, String>,
     #[serde(default)]
-    attachments: Vec<AttachmentInput>,
-    tag: Option<String>,
-    metadata: Option<Value>,
+    pub(crate) attachments: Vec<AttachmentInput>,
+    pub(crate) tag: Option<String>,
+    pub(crate) metadata: Option<Value>,
     /// Message-stream permalink; defaults to the server's default stream.
-    stream: Option<String>,
+    pub(crate) stream: Option<String>,
 }
 
 /// The From-address' domain, or an error message.
@@ -192,8 +192,11 @@ fn domain_of(address: &str) -> Option<&str> {
 }
 
 /// Validate + build one message and enqueue it per recipient. Returns the
-/// per-message result object (native shape).
-async fn enqueue_send(
+/// per-message result object (native shape). Also the internal entry point
+/// for platform mail (`crate::app_mailer`), so app mail takes exactly the
+/// HTTP-send path: From-domain authorization, default stream, MIME build,
+/// `ServerStore::store_outgoing`.
+pub(crate) async fn enqueue_send(
     state: &ApiState,
     server: &Server,
     body: SendMessage,

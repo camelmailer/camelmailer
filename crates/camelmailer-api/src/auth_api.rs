@@ -362,6 +362,17 @@ async fn register(
         &headers,
     )
     .await;
+    // Welcome mail (no token) — a no-op unless app_mail is enabled; a
+    // delivery failure is logged and never fails the registration.
+    crate::app_mailer::deliver(
+        &state,
+        crate::app_mailer::welcome_mail(
+            &user.email_address,
+            &user.first_name,
+            state.config.auth.frontend_url.as_deref(),
+        ),
+    )
+    .await;
     match issue_session(store, &state, &user, &headers).await {
         Ok((token, session)) => render_success(
             Some(&start.0),
@@ -687,14 +698,38 @@ async fn password_reset_request(
                 token
             )
         });
-        // The reset link is delivered out of band; without an app-mail
-        // transport it is logged for the operator to relay.
-        tracing::info!(
-            user = %email,
-            link = link.as_deref().unwrap_or("(configure auth.frontend_url for a link)"),
-            token = %token,
-            "password reset requested"
-        );
+        // With app_mail enabled the reset link is emailed to the user (and
+        // the token stays out of the log); otherwise — or when the mail
+        // cannot be enqueued — it is logged for the operator to relay.
+        let mut mailed = false;
+        if state.config.app_mail.enabled {
+            match link.as_deref() {
+                Some(link) => {
+                    mailed = crate::app_mailer::deliver(
+                        &state,
+                        crate::app_mailer::password_reset_mail(
+                            &email,
+                            link,
+                            state.config.auth.password_reset_expiry_hours,
+                        ),
+                    )
+                    .await;
+                }
+                None => tracing::warn!(
+                    "app_mail is enabled but auth.frontend_url is not set; cannot email the reset link"
+                ),
+            }
+        }
+        if mailed {
+            tracing::info!(user = %email, "password reset requested; reset link emailed");
+        } else {
+            tracing::info!(
+                user = %email,
+                link = link.as_deref().unwrap_or("(configure auth.frontend_url for a link)"),
+                token = %token,
+                "password reset requested"
+            );
+        }
     }
     render_success(
         Some(&start.0),

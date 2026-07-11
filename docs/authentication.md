@@ -62,9 +62,12 @@ The rest of the account surface:
 Two-factor codes are standard RFC 6238 TOTP (SHA-1, 30 s, 6 digits) —
 compatible with Google Authenticator, 1Password, Authy, etc.
 
-> Password-reset tokens are delivered out of band: the operator finds the
+> Without `app_mail` (see [Platform email delivery](#platform-email-delivery))
+> password-reset tokens are delivered out of band: the operator finds the
 > reset link in the web-server log (`password reset requested`). Set
-> `auth.frontend_url` so the log carries a clickable frontend link.
+> `auth.frontend_url` so the log carries a clickable frontend link. With
+> `app_mail` enabled the link is emailed to the user instead and the token
+> stays out of the log.
 
 ## Self-registration
 
@@ -142,6 +145,39 @@ The invitation flow for people **without** an account:
 
 Invitations expire after `auth.invitation_expiry_days` (default 7) and are
 single-use.
+
+## Platform email delivery
+
+CamelMailer can send its own account mail through its own sending
+pipeline (dogfooding). Create a mail server on **this** installation with
+a verified sending domain and an API credential, then configure:
+
+```yaml
+app_mail:
+  enabled: true
+  server_api_key: "<API credential of a mail server of this installation>"
+  from_address: no-reply@example.com   # domain must be verified on that server
+  from_name: CamelMailer               # optional display name
+auth:
+  frontend_url: https://mail-admin.example.com   # needed for the links
+```
+
+When enabled (both `server_api_key` and `from_address` are then
+required), three mails are sent:
+
+| Trigger | Mail |
+|---|---|
+| `POST /api/v2/auth/password-reset` | Reset link (`{frontend_url}/reset-password?token=…`) to the user — the token travels **only** in the mail, not in the log |
+| `POST /api/v2/admin/organizations/{org}/invitations` | Accept link (`{frontend_url}/invitations/accept?token=…`) to the invitee — the response still returns `invite_token` to the inviting admin |
+| `POST /api/v2/auth/register` | A short welcome mail (no token) |
+
+There is no HTTP loopback: the key is resolved internally exactly like
+messaging-API authentication (credential → server) and the mail is
+enqueued through the same path as `POST /api/v2/server/messages` — it
+shows up as a regular outgoing message of that server. Delivery problems
+(invalid key, suspended server, unverified From domain) are logged via
+`tracing` and **never** fail the triggering request; password resets fall
+back to logging the link for the operator.
 
 ## Single sign-on (OIDC)
 
@@ -231,11 +267,15 @@ auth:
   invitation_expiry_days: 7
   password_reset_expiry_hours: 2
   frontend_url: null              # e.g. https://mail-admin.example.com
+
+app_mail:                         # platform email delivery (see above)
+  enabled: false
+  server_api_key: null            # required when enabled
+  from_address: null              # required when enabled
+  from_name: CamelMailer
 ```
 
 ## Deliberately deferred
 
 SAML (OIDC is the supported enterprise SSO protocol — most IdPs speak
-both), SCIM provisioning, WebAuthn/passkeys, per-user API scopes, and
-app-mail delivery of reset/invitation links (tokens are currently handed
-to the operator/frontend instead).
+both), SCIM provisioning, WebAuthn/passkeys, and per-user API scopes.

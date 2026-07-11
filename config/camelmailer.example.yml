@@ -99,6 +99,20 @@ auth:
   # the OIDC post-login redirect.
   # frontend_url: https://mail-admin.example.com
 
+# Platform email delivery — the installation sends its own account mail
+# (password resets, invitations, welcome mail) through its own sending
+# pipeline. Create a mail server on THIS installation with a verified
+# sending domain and an API credential, then point this group at it.
+# Requires auth.frontend_url for the links in reset/invitation mail.
+# When enabled, server_api_key and from_address are required.
+app_mail:
+  enabled: false
+  # API credential (X-Server-API-Key) of a mail server of THIS installation
+  # through which platform mail is sent:
+  # server_api_key: …
+  # from_address: no-reply@example.com   # domain must be verified on that server
+  # from_name: CamelMailer
+
 # OpenID Connect single sign-on (Okta, Entra ID, Google, Keycloak, …).
 # Register the redirect URI:
 #   {web_protocol}://{web_hostname}/api/v2/auth/oidc/callback
