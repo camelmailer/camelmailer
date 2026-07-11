@@ -654,6 +654,7 @@ fn credential_json(credential: &Credential) -> Value {
         "name": credential.name,
         "key": credential.key,
         "hold": credential.hold,
+        "last_used_at": credential.last_used_at.map(|at| at.to_rfc3339()),
     })
 }
 

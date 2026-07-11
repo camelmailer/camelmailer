@@ -99,6 +99,7 @@ impl Fixtures {
             name: "Test Credential".into(),
             key: key.into(),
             hold: false,
+            last_used_at: None,
         })
     }
 

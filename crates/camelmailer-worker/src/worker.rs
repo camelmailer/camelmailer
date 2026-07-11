@@ -21,6 +21,12 @@ use std::time::Duration;
 /// (mirrors Postal's webhook retry schedule length).
 const WEBHOOK_MAX_ATTEMPTS: i32 = 10;
 
+/// API request-log entries older than this are deleted by housekeeping.
+const API_REQUEST_RETENTION_DAYS: i64 = 30;
+
+/// How often the worker loop runs housekeeping.
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(3600);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOutcome {
     /// Outgoing message delivered via SMTP.
@@ -157,6 +163,7 @@ impl Worker {
                     "recipient is on the suppression list",
                     "",
                     false,
+                    None,
                 )
                 .await?;
             self.send_webhooks(
@@ -222,6 +229,7 @@ impl Worker {
                         "message accepted by the remote server",
                         &response,
                         tls,
+                        None,
                     )
                     .await?;
                 self.send_webhooks(
@@ -235,6 +243,10 @@ impl Worker {
             SendOutcome::SoftFail { response } => {
                 if queued.attempts + 1 >= self.max_attempts {
                     self.queue.complete(queued.id).await?;
+                    // Terminal failure: classify the bounce from the last
+                    // SMTP response (5xx -> hard, 4xx -> soft, otherwise
+                    // undetermined — see camelmailer_core::bounce).
+                    let category = camelmailer_core::bounce::classify_response(&response);
                     self.sink
                         .record_delivery(
                             message.server_id,
@@ -243,6 +255,7 @@ impl Worker {
                             "delivery attempts exhausted",
                             &response,
                             false,
+                            Some(category.as_str()),
                         )
                         .await?;
                     self.send_webhooks(
@@ -262,6 +275,9 @@ impl Worker {
                             "temporary delivery failure",
                             &response,
                             false,
+                            // transient — the message may still deliver, so
+                            // no bounce category is persisted yet
+                            None,
                         )
                         .await?;
                     self.send_webhooks(
@@ -275,6 +291,7 @@ impl Worker {
             }
             SendOutcome::HardFail { response } => {
                 self.queue.complete(queued.id).await?;
+                let category = camelmailer_core::bounce::classify_response(&response);
                 self.sink
                     .record_delivery(
                         message.server_id,
@@ -283,6 +300,7 @@ impl Worker {
                         "message rejected by the remote server",
                         &response,
                         false,
+                        Some(category.as_str()),
                     )
                     .await?;
                 self.send_webhooks(
@@ -370,10 +388,22 @@ impl Worker {
                     "message failed inspection (spam or virus)",
                     "",
                     false,
+                    None,
                 )
                 .await?;
             self.queue.complete(queued.id).await?;
             return Ok(ProcessOutcome::Held);
+        }
+
+        // Bounce processing: classify arriving DSNs (bounce-flagged
+        // messages) from their Status:/Diagnostic-Code: fields so the
+        // observability API can break bounces down into
+        // hard / soft / undetermined.
+        if message.bounce {
+            let category = camelmailer_core::bounce::classify_dsn(&message.raw_message);
+            self.sink
+                .set_bounce_category(message.server_id, message.id, category.as_str())
+                .await?;
         }
 
         let route = match message.route_id {
@@ -458,6 +488,7 @@ impl Worker {
                         "message could not be parsed as a DMARC aggregate report",
                         &error.to_string(),
                         false,
+                        None,
                     )
                     .await?;
                 return Ok(ProcessOutcome::Held);
@@ -502,6 +533,7 @@ impl Worker {
                         ),
                         "",
                         false,
+                        None,
                     )
                     .await?;
                 Ok(ProcessOutcome::DmarcReportIngested)
@@ -701,10 +733,30 @@ impl Worker {
         Ok(processed)
     }
 
-    /// The long-running worker loop: drain the queue, then poll.
+    /// Housekeeping: prune API request-log entries older than the 30-day
+    /// retention. Returns how many rows were removed. Runs periodically
+    /// from [`Worker::run`].
+    pub async fn housekeep(&self) -> Result<u64, camelmailer_core::StoreError> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(API_REQUEST_RETENTION_DAYS);
+        camelmailer_core::ServerStore::prune_api_requests(&self.store, cutoff).await
+    }
+
+    /// The long-running worker loop: drain the queue, then poll. Runs
+    /// housekeeping once at startup and then hourly.
     pub async fn run(&self) -> Result<(), sqlx::Error> {
         tracing::info!(worker_id = %self.worker_id, "camelmailer worker started");
+        let mut last_housekeeping: Option<std::time::Instant> = None;
         loop {
+            if last_housekeeping.is_none_or(|at| at.elapsed() >= HOUSEKEEPING_INTERVAL) {
+                last_housekeeping = Some(std::time::Instant::now());
+                match self.housekeep().await {
+                    Ok(0) => {}
+                    Ok(removed) => {
+                        tracing::info!(removed, "pruned expired API request-log entries")
+                    }
+                    Err(error) => tracing::error!(%error, "housekeeping error"),
+                }
+            }
             let mut idle = true;
             match self.process_next().await {
                 Ok(Some(outcome)) => {

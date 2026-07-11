@@ -1269,3 +1269,259 @@ async fn streams_are_tenant_scoped() {
     let (status, _) = request(&app, "/api/v2/server/streams/secret", Some(&token_b)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// -------------------------- observability: tags, bounce categories, logs
+
+#[tokio::test]
+async fn tags_lists_recent_tags_with_counts_and_is_tenant_scoped() {
+    let (app, token_a, token_b, store) = build_two_with_domains().await;
+    for (subject, tag) in [("A1", "welcome"), ("A2", "welcome"), ("A3", "promo")] {
+        send_one(
+            &app,
+            &token_a,
+            "news@alpha.example",
+            "one@dest.example",
+            subject,
+            tag,
+        )
+        .await;
+    }
+    // a tag last used outside the 30-day window is not listed
+    let stale = send_one(
+        &app,
+        &token_a,
+        "news@alpha.example",
+        "one@dest.example",
+        "Old",
+        "stale",
+    )
+    .await;
+    store.set_message_created_at(stale, chrono::Utc::now() - chrono::Duration::days(40));
+    send_one(
+        &app,
+        &token_b,
+        "news@beta.example",
+        "two@dest.example",
+        "B1",
+        "beta-only",
+    )
+    .await;
+
+    let (status, body) = request(&app, "/api/v2/server/tags", Some(&token_a)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["tags"],
+        json!([
+            { "tag": "welcome", "count": 2 },
+            { "tag": "promo", "count": 1 },
+        ])
+    );
+
+    // the other tenant sees only its own tags
+    let (_, body) = request(&app, "/api/v2/server/tags", Some(&token_b)).await;
+    assert_eq!(
+        body["data"]["tags"],
+        json!([{ "tag": "beta-only", "count": 1 }])
+    );
+}
+
+#[tokio::test]
+async fn stats_scope_to_a_tag() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    let tagged = send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "one@dest.example",
+        "T",
+        "receipt",
+    )
+    .await;
+    store.set_message_status(tagged, "Sent");
+    send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "two@dest.example",
+        "U",
+        "other",
+    )
+    .await;
+
+    let (status, body) = request(&app, "/api/v2/server/stats?tag=receipt", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["stats"]["total"], 1);
+    assert_eq!(body["data"]["stats"]["sent"], 1);
+
+    let (_, body) = request(&app, "/api/v2/server/stats?tag=missing", Some(&token)).await;
+    assert_eq!(body["data"]["stats"]["total"], 0);
+
+    // no tag = everything
+    let (_, body) = request(&app, "/api/v2/server/stats", Some(&token)).await;
+    assert_eq!(body["data"]["stats"]["total"], 2);
+}
+
+#[tokio::test]
+async fn bounce_categories_are_exposed_and_broken_down_in_stats() {
+    use camelmailer_core::bounce::BounceCategory;
+    let (app, token, _, store) = build_two_with_domains().await;
+    let send = |subject: &'static str| {
+        send_one(
+            &app,
+            &token,
+            "news@alpha.example",
+            "one@dest.example",
+            subject,
+            "t",
+        )
+    };
+    // a classified hard bounce (5xx reject)
+    let hard = send("Hard").await;
+    store.set_message_status(hard, "Bounced");
+    store.set_bounce_category(hard, BounceCategory::Hard);
+    // a terminal delivery failure classified soft (exhausted 4xx retries)
+    let soft = send("Soft").await;
+    store.set_message_status(soft, "HardFail");
+    store.set_bounce_category(soft, BounceCategory::Soft);
+    // an unclassified bounce counts as undetermined
+    let unknown = send("Unknown").await;
+    store.set_message_status(unknown, "Bounced");
+    // a delivered message contributes to no bucket
+    let ok = send("OK").await;
+    store.set_message_status(ok, "Sent");
+
+    // GET /bounces carries the category (null until classified)
+    let (status, body) = request(&app, "/api/v2/server/bounces", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let bounces = body["data"]["bounces"].as_array().unwrap();
+    let category_of = |subject: &str| {
+        bounces
+            .iter()
+            .find(|b| b["subject"] == subject)
+            .map(|b| b["bounce_category"].clone())
+            .unwrap()
+    };
+    assert_eq!(category_of("Hard"), json!("hard"));
+    assert_eq!(category_of("Unknown"), Value::Null);
+
+    let (status, body) = request(
+        &app,
+        &format!("/api/v2/server/bounces/{hard}"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["bounce"]["bounce_category"], "hard");
+
+    // GET /stats breaks bounces down by category
+    let (_, body) = request(&app, "/api/v2/server/stats", Some(&token)).await;
+    assert_eq!(
+        body["data"]["stats"]["bounces"],
+        json!({ "hard": 1, "soft": 1, "undetermined": 1 })
+    );
+}
+
+/// Poll `GET /logs` until at least `min` entries whose path contains
+/// `needle` show up (the log write is fire-and-forget on a background
+/// task). Panics after ~2s.
+async fn wait_for_logged(app: &Router, token: &str, needle: &str, min: usize) -> Vec<Value> {
+    for _ in 0..200 {
+        let (_, body) = request(app, "/api/v2/server/logs?per_page=100", Some(token)).await;
+        let matching: Vec<Value> = body["data"]["requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r["path"].as_str().unwrap_or("").contains(needle))
+            .collect();
+        if matching.len() >= min {
+            return matching;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("request log never showed {min} entries matching {needle:?}");
+}
+
+#[tokio::test]
+async fn request_log_records_authenticated_requests_asynchronously() {
+    let (app, token, _, _) = build_two_with_domains().await;
+
+    // a 2xx request, with an oversized user agent and a query string
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v2/server/messages?tag=secret-query")
+                .header("X-Server-API-Key", &token)
+                .header("User-Agent", "a".repeat(300))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // a 4xx request is logged just like a 2xx one
+    let (status, _) = request(&app, "/api/v2/server/messages/999999", Some(&token)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let logged = wait_for_logged(&app, &token, "/messages", 2).await;
+    // newest first
+    assert_eq!(logged[0]["path"], "/api/v2/server/messages/999999");
+    assert_eq!(logged[0]["status_code"], 404);
+    assert_eq!(logged[0]["method"], "GET");
+    assert_eq!(logged[1]["path"], "/api/v2/server/messages");
+    assert_eq!(logged[1]["status_code"], 200);
+    // no query strings, truncated user agent, a duration
+    assert_eq!(logged[1]["user_agent"].as_str().unwrap().len(), 255);
+    assert!(logged[1]["duration_ms"].as_i64().unwrap() >= 0);
+    assert!(logged[1]["created_at"].is_string());
+}
+
+#[tokio::test]
+async fn request_log_filters_by_status_class_and_method() {
+    let (app, token, _, _) = build_two_with_domains().await;
+    let (_, _) = request(&app, "/api/v2/server/messages", Some(&token)).await;
+    let (_, _) = request(&app, "/api/v2/server/messages/999999", Some(&token)).await;
+    wait_for_logged(&app, &token, "/messages", 2).await;
+
+    let (status, body) = request(&app, "/api/v2/server/logs?status=4xx", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let requests = body["data"]["requests"].as_array().unwrap();
+    assert!(!requests.is_empty());
+    assert!(requests
+        .iter()
+        .all(|r| (400..500).contains(&r["status_code"].as_i64().unwrap())));
+
+    let (_, body) = request(&app, "/api/v2/server/logs?method=post", Some(&token)).await;
+    assert_eq!(body["data"]["requests"].as_array().unwrap().len(), 0);
+
+    let (status, body) = request(&app, "/api/v2/server/logs?status=bogus", Some(&token)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+}
+
+#[tokio::test]
+async fn request_log_is_tenant_scoped_and_skips_unauthenticated_requests() {
+    let (app, token_a, token_b, store) = build_two_with_domains().await;
+
+    // server A traffic + an unauthenticated 401 (which must not be logged)
+    let (_, _) = request(&app, "/api/v2/server/messages", Some(&token_a)).await;
+    let (status, _) = request(&app, "/api/v2/server/messages", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    wait_for_logged(&app, &token_a, "/messages", 1).await;
+
+    // the foreign server sees none of A's entries
+    let (_, body) = request(&app, "/api/v2/server/logs?per_page=100", Some(&token_b)).await;
+    let foreign = body["data"]["requests"].as_array().unwrap();
+    assert!(foreign
+        .iter()
+        .all(|r| !r["path"].as_str().unwrap().contains("/messages")));
+
+    // the 401 was never logged anywhere: no entry without a server, and
+    // A's log holds exactly one /messages entry
+    let logged = wait_for_logged(&app, &token_a, "/messages", 1).await;
+    assert_eq!(logged.len(), 1);
+    let _ = store;
+}

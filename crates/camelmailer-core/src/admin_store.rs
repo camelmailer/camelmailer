@@ -438,12 +438,17 @@ impl AdminStore for crate::store::MemoryStore {
     }
 
     async fn server_for_api_token(&self, key: &str) -> Result<Option<Server>, StoreError> {
-        let inner = self.inner.read().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let credential = inner
             .credentials
-            .values()
+            .values_mut()
             .find(|c| c.credential_type == CredentialType::Api && c.key == key && !c.hold);
-        Ok(credential.and_then(|c| inner.servers.get(&c.server_id).cloned()))
+        let server_id = credential.map(|credential| {
+            // successful API-key auth stamps last_used_at (Pg parity)
+            credential.last_used_at = Some(chrono::Utc::now());
+            credential.server_id
+        });
+        Ok(server_id.and_then(|id| inner.servers.get(&id).cloned()))
     }
 
     async fn authenticated_domain(
@@ -612,6 +617,7 @@ impl AdminStore for crate::store::MemoryStore {
             name: new.name,
             key,
             hold: false,
+            last_used_at: None,
         }))
     }
 
@@ -1267,6 +1273,54 @@ mod tests {
             .await
             .expect_err("duplicate email must conflict");
         assert!(matches!(error, StoreError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn api_token_auth_stamps_the_credentials_last_used_at() {
+        let store = MemoryStore::new();
+        let organization = store
+            .create_organization(NewOrganization {
+                name: "Acme".into(),
+                permalink: "acme".into(),
+            })
+            .await
+            .unwrap();
+        let server = store
+            .create_server(NewServer {
+                organization_id: organization.id,
+                name: "S".into(),
+                permalink: "s".into(),
+                mode: ServerMode::Live,
+            })
+            .await
+            .unwrap();
+        let credential = store
+            .create_credential_record(NewCredential {
+                server_id: server.id,
+                credential_type: CredentialType::Api,
+                name: "api".into(),
+                key: Some("tok".into()),
+            })
+            .await
+            .unwrap();
+        assert!(credential.last_used_at.is_none());
+
+        // an invalid key stamps nothing
+        assert!(store.server_for_api_token("wrong").await.unwrap().is_none());
+        let listed = store.list_credentials(server.id).await.unwrap();
+        assert!(listed[0].last_used_at.is_none());
+
+        // successful API-key auth records the use
+        let resolved = store.server_for_api_token("tok").await.unwrap().unwrap();
+        assert_eq!(resolved.id, server.id);
+        let listed = store.list_credentials(server.id).await.unwrap();
+        assert!(listed[0].last_used_at.is_some());
+
+        // held credentials do not resolve
+        let mut held = listed[0].clone();
+        held.hold = true;
+        store.update_credential(held).await.unwrap();
+        assert!(store.server_for_api_token("tok").await.unwrap().is_none());
     }
 
     #[tokio::test]

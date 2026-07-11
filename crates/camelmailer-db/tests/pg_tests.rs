@@ -728,10 +728,11 @@ async fn deliveries_update_message_status_and_are_listed() {
         "greylisted",
         "451 try later",
         false,
+        None,
     )
     .await
     .unwrap();
-    sink.record_delivery(f.server.id, id, "Sent", "accepted", "250 OK", true)
+    sink.record_delivery(f.server.id, id, "Sent", "accepted", "250 OK", true, None)
         .await
         .unwrap();
 
@@ -746,7 +747,7 @@ async fn deliveries_update_message_status_and_are_listed() {
     assert_eq!(deliveries[1].output.as_deref(), Some("250 OK"));
 
     // Held marks the message held
-    sink.record_delivery(f.server.id, id, "Held", "suppressed", "", false)
+    sink.record_delivery(f.server.id, id, "Held", "suppressed", "", false, None)
         .await
         .unwrap();
     let message = sink.message_by_id(f.server.id, id).await.unwrap().unwrap();
@@ -814,7 +815,7 @@ async fn activity_tables_are_rls_protected() {
         .insert_message(&message_for(f.server.id, "user@example.net"))
         .await
         .unwrap();
-    sink.record_delivery(f.server.id, id, "Sent", "ok", "250 OK", false)
+    sink.record_delivery(f.server.id, id, "Sent", "ok", "250 OK", false, None)
         .await
         .unwrap();
     let (link_id, _) = sink
@@ -897,6 +898,10 @@ async fn server_for_api_token_resolves_and_records_use() {
             .unwrap()
             .get("last_used_at");
     assert!(last_used.is_some());
+
+    // ... and surfaces on the trait-level credential listing
+    let listed = f.store.list_credentials(f.server.id).await.unwrap();
+    assert!(listed[0].last_used_at.is_some());
 
     // held credentials do not resolve
     sqlx::query("UPDATE credentials SET hold = true WHERE key = $1")
@@ -990,7 +995,7 @@ async fn server_store_reads_are_filtered_and_tenant_scoped() {
 
     // a delivery + open + click recorded on our message are readable
     let sink = PgMessageSink::new(f.store.clone());
-    sink.record_delivery(f.server.id, welcome_id, "Sent", "250 OK", "", true)
+    sink.record_delivery(f.server.id, welcome_id, "Sent", "250 OK", "", true, None)
         .await
         .unwrap();
     sink.record_load(f.server.id, welcome_id, "1.2.3.4", "Mail")
@@ -1076,7 +1081,7 @@ async fn server_store_stats_and_bounces_are_tenant_scoped() {
         .await
         .map(|m| (m.id, m.token))
         .unwrap();
-    sink.record_delivery(f.server.id, sent_id, "Sent", "250 OK", "", true)
+    sink.record_delivery(f.server.id, sent_id, "Sent", "250 OK", "", true, None)
         .await
         .unwrap();
     sink.record_load(f.server.id, sent_id, "1.2.3.4", "Mail")
@@ -1098,7 +1103,7 @@ async fn server_store_stats_and_bounces_are_tenant_scoped() {
         .await
         .map(|m| (m.id, m.token))
         .unwrap();
-    sink.record_delivery(f.server.id, bounced_id, "Bounced", "550", "", false)
+    sink.record_delivery(f.server.id, bounced_id, "Bounced", "550", "", false, None)
         .await
         .unwrap();
 
@@ -2536,4 +2541,348 @@ async fn dmarc_tables_reject_writes_for_a_foreign_tenant() {
         error.to_string().contains("row-level security"),
         "unexpected error: {error}"
     );
+}
+
+// -------------------- observability: last_used, tags, bounces, request log
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_credential_use_stamps_last_used_at_for_smtp_auth() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let credential = f
+        .store
+        .create_credential(f.server.id, CredentialType::Smtp, "smtp-secret")
+        .await
+        .unwrap();
+    assert!(credential.last_used_at.is_none());
+    let listed = f.store.list_credentials(f.server.id).await.unwrap();
+    assert!(listed[0].last_used_at.is_none());
+
+    // the SMTP session calls this after a successful AUTH
+    f.store.record_credential_use(credential.id);
+
+    let listed = f.store.list_credentials(f.server.id).await.unwrap();
+    assert!(listed[0].last_used_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounce_categories_are_persisted_and_surfaced() {
+    use camelmailer_core::{MessageFilter, ServerStore, StatsFilter};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let outgoing = |rcpt: &str| {
+        let mut message = message_for(f.server.id, rcpt);
+        message.scope = MessageScope::Outgoing;
+        message
+    };
+
+    // terminal 5xx reject -> hard
+    let hard = sink
+        .insert_message(&outgoing("a@dest.example"))
+        .await
+        .unwrap();
+    sink.record_delivery(
+        f.server.id,
+        hard,
+        "HardFail",
+        "message rejected by the remote server",
+        "550 5.1.1 user unknown",
+        false,
+        Some("hard"),
+    )
+    .await
+    .unwrap();
+
+    // exhausted 4xx retries -> soft
+    let soft = sink
+        .insert_message(&outgoing("b@dest.example"))
+        .await
+        .unwrap();
+    sink.record_delivery(
+        f.server.id,
+        soft,
+        "HardFail",
+        "delivery attempts exhausted",
+        "421 try later",
+        false,
+        Some("soft"),
+    )
+    .await
+    .unwrap();
+
+    // an unclassified bounce counts as undetermined
+    let dsn = sink
+        .insert_message(&outgoing("c@dest.example"))
+        .await
+        .unwrap();
+    sink.record_delivery(
+        f.server.id,
+        dsn,
+        "Bounced",
+        "bounce received",
+        "",
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // a transient SoftFail keeps no category (the message may still send)
+    let retrying = sink
+        .insert_message(&outgoing("d@dest.example"))
+        .await
+        .unwrap();
+    sink.record_delivery(
+        f.server.id,
+        retrying,
+        "SoftFail",
+        "temporary delivery failure",
+        "451 greylisted",
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let record = f.store.message(f.server.id, hard).await.unwrap().unwrap();
+    assert_eq!(record.bounce_category.as_deref(), Some("hard"));
+    let record = f
+        .store
+        .message(f.server.id, retrying)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.bounce_category, None);
+
+    // the DSN processing hook classifies after the fact
+    sink.set_bounce_category(f.server.id, dsn, "undetermined")
+        .await
+        .unwrap();
+    let record = f.store.message(f.server.id, dsn).await.unwrap().unwrap();
+    assert_eq!(record.bounce_category.as_deref(), Some("undetermined"));
+
+    // stats break bounces down by category (HardFail terminal failures
+    // and Bounced messages; the retrying SoftFail is in no bucket)
+    let stats = f
+        .store
+        .message_stats(f.server.id, &StatsFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(stats.bounces_hard, 1);
+    assert_eq!(stats.bounces_soft, 1);
+    assert_eq!(stats.bounces_undetermined, 1);
+
+    // the bounce listing carries the category
+    let bounces = f
+        .store
+        .bounces(f.server.id, &MessageFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(bounces.len(), 1);
+    assert_eq!(bounces[0].bounce_category.as_deref(), Some("undetermined"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tags_and_tag_scoped_stats_are_tenant_isolated_by_rls() {
+    use camelmailer_core::{ServerStore, StatsFilter};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let sink = PgMessageSink::new(f.store.clone());
+    let tagged = |server_id, tag: &str| {
+        let mut message = message_for(server_id, "user@dest.example");
+        message.scope = MessageScope::Outgoing;
+        message.tag = Some(tag.into());
+        message
+    };
+
+    sink.insert_message(&tagged(f.server.id, "welcome"))
+        .await
+        .unwrap();
+    sink.insert_message(&tagged(f.server.id, "welcome"))
+        .await
+        .unwrap();
+    sink.insert_message(&tagged(f.server.id, "promo"))
+        .await
+        .unwrap();
+    sink.insert_message(&tagged(other.id, "other-tag"))
+        .await
+        .unwrap();
+    // an out-of-window message: age it inside the tenant's RLS context
+    let stale = sink
+        .insert_message(&tagged(f.server.id, "stale"))
+        .await
+        .unwrap();
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+            .bind(f.server.id.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE messages SET created_at = now() - interval '40 days' WHERE id = $1")
+            .bind(stale)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let since = chrono::Utc::now() - chrono::Duration::days(30);
+    let tags = f.store.tags(f.server.id, since).await.unwrap();
+    let pairs: Vec<(String, i64)> = tags.into_iter().map(|t| (t.tag, t.count)).collect();
+    assert_eq!(
+        pairs,
+        vec![("welcome".to_string(), 2), ("promo".to_string(), 1)]
+    );
+
+    // the other tenant sees only its own tag
+    let tags = f.store.tags(other.id, since).await.unwrap();
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].tag, "other-tag");
+
+    // tag-scoped stats
+    let stats = f
+        .store
+        .message_stats(
+            f.server.id,
+            &StatsFilter {
+                tag: Some("welcome".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats.total, 2);
+    let stats = f
+        .store
+        .message_stats(
+            f.server.id,
+            &StatsFilter {
+                tag: Some("other-tag".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats.total, 0, "a foreign tenant's tag matches nothing");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_request_log_roundtrip_scoping_and_retention() {
+    use camelmailer_core::{ApiRequestFilter, NewApiRequest, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let entry = |server_id, method: &str, status| NewApiRequest {
+        server_id,
+        method: method.into(),
+        path: "/api/v2/server/messages".into(),
+        status_code: status,
+        duration_ms: 7,
+        user_agent: Some("pg-test".into()),
+    };
+    f.store
+        .record_api_request(entry(f.server.id, "GET", 200))
+        .await
+        .unwrap();
+    f.store
+        .record_api_request(entry(f.server.id, "POST", 422))
+        .await
+        .unwrap();
+    f.store
+        .record_api_request(entry(other.id, "GET", 200))
+        .await
+        .unwrap();
+
+    // newest first, explicitly scoped to the server
+    let all = f
+        .store
+        .api_requests(f.server.id, &ApiRequestFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].method, "POST");
+    assert_eq!(all[0].user_agent.as_deref(), Some("pg-test"));
+
+    // status-class + case-insensitive method filters
+    let four = f
+        .store
+        .api_requests(
+            f.server.id,
+            &ApiRequestFilter {
+                status_class: Some(4),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(four.len(), 1);
+    assert_eq!(four[0].status_code, 422);
+    let gets = f
+        .store
+        .api_requests(
+            f.server.id,
+            &ApiRequestFilter {
+                method: Some("get".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(gets.len(), 1);
+
+    // the foreign server never sees these entries
+    let theirs = f
+        .store
+        .api_requests(other.id, &ApiRequestFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(theirs.len(), 1);
+
+    // retention: entries older than the cutoff are pruned across tenants
+    sqlx::query("UPDATE api_requests SET created_at = now() - interval '31 days' WHERE id = $1")
+        .bind(all[1].id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let removed = f
+        .store
+        .prune_api_requests(chrono::Utc::now() - chrono::Duration::days(30))
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+    let remaining = f
+        .store
+        .api_requests(f.server.id, &ApiRequestFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, all[0].id);
 }

@@ -303,10 +303,15 @@ paths:
     get:
       tags: [Stats]
       summary: Message counters
+      description: >
+        Aggregate counters, optionally restricted to a `created_at` time
+        window and/or to messages carrying exactly one `tag`. Includes a
+        `bounces` breakdown by category (`hard` / `soft` / `undetermined`).
       security: [{ ServerApiKey: [] }]
       parameters:
         - { name: from, in: query, schema: { type: string, format: date-time } }
         - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: tag, in: query, description: Scope every counter to messages with this tag, schema: { type: string } }
       responses:
         "200":
           description: Counters
@@ -332,6 +337,10 @@ paths:
     get:
       tags: [Stats]
       summary: List bounce messages
+      description: >
+        Each bounce carries its classification in `bounce_category`
+        (`hard` = permanent 5xx failure, `soft` = exhausted 4xx retries,
+        `undetermined` = unclassifiable).
       security: [{ ServerApiKey: [] }]
       responses:
         "200": { $ref: "#/components/responses/Success" }
@@ -343,6 +352,66 @@ paths:
       parameters: [{ $ref: "#/components/parameters/MessageId" }]
       responses:
         "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/tags:
+    get:
+      tags: [Stats]
+      summary: List recently used tags
+      description: >
+        The tags used by the server's messages in the last 30 days, with
+        message counts, most used first. Tenant-scoped.
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200":
+          description: Tags with counts
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          tags:
+                            type: array
+                            items: { $ref: "#/components/schemas/TagCount" }
+  /api/v2/server/logs:
+    get:
+      tags: [Stats]
+      summary: List logged API requests
+      description: >
+        The server's API request log, newest first. Every authenticated
+        request to `/api/v2/server/*` is logged asynchronously with its
+        method, path (without the query string), status code, duration and
+        a truncated user agent — never bodies, API keys or query strings.
+        Entries are retained for 30 days.
+      security: [{ ServerApiKey: [] }]
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, maximum: 100 } }
+        - { name: status, in: query, description: Status-code class, schema: { type: string, enum: [1xx, 2xx, 3xx, 4xx, 5xx] } }
+        - { name: method, in: query, description: Exact HTTP method (case-insensitive), schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: Logged requests
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          requests:
+                            type: array
+                            items: { $ref: "#/components/schemas/ApiRequest" }
+                          pagination: { $ref: "#/components/schemas/Pagination" }
+        "422": { $ref: "#/components/responses/ValidationError" }
 
   /api/v2/server/streams:
     get:
@@ -1335,6 +1404,10 @@ paths:
     get:
       tags: [Credentials]
       summary: List credentials
+      description: >
+        Each credential includes `last_used_at` — the last time it
+        authenticated a request (API-key auth on the messaging API or
+        SMTP AUTH); null if never used.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters:
         - { $ref: "#/components/parameters/Org" }
@@ -1923,6 +1996,13 @@ components:
         tag: { type: string, nullable: true }
         status: { type: string, nullable: true, example: Sent }
         bounce: { type: boolean }
+        bounce_category:
+          type: string
+          nullable: true
+          enum: [hard, soft, undetermined]
+          description: >
+            Bounce classification, set when the message terminally failed
+            or was processed as an inbound bounce (DSN); null otherwise.
         spam_status: { type: string, nullable: true }
         spam_score: { type: number, nullable: true }
         held: { type: boolean }
@@ -1949,6 +2029,31 @@ components:
         clicks: { type: integer }
         unique_opens: { type: integer }
         unique_clicks: { type: integer }
+        bounces:
+          type: object
+          description: Bounce breakdown by classification.
+          properties:
+            hard: { type: integer }
+            soft: { type: integer }
+            undetermined: { type: integer }
+
+    TagCount:
+      type: object
+      properties:
+        tag: { type: string, example: welcome }
+        count: { type: integer, description: Messages carrying the tag in the last 30 days }
+
+    ApiRequest:
+      type: object
+      description: One logged API request (metadata only — no bodies, keys or query strings).
+      properties:
+        id: { type: integer }
+        method: { type: string, example: GET }
+        path: { type: string, example: /api/v2/server/messages }
+        status_code: { type: integer, example: 200 }
+        duration_ms: { type: integer }
+        user_agent: { type: string, nullable: true, description: Truncated to 255 characters }
+        created_at: { type: string, format: date-time }
 
     TemplateInput:
       type: object

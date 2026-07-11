@@ -99,6 +99,10 @@ pub struct MessageRecord {
     pub tag: Option<String>,
     pub status: String,
     pub bounce: bool,
+    /// `hard` / `soft` / `undetermined` once the message terminally failed
+    /// or was processed as a bounce (see [`crate::bounce`]); `None` until
+    /// then.
+    pub bounce_category: Option<String>,
     pub spam_status: String,
     pub spam_score: f64,
     pub held: bool,

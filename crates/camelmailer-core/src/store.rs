@@ -171,6 +171,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) saml_assertions: HashMap<String, chrono::DateTime<chrono::Utc>>,
     /// Authentication audit log, in insertion order.
     pub(crate) auth_events: Vec<crate::auth::AuthEvent>,
+    /// Per-server API request log (metadata only), in insertion order.
+    pub(crate) api_requests: Vec<crate::server_store::ApiRequestRecord>,
 }
 
 /// A thread-safe in-memory [`Store`].
@@ -334,6 +336,7 @@ impl MemoryStore {
             tag: message.tag,
             status: "Pending".into(),
             bounce: message.bounce,
+            bounce_category: None,
             spam_status: "NotChecked".into(),
             spam_score: 0.0,
             held: false,
@@ -361,6 +364,23 @@ impl MemoryStore {
             if status == "Bounced" {
                 message.bounce = true;
             }
+        }
+    }
+
+    /// Set a message's bounce category (the in-memory analogue of the
+    /// worker persisting the classification on a terminal failure).
+    pub fn set_bounce_category(&self, message_id: i64, category: crate::bounce::BounceCategory) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(message) = inner.messages.iter_mut().find(|m| m.id == message_id) {
+            message.bounce_category = Some(category.as_str().to_string());
+        }
+    }
+
+    /// Override a message's created_at (test seeding for time windows).
+    pub fn set_message_created_at(&self, message_id: i64, at: chrono::DateTime<chrono::Utc>) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(message) = inner.messages.iter_mut().find(|m| m.id == message_id) {
+            message.created_at = at;
         }
     }
 
@@ -539,6 +559,12 @@ impl MemoryStore {
             .filter(|m| m.server_id == server_id)
             .filter(|m| filter.from.is_none_or(|from| m.created_at >= from))
             .filter(|m| filter.to.is_none_or(|to| m.created_at <= to))
+            .filter(|m| {
+                filter
+                    .tag
+                    .as_deref()
+                    .is_none_or(|tag| m.tag.as_deref() == Some(tag))
+            })
             .map(|m| m.id)
             .collect();
 
@@ -557,6 +583,17 @@ impl MemoryStore {
                 "Bounced" => stats.bounced += 1,
                 "Pending" => stats.pending += 1,
                 _ => {}
+            }
+            match message.bounce_category.as_deref() {
+                Some("hard") => stats.bounces_hard += 1,
+                Some("soft") => stats.bounces_soft += 1,
+                Some("undetermined") => stats.bounces_undetermined += 1,
+                Some(_) => {}
+                // unclassified bounces count as undetermined
+                None if message.bounce || message.status == "Bounced" => {
+                    stats.bounces_undetermined += 1
+                }
+                None => {}
             }
         }
 
@@ -612,6 +649,87 @@ impl MemoryStore {
             .map(|(domain, count)| crate::server_store::QueuedDomain { domain, count })
             .collect();
         crate::server_store::DeliveryStats { queued, domains }
+    }
+
+    /// Tags used by a server's messages since `since`, with counts, most
+    /// used first (ties by tag name) — the read model of `GET /tags`.
+    pub fn tags_for(
+        &self,
+        server_id: Id,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<crate::server_store::TagCount> {
+        use std::collections::BTreeMap;
+        let inner = self.inner.read().unwrap();
+        let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+        for message in inner
+            .messages
+            .iter()
+            .filter(|m| m.server_id == server_id && m.created_at >= since)
+        {
+            if let Some(tag) = &message.tag {
+                *counts.entry(tag.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut tags: Vec<_> = counts
+            .into_iter()
+            .map(|(tag, count)| crate::server_store::TagCount { tag, count })
+            .collect();
+        tags.sort_by(|a, b| b.count.cmp(&a.count).then(a.tag.cmp(&b.tag)));
+        tags
+    }
+
+    /// Append one API request-log entry.
+    pub fn insert_api_request(&self, new: crate::server_store::NewApiRequest) {
+        let id = self.next_id() as i64;
+        let mut inner = self.inner.write().unwrap();
+        inner
+            .api_requests
+            .push(crate::server_store::ApiRequestRecord {
+                id,
+                server_id: new.server_id,
+                method: new.method,
+                path: new.path,
+                status_code: new.status_code,
+                duration_ms: new.duration_ms,
+                user_agent: new.user_agent,
+                created_at: chrono::Utc::now(),
+            });
+    }
+
+    /// A server's logged API requests matching the filter, newest first.
+    pub fn api_requests_for(
+        &self,
+        server_id: Id,
+        filter: &crate::server_store::ApiRequestFilter,
+    ) -> Vec<crate::server_store::ApiRequestRecord> {
+        let mut requests: Vec<_> = self
+            .inner
+            .read()
+            .unwrap()
+            .api_requests
+            .iter()
+            .filter(|r| r.server_id == server_id && filter.matches(r))
+            .cloned()
+            .collect();
+        requests.sort_by_key(|r| std::cmp::Reverse(r.id));
+        requests
+    }
+
+    /// Delete API request-log entries older than the cutoff (all servers);
+    /// returns how many were removed.
+    pub fn prune_api_requests_before(&self, older_than: chrono::DateTime<chrono::Utc>) -> u64 {
+        let mut inner = self.inner.write().unwrap();
+        let before = inner.api_requests.len();
+        inner.api_requests.retain(|r| r.created_at >= older_than);
+        (before - inner.api_requests.len()) as u64
+    }
+
+    /// Override a logged request's created_at (test seeding for retention).
+    pub fn set_api_request_created_at(&self, id: i64, at: chrono::DateTime<chrono::Utc>) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(request) = inner.api_requests.iter_mut().find(|r| r.id == id) {
+            request.created_at = at;
+        }
     }
 
     /// Insert or replace a message stream.
@@ -986,6 +1104,9 @@ impl Store for MemoryStore {
     fn record_credential_use(&self, credential_id: Id) {
         let mut inner = self.inner.write().unwrap();
         *inner.credential_uses.entry(credential_id).or_insert(0) += 1;
+        if let Some(credential) = inner.credentials.get_mut(&credential_id) {
+            credential.last_used_at = Some(chrono::Utc::now());
+        }
     }
 
     fn find_confirmed_sender_address(&self, server_id: Id, header_values: &[&str]) -> bool {
@@ -1117,6 +1238,27 @@ mod tests {
         ));
         // scoped to the server
         assert!(!store.find_confirmed_sender_address(server_id + 1000, &["solo@external.example"]));
+    }
+
+    #[test]
+    fn record_credential_use_bumps_count_and_stamps_last_used_at() {
+        let fixtures = Fixtures::new();
+        let credential = fixtures.credential(CredentialType::Smtp, "secret-key");
+        let store = fixtures.store();
+        assert!(store
+            .find_smtp_credential_by_key("secret-key")
+            .unwrap()
+            .last_used_at
+            .is_none());
+
+        // SMTP AUTH calls this after a successful login
+        store.record_credential_use(credential.id);
+        assert_eq!(store.credential_use_count(credential.id), 1);
+        assert!(store
+            .find_smtp_credential_by_key("secret-key")
+            .unwrap()
+            .last_used_at
+            .is_some());
     }
 
     #[test]
