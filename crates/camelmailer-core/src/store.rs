@@ -84,7 +84,7 @@ pub fn match_ip_credential(credentials: Vec<Credential>, ip: IpAddr) -> Option<C
         })
         .collect();
     // Longest prefix first, mirroring `sort_by { |c| c.ipaddr&.prefix }.reverse`
-    candidates.sort_by(|a, b| b.0.prefix_len().cmp(&a.0.prefix_len()));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0.prefix_len()));
     candidates
         .into_iter()
         .find(|(net, _)| {
@@ -378,7 +378,7 @@ impl MemoryStore {
             })
             .cloned()
             .collect();
-        matched.sort_by(|a, b| b.id.cmp(&a.id));
+        matched.sort_by_key(|m| std::cmp::Reverse(m.id));
         matched
     }
 

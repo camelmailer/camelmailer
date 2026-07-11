@@ -44,11 +44,19 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
-      CAMELMAILER_TEST_DATABASE_URL: postgres://camelmailer:camelmailer@localhost:5432/camelmailer_test
+      CAMELMAILER_TEST_DATABASE_URL: postgres://camelmailer_tests:camelmailer_tests@localhost:5432/camelmailer_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The bootstrap user of the postgres image is a superuser, and
+      # superusers bypass row-level security no matter what — the RLS
+      # tests must run as a plain role (CREATEDB for the throwaway
+      # per-test databases).
+      - name: Create non-superuser test role
+        run: >-
+          PGPASSWORD=camelmailer psql -h localhost -U camelmailer -d camelmailer_test
+          -c "CREATE ROLE camelmailer_tests LOGIN PASSWORD 'camelmailer_tests' NOSUPERUSER CREATEDB;"
       - run: cargo test --workspace
 
   docker:
