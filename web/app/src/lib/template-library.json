@@ -1,0 +1,321 @@
+[
+  {
+    "name": "account-deletion",
+    "permalink": "account-deletion",
+    "description": "Confirms a deletion request with a grace period.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "grace_days",
+      "action_url"
+    ],
+    "subject": "Your {{ product }} account will be deleted",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Deletion scheduled — you can still undo this.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Account deletion scheduled</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, we received the request to delete your {{ product }} account. Your data will be permanently removed in <strong>{{ grace_days }} days</strong>.</p><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Changed your mind? You can cancel any time before then:</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Keep my account</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">After the grace period this cannot be undone.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nYour {{ product }} account is scheduled for deletion. All data will be permanently\nremoved in {{ grace_days }} days.\n\nChanged your mind? Cancel here: {{ action_url }}\n\nAfter the grace period this cannot be undone."
+  },
+  {
+    "name": "comment-reply",
+    "permalink": "comment-reply",
+    "description": "New reply in a thread the user participates in.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "author",
+      "context",
+      "excerpt",
+      "action_url"
+    ],
+    "subject": "New reply from {{ author }} in {{ context }}",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">New reply in your thread.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">New reply in {{ context }}</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\"><strong>{{ author }}</strong> replied:</p><blockquote style=\"margin:8px 0 20px;padding:12px 16px;border-left:3px solid #e4e4e7;color:#52525b;font-size:14px;line-height:1.6;\">{{ excerpt }}</blockquote><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Open the thread</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "{{ author }} replied in {{ context }}:\n\n> {{ excerpt }}\n\nOpen the thread: {{ action_url }}"
+  },
+  {
+    "name": "data-export-ready",
+    "permalink": "data-export-ready",
+    "description": "Requested export finished; expiring download link.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "action_url",
+      "expires_in"
+    ],
+    "subject": "Your {{ product }} data export is ready",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Your download is ready.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Your export is ready</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, the data export you requested is ready to download.</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Download export</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">For your security the download link expires in {{ expires_in }}.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nYour {{ product }} data export is ready:\n\n{{ action_url }}\n\nThe link expires in {{ expires_in }}."
+  },
+  {
+    "name": "email-verification",
+    "permalink": "email-verification",
+    "description": "Confirms the user owns the address; link + short expiry note.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "action_url",
+      "expires_in"
+    ],
+    "subject": "Verify your email address",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Confirm your address to finish signing up.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Verify your email</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, please confirm this email address for your {{ product }} account.</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Verify email address</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">This link expires in {{ expires_in }}. If you didn't create an account, you can ignore this email.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nPlease confirm this email address for your {{ product }} account:\n\n{{ action_url }}\n\nThe link expires in {{ expires_in }}. If you didn't create an account, ignore this email."
+  },
+  {
+    "name": "magic-link",
+    "permalink": "magic-link",
+    "description": "Passwordless sign-in link.",
+    "variables": [
+      "product",
+      "support_email",
+      "action_url",
+      "expires_in"
+    ],
+    "subject": "Your sign-in link for {{ product }}",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Tap to sign in — no password needed.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Sign in to {{ product }}</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Use the button below to sign in. No password needed.</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Sign in</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">You receive this because it concerns the security of your {{ product }} account. The link expires in {{ expires_in }} and can be used once.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Sign in to {{ product }}:\n\n{{ action_url }}\n\nThe link expires in {{ expires_in }} and can be used once. If you didn't request it, ignore this email."
+  },
+  {
+    "name": "mention-notification",
+    "permalink": "mention-notification",
+    "description": "Someone mentioned the user; quote + deep link.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "author",
+      "context",
+      "excerpt",
+      "action_url"
+    ],
+    "subject": "{{ author }} mentioned you in {{ context }}",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">You were mentioned.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">{{ author }} mentioned you</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">In <strong>{{ context }}</strong>:</p><blockquote style=\"margin:8px 0 20px;padding:12px 16px;border-left:3px solid #e4e4e7;color:#52525b;font-size:14px;line-height:1.6;\">{{ excerpt }}</blockquote><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">View and reply</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "{{ author }} mentioned you in {{ context }}:\n\n> {{ excerpt }}\n\nView and reply: {{ action_url }}"
+  },
+  {
+    "name": "new-device-login",
+    "permalink": "new-device-login",
+    "description": "Alert for a sign-in from a new device or location.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "when",
+      "device",
+      "location",
+      "ip_address",
+      "action_url"
+    ],
+    "subject": "New sign-in to your {{ product }} account",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">New device sign-in detected.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">New sign-in detected</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, your {{ product }} account was just signed in from a new device:</p><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;border-top:1px solid #e4e4e7;\"><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Time</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ when }}</td></tr><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Device</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ device }}</td></tr><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Location</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ location }}</td></tr><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">IP address</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ ip_address }}</td></tr></table><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">If this was you, no action is needed.</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Secure my account</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">You receive this because it concerns the security of your {{ product }} account. </p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nNew sign-in to your {{ product }} account:\n\n  Time:     {{ when }}\n  Device:   {{ device }}\n  Location: {{ location }}\n  IP:       {{ ip_address }}\n\nIf this was you, ignore this email. Otherwise secure your account: {{ action_url }}"
+  },
+  {
+    "name": "order-confirmation",
+    "permalink": "order-confirmation",
+    "description": "Order received; items table via {{#items}} section.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "order_number",
+      "items (list of {name, quantity, price})",
+      "total",
+      "action_url"
+    ],
+    "subject": "Order {{ order_number }} confirmed",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">We've received your order.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Thanks for your order, {{ name }}!</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">We've received order <strong>{{ order_number }}</strong> and will let you know as soon as it ships.</p><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;border-top:1px solid #e4e4e7;\">{{#items}}<tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">{{ name }} × {{ quantity }}</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ price }}</td></tr>{{/items}}<tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Total</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:700;\">{{ total }}</td></tr></table><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">View your order</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Thanks for your order, {{ name }}!\n\nOrder {{ order_number }} is confirmed.\n\n{{#items}}  {{ name }} x {{ quantity }} — {{ price }}\n{{/items}}  Total: {{ total }}\n\nView your order: {{ action_url }}"
+  },
+  {
+    "name": "password-changed",
+    "permalink": "password-changed",
+    "description": "Security notice after a successful password change.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "when",
+      "ip_address"
+    ],
+    "subject": "Your {{ product }} password was changed",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">If this was you, no action is needed.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Password changed</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, the password of your {{ product }} account was changed on {{ when }} (IP {{ ip_address }}).</p><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">If this was you, no action is needed. All other sessions were signed out.</p><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\"><strong>Wasn't you?</strong> Reset your password immediately and contact us at <a href=\"mailto:{{ support_email }}\" style=\"color:#18181b;\">{{ support_email }}</a>.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nYour {{ product }} password was changed on {{ when }} (IP {{ ip_address }}).\nAll other sessions were signed out.\n\nIf this wasn't you, reset your password immediately and contact {{ support_email }}."
+  },
+  {
+    "name": "password-reset",
+    "permalink": "password-reset",
+    "description": "Reset link with expiry; safe to ignore if not requested.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "action_url",
+      "expires_in"
+    ],
+    "subject": "Reset your {{ product }} password",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Choose a new password.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Reset your password</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, we received a request to reset the password of your {{ product }} account.</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Choose a new password</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">You receive this because it concerns the security of your {{ product }} account. The link expires in {{ expires_in }}. If you didn't request a reset, your password is unchanged and you can ignore this email.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nWe received a request to reset your {{ product }} password. Choose a new one here:\n\n{{ action_url }}\n\nThe link expires in {{ expires_in }}. If you didn't request this, your password is unchanged."
+  },
+  {
+    "name": "payment-failed",
+    "permalink": "payment-failed",
+    "description": "Dunning: charge failed, retry date, update-payment CTA.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "amount",
+      "retry_date",
+      "action_url"
+    ],
+    "subject": "Action needed: payment for {{ product }} failed",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">We couldn't process your payment.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Payment failed</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, we couldn't charge <strong>{{ amount }}</strong> for your {{ product }} subscription.</p><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">We'll retry on <strong>{{ retry_date }}</strong>. To avoid any interruption, please check your payment details:</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Update payment method</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Already fixed it? Then you're all set — we'll retry automatically.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nWe couldn't charge {{ amount }} for your {{ product }} subscription.\nWe'll retry on {{ retry_date }}.\n\nUpdate your payment method to avoid interruption: {{ action_url }}"
+  },
+  {
+    "name": "payment-receipt",
+    "permalink": "payment-receipt",
+    "description": "Payment succeeded; amounts, invoice number, download link.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "amount",
+      "invoice_number",
+      "date",
+      "payment_method",
+      "action_url"
+    ],
+    "subject": "Receipt: {{ amount }} for {{ product }}",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Your payment went through.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Payment received</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, thanks! We've received your payment.</p><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;border-top:1px solid #e4e4e7;\"><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Amount</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:700;\">{{ amount }}</td></tr><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Invoice</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ invoice_number }}</td></tr><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Date</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ date }}</td></tr><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Payment method</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ payment_method }}</td></tr></table><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Download invoice</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nPayment received — thank you!\n\n  Amount:  {{ amount }}\n  Invoice: {{ invoice_number }}\n  Date:    {{ date }}\n  Method:  {{ payment_method }}\n\nDownload your invoice: {{ action_url }}"
+  },
+  {
+    "name": "refund-processed",
+    "permalink": "refund-processed",
+    "description": "Refund issued; amount and arrival window.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "amount",
+      "order_number",
+      "arrival_window"
+    ],
+    "subject": "Your refund of {{ amount }} is on its way",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Refund processed.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Refund processed</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, we've refunded <strong>{{ amount }}</strong> for order {{ order_number }}.</p><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Depending on your bank it will appear on your statement within {{ arrival_window }}.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nWe've refunded {{ amount }} for order {{ order_number }}.\nIt will appear on your statement within {{ arrival_window }}."
+  },
+  {
+    "name": "shipping-notification",
+    "permalink": "shipping-notification",
+    "description": "Order shipped; carrier + tracking link.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "order_number",
+      "carrier",
+      "tracking_number",
+      "eta",
+      "action_url"
+    ],
+    "subject": "Your order {{ order_number }} has shipped 📦",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">It's on the way.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Your order is on its way</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, order <strong>{{ order_number }}</strong> has shipped.</p><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;border-top:1px solid #e4e4e7;\"><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Carrier</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ carrier }}</td></tr><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Tracking number</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ tracking_number }}</td></tr><tr><td style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#71717a;\">Estimated arrival</td><td align=\"right\" style=\"padding:10px 0;border-bottom:1px solid #e4e4e7;font-size:14px;color:#18181b;font-weight:400;\">{{ eta }}</td></tr></table><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Track your package</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nOrder {{ order_number }} has shipped!\n\n  Carrier:  {{ carrier }}\n  Tracking: {{ tracking_number }}\n  ETA:      {{ eta }}\n\nTrack it here: {{ action_url }}"
+  },
+  {
+    "name": "subscription-cancelled",
+    "permalink": "subscription-cancelled",
+    "description": "Cancellation confirmed; access end date; resubscribe link.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "plan",
+      "access_until",
+      "action_url"
+    ],
+    "subject": "Your {{ product }} subscription is cancelled",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Cancellation confirmed.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Subscription cancelled</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, your <strong>{{ plan }}</strong> subscription is cancelled. You keep full access until <strong>{{ access_until }}</strong>.</p><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Changed your mind? You can resume any time before then:</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Resume subscription</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nYour {{ plan }} subscription is cancelled. You keep access until {{ access_until }}.\n\nChanged your mind? Resume here: {{ action_url }}"
+  },
+  {
+    "name": "subscription-renewal",
+    "permalink": "subscription-renewal",
+    "description": "Upcoming renewal notice with amount and date.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "plan",
+      "amount",
+      "renewal_date",
+      "action_url"
+    ],
+    "subject": "Your {{ product }} plan renews on {{ renewal_date }}",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Heads-up: your subscription renews soon.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Renewal ahead</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, your <strong>{{ plan }}</strong> plan renews on <strong>{{ renewal_date }}</strong> for <strong>{{ amount }}</strong>.</p><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Nothing to do if you want to keep it — this is just the heads-up.</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Manage subscription</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nYour {{ plan }} plan renews on {{ renewal_date }} for {{ amount }}.\nNothing to do if you want to keep it.\n\nManage your subscription: {{ action_url }}"
+  },
+  {
+    "name": "team-invitation",
+    "permalink": "team-invitation",
+    "description": "Invite to a team/workspace with inviter context.",
+    "variables": [
+      "product",
+      "support_email",
+      "inviter",
+      "team",
+      "role",
+      "action_url",
+      "expires_in"
+    ],
+    "subject": "{{ inviter }} invited you to {{ team }} on {{ product }}",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">You've been invited to join a team.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Join {{ team }}</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">{{ inviter }} invited you to join <strong>{{ team }}</strong> on {{ product }} as <strong>{{ role }}</strong>.</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Accept invitation</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">The invitation expires in {{ expires_in }}. If you weren't expecting it, you can ignore this email.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "{{ inviter }} invited you to join {{ team }} on {{ product }} as {{ role }}.\n\nAccept here: {{ action_url }}\n\nThe invitation expires in {{ expires_in }}."
+  },
+  {
+    "name": "trial-ending",
+    "permalink": "trial-ending",
+    "description": "Trial expiry reminder with upgrade CTA.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "days_left",
+      "action_url"
+    ],
+    "subject": "Your {{ product }} trial ends in {{ days_left }} days",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Don't lose access to your work.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">{{ days_left }} days left in your trial</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Hi {{ name }}, your {{ product }} trial ends in <strong>{{ days_left }} days</strong>. Pick a plan to keep everything running without interruption.</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Choose a plan</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Questions about plans? Just reply — happy to help.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Hi {{ name }},\n\nYour {{ product }} trial ends in {{ days_left }} days.\nChoose a plan to keep everything running: {{ action_url }}"
+  },
+  {
+    "name": "two-factor-code",
+    "permalink": "two-factor-code",
+    "description": "One-time security code (login step-up, sensitive action).",
+    "variables": [
+      "product",
+      "support_email",
+      "code",
+      "expires_in"
+    ],
+    "subject": "{{ code }} is your {{ product }} security code",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Your one-time code.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Your security code</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Enter this code to continue. It expires in {{ expires_in }}.</p><div style=\"margin:8px 0 20px;padding:16px;background:#f4f4f5;border-radius:8px;font-family:ui-monospace,Menlo,monospace;font-size:26px;letter-spacing:6px;text-align:center;color:#18181b;font-weight:700;\">{{ code }}</div><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">You receive this because it concerns the security of your {{ product }} account. Never share this code — {{ product }} will never ask for it.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Your {{ product }} security code: {{ code }}\n\nIt expires in {{ expires_in }}. Never share this code — {{ product }} will never ask for it."
+  },
+  {
+    "name": "welcome",
+    "permalink": "welcome",
+    "description": "Sent right after signup: greets the user and points at the first action.",
+    "variables": [
+      "product",
+      "support_email",
+      "name",
+      "action_url"
+    ],
+    "subject": "Welcome to {{ product }}, {{ name }}!",
+    "html_body": "<!doctype html>\n<html>\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <meta name=\"color-scheme\" content=\"light\">\n</head>\n<body style=\"margin:0;padding:0;background:#f4f4f5;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n  <div style=\"display:none;max-height:0;overflow:hidden;\">Your account is ready.</div>\n  <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f4f5;\">\n    <tr><td align=\"center\" style=\"padding:32px 16px;\">\n      <table role=\"presentation\" width=\"560\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:560px;width:100%;\">\n        <tr><td style=\"padding:0 8px 16px;font-size:16px;font-weight:700;color:#18181b;\">{{ product }}</td></tr>\n        <tr><td style=\"background:#ffffff;border:1px solid #e4e4e7;border-radius:12px;padding:32px;\">\n<h1 style=\"margin:0 0 16px;font-size:20px;line-height:1.3;color:#18181b;\">Welcome aboard, {{ name }} 👋</h1><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">Your {{ product }} account is ready. The best way to start is to jump right in:</p><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin:8px 0 20px;\"><tr><td style=\"background:#18181b;border-radius:8px;\"><a href=\"{{ action_url }}\" style=\"display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;\">Get started</a></td></tr></table><p style=\"margin:16px 0 0;font-size:13px;line-height:1.6;color:#a1a1aa;\">Or copy this link into your browser:<br><a href=\"{{ action_url }}\" style=\"color:#71717a;word-break:break-all;\">{{ action_url }}</a></p><p style=\"margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;\">If you have any questions, just reply — a human reads these.</p>\n        </td></tr>\n        <tr><td style=\"padding:16px 8px;font-size:12px;line-height:1.6;color:#a1a1aa;\">\n          Questions? Just reply to this email or contact\n          <a href=\"mailto:{{ support_email }}\" style=\"color:#71717a;\">{{ support_email }}</a>.\n        </td></tr>\n      </table>\n    </td></tr>\n  </table>\n</body>\n</html>",
+    "text_body": "Welcome aboard, {{ name }}!\n\nYour {{ product }} account is ready. Get started here:\n\n{{ action_url }}\n\nQuestions? Just reply to this email or write to {{ support_email }}."
+  }
+]
