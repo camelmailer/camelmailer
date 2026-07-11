@@ -9,6 +9,7 @@ import Link from "next/link"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { usePathname, useRouter } from "next/navigation"
 import {
+  ChevronRightIcon,
   CircleCheckIcon,
   FileTextIcon,
   InboxIcon,
@@ -20,6 +21,7 @@ import {
   RefreshCwIcon,
   ScrollTextIcon,
   SearchIcon,
+  TriangleAlertIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 import { CopyButton, formatDate, PageHeader } from "@/components/shared"
@@ -286,25 +288,48 @@ function ShareDialog({ api, id, onClose }: { api: Api; id: number; onClose: () =
   )
 }
 
+/// One deliverability check as an expandable row (title always shown, the
+/// coaching detail behind a disclosure). Warnings default to open so the
+/// actionable advice is visible without a click.
 function InsightRow({ check }: { check: InsightCheck }) {
+  const warn = check.status === "warning"
+  const [open, setOpen] = useState(warn)
   return (
-    <div className="flex items-start gap-2 rounded-md border p-2">
-      <Badge
-        variant={check.status === "ok" ? "default" : "destructive"}
-        className="mt-0.5 shrink-0"
+    <div
+      className={`rounded-md border ${
+        warn
+          ? "border-amber-600/30 bg-amber-600/5 dark:border-amber-400/30 dark:bg-amber-400/5"
+          : "border-green-600/20 bg-green-600/5 dark:border-green-400/20 dark:bg-green-400/5"
+      }`}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 p-2 text-left"
       >
-        {check.status}
-      </Badge>
-      <div className="min-w-0">
-        <p className="text-sm font-medium">{check.title}</p>
-        <p className="text-xs text-muted-foreground">{check.detail}</p>
-      </div>
+        {warn ? (
+          <TriangleAlertIcon className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+        ) : (
+          <CircleCheckIcon className="size-4 shrink-0 text-green-600 dark:text-green-400" />
+        )}
+        <span className="min-w-0 flex-1 truncate text-sm font-medium">{check.title}</span>
+        <ChevronRightIcon
+          className={`size-4 shrink-0 text-muted-foreground transition-transform ${
+            open ? "rotate-90" : ""
+          }`}
+        />
+      </button>
+      {open && (
+        <p className="px-2 pb-2 pl-8 text-xs text-muted-foreground">{check.detail}</p>
+      )}
     </div>
   )
 }
 
-/// The "Insights" tab: DOING GREAT / IMPROVE sections over the server-side
-/// deliverability checks, with the generation timestamp underneath.
+/// The "Insights" tab: a deliverability coach. Two sections — "Doing
+/// great" (ok) and "Improve" (warning) — over the server-side checks,
+/// each with a section counter, plus the "Report generated on …" footer.
 function InsightsPanel({ api, id }: { api: Api; id: number }) {
   const insights = useQuery({
     queryKey: ["sapi-insights", id],
@@ -319,12 +344,32 @@ function InsightsPanel({ api, id }: { api: Api; id: number }) {
   }
   const great = data.checks.filter((check) => check.status === "ok")
   const improve = data.checks.filter((check) => check.status === "warning")
+
+  if (data.checks.length === 0) {
+    return (
+      <EmptyState
+        icon={CircleCheckIcon}
+        title="Nothing to analyze yet"
+        description="Deliverability insights appear once this message has been processed."
+      />
+    )
+  }
+
   return (
     <div className="grid gap-4">
+      {improve.length === 0 && (
+        <div className="flex items-center gap-2 rounded-md border border-green-600/30 bg-green-600/10 p-3 text-sm text-green-700 dark:border-green-400/30 dark:bg-green-400/10 dark:text-green-400">
+          <CircleCheckIcon className="size-4 shrink-0" />
+          No issues found — this message follows deliverability best practices.
+        </div>
+      )}
       {improve.length > 0 && (
         <div className="grid gap-2">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-amber-600 dark:text-amber-400">
             Improve
+            <Badge variant="destructive" className="px-1.5">
+              {improve.length}
+            </Badge>
           </h3>
           {improve.map((check) => (
             <InsightRow key={check.id} check={check} />
@@ -333,8 +378,11 @@ function InsightsPanel({ api, id }: { api: Api; id: number }) {
       )}
       {great.length > 0 && (
         <div className="grid gap-2">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <h3 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-green-700 dark:text-green-400">
             Doing great
+            <Badge variant="secondary" className="px-1.5">
+              {great.length}
+            </Badge>
           </h3>
           {great.map((check) => (
             <InsightRow key={check.id} check={check} />
@@ -1646,7 +1694,8 @@ const SUBTABS = [
   { value: "messages", label: "Activity" },
   { value: "logs", label: "Logs" },
   { value: "queue", label: "Queue" },
-  { value: "stats", label: "Stats" },
+  { value: "stats", label: "Summary" },
+  { value: "statistics", label: "Statistics" },
   { value: "streams", label: "Streams" },
   { value: "templates", label: "Templates" },
 ]

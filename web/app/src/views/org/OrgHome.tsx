@@ -56,6 +56,7 @@ import {
 } from "@/components/ui/table"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { adminApi, ApiError, type Role } from "@/lib/api"
+import { canManageBilling } from "@/lib/api-p4"
 import { useAuth } from "@/lib/auth"
 
 const ROLES: Role[] = ["viewer", "member", "admin", "owner"]
@@ -523,8 +524,8 @@ export function OrgSettings({ org }: { org: string }) {
   const role = useOrgRole(org)
   const [confirmOpen, setConfirmOpen] = useState(false)
 
-  // Billing needs admin+; security and the danger zone stay owner-only.
-  const canBilling = role === "root" || role === "owner" || role === "admin"
+  // Security and the danger zone are owner-only; billing moved to its own
+  // Usage & Billing tab (views/org/Billing.tsx).
   const isOwner = role === "root" || role === "owner"
 
   const orgQuery = useQuery({
@@ -547,57 +548,11 @@ export function OrgSettings({ org }: { org: string }) {
     onError: (err) => errorToast(err, "Could not update the organization"),
   })
 
-  // `enabled: false` (the self-hosted default) hides billing entirely.
-  const billing = useQuery({
-    queryKey: ["billing", org],
-    queryFn: () => adminApi.billing(org).get(),
-    enabled: canBilling,
-  })
-  const showBilling = canBilling && billing.data?.enabled === true
-
-  const openPortal = useMutation({
-    mutationFn: () => adminApi.billing(org).portal(),
-    onSuccess: ({ url }) => {
-      window.location.href = url
-    },
-    onError: (err) =>
-      toast.error(
-        err instanceof ApiError && err.code === "BillingUnavailable"
-          ? "Billing is temporarily unavailable. Please try again in a few minutes."
-          : err instanceof ApiError
-            ? err.message
-            : "Could not open the billing portal",
-      ),
-  })
-
-  // Admins only see this page when billing is on (owners always do).
-  if (!isOwner && !showBilling) {
+  if (!isOwner) {
     return <SimpleEmptyState>Only owners can manage organization settings.</SimpleEmptyState>
   }
   return (
     <div className="max-w-lg space-y-4">
-      {showBilling && (
-        <>
-          <PageHeader title="Billing" />
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Billing Portal</CardTitle>
-            </CardHeader>
-            <CardContent className="flex items-center justify-between gap-4">
-              <p className="text-sm text-muted-foreground">
-                Manage your subscription, payment methods and invoices in the
-                billing portal.
-              </p>
-              <Button
-                onClick={() => openPortal.mutate()}
-                disabled={openPortal.isPending}
-              >
-                {openPortal.isPending ? "Opening…" : "Billing Portal"}
-              </Button>
-            </CardContent>
-          </Card>
-        </>
-      )}
       {isOwner && (
         <>
           <PageHeader title="Security" />
@@ -709,6 +664,18 @@ export function OrgShell({ org, children }: { org: string; children: React.React
   const router = useRouter()
   const pathname = usePathname() ?? ""
   const tab = pathname.split(`/orgs/${org}`)[1]?.split("/")[1] || "servers"
+  const role = useOrgRole(org)
+  const canBilling = canManageBilling(role)
+
+  // The Billing tab only appears when the hosted billing group is on and
+  // the caller may manage it (admins/owners) — self-hosted hides it.
+  const billing = useQuery({
+    queryKey: ["billing", org],
+    queryFn: () => adminApi.billing(org).get(),
+    enabled: canBilling,
+    retry: false,
+  })
+  const showBilling = canBilling && billing.data?.enabled === true
 
   return (
     <div>
@@ -723,6 +690,7 @@ export function OrgShell({ org, children }: { org: string; children: React.React
           <TabsTrigger value="servers">Servers</TabsTrigger>
           <TabsTrigger value="members">Members</TabsTrigger>
           <TabsTrigger value="invitations">Invitations</TabsTrigger>
+          {showBilling && <TabsTrigger value="billing">Billing</TabsTrigger>}
           <TabsTrigger value="settings">Settings</TabsTrigger>
         </TabsList>
       </Tabs>

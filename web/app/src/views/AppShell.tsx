@@ -60,6 +60,7 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { CodePanel } from "@/components/code-panel"
 import { CommandPalette } from "@/components/command-palette"
 import { FormDialog, Kbd } from "@/components/form-dialog"
 import { NEW_ORG_EVENT, OrgSwitcher } from "@/components/org-switcher"
@@ -91,7 +92,8 @@ const SEGMENT_LABELS: Record<string, string> = {
   messaging: "Messaging",
   messages: "Messages",
   queue: "Queue",
-  stats: "Statistics",
+  stats: "Summary",
+  statistics: "Statistics",
   streams: "Streams",
   templates: "Templates",
   users: "Users",
@@ -318,10 +320,10 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
         ...(showBilling
           ? [
               {
-                href: `${orgBase}/settings`,
+                href: `${orgBase}/billing`,
                 label: "Billing",
                 icon: CreditCardIcon,
-                match: "never" as const,
+                match: "prefix" as const,
               },
             ]
           : []),
@@ -497,6 +499,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           />
           <AppBreadcrumbs />
           <div className="ml-auto flex items-center gap-2">
+            <CodePanel />
             <Button
               variant="outline"
               size="sm"
