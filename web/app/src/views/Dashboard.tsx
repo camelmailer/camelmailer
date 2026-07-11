@@ -1,9 +1,15 @@
 "use client"
 
-import { useQuery } from "@tanstack/react-query"
+import { useQueries, useQuery } from "@tanstack/react-query"
 import Link from "next/link"
 import { BuildingIcon } from "lucide-react"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { EmptyState, PageHeader } from "@/components/shared"
 import { adminApi } from "@/lib/api"
@@ -26,8 +32,66 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
       }))
     : (me?.memberships ?? []).map(({ organization, role }) => ({ organization, role }))
 
+  // Server counts across the user's organizations (shares the sidebar's
+  // per-org query). Anything we cannot fetch shows as "—" — no made-up
+  // numbers.
+  const serverQueries = useQueries({
+    queries: (all ? [] : items).map(({ organization }) => ({
+      queryKey: ["servers", organization.permalink],
+      queryFn: () => adminApi.servers(organization.permalink).list(),
+    })),
+  })
+  const serverCount =
+    !all && serverQueries.every((q) => q.isSuccess)
+      ? serverQueries.reduce((n, q) => n + (q.data?.servers.length ?? 0), 0)
+      : null
+
   return (
     <div>
+      {!all && (
+        <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <Card className="gap-2 py-5">
+            <CardHeader>
+              <CardDescription>Organizations</CardDescription>
+              <CardTitle className="text-2xl font-semibold tabular-nums">
+                {items.length}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="text-xs text-muted-foreground">
+              Organizations you are a member of
+            </CardContent>
+          </Card>
+          <Card className="gap-2 py-5">
+            <CardHeader>
+              <CardDescription>Servers</CardDescription>
+              <CardTitle className="text-2xl font-semibold tabular-nums">
+                {serverCount ?? "—"}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="text-xs text-muted-foreground">
+              Mail servers across your organizations
+            </CardContent>
+          </Card>
+          <Card className="gap-2 py-5">
+            <CardHeader>
+              <CardDescription>Messages (30d)</CardDescription>
+              <CardTitle className="text-2xl font-semibold tabular-nums">—</CardTitle>
+            </CardHeader>
+            <CardContent className="text-xs text-muted-foreground">
+              Available per server under Messaging → Statistics
+            </CardContent>
+          </Card>
+          <Card className="gap-2 py-5">
+            <CardHeader>
+              <CardDescription>Delivery rate</CardDescription>
+              <CardTitle className="text-2xl font-semibold tabular-nums">—</CardTitle>
+            </CardHeader>
+            <CardContent className="text-xs text-muted-foreground">
+              Available per server under Messaging → Statistics
+            </CardContent>
+          </Card>
+        </div>
+      )}
       <PageHeader
         title={all ? "All organizations" : "Your organizations"}
         description={
