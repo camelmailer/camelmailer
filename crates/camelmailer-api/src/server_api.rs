@@ -419,7 +419,7 @@ async fn messages_send_batch(
 
 // -------------------------------------------------------------- read APIs
 
-fn message_json(message: &MessageRecord) -> Value {
+pub(crate) fn message_json(message: &MessageRecord) -> Value {
     json!({
         "id": message.id,
         "token": message.token,
@@ -443,7 +443,7 @@ fn message_json(message: &MessageRecord) -> Value {
     })
 }
 
-fn delivery_json(delivery: &DeliveryRecord) -> Value {
+pub(crate) fn delivery_json(delivery: &DeliveryRecord) -> Value {
     json!({
         "id": delivery.id,
         "status": delivery.status,
@@ -454,7 +454,7 @@ fn delivery_json(delivery: &DeliveryRecord) -> Value {
     })
 }
 
-fn activity_json(event: &ActivityEvent) -> Value {
+pub(crate) fn activity_json(event: &ActivityEvent) -> Value {
     json!({
         "ip_address": event.ip_address,
         "user_agent": event.user_agent,
@@ -704,6 +704,113 @@ async fn message_exists(
     id: i64,
 ) -> bool {
     matches!(store.message(server_id, id).await, Ok(Some(_)))
+}
+
+// --------------------------------------------------------- share links
+
+#[derive(Debug, Deserialize, Default)]
+struct CreateShare {
+    expires_in_hours: Option<i64>,
+}
+
+/// `POST /api/v2/server/messages/{id}/share` — create a public share link
+/// for one message (Resend-style). The token is random, returned exactly
+/// once inside the URL, and stored only as a SHA-256 hash; the public
+/// lookup goes through the hash. Default expiry 48 h, maximum 168 h.
+async fn message_share_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+    body: Option<Json<CreateShare>>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let expires_in_hours = body
+        .and_then(|Json(b)| b.expires_in_hours)
+        .unwrap_or(crate::share::DEFAULT_SHARE_EXPIRY_HOURS);
+    if !(1..=crate::share::MAX_SHARE_EXPIRY_HOURS).contains(&expires_in_hours) {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            &format!(
+                "expires_in_hours must be between 1 and {}",
+                crate::share::MAX_SHARE_EXPIRY_HOURS
+            ),
+        )
+        .into_response();
+    }
+    // server-scoped: only a message of THIS server can be shared
+    if !message_exists(store, server.0.id, id).await {
+        return not_found(&start.0);
+    }
+
+    let token = camelmailer_core::auth::generate_auth_token();
+    let expires_at = chrono::Utc::now() + chrono::Duration::hours(expires_in_hours);
+    let share = match store
+        .create_message_share(camelmailer_core::NewMessageShare {
+            server_id: server.0.id,
+            message_id: id,
+            token_hash: camelmailer_core::auth::hash_token(&token),
+            expires_at,
+        })
+        .await
+    {
+        Ok(share) => share,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+
+    let base = state
+        .config
+        .auth
+        .frontend_url
+        .as_deref()
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string();
+    render_success(
+        Some(&start.0),
+        StatusCode::CREATED,
+        json!({
+            "url": format!("{base}/share/m/{token}"),
+            "expires_at": share.expires_at.to_rfc3339(),
+        }),
+    )
+    .into_response()
+}
+
+// ------------------------------------------------------------- insights
+
+/// `GET /api/v2/server/messages/{id}/insights` — the deliverability rule
+/// catalog evaluated for one message (see [`crate::insights`]).
+async fn message_insights(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let message = match store.message(server.0.id, id).await {
+        Ok(Some(message)) => message,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let checks = crate::insights::evaluate(&state, &server.0, &message).await;
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "checks": checks.iter().map(|check| check.json()).collect::<Vec<_>>(),
+        }),
+    )
+    .into_response()
 }
 
 // -------------------------------------------------------- stats + bounces
@@ -1724,6 +1831,8 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/messages/{id}/opens", get(message_opens))
         .route("/messages/{id}/clicks", get(message_clicks))
         .route("/messages/{id}/raw", get(message_raw))
+        .route("/messages/{id}/share", post(message_share_create))
+        .route("/messages/{id}/insights", get(message_insights))
         .route("/stats", get(stats_show))
         .route("/stats/deliveries", get(delivery_stats_show))
         .route("/bounces", get(bounces_index))

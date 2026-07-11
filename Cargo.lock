@@ -409,6 +409,7 @@ version = "0.3.0"
 dependencies = [
  "argon2",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "hmac 0.12.1",
  "ipnet",

@@ -40,6 +40,39 @@ integration tests) is green.
   in Organization → Settings and a full-page "Enable 2FA to access this
   organization" card (linking to Account → Security) whenever the API
   answers `TwoFactorEnforced`.
+- **Public share links for message details** —
+  `POST /api/v2/server/messages/{id}/share` (`expires_in_hours`, default
+  48, max 168) returns a one-time URL `<frontend_url>/share/m/<token>`;
+  the token is random and stored **only as a SHA-256 hash** (table
+  `message_shares`, a cross-tenant lookup like tracking tokens). The
+  unauthenticated `GET /api/v2/share/messages/{token}` serves the full
+  support context — message, deliveries, opens, clicks and the decoded
+  HTML/text bodies — while the link is valid; unknown tokens answer
+  `404 NotFound`, expired ones the stable `404 ShareLinkExpired`. The
+  dashboard grows a "Share" action in the message detail (expiry picker,
+  generated URL with copy) and a public read-only page at
+  `/share/m/<token>` (meta, delivery timeline, HTML/text tabs).
+
+- **Deliverability insights per message** —
+  `GET /api/v2/server/messages/{id}/insights` evaluates a rule catalog
+  from stored data plus one live DNS lookup: plain-text part present,
+  subject present and ≤ 78 characters, no no-reply From, links and
+  images on the From domain (URL shorteners called out), body under
+  100 KB, From domain verified, DMARC record published (a DNS failure
+  skips the check instead of failing the request), and
+  DKIM active (domain or installation key). The dashboard shows an
+  "Insights" tab in the message detail with DOING GREAT / IMPROVE
+  sections, a warning-count badge and the generation timestamp.
+
+- **Webhook test sends** —
+  `POST /api/v2/admin/organizations/{org}/servers/{server}/webhooks/{id}/test`
+  with `{ "event": "MessageSent" }` synchronously delivers a realistic
+  sample payload (marked `"test": true`) to the webhook URL, including
+  the custom headers and the RSA signature exactly as the worker sends
+  them (10 s timeout), and reports
+  `{ delivered, status_code, duration_ms, error? }`. The dashboard adds
+  a "Send test" action per webhook with event picker, result pill and
+  the sample payload (JSON, copyable).
 
 ## [0.3.0] - 2026-07-11
 

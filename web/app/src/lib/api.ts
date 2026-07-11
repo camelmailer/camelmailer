@@ -400,6 +400,46 @@ export type Template = {
   archived: boolean
 }
 
+// message share links + deliverability insights
+export type MessageShare = { url: string; expires_at: string }
+
+export type SharedMessage = {
+  message: Message
+  deliveries: Delivery[]
+  opens: { ip_address: string | null; user_agent: string | null; created_at: string }[]
+  clicks: {
+    ip_address: string | null
+    user_agent: string | null
+    url: string | null
+    created_at: string
+  }[]
+  html_body: string | null
+  text_body: string | null
+  expires_at: string
+}
+
+export type InsightCheck = {
+  id: string
+  title: string
+  status: "ok" | "warning"
+  detail: string
+}
+
+export type MessageInsights = { generated_at: string; checks: InsightCheck[] }
+
+export type WebhookTestResult = {
+  delivered: boolean
+  status_code: number | null
+  duration_ms: number
+  error?: string
+}
+
+/** Resolve a public share link — no authentication. */
+export const shareApi = {
+  message: (token: string) =>
+    api.get<SharedMessage>(`/api/v2/share/messages/${encodeURIComponent(token)}`),
+}
+
 // -------------------------------------------------------------- auth API
 
 export const authApi = {
@@ -675,6 +715,8 @@ export const adminApi = {
       ) => api.patch<{ webhook: Webhook }>(`${base}/${id}`, fields),
       enable: (id: number) => api.post<{ webhook: Webhook }>(`${base}/${id}/enable`),
       disable: (id: number) => api.post<{ webhook: Webhook }>(`${base}/${id}/disable`),
+      test: (id: number, event: string) =>
+        api.post<{ result: WebhookTestResult }>(`${base}/${id}/test`, { event }),
       delete: (id: number) => api.delete<{ deleted: boolean }>(`${base}/${id}`),
     }
   },
@@ -809,6 +851,10 @@ export function serverApi(key: string) {
     deliveries: (id: number) =>
       api.get<{ deliveries: Delivery[] }>(`/api/v2/server/messages/${id}/deliveries`, h),
     raw: (id: number) => api.get<{ raw: string }>(`/api/v2/server/messages/${id}/raw`, h),
+    share: (id: number, expires_in_hours: number) =>
+      api.post<MessageShare>(`/api/v2/server/messages/${id}/share`, { expires_in_hours }, h),
+    insights: (id: number) =>
+      api.get<MessageInsights>(`/api/v2/server/messages/${id}/insights`, h),
     // inbound queue management
     inbound: (params = "") =>
       api.get<{ messages: Message[]; pagination: Pagination }>(

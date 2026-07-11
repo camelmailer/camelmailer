@@ -2669,3 +2669,75 @@ async fn dmarc_tables_reject_writes_for_a_foreign_tenant() {
         "unexpected error: {error}"
     );
 }
+
+// ---------------------------------------------------------- message shares
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_shares_round_trip_by_token_hash() {
+    use camelmailer_core::ServerStore;
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    let sent = f
+        .store
+        .store_outgoing(QueuedMessage {
+            scope: MessageScope::Outgoing,
+            ..message_for(f.server.id, "share@example.net")
+        })
+        .await
+        .unwrap();
+
+    let token_hash = camelmailer_core::auth::hash_token("share-token");
+    let expires_at = chrono::Utc::now() + chrono::Duration::hours(48);
+    let share = f
+        .store
+        .create_message_share(camelmailer_core::NewMessageShare {
+            server_id: f.server.id,
+            message_id: sent.id,
+            token_hash: token_hash.clone(),
+            expires_at,
+        })
+        .await
+        .unwrap();
+    assert_eq!(share.server_id, f.server.id);
+    assert_eq!(share.message_id, sent.id);
+
+    // resolvable by hash (cross-tenant lookup), not by the raw token
+    let found = f
+        .store
+        .message_share_by_token_hash(&token_hash)
+        .await
+        .unwrap()
+        .expect("share must resolve by hash");
+    assert_eq!(found.id, share.id);
+    assert_eq!(found.message_id, sent.id);
+    assert!((found.expires_at - expires_at).num_seconds().abs() < 2);
+    assert!(f
+        .store
+        .message_share_by_token_hash("share-token")
+        .await
+        .unwrap()
+        .is_none());
+
+    // duplicate hashes are rejected (UNIQUE)
+    let duplicate = f
+        .store
+        .create_message_share(camelmailer_core::NewMessageShare {
+            server_id: f.server.id,
+            message_id: sent.id,
+            token_hash,
+            expires_at,
+        })
+        .await;
+    assert!(duplicate.is_err());
+
+    // the resolved share's tenant context reads the message under RLS
+    let message = f
+        .store
+        .message(found.server_id, found.message_id)
+        .await
+        .unwrap()
+        .expect("shared message must load in its tenant context");
+    assert_eq!(message.rcpt_to, "share@example.net");
+}

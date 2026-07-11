@@ -102,6 +102,29 @@ pub struct MessageStats {
     pub unique_clicks: i64,
 }
 
+/// A public share link for one message. Only the SHA-256 hash of the share
+/// token is ever stored; the unauthenticated share endpoint resolves the
+/// presented token by hash (a cross-tenant lookup like tracking tokens).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageShare {
+    pub id: i64,
+    pub server_id: Id,
+    pub message_id: i64,
+    /// SHA-256 hex of the share token (never the token itself).
+    pub token_hash: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fields for creating a message share link.
+#[derive(Debug, Clone)]
+pub struct NewMessageShare {
+    pub server_id: Id,
+    pub message_id: i64,
+    pub token_hash: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Outbound queue depth per destination domain.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueuedDomain {
@@ -266,6 +289,21 @@ pub trait ServerStore: Send + Sync {
         server_id: Id,
         filter: &DmarcFilter,
     ) -> Result<Vec<DmarcRecordRow>, StoreError>;
+
+    // message share links (cross-tenant lookup by token hash)
+    /// Persist a share link (`new.token_hash` is the SHA-256 of the token;
+    /// the token itself is never stored). Creation is server-scoped: the
+    /// caller must have resolved the message within its own server first.
+    async fn create_message_share(&self, new: NewMessageShare) -> Result<MessageShare, StoreError>;
+
+    /// Resolve a presented share token (by hash) to its share record —
+    /// deliberately NOT server-scoped: the public share endpoint has no
+    /// tenant context until this lookup provides one. Expiry is enforced
+    /// by the caller.
+    async fn message_share_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<MessageShare>, StoreError>;
 }
 
 #[async_trait]
@@ -480,5 +518,16 @@ impl ServerStore for crate::store::MemoryStore {
         filter: &DmarcFilter,
     ) -> Result<Vec<DmarcRecordRow>, StoreError> {
         Ok(self.dmarc_records_for(server_id, filter))
+    }
+
+    async fn create_message_share(&self, new: NewMessageShare) -> Result<MessageShare, StoreError> {
+        Ok(self.insert_message_share(new))
+    }
+
+    async fn message_share_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<MessageShare>, StoreError> {
+        Ok(self.find_message_share(token_hash))
     }
 }

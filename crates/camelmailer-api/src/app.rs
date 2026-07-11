@@ -51,6 +51,13 @@ pub struct ApiState {
     /// GitHub's OAuth surface for `auth.sso_providers` — the real client
     /// in production, a mock in tests.
     pub sso_github: Arc<dyn crate::sso::GithubOauth>,
+    /// The HTTP leg of synchronous webhook test deliveries — reqwest with
+    /// a 10 s timeout in production; tests may inject a short timeout.
+    pub webhook_sender: Arc<dyn crate::webhook_send::WebhookSender>,
+    /// PEM of the installation signing key (`camelmailer.signing_key_path`)
+    /// — signs webhook test payloads exactly like the worker. `None` when
+    /// the key file does not exist (signing is then skipped).
+    pub installation_signing_key_pem: Option<String>,
 }
 
 impl ApiState {
@@ -78,6 +85,8 @@ impl ApiState {
             dns_resolver,
             installation_dkim_public_key: None,
             sso_github: Arc::new(crate::sso::HttpGithub::default()),
+            webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
+            installation_signing_key_pem: None,
         })
     }
 
@@ -97,6 +106,8 @@ impl ApiState {
             dns_resolver: Arc::new(crate::dns::HickoryDnsResolver),
             installation_dkim_public_key: None,
             sso_github: Arc::new(crate::sso::HttpGithub::default()),
+            webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
+            installation_signing_key_pem: None,
         })
     }
 
@@ -216,12 +227,41 @@ impl ApiState {
         dns_resolver: Arc<dyn camelmailer_core::DnsResolver>,
         sso_github: Arc<dyn crate::sso::GithubOauth>,
     ) -> Arc<Self> {
-        // The DKIM fallback for domains without their own key: the public
-        // half of the installation signing key, when it exists.
-        let installation_dkim_public_key =
-            std::fs::read_to_string(&config.camelmailer.signing_key_path)
-                .ok()
-                .and_then(|pem| crate::resources::dkim_public_key_b64(&pem));
+        Self::full_with_webhook_sender(
+            store,
+            server_store,
+            auth_store,
+            global_admin_api_key,
+            config,
+            billing,
+            dns_resolver,
+            sso_github,
+            Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
+        )
+    }
+
+    /// [`ApiState::full_with_all`] with an explicit webhook sender —
+    /// router tests inject one with a short timeout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn full_with_webhook_sender(
+        store: Arc<dyn AdminStore>,
+        server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
+        auth_store: Option<Arc<dyn camelmailer_core::AuthStore>>,
+        global_admin_api_key: Option<String>,
+        config: camelmailer_config::Config,
+        billing: Option<Arc<dyn crate::billing::BillingProvider>>,
+        dns_resolver: Arc<dyn camelmailer_core::DnsResolver>,
+        sso_github: Arc<dyn crate::sso::GithubOauth>,
+        webhook_sender: Arc<dyn crate::webhook_send::WebhookSender>,
+    ) -> Arc<Self> {
+        // The installation signing key doubles as the DKIM fallback for
+        // domains without their own key (public half) and as the webhook
+        // payload signing key (private half), when it exists.
+        let installation_signing_key_pem =
+            std::fs::read_to_string(&config.camelmailer.signing_key_path).ok();
+        let installation_dkim_public_key = installation_signing_key_pem
+            .as_deref()
+            .and_then(crate::resources::dkim_public_key_b64);
         Arc::new(Self {
             store,
             server_store,
@@ -232,6 +272,8 @@ impl ApiState {
             dns_resolver,
             installation_dkim_public_key,
             sso_github,
+            webhook_sender,
+            installation_signing_key_pem,
         })
     }
 
@@ -1359,6 +1401,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/webhooks/{id}/disable",
             axum::routing::post(resources::webhooks_disable),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/webhooks/{id}/test",
+            axum::routing::post(resources::webhooks_test),
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/sender_addresses",
