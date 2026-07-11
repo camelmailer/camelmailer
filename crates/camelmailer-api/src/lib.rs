@@ -15,8 +15,8 @@ pub mod share;
 pub mod sso;
 pub mod tracking;
 mod webauthn;
-mod workspace;
 pub mod webhook_send;
+mod workspace;
 mod xmldsig;
 
 mod insights;

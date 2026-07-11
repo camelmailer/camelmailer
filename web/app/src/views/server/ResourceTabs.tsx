@@ -897,19 +897,6 @@ export function Webhooks({ org, server }: Scope) {
             </div>
           </div>
       </FormDialog>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={() => create.mutate()}
-              disabled={create.isPending || !name.trim() || !url.startsWith("http")}
-            >
-              Create
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
       {testing && (
         <SendTestDialog
           org={org}
