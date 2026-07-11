@@ -137,7 +137,18 @@ export type Server = {
   default_stream_id: number | null
 }
 
-export type Domain = { id: number; uuid: string; name: string; verified: boolean }
+export type DnsRecord = { name: string; type: string; value: string }
+
+export type Domain = {
+  id: number
+  uuid: string
+  name: string
+  verified: boolean
+  // null when neither the domain nor the installation has a DKIM key
+  dkim_record: DnsRecord | null
+  verification_record: DnsRecord
+  spf_record: DnsRecord
+}
 
 export type Credential = {
   id: number

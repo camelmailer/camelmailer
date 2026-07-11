@@ -224,6 +224,8 @@ async fn verified_domains_still_authorize_without_a_sender_address() {
         owner: DomainOwner::Server(server_id),
         name: "acme.example".into(),
         verified: true,
+        dkim_private_key: None,
+        verification_token: String::new(),
     });
     let (status, body) = send_from(&app, "anyone@acme.example").await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -263,6 +265,8 @@ async fn with_app_mail_enabled_the_token_is_mailed_not_returned() {
         owner: DomainOwner::Server(platform.id),
         name: "platform.example".into(),
         verified: true,
+        dkim_private_key: None,
+        verification_token: String::new(),
     });
     store
         .create_credential_record(NewCredential {

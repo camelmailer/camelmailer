@@ -175,7 +175,15 @@ pub trait AdminStore: Send + Sync {
     async fn list_domains(&self, server_id: Id) -> Result<Vec<Domain>, StoreError>;
     async fn domain_by_name(&self, server_id: Id, name: &str)
         -> Result<Option<Domain>, StoreError>;
-    async fn create_server_domain(&self, server_id: Id, name: &str) -> Result<Domain, StoreError>;
+    /// Create a server-scoped sending domain. A fresh, stable
+    /// `verification_token` is generated; `dkim_private_key` (PEM) is the
+    /// domain's own DKIM key — `None` keeps the installation-key fallback.
+    async fn create_server_domain(
+        &self,
+        server_id: Id,
+        name: &str,
+        dkim_private_key: Option<String>,
+    ) -> Result<Domain, StoreError>;
     async fn set_domain_verified(&self, domain_id: Id, verified: bool) -> Result<(), StoreError>;
     async fn delete_domain(&self, domain_id: Id) -> Result<bool, StoreError>;
 
@@ -533,7 +541,12 @@ impl AdminStore for crate::store::MemoryStore {
             .cloned())
     }
 
-    async fn create_server_domain(&self, server_id: Id, name: &str) -> Result<Domain, StoreError> {
+    async fn create_server_domain(
+        &self,
+        server_id: Id,
+        name: &str,
+        dkim_private_key: Option<String>,
+    ) -> Result<Domain, StoreError> {
         if self.domain_by_name(server_id, name).await?.is_some() {
             return Err(StoreError::Conflict("Name has already been taken".into()));
         }
@@ -543,6 +556,8 @@ impl AdminStore for crate::store::MemoryStore {
             owner: DomainOwner::Server(server_id),
             name: name.into(),
             verified: false,
+            verification_token: crate::token::generate_token(32),
+            dkim_private_key,
         }))
     }
 
@@ -1195,6 +1210,44 @@ mod tests {
         assert!(store.delete_sender_address(address.id).await.unwrap());
         assert!(!store.delete_sender_address(address.id).await.unwrap());
         assert!(store.list_sender_addresses(1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_server_domain_stores_the_dkim_key_and_a_stable_verification_token() {
+        let store = MemoryStore::new();
+        let with_key = store
+            .create_server_domain(1, "keyed.example", Some("PEM".into()))
+            .await
+            .unwrap();
+        assert_eq!(with_key.dkim_private_key.as_deref(), Some("PEM"));
+        assert!(!with_key.verification_token.is_empty());
+        assert!(!with_key.verified);
+
+        let without_key = store
+            .create_server_domain(1, "plain.example", None)
+            .await
+            .unwrap();
+        assert!(without_key.dkim_private_key.is_none());
+        assert!(!without_key.verification_token.is_empty());
+        assert_ne!(
+            with_key.verification_token, without_key.verification_token,
+            "tokens must be per-domain"
+        );
+
+        // the token and the key are stable across reads
+        let reread = store
+            .domain_by_name(1, "keyed.example")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.verification_token, with_key.verification_token);
+        assert_eq!(reread.dkim_private_key, with_key.dkim_private_key);
+
+        let error = store
+            .create_server_domain(1, "keyed.example", None)
+            .await
+            .expect_err("duplicate domain must conflict");
+        assert!(matches!(error, StoreError::Conflict(_)));
     }
 
     #[tokio::test]

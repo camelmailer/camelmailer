@@ -23,13 +23,22 @@ fn password_digest() -> &'static str {
 struct Harness {
     app: Router,
     store: Arc<MemoryStore>,
+    dns: Arc<camelmailer_core::StaticDnsResolver>,
 }
 
 async fn harness_with_config(config: camelmailer_config::Config) -> Harness {
     let store = Arc::new(MemoryStore::new());
-    let state = ApiState::full(store.clone(), None, Some(store.clone()), None, config);
+    let dns = Arc::new(camelmailer_core::StaticDnsResolver::new());
+    let state = ApiState::full_with_resolver(
+        store.clone(),
+        None,
+        Some(store.clone()),
+        None,
+        config,
+        dns.clone(),
+    );
     let app = build_router(state.clone()).merge(build_auth_router(state));
-    Harness { app, store }
+    Harness { app, store, dns }
 }
 
 async fn harness() -> Harness {
@@ -311,6 +320,82 @@ async fn members_manage_server_resources_but_not_servers() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// -------------------------------------------------- domain verification
+
+#[tokio::test]
+async fn members_verify_domains_via_dns_but_cannot_force() {
+    let h = harness().await;
+    let org = h.org("Acme").await;
+    let admin = h.member(&org, "admin@example.com", Role::Admin).await;
+    let _ = admin;
+    let admin_token = h.login("admin@example.com").await;
+    h.request(
+        "POST",
+        "/api/v2/admin/organizations/acme/servers",
+        Some(&admin_token),
+        Some(json!({ "name": "Prod" })),
+    )
+    .await;
+
+    h.member(&org, "member@example.com", Role::Member).await;
+    let member_token = h.login("member@example.com").await;
+    let (status, body) = h
+        .request(
+            "POST",
+            "/api/v2/admin/organizations/acme/servers/prod/domains",
+            Some(&member_token),
+            Some(json!({ "name": "acme.example" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let challenge = body["data"]["domain"]["verification_record"]["value"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // force is the operator escape hatch: machine key only, never a user
+    // session — not even for organization admins.
+    let (status, body) = h
+        .request(
+            "POST",
+            "/api/v2/admin/organizations/acme/servers/prod/domains/acme.example/verify",
+            Some(&admin_token),
+            Some(json!({ "force": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "Forbidden");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("X-Admin-API-Key"));
+
+    // the honest DNS path works for members
+    let (status, body) = h
+        .request(
+            "POST",
+            "/api/v2/admin/organizations/acme/servers/prod/domains/acme.example/verify",
+            Some(&member_token),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+
+    h.dns
+        .add_txt("_camelmailer-challenge.acme.example", &challenge);
+    let (status, body) = h
+        .request(
+            "POST",
+            "/api/v2/admin/organizations/acme/servers/prod/domains/acme.example/verify",
+            Some(&member_token),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "verify failed: {body}");
+    assert_eq!(body["data"]["domain"]["verified"], true);
 }
 
 #[tokio::test]

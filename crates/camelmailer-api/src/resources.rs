@@ -3,9 +3,9 @@
 //! the corresponding controllers in `app/controllers/admin_api/`.
 
 use crate::app::{
-    find_server, paginate, render_deleted, render_not_found, render_parameter_missing,
-    render_store_error, render_success, render_validation_error, ApiResponse, ApiState,
-    PaginationParams, RequestStart,
+    find_server, paginate, render_deleted, render_error, render_not_found,
+    render_parameter_missing, render_store_error, render_success, render_validation_error,
+    ApiResponse, ApiState, PaginationParams, Principal, RequestStart,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -54,12 +54,65 @@ fn from_result<T>(
 
 // ----------------------------------------------------------------- domains
 
-fn domain_json(domain: &Domain) -> Value {
+/// base64(SubjectPublicKeyInfo DER) — the `p=` value of a DKIM TXT record —
+/// for an RSA private key in PKCS#8 or PKCS#1 PEM form.
+pub(crate) fn dkim_public_key_b64(private_pem: &str) -> Option<String> {
+    use base64::Engine;
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
+    let key = rsa::RsaPrivateKey::from_pkcs8_pem(private_pem)
+        .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(private_pem))
+        .ok()?;
+    let der = key.to_public_key().to_public_key_der().ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(der.as_bytes()))
+}
+
+/// Generate the RSA-2048 DKIM key a new domain is created with.
+fn generate_dkim_key() -> Result<String, String> {
+    use rsa::pkcs8::EncodePrivateKey;
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
+        .map_err(|error| format!("could not generate an RSA key: {error}"))?;
+    key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+        .map(|pem| pem.to_string())
+        .map_err(|error| format!("could not encode the DKIM key: {error}"))
+}
+
+fn dns_record_json(name: String, value: String) -> Value {
+    json!({ "name": name, "type": "TXT", "value": value })
+}
+
+/// A domain plus the three DNS records its owner should publish. The DKIM
+/// record uses the domain's own key when it has one and the installation
+/// key otherwise; the private key itself is never rendered.
+fn domain_json(state: &ApiState, domain: &Domain) -> Value {
+    let dkim_public = domain
+        .dkim_private_key
+        .as_deref()
+        .and_then(dkim_public_key_b64)
+        .or_else(|| state.installation_dkim_public_key.clone());
+    let dns = &state.config.dns;
+    let spf_source = if dns.spf_include.is_empty() {
+        format!("a:{}", state.config.camelmailer.smtp_hostname)
+    } else {
+        format!("include:{}", dns.spf_include)
+    };
     json!({
         "id": domain.id,
         "uuid": domain.uuid,
         "name": domain.name,
         "verified": domain.verified,
+        "dkim_record": dkim_public.map(|p| dns_record_json(
+            format!("{}._domainkey.{}", dns.dkim_identifier, domain.name),
+            format!("v=DKIM1; k=rsa; p={p}"),
+        )),
+        "verification_record": dns_record_json(
+            format!("_camelmailer-challenge.{}", domain.name),
+            format!("camelmailer-verification={}", domain.verification_token),
+        ),
+        "spf_record": dns_record_json(
+            domain.name.clone(),
+            format!("v=spf1 {spf_source} ~all"),
+        ),
     })
 }
 
@@ -81,7 +134,11 @@ pub(crate) async fn domains_index(
             ok(
                 &start,
                 json!({
-                    "domains": result.items.iter().map(domain_json).collect::<Vec<_>>(),
+                    "domains": result
+                        .items
+                        .iter()
+                        .map(|domain| domain_json(&state, domain))
+                        .collect::<Vec<_>>(),
                     "pagination": result.pagination,
                 }),
             )
@@ -110,10 +167,22 @@ pub(crate) async fn domains_create(
             "param is missing or the value is empty: name",
         );
     };
+    // Every new domain gets its own RSA-2048 DKIM key; domains created
+    // before this existed keep signing with the installation key.
+    let dkim_private_key = match tokio::task::spawn_blocking(generate_dkim_key).await {
+        Ok(Ok(pem)) => pem,
+        Ok(Err(message)) => return render_store_error(Some(&start), StoreError::Other(message)),
+        Err(error) => {
+            return render_store_error(Some(&start), StoreError::Other(error.to_string()))
+        }
+    };
     from_result(
         &start,
-        state.store.create_server_domain(server.id, &name).await,
-        |domain| created(&start, json!({ "domain": domain_json(&domain) })),
+        state
+            .store
+            .create_server_domain(server.id, &name, Some(dkim_private_key))
+            .await,
+        |domain| created(&start, json!({ "domain": domain_json(&state, &domain) })),
     )
 }
 
@@ -138,26 +207,72 @@ pub(crate) async fn domains_show(
     Path((org, server, name)): Path<(String, String, String)>,
 ) -> ApiResponse {
     match require_domain(&state, &start, &org, &server, &name).await {
-        Ok(domain) => ok(&start, json!({ "domain": domain_json(&domain) })),
+        Ok(domain) => ok(&start, json!({ "domain": domain_json(&state, &domain) })),
         Err(response) => response,
     }
 }
 
+#[derive(Deserialize, Default)]
+pub(crate) struct VerifyDomain {
+    force: Option<bool>,
+}
+
+/// `POST …/domains/{name}/verify` — prove domain ownership via DNS: the
+/// TXT record `_camelmailer-challenge.<domain>` must contain
+/// `camelmailer-verification=<token>`. Operators authenticating with the
+/// `X-Admin-API-Key` machine key (never a user session) may skip the
+/// check with `{"force": true}`.
 pub(crate) async fn domains_verify(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
+    principal: axum::Extension<Principal>,
     Path((org, server, name)): Path<(String, String, String)>,
+    body: Option<Json<VerifyDomain>>,
 ) -> ApiResponse {
-    match require_domain(&state, &start, &org, &server, &name).await {
-        Ok(mut domain) => {
-            if let Err(error) = state.store.set_domain_verified(domain.id, true).await {
-                return render_store_error(Some(&start), error);
-            }
-            domain.verified = true;
-            ok(&start, json!({ "domain": domain_json(&domain) }))
+    let mut domain = match require_domain(&state, &start, &org, &server, &name).await {
+        Ok(domain) => domain,
+        Err(response) => return response,
+    };
+    let force = body
+        .map(|Json(b)| b.force.unwrap_or(false))
+        .unwrap_or(false);
+    if force {
+        if !matches!(principal.0, Principal::AdminKey) {
+            return render_error(
+                Some(&start),
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+                "Forced verification requires the X-Admin-API-Key machine key",
+            );
         }
-        Err(response) => response,
+    } else {
+        let record_name = format!("_camelmailer-challenge.{}", domain.name);
+        let expected = format!("camelmailer-verification={}", domain.verification_token);
+        match state.dns_resolver.txt_records(&record_name).await {
+            Ok(records) if records.iter().any(|record| record.trim() == expected) => {}
+            Ok(_) => {
+                return render_validation_error(
+                    Some(&start),
+                    &format!(
+                        "Domain ownership is not proven yet: publish a TXT record at \
+                         {record_name} with the value \"{expected}\", wait for DNS to \
+                         propagate, then retry"
+                    ),
+                )
+            }
+            Err(error) => {
+                return render_validation_error(
+                    Some(&start),
+                    &format!("Could not check the TXT record at {record_name}: {error}"),
+                )
+            }
+        }
     }
+    if let Err(error) = state.store.set_domain_verified(domain.id, true).await {
+        return render_store_error(Some(&start), error);
+    }
+    domain.verified = true;
+    ok(&start, json!({ "domain": domain_json(&state, &domain) }))
 }
 
 pub(crate) async fn domains_destroy(

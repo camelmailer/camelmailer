@@ -178,6 +178,8 @@ fn domain_from_row(row: &PgRow) -> Domain {
         },
         name: row.get("name"),
         verified: row.get("verified"),
+        verification_token: row.get("verification_token"),
+        dkim_private_key: row.get("dkim_private_key"),
     }
 }
 
@@ -371,21 +373,27 @@ impl PgStore {
         owner: DomainOwner,
         name: &str,
         verified: bool,
+        dkim_private_key: Option<&str>,
     ) -> Result<Domain, StoreError> {
         let (owner_type, owner_id) = match owner {
             DomainOwner::Organization(id) => ("Organization", id as i64),
             DomainOwner::Server(id) => ("Server", id as i64),
         };
         let uuid = token::generate_uuid();
+        let verification_token = token::generate_token(32);
         let row = sqlx::query(
-            "INSERT INTO domains (uuid, owner_type, owner_id, name, verified)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            "INSERT INTO domains
+                 (uuid, owner_type, owner_id, name, verified,
+                  verification_token, dkim_private_key)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
         )
         .bind(&uuid)
         .bind(owner_type)
         .bind(owner_id)
         .bind(name)
         .bind(verified)
+        .bind(&verification_token)
+        .bind(dkim_private_key)
         .fetch_one(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -395,6 +403,8 @@ impl PgStore {
             owner,
             name: name.into(),
             verified,
+            verification_token,
+            dkim_private_key: dkim_private_key.map(str::to_string),
         })
     }
 
@@ -832,9 +842,19 @@ impl AdminStore for PgStore {
         .map_err(Self::sqlx_error)
     }
 
-    async fn create_server_domain(&self, server_id: Id, name: &str) -> Result<Domain, StoreError> {
-        self.create_domain(DomainOwner::Server(server_id), name, false)
-            .await
+    async fn create_server_domain(
+        &self,
+        server_id: Id,
+        name: &str,
+        dkim_private_key: Option<String>,
+    ) -> Result<Domain, StoreError> {
+        self.create_domain(
+            DomainOwner::Server(server_id),
+            name,
+            false,
+            dkim_private_key.as_deref(),
+        )
+        .await
     }
 
     async fn set_domain_verified(&self, domain_id: Id, verified: bool) -> Result<(), StoreError> {

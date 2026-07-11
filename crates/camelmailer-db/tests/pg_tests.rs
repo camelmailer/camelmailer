@@ -280,7 +280,7 @@ async fn store_finds_smtp_credentials_servers_and_routes() {
         .unwrap();
     let domain = f
         .store
-        .create_domain(DomainOwner::Server(f.server.id), "example.com", true)
+        .create_domain(DomainOwner::Server(f.server.id), "example.com", true, None)
         .await
         .unwrap();
     let route = f
@@ -360,11 +360,16 @@ async fn store_authenticates_from_domains_only_when_verified() {
 
     let verified = f
         .store
-        .create_domain(DomainOwner::Server(f.server.id), "example.com", true)
+        .create_domain(DomainOwner::Server(f.server.id), "example.com", true, None)
         .await
         .unwrap();
     f.store
-        .create_domain(DomainOwner::Server(f.server.id), "unverified.net", false)
+        .create_domain(
+            DomainOwner::Server(f.server.id),
+            "unverified.net",
+            false,
+            None,
+        )
         .await
         .unwrap();
     let org_domain = f
@@ -373,6 +378,7 @@ async fn store_authenticates_from_domains_only_when_verified() {
             DomainOwner::Organization(f.organization.id),
             "org.example",
             true,
+            None,
         )
         .await
         .unwrap();
@@ -397,6 +403,64 @@ async fn store_authenticates_from_domains_only_when_verified() {
             .find_authenticated_domain(f.server.id, &["test@example.com", "x@unverified.net"]),
         None
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domains_store_dkim_keys_and_stable_verification_tokens() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    let with_key = f
+        .store
+        .create_server_domain(f.server.id, "keyed.example", Some("PEM".into()))
+        .await
+        .unwrap();
+    assert_eq!(with_key.dkim_private_key.as_deref(), Some("PEM"));
+    assert!(!with_key.verification_token.is_empty());
+    assert!(!with_key.verified);
+
+    let without_key = f
+        .store
+        .create_server_domain(f.server.id, "plain.example", None)
+        .await
+        .unwrap();
+    assert!(without_key.dkim_private_key.is_none());
+    assert!(!without_key.verification_token.is_empty());
+    assert_ne!(
+        with_key.verification_token, without_key.verification_token,
+        "tokens must be per-domain"
+    );
+
+    // the token and the key are stable across reads (by name and by id)
+    let reread = f
+        .store
+        .domain_by_name(f.server.id, "keyed.example")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reread.verification_token, with_key.verification_token);
+    assert_eq!(reread.dkim_private_key, with_key.dkim_private_key);
+    let by_id = f.store.domain_by_id(with_key.id).await.unwrap().unwrap();
+    assert_eq!(by_id.verification_token, with_key.verification_token);
+    assert_eq!(by_id.dkim_private_key, with_key.dkim_private_key);
+
+    // verifying does not touch the token or the key
+    f.store
+        .set_domain_verified(with_key.id, true)
+        .await
+        .unwrap();
+    let verified = f.store.domain_by_id(with_key.id).await.unwrap().unwrap();
+    assert!(verified.verified);
+    assert_eq!(verified.verification_token, with_key.verification_token);
+    assert_eq!(verified.dkim_private_key, with_key.dkim_private_key);
+
+    let error = f
+        .store
+        .create_server_domain(f.server.id, "keyed.example", None)
+        .await
+        .expect_err("duplicate domain must conflict");
+    assert!(matches!(error, camelmailer_core::StoreError::Conflict(_)));
 }
 
 // ------------------------------------------------------------- AdminStore
@@ -491,7 +555,7 @@ async fn a_full_smtp_session_stores_the_message_in_postgres() {
     let f = fixtures(pool).await;
 
     f.store
-        .create_domain(DomainOwner::Server(f.server.id), "example.com", true)
+        .create_domain(DomainOwner::Server(f.server.id), "example.com", true, None)
         .await
         .unwrap();
     let credential = f

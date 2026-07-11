@@ -205,6 +205,7 @@ dependencies = [
  "camelmailer-config",
  "camelmailer-core",
  "chrono",
+ "hickory-resolver",
  "http-body-util",
  "jsonwebtoken",
  "rand 0.8.6",

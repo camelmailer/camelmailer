@@ -109,6 +109,8 @@ impl Fixtures {
             owner: DomainOwner::Server(self.server.id),
             name: name.into(),
             verified: true,
+            verification_token: token::generate_token(32),
+            dkim_private_key: None,
         })
     }
 
@@ -119,6 +121,8 @@ impl Fixtures {
             owner: DomainOwner::Server(self.server.id),
             name: name.into(),
             verified: false,
+            verification_token: token::generate_token(32),
+            dkim_private_key: None,
         })
     }
 

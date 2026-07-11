@@ -68,6 +68,8 @@ async fn build(config: camelmailer_config::Config) -> (Router, Arc<MemoryStore>,
         owner: DomainOwner::Server(server.id),
         name: "platform.example".into(),
         verified: true,
+        verification_token: "vtoken".into(),
+        dkim_private_key: None,
     });
     store
         .create_credential_record(NewCredential {

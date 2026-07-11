@@ -7,6 +7,7 @@
 pub mod admin_store;
 pub mod auth;
 pub mod auth_store;
+pub mod dns;
 pub mod message;
 pub mod mime;
 pub mod model;
@@ -26,6 +27,7 @@ pub use auth::{
     OrganizationMembership, Role, UserAuth,
 };
 pub use auth_store::AuthStore;
+pub use dns::{DnsError, DnsResolver, StaticDnsResolver};
 pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,
 };

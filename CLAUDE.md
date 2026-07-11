@@ -88,8 +88,8 @@ Other conventions:
 
 ## Known deliberate gaps
 
-SAML and SCIM (OIDC is the SSO path), WebAuthn, per-domain DKIM keys
-(one installation key + selector), billing (planned separately). Legal
+SAML and SCIM (OIDC is the SSO path), WebAuthn, billing (planned
+separately). Legal
 pages of the (separately hosted) marketing site are placeholder
 templates and marked as such. App-mail delivery of reset/invitation/welcome mail is no longer a
 gap: the `app_mail` config group (`enabled`, `server_api_key`,

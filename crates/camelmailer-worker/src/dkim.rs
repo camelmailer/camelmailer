@@ -158,6 +158,26 @@ pub fn sign(
     format!("DKIM-Signature: {unsigned_dkim}{signature}")
 }
 
+/// Choose the signing key for a domain: the domain's own DKIM key when it
+/// has one, otherwise the installation key. An unparseable per-domain key
+/// logs a warning and falls back to the installation key rather than
+/// leaving mail unsigned.
+pub fn signer_for_domain(
+    domain_key_pem: Option<&str>,
+    installation: Option<&Signer>,
+) -> Option<Signer> {
+    if let Some(pem) = domain_key_pem {
+        match Signer::from_pem(pem) {
+            Ok(signer) => return Some(signer),
+            Err(error) => tracing::warn!(
+                %error,
+                "invalid per-domain DKIM key; falling back to the installation key"
+            ),
+        }
+    }
+    installation.cloned()
+}
+
 /// Prepend a DKIM-Signature header to a raw message.
 pub fn sign_and_prepend(
     raw_message: &[u8],
@@ -182,6 +202,73 @@ mod tests {
     fn test_signer() -> Signer {
         let pem = include_str!("../tests/fixtures/test_signing_key.pem");
         Signer::from_pem(pem).unwrap()
+    }
+
+    fn domain_key_pem() -> &'static str {
+        include_str!("../tests/fixtures/test_domain_key.pem")
+    }
+
+    #[test]
+    fn the_domain_key_signs_when_present() {
+        let installation = test_signer();
+        let signer = signer_for_domain(Some(domain_key_pem()), Some(&installation))
+            .expect("a signer must be selected");
+        let domain_signer = Signer::from_pem(domain_key_pem()).unwrap();
+        assert_eq!(signer.public_key(), domain_signer.public_key());
+        assert_ne!(signer.public_key(), installation.public_key());
+        // and it works without any installation key at all
+        let signer = signer_for_domain(Some(domain_key_pem()), None).unwrap();
+        assert_eq!(signer.public_key(), domain_signer.public_key());
+    }
+
+    #[test]
+    fn without_a_domain_key_the_installation_key_signs() {
+        let installation = test_signer();
+        let signer = signer_for_domain(None, Some(&installation)).unwrap();
+        assert_eq!(signer.public_key(), installation.public_key());
+        assert!(signer_for_domain(None, None).is_none());
+    }
+
+    #[test]
+    fn an_invalid_domain_key_falls_back_to_the_installation_key() {
+        let installation = test_signer();
+        let signer = signer_for_domain(Some("not a pem"), Some(&installation)).unwrap();
+        assert_eq!(signer.public_key(), installation.public_key());
+        assert!(signer_for_domain(Some("not a pem"), None).is_none());
+    }
+
+    #[test]
+    fn a_message_signed_with_the_domain_key_verifies_against_it() {
+        let raw = b"From: sender@org.example\r\nSubject: Domain key\r\n\r\nBody.\r\n";
+        let signer = signer_for_domain(Some(domain_key_pem()), Some(&test_signer())).unwrap();
+        let header = sign(raw, "org.example", "postal", &signer, 1_700_000_000);
+
+        let b_position = header.rfind("b=").unwrap();
+        let signature_b64 = &header[b_position + 2..];
+        let unsigned = &header["DKIM-Signature: ".len()..b_position + 2];
+
+        let (raw_headers, _) = split_message(raw);
+        let mut signing_input = String::new();
+        for name in ["from", "subject"] {
+            let header_line = raw_headers
+                .iter()
+                .filter_map(|h| canonicalize_header(h))
+                .find(|(n, _)| n == name)
+                .unwrap();
+            signing_input.push_str(&format!("{}:{}\r\n", header_line.0, header_line.1));
+        }
+        let (n, v) = canonicalize_header(&format!("DKIM-Signature: {unsigned}")).unwrap();
+        signing_input.push_str(&format!("{n}:{v}"));
+
+        let signature_bytes = base64::engine::general_purpose::STANDARD
+            .decode(signature_b64)
+            .unwrap();
+        let domain_public = Signer::from_pem(domain_key_pem()).unwrap().public_key();
+        let verifying_key = rsa::pkcs1v15::VerifyingKey::<Sha256>::new(domain_public);
+        let signature = rsa::pkcs1v15::Signature::try_from(signature_bytes.as_slice()).unwrap();
+        verifying_key
+            .verify(signing_input.as_bytes(), &signature)
+            .expect("the signature must verify against the domain key");
     }
 
     #[test]

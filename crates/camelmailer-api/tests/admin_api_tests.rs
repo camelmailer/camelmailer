@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use camelmailer_api::{build_router, ApiState};
-use camelmailer_core::MemoryStore;
+use camelmailer_core::{MemoryStore, StaticDnsResolver};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -402,7 +402,16 @@ async fn servers_in_a_missing_organization_render_not_found() {
 // ------------------------------------------------- server-scoped resources
 
 async fn build_app_with_server() -> Router {
-    let (app, _) = build_app().await;
+    build_app_with_resolver().await.0
+}
+
+/// Like [`build_app_with_server`] but also returns the injected mock DNS
+/// resolver, for the domain-verification tests.
+async fn build_app_with_resolver() -> (Router, Arc<StaticDnsResolver>) {
+    let resolver = Arc::new(StaticDnsResolver::new());
+    let store = Arc::new(MemoryStore::new());
+    let state = ApiState::new_with_resolver(store, Some(GLOBAL_KEY.to_string()), resolver.clone());
+    let app = build_router(state);
     request(
         &app,
         "POST",
@@ -419,15 +428,16 @@ async fn build_app_with_server() -> Router {
         Some(json!({ "name": "Mail", "permalink": "mail" })),
     )
     .await;
-    app
+    (app, resolver)
 }
 
 const BASE: &str = "/api/v2/admin/organizations/acme/servers/mail";
 
 #[tokio::test]
-async fn domains_crud_and_verify() {
-    let app = build_app_with_server().await;
+async fn domains_crud_returns_dns_records_and_verifies_via_dns() {
+    let (app, resolver) = build_app_with_resolver().await;
 
+    // create → the three records to publish, never the private key
     let (status, body) = request(
         &app,
         "POST",
@@ -437,8 +447,36 @@ async fn domains_crud_and_verify() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["data"]["domain"]["name"], "acme.example");
-    assert_eq!(body["data"]["domain"]["verified"], false);
+    let domain = &body["data"]["domain"];
+    assert_eq!(domain["name"], "acme.example");
+    assert_eq!(domain["verified"], false);
+    assert_eq!(
+        domain["verification_record"]["name"],
+        "_camelmailer-challenge.acme.example"
+    );
+    assert_eq!(domain["verification_record"]["type"], "TXT");
+    let challenge = domain["verification_record"]["value"].as_str().unwrap();
+    assert!(challenge.starts_with("camelmailer-verification="));
+    assert_eq!(
+        domain["dkim_record"]["name"],
+        "postal._domainkey.acme.example"
+    );
+    assert_eq!(domain["dkim_record"]["type"], "TXT");
+    assert!(domain["dkim_record"]["value"]
+        .as_str()
+        .unwrap()
+        .starts_with("v=DKIM1; k=rsa; p="));
+    assert_eq!(domain["spf_record"]["name"], "acme.example");
+    assert_eq!(domain["spf_record"]["type"], "TXT");
+    assert_eq!(
+        domain["spf_record"]["value"],
+        "v=spf1 include:spf.postal.example.com ~all"
+    );
+    assert!(
+        !body.to_string().contains("PRIVATE KEY"),
+        "the DKIM private key must never leave the API"
+    );
+    let challenge = challenge.to_string();
 
     // duplicate name conflicts
     let (status, _) = request(
@@ -451,6 +489,7 @@ async fn domains_crud_and_verify() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
+    // verify without the TXT record → 422 naming the record to publish
     let (status, body) = request(
         &app,
         "POST",
@@ -459,7 +498,51 @@ async fn domains_crud_and_verify() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("_camelmailer-challenge.acme.example"));
+    assert!(message.contains(&challenge));
+
+    // a DNS failure is also a 422, not a success
+    resolver.fail_with("SERVFAIL");
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains/acme.example/verify"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+
+    // publish the token → verified
+    let (_, body) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/domains/acme.example"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    // the token is stable across reads
+    assert_eq!(
+        body["data"]["domain"]["verification_record"]["value"],
+        challenge
+    );
+
+    resolver.add_txt("_camelmailer-challenge.acme.example", &challenge);
+    resolver.clear_error();
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains/acme.example/verify"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "verify failed: {body}");
     assert_eq!(body["data"]["domain"]["verified"], true);
 
     let (_, body) = request(
@@ -471,6 +554,7 @@ async fn domains_crud_and_verify() {
     )
     .await;
     assert_eq!(body["data"]["domains"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"]["domains"][0]["verified"], true);
 
     let (status, _) = request(
         &app,
@@ -490,6 +574,31 @@ async fn domains_crud_and_verify() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn force_verify_with_the_machine_key_skips_the_dns_check() {
+    let (app, _resolver) = build_app_with_resolver().await;
+    request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "forced.example" })),
+    )
+    .await;
+
+    // no TXT record published anywhere — force skips the lookup
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains/forced.example/verify"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "force": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["domain"]["verified"], true);
 }
 
 #[tokio::test]
