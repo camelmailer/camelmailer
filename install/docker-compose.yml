@@ -1,0 +1,97 @@
+# CamelMailer — full stack from the prebuilt GHCR image. No repo clone
+# needed; this single file is the whole installation:
+#
+#   mkdir camelmailer && cd camelmailer
+#   curl -fsSLO https://raw.githubusercontent.com/camelmailer/camelmailer/main/install/docker-compose.yml
+#   echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" > .env
+#   docker compose up -d
+#   docker compose exec web camelmailer make-user you@example.com Ada Ops --admin
+#
+# Pin a version with CAMELMAILER_VERSION=vX.Y.Z in .env (default: latest).
+# Requires Docker Compose v2.23.1+ (inline `configs: content:`).
+# See docs/quickstart.md for the zero-to-first-mail walkthrough.
+
+name: camelmailer
+
+x-app: &app
+  image: ghcr.io/camelmailer/camelmailer:${CAMELMAILER_VERSION:-latest}
+  environment:
+    DATABASE_URL: postgres://camelmailer:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/camelmailer
+    RUST_LOG: ${RUST_LOG:-info}
+    # To use a config file (DKIM signing key, DNS names, TLS, relays …),
+    # place camelmailer.yml next to this file, then uncomment:
+    # CAMELMAILER_CONFIG_FILE_PATH: /config/camelmailer.yml
+  # volumes:
+  #   - ./:/config:ro
+  restart: unless-stopped
+
+# First-boot init for the postgres container, inlined so no file from the
+# repository is needed. The application role is deliberately NOT a
+# superuser: superusers bypass PostgreSQL row-level security, which would
+# silently disable the tenant isolation on the message tables.
+# (The generated .env password is hex, so quoting is safe.)
+configs:
+  pg-init:
+    content: |
+      CREATE ROLE camelmailer LOGIN PASSWORD '${POSTGRES_PASSWORD}' NOSUPERUSER;
+      CREATE DATABASE camelmailer OWNER camelmailer;
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    configs:
+      - source: pg-init
+        target: /docker-entrypoint-initdb.d/10-app-role.sql
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # One-shot: creates/upgrades the schema, then exits.
+  migrate:
+    <<: *app
+    command: initialize
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    <<: *app
+    command: web-server
+    ports:
+      - "${WEB_PORT:-5000}:5000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  smtp:
+    <<: *app
+    command: smtp-server
+    ports:
+      - "${SMTP_PORT:-25}:25"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *app
+    command: worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:

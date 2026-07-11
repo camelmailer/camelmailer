@@ -1,0 +1,18 @@
+[Unit]
+Description=CamelMailer web server (Admin + Server + Auth HTTP APIs)
+Documentation=https://github.com/camelmailer/camelmailer
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=camelmailer
+Group=camelmailer
+EnvironmentFile=-/etc/camelmailer/env
+Environment=CAMELMAILER_CONFIG_FILE_PATH=/etc/camelmailer/camelmailer.yml
+ExecStart=/usr/bin/camelmailer web-server
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

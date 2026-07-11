@@ -22,9 +22,51 @@ servers with all resources, sending and message browsing. See
 [web/README.md](web/README.md). A library of 20 ready-to-clone
 transactional email templates lives in [templates/](templates/README.md).
 
-## Quickstart
+## Install
+
+Three equivalent ways to run the full stack — pick one:
+
+| | Best for | You need |
+|---|---|---|
+| **[Prebuilt Docker](#prebuilt-docker-image-ghcr)** | fastest start, no toolchain | Docker only |
+| **[Debian / Ubuntu](#debian--ubuntu-deb)** | bare-metal / VM, systemd | a PostgreSQL |
+| **[From source](#from-source)** | hacking on CamelMailer | Docker (or Rust) |
+
+### Prebuilt Docker image (GHCR)
+
+One file, no repo clone — pulls `ghcr.io/camelmailer/camelmailer`:
 
 ```bash
+mkdir camelmailer && cd camelmailer
+curl -fsSLO https://raw.githubusercontent.com/camelmailer/camelmailer/main/install/docker-compose.yml
+echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" > .env
+docker compose up -d
+docker compose exec web camelmailer make-user you@example.com Ada Ops --admin
+```
+
+Multi-arch (amd64 + arm64); pin a release with `CAMELMAILER_VERSION=vX.Y.Z`
+in `.env`. *(Maintainers: after the very first image publish, set the GHCR
+package to public once — org → Packages → camelmailer → Package settings →
+Change visibility — or anonymous pulls fail.)*
+
+### Debian / Ubuntu (.deb)
+
+Native amd64/arm64 packages with systemd units, from the
+[releases page](https://github.com/camelmailer/camelmailer/releases):
+
+```bash
+sudo dpkg -i camelmailer_*.deb        # binary, units, /etc/camelmailer/
+sudo editor /etc/camelmailer/camelmailer.yml   # point it at your PostgreSQL
+sudo systemctl enable --now camelmailer-web camelmailer-smtp camelmailer-worker
+```
+
+Step-by-step (incl. PostgreSQL setup and bootstrap):
+**[docs/install-deb.md](docs/install-deb.md)**.
+
+### From source
+
+```bash
+git clone https://github.com/camelmailer/camelmailer && cd camelmailer
 cp .env.example .env          # set POSTGRES_PASSWORD
 docker compose up -d --build
 curl http://localhost:5000/health
@@ -32,9 +74,9 @@ curl http://localhost:5000/health
 docker compose exec web camelmailer make-admin-api-key ops
 ```
 
-That's PostgreSQL + migrations + the HTTP API (`:5000`) + SMTP (`:25`) +
-the delivery worker. Follow **[docs/quickstart.md](docs/quickstart.md)** for
-the five-minute zero-to-first-mail walkthrough, and
+Each path gives you PostgreSQL + migrations + the HTTP API (`:5000`) + SMTP
+(`:25`) + the delivery worker. Follow **[docs/quickstart.md](docs/quickstart.md)**
+for the five-minute zero-to-first-mail walkthrough, and
 **[docs/configuration.md](docs/configuration.md)** for DKIM, DNS records,
 TLS, and the production checklist. Accounts, roles and SSO are covered in
 **[docs/authentication.md](docs/authentication.md)**.

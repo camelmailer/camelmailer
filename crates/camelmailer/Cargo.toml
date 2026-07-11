@@ -3,10 +3,41 @@ name = "camelmailer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Headless, API-first transactional mail delivery platform: SMTP in and out, HTTP APIs for everything, backed by PostgreSQL"
 
 [[bin]]
 name = "camelmailer"
 path = "src/main.rs"
+
+# Debian/Ubuntu package (built with `cargo deb -p camelmailer`).
+# Units + maintainer scripts live in packaging/debian/ at the repo root.
+[package.metadata.deb]
+name = "camelmailer"
+maintainer = "Michael Döhler <michaeldoehler@me.com>"
+copyright = "CamelMailer contributors. MIT licensed."
+license-file = ["../../LICENSE", "0"]
+section = "mail"
+priority = "optional"
+extended-description = """\
+CamelMailer is a self-hosted transactional email platform written in Rust: \
+an SMTP server, HTTP APIs (sending, templates, streams, statistics, \
+webhooks, tracking) and a delivery worker, all in one binary, backed by a \
+single PostgreSQL database with row-level-security tenant isolation. \
+This package installs the binary, three systemd units \
+(camelmailer-web, camelmailer-smtp, camelmailer-worker) and \
+/etc/camelmailer/camelmailer.yml. PostgreSQL is required but intentionally \
+not a hard dependency: it may run on another host."""
+depends = "$auto, ca-certificates, adduser"
+recommends = "postgresql"
+conf-files = ["/etc/camelmailer/camelmailer.yml"]
+maintainer-scripts = "../../packaging/debian"
+assets = [
+    ["target/release/camelmailer", "usr/bin/camelmailer", "755"],
+    ["../../packaging/debian/camelmailer-web.service", "lib/systemd/system/camelmailer-web.service", "644"],
+    ["../../packaging/debian/camelmailer-smtp.service", "lib/systemd/system/camelmailer-smtp.service", "644"],
+    ["../../packaging/debian/camelmailer-worker.service", "lib/systemd/system/camelmailer-worker.service", "644"],
+    ["../../config/camelmailer.example.yml", "etc/camelmailer/camelmailer.yml", "640"],
+]
 
 [dependencies]
 axum = { workspace = true }

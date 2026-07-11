@@ -1,0 +1,20 @@
+[Unit]
+Description=CamelMailer SMTP server (submission + inbound MX)
+Documentation=https://github.com/camelmailer/camelmailer
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=camelmailer
+Group=camelmailer
+EnvironmentFile=-/etc/camelmailer/env
+Environment=CAMELMAILER_CONFIG_FILE_PATH=/etc/camelmailer/camelmailer.yml
+ExecStart=/usr/bin/camelmailer smtp-server
+Restart=on-failure
+RestartSec=5
+# Port 25 as an unprivileged user:
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

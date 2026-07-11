@@ -1,0 +1,12 @@
+#!/bin/sh
+# prerm for camelmailer
+set -e
+
+if [ "$1" = "remove" ] && command -v systemctl >/dev/null 2>&1; then
+    for unit in camelmailer-web camelmailer-smtp camelmailer-worker; do
+        systemctl stop "$unit.service" 2>/dev/null || true
+        systemctl disable "$unit.service" 2>/dev/null || true
+    done
+fi
+
+exit 0

@@ -1,0 +1,34 @@
+#!/bin/sh
+# postinst for camelmailer
+set -e
+
+case "$1" in
+    configure)
+        # System user the services run as. Never a PostgreSQL superuser —
+        # superusers bypass row-level security (tenant isolation).
+        if ! getent passwd camelmailer >/dev/null; then
+            adduser --system --group --home /var/lib/camelmailer \
+                --no-create-home --quiet camelmailer
+        fi
+
+        mkdir -p /var/lib/camelmailer
+        chown camelmailer:camelmailer /var/lib/camelmailer
+        chmod 750 /var/lib/camelmailer
+
+        # Config is root-owned, readable by the service group only
+        # (it may contain the database password and signing key paths).
+        chown -R root:camelmailer /etc/camelmailer
+        chmod 750 /etc/camelmailer
+        chmod 640 /etc/camelmailer/camelmailer.yml
+        if [ -f /etc/camelmailer/env ]; then
+            chown root:camelmailer /etc/camelmailer/env
+            chmod 640 /etc/camelmailer/env
+        fi
+
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,23 @@
+#!/bin/sh
+# postrm for camelmailer
+set -e
+
+case "$1" in
+    remove|upgrade)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+    purge)
+        rm -rf /var/lib/camelmailer
+        rm -rf /etc/camelmailer
+        if getent passwd camelmailer >/dev/null 2>&1; then
+            deluser --system --quiet camelmailer 2>/dev/null || true
+        fi
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+esac
+
+exit 0

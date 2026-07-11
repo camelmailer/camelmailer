@@ -7,7 +7,7 @@ it the first image build.
 ## 1. Boot the stack
 
 ```bash
-git clone https://github.com/YOUR-ORG/camelmailer && cd camelmailer
+git clone https://github.com/camelmailer/camelmailer && cd camelmailer
 cp .env.example .env          # set POSTGRES_PASSWORD to anything
 docker compose up -d --build
 ```
