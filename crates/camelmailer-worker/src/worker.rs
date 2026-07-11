@@ -170,20 +170,27 @@ impl Worker {
         let tracked = self.apply_tracking(message).await?;
 
         // DKIM-sign at delivery time when the message carries an
-        // authenticated domain and a signing key is configured. The stored
-        // message stays unsigned, matching the Ruby behaviour.
-        let raw_message = match (&self.signer, message.domain_id) {
-            (Some(signer), Some(domain_id)) => match self.store.domain_by_id(domain_id).await {
-                Ok(Some(domain)) => dkim::sign_and_prepend(
-                    &tracked,
-                    &domain.name,
-                    &self.dkim_selector,
-                    signer,
-                    chrono::Utc::now().timestamp(),
-                ),
+        // authenticated domain: with the domain's own key when it has one,
+        // with the installation key otherwise. The stored message stays
+        // unsigned, matching the Ruby behaviour.
+        let raw_message = match message.domain_id {
+            Some(domain_id) => match self.store.domain_by_id(domain_id).await {
+                Ok(Some(domain)) => match dkim::signer_for_domain(
+                    domain.dkim_private_key.as_deref(),
+                    self.signer.as_ref(),
+                ) {
+                    Some(signer) => dkim::sign_and_prepend(
+                        &tracked,
+                        &domain.name,
+                        &self.dkim_selector,
+                        &signer,
+                        chrono::Utc::now().timestamp(),
+                    ),
+                    None => tracked,
+                },
                 _ => tracked,
             },
-            _ => tracked,
+            None => tracked,
         };
 
         // Source-address selection: send from the server's IP pool if one

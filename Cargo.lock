@@ -199,11 +199,13 @@ dependencies = [
 name = "camelmailer-api"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
  "camelmailer-config",
  "camelmailer-core",
  "chrono",
+ "hickory-resolver",
  "http-body-util",
  "jsonwebtoken",
  "rand 0.8.6",

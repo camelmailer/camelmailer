@@ -415,6 +415,7 @@ async fn incoming_route_messages_are_posted_to_their_endpoint() {
             camelmailer_core::DomainOwner::Server(s.server.id),
             "org.example",
             true,
+            None,
         )
         .await
         .unwrap();
@@ -675,6 +676,7 @@ async fn outgoing_mail_with_an_authenticated_domain_is_dkim_signed() {
             camelmailer_core::DomainOwner::Server(s.server.id),
             "org.example",
             true,
+            None,
         )
         .await
         .unwrap();
@@ -703,6 +705,45 @@ async fn outgoing_mail_with_an_authenticated_domain_is_dkim_signed() {
     // the stored message stays unsigned
     let stored = s.sink.messages_for_server(s.server.id).await.unwrap();
     assert!(!String::from_utf8_lossy(&stored[0].raw_message).contains("DKIM-Signature"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outgoing_mail_uses_the_domain_dkim_key_when_present() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    let domain_key = std::fs::read_to_string(format!(
+        "{}/tests/fixtures/test_domain_key.pem",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let domain = s
+        .store
+        .create_server_domain(s.server.id, "org.example", Some(domain_key.clone()))
+        .await
+        .unwrap();
+
+    let mut message = outgoing_message(s.server.id, "user@dest.example");
+    message.domain_id = Some(domain.id);
+    s.sink.insert_message(&message).await.unwrap();
+
+    // No installation signing key configured: the signature can only come
+    // from the domain's own key.
+    let config = worker_config(smtp.port);
+    assert!(!std::path::Path::new(&config.camelmailer.signing_key_path).exists());
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
+
+    let seen = smtp.received.lock().unwrap().clone();
+    let dkim_line = seen
+        .iter()
+        .find(|l| l.starts_with("DKIM-Signature: "))
+        .expect("the domain key must have signed the message");
+    assert!(dkim_line.contains("d=org.example;"));
+    assert!(dkim_line.contains("s=postal;"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -783,6 +824,7 @@ async fn incoming_route_setup(s: &Setup) -> (camelmailer_core::Domain, camelmail
             camelmailer_core::DomainOwner::Server(s.server.id),
             "org.example",
             true,
+            None,
         )
         .await
         .unwrap();
@@ -1309,7 +1351,7 @@ async fn http_sent_message_is_delivered_by_the_worker() {
     // a verified sending domain for From-authorization + DKIM
     let domain = s
         .store
-        .create_domain(DomainOwner::Server(s.server.id), "org.example", true)
+        .create_domain(DomainOwner::Server(s.server.id), "org.example", true, None)
         .await
         .unwrap();
 

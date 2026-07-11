@@ -39,16 +39,37 @@ pub struct ApiState {
     pub global_admin_api_key: Option<String>,
     /// The full configuration (auth policy, OIDC, hostnames).
     pub config: camelmailer_config::Config,
+    /// Live TXT lookups for `POST …/domains/{name}/verify` — hickory in
+    /// production, a static mock in tests.
+    pub dns_resolver: Arc<dyn camelmailer_core::DnsResolver>,
+    /// base64(SubjectPublicKeyInfo) of the installation signing key — the
+    /// DKIM `p=` value for domains without their own key.
+    pub installation_dkim_public_key: Option<String>,
 }
 
 impl ApiState {
     pub fn new(store: Arc<dyn AdminStore>, global_admin_api_key: Option<String>) -> Arc<Self> {
+        Self::new_with_resolver(
+            store,
+            global_admin_api_key,
+            Arc::new(crate::dns::HickoryDnsResolver),
+        )
+    }
+
+    /// [`ApiState::new`] with an injected DNS resolver (tests).
+    pub fn new_with_resolver(
+        store: Arc<dyn AdminStore>,
+        global_admin_api_key: Option<String>,
+        dns_resolver: Arc<dyn camelmailer_core::DnsResolver>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             server_store: None,
             auth_store: None,
             global_admin_api_key,
             config: camelmailer_config::Config::default(),
+            dns_resolver,
+            installation_dkim_public_key: None,
         })
     }
 
@@ -64,6 +85,8 @@ impl ApiState {
             auth_store: None,
             global_admin_api_key,
             config: camelmailer_config::Config::default(),
+            dns_resolver: Arc::new(crate::dns::HickoryDnsResolver),
+            installation_dkim_public_key: None,
         })
     }
 
@@ -76,12 +99,39 @@ impl ApiState {
         global_admin_api_key: Option<String>,
         config: camelmailer_config::Config,
     ) -> Arc<Self> {
+        Self::full_with_resolver(
+            store,
+            server_store,
+            auth_store,
+            global_admin_api_key,
+            config,
+            Arc::new(crate::dns::HickoryDnsResolver),
+        )
+    }
+
+    /// [`ApiState::full`] with an injected DNS resolver (tests).
+    pub fn full_with_resolver(
+        store: Arc<dyn AdminStore>,
+        server_store: Option<Arc<dyn camelmailer_core::ServerStore>>,
+        auth_store: Option<Arc<dyn camelmailer_core::AuthStore>>,
+        global_admin_api_key: Option<String>,
+        config: camelmailer_config::Config,
+        dns_resolver: Arc<dyn camelmailer_core::DnsResolver>,
+    ) -> Arc<Self> {
+        // The DKIM fallback for domains without their own key: the public
+        // half of the installation signing key, when it exists.
+        let installation_dkim_public_key =
+            std::fs::read_to_string(&config.camelmailer.signing_key_path)
+                .ok()
+                .and_then(|pem| crate::resources::dkim_public_key_b64(&pem));
         Arc::new(Self {
             store,
             server_store,
             auth_store,
             global_admin_api_key,
             config,
+            dns_resolver,
+            installation_dkim_public_key,
         })
     }
 

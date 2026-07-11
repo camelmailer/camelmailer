@@ -59,3 +59,8 @@ subtle = "2"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# RSA key generation (per-domain DKIM keys) is unusably slow at opt-level 0;
+# optimize just the bignum arithmetic in dev/test builds.
+[profile.dev.package.num-bigint-dig]
+opt-level = 2

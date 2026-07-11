@@ -781,6 +781,13 @@ paths:
     get:
       tags: [Domains]
       summary: List sending domains
+      description: >-
+        Each domain carries the three DNS records to publish:
+        `verification_record` (ownership challenge at
+        `_camelmailer-challenge.<domain>`), `spf_record` and `dkim_record`
+        (`<selector>._domainkey.<domain>`; the domain's own key when it has
+        one, the installation key otherwise). The DKIM private key is never
+        returned.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters:
         - { $ref: "#/components/parameters/Org" }
@@ -790,16 +797,33 @@ paths:
     post:
       tags: [Domains]
       summary: Add a sending domain
+      description: >-
+        Generates a dedicated RSA-2048 DKIM key for the domain and a stable
+        verification token. The response includes `verification_record`,
+        `spf_record` and `dkim_record` ready to publish.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters:
         - { $ref: "#/components/parameters/Org" }
         - { $ref: "#/components/parameters/ServerPermalink" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, example: mail.acme.com }
       responses:
         "201": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
   /api/v2/admin/organizations/{org}/servers/{server}/domains/{name}:
     get:
       tags: [Domains]
       summary: Show a domain
+      description: >-
+        Includes `verification_record`, `spf_record` and `dkim_record`
+        (see the list endpoint).
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters:
         - { $ref: "#/components/parameters/Org" }
@@ -820,14 +844,36 @@ paths:
   /api/v2/admin/organizations/{org}/servers/{server}/domains/{name}/verify:
     post:
       tags: [Domains]
-      summary: Mark a domain verified
+      summary: Verify a domain via DNS
+      description: >-
+        Looks up the TXT records at `_camelmailer-challenge.<domain>` and
+        marks the domain verified when one of them equals
+        `camelmailer-verification=<token>` (published as
+        `verification_record` by the domain endpoints). When the record is
+        missing — or the lookup fails — the response is a 422
+        `ValidationError` whose message names the exact record to publish.
+        Operator escape hatch: callers authenticated with the
+        `X-Admin-API-Key` machine key (never a user session) may skip the
+        DNS check by sending `{"force": true}`; user sessions sending
+        `force` get a 403 `Forbidden`.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters:
         - { $ref: "#/components/parameters/Org" }
         - { $ref: "#/components/parameters/ServerPermalink" }
         - { name: name, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force:
+                  type: boolean
+                  description: Skip the DNS check (X-Admin-API-Key only).
       responses:
         "200": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
 
   /api/v2/admin/organizations/{org}/servers/{server}/credentials:
     get:

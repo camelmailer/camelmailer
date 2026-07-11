@@ -41,7 +41,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { adminApi, ApiError } from "@/lib/api"
+import { adminApi, ApiError, type DnsRecord, type Domain } from "@/lib/api"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -51,6 +51,28 @@ type Scope = { org: string; server: string }
 
 // ------------------------------------------------------------- domains
 
+function DnsRecordRow({ label, record }: { label: string; record: DnsRecord }) {
+  return (
+    <div className="grid gap-1">
+      <Label>
+        {label} ({record.type})
+      </Label>
+      <div className="flex items-center gap-2">
+        <code className="min-w-0 flex-1 break-all rounded bg-muted px-2 py-1 text-xs">
+          {record.name}
+        </code>
+        <CopyButton value={record.name} />
+      </div>
+      <div className="flex items-center gap-2">
+        <code className="min-w-0 flex-1 break-all rounded bg-muted px-2 py-1 text-xs">
+          {record.value}
+        </code>
+        <CopyButton value={record.value} />
+      </div>
+    </div>
+  )
+}
+
 export function Domains({ org, server }: Scope) {
   const queryClient = useQueryClient()
   const key = ["domains", org, server]
@@ -58,14 +80,16 @@ export function Domains({ org, server }: Scope) {
   const [open, setOpen] = useState(false)
   const [name, setName] = useState("")
   const [deleteName, setDeleteName] = useState<string | null>(null)
+  const [recordsFor, setRecordsFor] = useState<Domain | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
 
   const create = useMutation({
     mutationFn: () => adminApi.domains(org, server).create(name),
-    onSuccess: () => {
+    onSuccess: ({ domain }) => {
       invalidate()
       setOpen(false)
       setName("")
+      setRecordsFor(domain)
     },
     onError: (err) => errorToast(err, "Could not add the domain"),
   })
@@ -104,6 +128,9 @@ export function Domains({ org, server }: Scope) {
                   )}
                 </TableCell>
                 <TableCell className="space-x-2 text-right">
+                  <Button variant="outline" size="sm" onClick={() => setRecordsFor(domain)}>
+                    DNS records
+                  </Button>
                   {!domain.verified && (
                     <Button
                       variant="outline"
@@ -146,6 +173,26 @@ export function Domains({ org, server }: Scope) {
               Add
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={recordsFor !== null} onOpenChange={(open) => !open && setRecordsFor(null)}>
+        <DialogContent className="sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>DNS records for {recordsFor?.name}</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground">
+            Publish these TXT records, then hit Verify. The verification record proves
+            ownership; SPF and DKIM authenticate the mail itself.
+          </p>
+          {recordsFor && (
+            <div className="grid gap-4">
+              <DnsRecordRow label="Verification" record={recordsFor.verification_record} />
+              <DnsRecordRow label="SPF" record={recordsFor.spf_record} />
+              {recordsFor.dkim_record && (
+                <DnsRecordRow label="DKIM" record={recordsFor.dkim_record} />
+              )}
+            </div>
+          )}
         </DialogContent>
       </Dialog>
       <ConfirmDialog

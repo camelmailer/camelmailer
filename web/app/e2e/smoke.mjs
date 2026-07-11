@@ -48,14 +48,48 @@ try {
   await page.getByText("General").waitFor()
   await shot("server")
 
-  // ---- domain + verify
+  // ---- domain: records dialog, DNS-gated verify, operator force
   await page.getByRole("tab", { name: "Domains" }).click()
   await page.waitForURL(`${BASE}/orgs/e2e-corp/servers/production/domains`)
   await page.getByRole("button", { name: "Add domain" }).click()
   await page.getByPlaceholder("mail.acme.com").fill("e2e.example")
   await page.getByRole("button", { name: "Add", exact: true }).click()
+  // creating a domain opens the DNS-records dialog (verification/SPF/DKIM)
+  await page.getByText("DNS records for e2e.example").waitFor()
+  await page.getByText("camelmailer-verification=").first().waitFor()
+  await shot("domain-records")
+  await page.keyboard.press("Escape")
   await page.getByRole("cell", { name: "e2e.example" }).waitFor()
+  // without the published TXT record, Verify surfaces the API's message
   await page.getByRole("button", { name: "Verify" }).click()
+  await page
+    .getByText(/Domain ownership is not proven yet|Could not check the TXT record/)
+    .first()
+    .waitFor()
+  await shot("domain-verify-rejected")
+  // operator escape hatch: mint a machine key and force-verify with it
+  const forced = await page.evaluate(async () => {
+    const token = localStorage.getItem("camelmailer.session_token")
+    const created = await fetch("/api/v2/admin/admin_api_keys", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: "e2e-force" }),
+    }).then((r) => r.json())
+    const verify = await fetch(
+      "/api/v2/admin/organizations/e2e-corp/servers/production/domains/e2e.example/verify",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Admin-API-Key": created.data.admin_api_key.key,
+        },
+        body: JSON.stringify({ force: true }),
+      },
+    ).then((r) => r.json())
+    return verify.data?.domain?.verified === true
+  })
+  if (!forced) throw new Error("force-verify with the machine key failed")
+  await page.reload()
   await page.getByText("verified", { exact: true }).waitFor()
   await shot("domains")
 

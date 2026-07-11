@@ -70,6 +70,15 @@ pub struct Domain {
     pub owner: DomainOwner,
     pub name: String,
     pub verified: bool,
+    /// Stable token published as a TXT record at
+    /// `_camelmailer-challenge.<domain>` to prove ownership. Generated once
+    /// when the domain is created.
+    pub verification_token: String,
+    /// Per-domain DKIM RSA private key (PEM). `None` means the domain signs
+    /// with the installation key (`camelmailer.signing_key_path`) — that
+    /// fallback stays valid forever. Never serialized.
+    #[serde(skip_serializing)]
+    pub dkim_private_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

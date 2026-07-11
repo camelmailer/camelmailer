@@ -239,6 +239,8 @@ async fn build_with_verified_domain() -> (Router, String, Arc<MS>, u64) {
         owner: DomainOwner::Server(server.id),
         name: "org.example".into(),
         verified: true,
+        verification_token: "vtoken".into(),
+        dkim_private_key: None,
     });
     let token = "send-token-0000000000".to_string();
     store
@@ -417,6 +419,8 @@ async fn build_two_with_domains() -> (Router, String, String, Arc<MS>) {
             owner: DomainOwner::Server(server.id),
             name: domain.into(),
             verified: true,
+            verification_token: "vtoken".into(),
+            dkim_private_key: None,
         });
         let token = format!("tok-{}-000000000000", name.to_lowercase());
         store

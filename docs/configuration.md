@@ -45,15 +45,20 @@ is the way to send when your provider blocks outbound port 25:
 | `smtps://host:465` | implicit TLS from the first byte |
 | `smtp://user:pass@host:587` | AUTH PLAIN after the TLS handshake (percent-encode special characters) |
 
-The **signing key** is one RSA private key used for DKIM signatures and
-webhook payload signing:
+The **signing key** is one RSA private key used for webhook payload
+signing and as the DKIM fallback:
 
 ```bash
 openssl genrsa -out signing.key 2048
 ```
 
-Without it the stack still runs — the worker logs a warning and skips
-DKIM/webhook signing. Set it before sending real mail.
+Every domain created through the API gets its **own RSA-2048 DKIM key**
+(generated and stored server-side; the private key never leaves the
+installation). The installation signing key remains the DKIM fallback
+for domains created before per-domain keys existed — that fallback stays
+valid forever. Without a signing key the stack still runs — the worker
+logs a warning and skips webhook signing and DKIM for fallback-key
+domains; domains with their own key are always signed.
 
 ### `postgres:` — storage
 
@@ -106,9 +111,18 @@ For deliverability you publish, per installation:
 |---|---|---|
 | MX for inbound | `dns.mx_records` | `mx.example.com` |
 | SPF include | `dns.spf_include` | `v=spf1 include:spf.example.com ~all` on sender domains |
-| DKIM selector | `dns.dkim_identifier` | `camelmailer._domainkey.<domain>` TXT with the signing key's public part |
+| DKIM selector | `dns.dkim_identifier` | `camelmailer._domainkey.<domain>` TXT with the domain key's public part (installation key for pre-existing domains) |
 | Return-path | `dns.return_path_domain` | `rp.example.com` |
 | Click/open tracking | `dns.track_domain` | CNAME → the web server |
+
+You don't have to assemble these by hand for sending domains:
+`GET /api/v2/admin/…/domains/{name}` (and the dashboard's *DNS records*
+dialog) returns the exact `verification_record`, `spf_record` and
+`dkim_record` to publish. Domain ownership is proven via DNS — publish
+the TXT record `_camelmailer-challenge.<domain>` with the value
+`camelmailer-verification=<token>` and call
+`POST …/domains/{name}/verify`. Operators can skip the check with
+`{"force": true}` using the `X-Admin-API-Key` machine key.
 
 ### `rspamd:` / `clamav:` — inbound inspection (optional)
 

@@ -15,6 +15,28 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-domain DKIM keys** — every domain created through the API gets
+  its own RSA-2048 signing key; the worker signs with the domain key
+  when present and falls back to the installation key
+  (`camelmailer.signing_key_path`) otherwise — the fallback stays valid
+  forever, so existing domains keep working. The domain endpoints return
+  a ready-to-publish `dkim_record`
+  (`<dns.dkim_identifier>._domainkey.<domain>`); the private key is
+  never exposed.
+- **DNS-based domain verification** — domains carry a stable
+  `verification_token`; `GET …/domains/{name}` returns
+  `verification_record` (`_camelmailer-challenge.<domain>` TXT with
+  `camelmailer-verification=<token>`) and an `spf_record`
+  recommendation. `POST …/domains/{name}/verify` now checks the TXT
+  record live (hickory-resolver) and answers 422 `ValidationError`
+  naming the missing record on failure; operators with the
+  `X-Admin-API-Key` machine key may skip the check with
+  `{"force": true}` (user sessions get 403). The dashboard shows the
+  three records with copy buttons and surfaces the API's error message
+  on Verify.
+
 ## [0.2.0] - 2026-07-11
 
 ### Added
