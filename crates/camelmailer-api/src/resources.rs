@@ -12,8 +12,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use camelmailer_core::{
     Credential, CredentialType, Domain, IpAddress, IpPool, NewCredential, NewIpAddress, NewRoute,
-    NewSuppression, NewUser, NewWebhook, Route, RouteMode, Server, StoreError, Suppression, User,
-    Webhook,
+    NewSenderAddress, NewSuppression, NewTemplate, NewUser, NewWebhook, Route, RouteMode,
+    SenderAddress, Server, StoreError, Suppression, Template, User, Webhook, WEBHOOK_EVENTS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -544,7 +544,41 @@ fn webhook_json(webhook: &Webhook) -> Value {
         "all_events": webhook.all_events,
         "enabled": webhook.enabled,
         "sign": webhook.sign,
+        "events": webhook.events,
+        "headers": webhook.headers,
     })
+}
+
+/// Validate subscribed event names against the worker's event list.
+fn validate_webhook_events(events: &[String]) -> Result<(), String> {
+    for event in events {
+        if !WEBHOOK_EVENTS.contains(&event.as_str()) {
+            return Err(format!(
+                "Event {event:?} is not a valid webhook event (valid events: {})",
+                WEBHOOK_EVENTS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate custom delivery headers. Error messages carry only the header
+/// NAME — values may be secrets (e.g. Authorization) and are never logged
+/// or echoed.
+fn validate_webhook_headers(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    for (name, value) in headers {
+        if axum::http::HeaderName::try_from(name.as_str()).is_err() {
+            return Err(format!(
+                "Header name {name:?} is not a valid HTTP header name"
+            ));
+        }
+        if axum::http::HeaderValue::try_from(value.as_str()).is_err() {
+            return Err(format!("Header {name:?} has an invalid value"));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn webhooks_index(
@@ -579,6 +613,10 @@ pub(crate) struct CreateWebhook {
     url: Option<String>,
     all_events: Option<bool>,
     sign: Option<bool>,
+    /// Subscribed event names; empty/omitted = all events.
+    events: Option<Vec<String>>,
+    /// Extra HTTP headers set on every delivery request.
+    headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
 pub(crate) async fn webhooks_create(
@@ -606,6 +644,19 @@ pub(crate) async fn webhooks_create(
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return render_validation_error(Some(&start), "Url must be a valid HTTP(S) URL");
     }
+    let events = body.events.unwrap_or_default();
+    if let Err(message) = validate_webhook_events(&events) {
+        return render_validation_error(Some(&start), &message);
+    }
+    let headers = body.headers.unwrap_or_default();
+    if let Err(message) = validate_webhook_headers(&headers) {
+        return render_validation_error(Some(&start), &message);
+    }
+    let all_events = if events.is_empty() {
+        body.all_events.unwrap_or(true)
+    } else {
+        false
+    };
     from_result(
         &start,
         state
@@ -614,11 +665,68 @@ pub(crate) async fn webhooks_create(
                 server_id: server.id,
                 name,
                 url,
-                all_events: body.all_events.unwrap_or(true),
+                all_events,
                 sign: body.sign.unwrap_or(true),
+                events,
+                headers,
             })
             .await,
         |webhook| created(&start, json!({ "webhook": webhook_json(&webhook) })),
+    )
+}
+
+#[derive(Deserialize)]
+pub(crate) struct UpdateWebhook {
+    name: Option<String>,
+    url: Option<String>,
+    sign: Option<bool>,
+    enabled: Option<bool>,
+    events: Option<Vec<String>>,
+    headers: Option<std::collections::BTreeMap<String, String>>,
+}
+
+pub(crate) async fn webhooks_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server, id)): Path<(String, String, u64)>,
+    Json(body): Json<UpdateWebhook>,
+) -> ApiResponse {
+    let mut webhook = match require_webhook(&state, &start, &org, &server, id).await {
+        Ok(webhook) => webhook,
+        Err(response) => return response,
+    };
+    if let Some(name) = body.name.filter(|n| !n.is_empty()) {
+        webhook.name = name;
+    }
+    if let Some(url) = body.url.filter(|u| !u.is_empty()) {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return render_validation_error(Some(&start), "Url must be a valid HTTP(S) URL");
+        }
+        webhook.url = url;
+    }
+    if let Some(sign) = body.sign {
+        webhook.sign = sign;
+    }
+    if let Some(enabled) = body.enabled {
+        webhook.enabled = enabled;
+    }
+    if let Some(events) = body.events {
+        if let Err(message) = validate_webhook_events(&events) {
+            return render_validation_error(Some(&start), &message);
+        }
+        webhook.all_events = events.is_empty();
+        webhook.events = events;
+    }
+    if let Some(headers) = body.headers {
+        if let Err(message) = validate_webhook_headers(&headers) {
+            return render_validation_error(Some(&start), &message);
+        }
+        webhook.headers = headers;
+    }
+    from_result(
+        &start,
+        state.store.update_webhook(webhook).await,
+        |webhook| ok(&start, json!({ "webhook": webhook_json(&webhook) })),
     )
 }
 
@@ -696,6 +804,274 @@ pub(crate) async fn webhooks_disable(
     Path((org, server, id)): Path<(String, String, u64)>,
 ) -> ApiResponse {
     set_webhook_enabled(state, start.0, org, server, id, false).await
+}
+
+// ------------------------------------------------------- sender addresses
+
+fn sender_address_json(address: &SenderAddress) -> Value {
+    json!({
+        "id": address.id,
+        "uuid": address.uuid,
+        "email_address": address.email_address,
+        "verified": address.verified,
+        "status": if address.verified { "confirmed" } else { "pending" },
+    })
+}
+
+pub(crate) async fn sender_addresses_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server)): Path<(String, String)>,
+    Query(params): Query<PaginationParams>,
+) -> ApiResponse {
+    let server = match require_server(&state, &start, &org, &server).await {
+        Ok(server) => server,
+        Err(response) => return response,
+    };
+    from_result(
+        &start,
+        state.store.list_sender_addresses(server.id).await,
+        |addresses| {
+            let result = paginate(&addresses, &params);
+            ok(
+                &start,
+                json!({
+                    "sender_addresses": result.items.iter().map(sender_address_json).collect::<Vec<_>>(),
+                    "pagination": result.pagination,
+                }),
+            )
+        },
+    )
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CreateSenderAddress {
+    email: Option<String>,
+}
+
+/// `POST …/sender_addresses` — add a single sender address. A verification
+/// token is generated (stored hashed) and, when `app_mail` is enabled, a
+/// confirmation link is emailed to exactly that address. When the mail
+/// cannot be sent (app_mail disabled, or no frontend URL), the token is
+/// returned to the operator in the response — exactly once.
+pub(crate) async fn sender_addresses_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server)): Path<(String, String)>,
+    Json(body): Json<CreateSenderAddress>,
+) -> ApiResponse {
+    let server = match require_server(&state, &start, &org, &server).await {
+        Ok(server) => server,
+        Err(response) => return response,
+    };
+    let Some(email) = body
+        .email
+        .map(|e| e.trim().to_lowercase())
+        .filter(|e| !e.is_empty())
+    else {
+        return render_parameter_missing(
+            Some(&start),
+            "param is missing or the value is empty: email",
+        );
+    };
+    if !email.contains('@') || email.starts_with('@') || email.ends_with('@') {
+        return render_validation_error(Some(&start), "Email address is invalid");
+    }
+    let token = camelmailer_core::auth::generate_auth_token();
+    let address = match state
+        .store
+        .create_sender_address(NewSenderAddress {
+            server_id: server.id,
+            email_address: email,
+            verification_token_hash: camelmailer_core::auth::hash_token(&token),
+        })
+        .await
+    {
+        Ok(address) => address,
+        Err(error) => return render_store_error(Some(&start), error),
+    };
+
+    let link = state.config.auth.frontend_url.as_deref().map(|base| {
+        format!(
+            "{}/sender-addresses/confirm?token={}",
+            base.trim_end_matches('/'),
+            token
+        )
+    });
+    // With app_mail enabled the confirmation link is emailed to the address
+    // itself (the token stays out of the response and the logs); otherwise
+    // the token is handed to the operator — exactly once.
+    let mut mailed = false;
+    if state.config.app_mail.enabled {
+        match link.as_deref() {
+            Some(link) => {
+                mailed = crate::app_mailer::deliver(
+                    &state,
+                    crate::app_mailer::sender_address_confirmation_mail(
+                        &address.email_address,
+                        link,
+                    ),
+                )
+                .await;
+            }
+            None => tracing::warn!(
+                "app_mail is enabled but auth.frontend_url is not set; cannot email the sender-address confirmation link"
+            ),
+        }
+    }
+    let mut data = json!({ "sender_address": sender_address_json(&address) });
+    if !mailed {
+        data["verification_token"] = json!(token);
+    }
+    created(&start, data)
+}
+
+pub(crate) async fn sender_addresses_destroy(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server, id)): Path<(String, String, u64)>,
+) -> ApiResponse {
+    let server = match require_server(&state, &start, &org, &server).await {
+        Ok(server) => server,
+        Err(response) => return response,
+    };
+    match state.store.sender_address_by_id(server.id, id).await {
+        Ok(Some(address)) => from_result(
+            &start,
+            state.store.delete_sender_address(address.id).await,
+            |_| render_deleted(Some(&start)),
+        ),
+        Ok(None) => render_not_found(Some(&start)),
+        Err(error) => render_store_error(Some(&start), error),
+    }
+}
+
+// ------------------------------------------------------ template copying
+
+fn copied_template_json(template: &Template) -> Value {
+    json!({
+        "id": template.id,
+        "uuid": template.uuid,
+        "name": template.name,
+        "permalink": template.permalink,
+        "subject": template.subject,
+        "html_body": template.html_body,
+        "text_body": template.text_body,
+        "archived": template.archived,
+    })
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CopyTemplate {
+    target_server: Option<String>,
+    overwrite: Option<bool>,
+}
+
+/// `POST …/servers/{server}/templates/{permalink}/copy_to` — copy a
+/// template to another server of the SAME organization. A target outside
+/// the organization answers 404 (like any unknown permalink, so nothing
+/// leaks); an existing permalink on the target is a 422 unless
+/// `overwrite: true`.
+pub(crate) async fn templates_copy_to(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server, template_permalink)): Path<(String, String, String)>,
+    Json(body): Json<CopyTemplate>,
+) -> ApiResponse {
+    let server = match require_server(&state, &start, &org, &server).await {
+        Ok(server) => server,
+        Err(response) => return response,
+    };
+    let Some(server_store) = state.server_store.as_ref() else {
+        return render_store_error(
+            Some(&start),
+            StoreError::Other("message storage is not configured".into()),
+        );
+    };
+    let Some(target_permalink) = body.target_server.filter(|t| !t.is_empty()) else {
+        return render_parameter_missing(
+            Some(&start),
+            "param is missing or the value is empty: target_server",
+        );
+    };
+    let source = match server_store
+        .template_by_permalink(server.id, &template_permalink)
+        .await
+    {
+        Ok(Some(template)) => template,
+        Ok(None) => return render_not_found(Some(&start)),
+        Err(error) => return render_store_error(Some(&start), error),
+    };
+    // Only servers of the same organization resolve; anything else is an
+    // indistinguishable 404.
+    let target = match state
+        .store
+        .server_by_permalink(server.organization_id, &target_permalink)
+        .await
+    {
+        Ok(Some(target)) => target,
+        Ok(None) => return render_not_found(Some(&start)),
+        Err(error) => return render_store_error(Some(&start), error),
+    };
+    let existing = match server_store
+        .template_by_permalink(target.id, &template_permalink)
+        .await
+    {
+        Ok(existing) => existing,
+        Err(error) => return render_store_error(Some(&start), error),
+    };
+    match existing {
+        Some(existing) => {
+            if !body.overwrite.unwrap_or(false) {
+                return render_validation_error(
+                    Some(&start),
+                    &format!(
+                        "Template {template_permalink:?} already exists on server {target_permalink:?} (pass overwrite: true to replace it)"
+                    ),
+                );
+            }
+            let updated = Template {
+                id: existing.id,
+                uuid: existing.uuid,
+                server_id: existing.server_id,
+                name: source.name,
+                permalink: existing.permalink,
+                subject: source.subject,
+                html_body: source.html_body,
+                text_body: source.text_body,
+                archived: source.archived,
+            };
+            from_result(
+                &start,
+                server_store.update_template(updated).await,
+                |template| {
+                    ok(
+                        &start,
+                        json!({ "template": copied_template_json(&template), "overwritten": true }),
+                    )
+                },
+            )
+        }
+        None => from_result(
+            &start,
+            server_store
+                .create_template(NewTemplate {
+                    server_id: target.id,
+                    name: source.name,
+                    permalink: source.permalink,
+                    subject: source.subject,
+                    html_body: source.html_body,
+                    text_body: source.text_body,
+                })
+                .await,
+            |template| {
+                created(
+                    &start,
+                    json!({ "template": copied_template_json(&template), "overwritten": false }),
+                )
+            },
+        ),
+    }
 }
 
 // ------------------------------------------------------------ suppressions

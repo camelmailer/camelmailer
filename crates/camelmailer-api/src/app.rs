@@ -1153,7 +1153,9 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/webhooks/{id}",
-            get(resources::webhooks_show).delete(resources::webhooks_destroy),
+            get(resources::webhooks_show)
+                .patch(resources::webhooks_update)
+                .delete(resources::webhooks_destroy),
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/webhooks/{id}/enable",
@@ -1162,6 +1164,18 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/webhooks/{id}/disable",
             axum::routing::post(resources::webhooks_disable),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/sender_addresses",
+            get(resources::sender_addresses_index).post(resources::sender_addresses_create),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/sender_addresses/{id}",
+            axum::routing::delete(resources::sender_addresses_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/templates/{template_permalink}/copy_to",
+            axum::routing::post(resources::templates_copy_to),
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/suppressions",

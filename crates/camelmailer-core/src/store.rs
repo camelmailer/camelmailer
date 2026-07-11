@@ -54,6 +54,12 @@ pub trait Store: Send + Sync {
 
     /// Record a use of a credential (`credential.use` — bumps last_used_at).
     fn record_credential_use(&self, credential_id: Id);
+
+    /// Per-address From authorization for SMTP submission: every address
+    /// in the header values must be a confirmed sender address of the
+    /// server (the counterpart of [`Store::find_authenticated_domain`]
+    /// when no verified sending domain matches).
+    fn find_confirmed_sender_address(&self, server_id: Id, header_values: &[&str]) -> bool;
 }
 
 /// Extract the bare address from a header value like `Name <addr@host>`
@@ -120,6 +126,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) ip_pools: HashMap<Id, IpPool>,
     pub(crate) ip_addresses: HashMap<Id, IpAddress>,
     pub(crate) webhooks: HashMap<Id, Webhook>,
+    /// Verified single sender addresses (per-address From authorization).
+    pub(crate) sender_addresses: HashMap<Id, SenderAddress>,
     pub(crate) suppressions: HashMap<Id, Suppression>,
     /// HTTP-sent / stored messages, for the per-server read API tests.
     pub(crate) messages: Vec<crate::message::MessageRecord>,
@@ -198,6 +206,13 @@ impl MemoryStore {
         let mut inner = self.inner.write().unwrap();
         inner.credentials.insert(credential.id, credential.clone());
         credential
+    }
+
+    /// Insert or replace a sender address (test seeding).
+    pub fn insert_sender_address(&self, address: SenderAddress) -> SenderAddress {
+        let mut inner = self.inner.write().unwrap();
+        inner.sender_addresses.insert(address.id, address.clone());
+        address
     }
 
     pub fn delete_organization(&self, id: Id) -> bool {
@@ -847,6 +862,19 @@ impl Store for MemoryStore {
         let mut inner = self.inner.write().unwrap();
         *inner.credential_uses.entry(credential_id).or_insert(0) += 1;
     }
+
+    fn find_confirmed_sender_address(&self, server_id: Id, header_values: &[&str]) -> bool {
+        let inner = self.inner.read().unwrap();
+        let authorized = |value: &str| -> bool {
+            let address = strip_name_from_address(value);
+            inner.sender_addresses.values().any(|a| {
+                a.server_id == server_id
+                    && a.verified
+                    && a.email_address.eq_ignore_ascii_case(address)
+            })
+        };
+        !header_values.is_empty() && header_values.iter().all(|value| authorized(value))
+    }
 }
 
 #[cfg(test)]
@@ -941,6 +969,29 @@ mod tests {
             store.find_authenticated_domain(fixtures.server_id(), &["test@example.com"]),
             None
         );
+    }
+
+    #[test]
+    fn confirmed_sender_addresses_authorize_the_exact_from_address() {
+        let fixtures = Fixtures::new();
+        fixtures.sender_address("solo@external.example", true);
+        fixtures.sender_address("pending@external.example", false);
+        let store = fixtures.store();
+        let server_id = fixtures.server_id();
+
+        assert!(store.find_confirmed_sender_address(server_id, &["solo@external.example"]));
+        assert!(store.find_confirmed_sender_address(server_id, &["Solo <SOLO@external.example>"]));
+        // unconfirmed, unknown, or empty header values do not authorize
+        assert!(!store.find_confirmed_sender_address(server_id, &["pending@external.example"]));
+        assert!(!store.find_confirmed_sender_address(server_id, &["other@external.example"]));
+        assert!(!store.find_confirmed_sender_address(server_id, &[]));
+        // every address in the header must be confirmed
+        assert!(!store.find_confirmed_sender_address(
+            server_id,
+            &["solo@external.example", "other@external.example"]
+        ));
+        // scoped to the server
+        assert!(!store.find_confirmed_sender_address(server_id + 1000, &["solo@external.example"]));
     }
 
     #[test]

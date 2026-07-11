@@ -790,7 +790,9 @@ impl Session {
             let server = self.store.server(credential.server_id);
             authenticated_domain_id =
                 self.find_authenticated_domain(credential.server_id, &headers, server.as_ref());
-            if authenticated_domain_id.is_none() {
+            if authenticated_domain_id.is_none()
+                && !self.confirmed_sender_address_in_from(credential.server_id, &headers)
+            {
                 self.transaction_reset();
                 self.state = State::Welcomed;
                 return Reply::line("530 From/Sender name is not valid");
@@ -886,6 +888,21 @@ impl Session {
         self.transaction_reset();
         self.state = State::Welcomed;
         Reply::line("250 OK")
+    }
+
+    /// The per-address half of the From authorization: every From header
+    /// address must be a confirmed sender address of the server (same
+    /// rule as the HTTP send path).
+    fn confirmed_sender_address_in_from(
+        &self,
+        server_id: camelmailer_core::Id,
+        headers: &HashMap<String, Vec<String>>,
+    ) -> bool {
+        let values: Vec<&str> = headers
+            .get("from")
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        self.store.find_confirmed_sender_address(server_id, &values)
     }
 
     fn find_authenticated_domain(

@@ -786,6 +786,42 @@ fn finish_rejects_unauthenticated_from_domains() {
 }
 
 #[test]
+fn finish_accepts_a_confirmed_sender_address_without_a_verified_domain() {
+    let mut setup = authenticated_setup("test@example.com", "test@example.com");
+    // no verified domain for solo.example, but the exact address is a
+    // confirmed sender address of the server
+    setup.fixtures.sender_address("sender@solo.example", true);
+    setup.session.handle("DATA");
+    setup.session.handle("Subject: Test");
+    setup.session.handle("From: sender@solo.example");
+    setup.session.handle("To: test@example.com");
+    setup.session.handle("");
+    setup.session.handle("This is a test message");
+    setup.session.handle("\r");
+    let reply = setup.session.handle(".\r");
+    assert_eq!(line(&reply), "250 OK");
+    // stored without an authenticated DKIM domain
+    let queued = setup.sink.messages();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].domain_id, None);
+}
+
+#[test]
+fn finish_rejects_a_pending_sender_address() {
+    let mut setup = authenticated_setup("test@example.com", "test@example.com");
+    setup.fixtures.sender_address("sender@solo.example", false);
+    setup.session.handle("DATA");
+    setup.session.handle("Subject: Test");
+    setup.session.handle("From: sender@solo.example");
+    setup.session.handle("To: test@example.com");
+    setup.session.handle("");
+    setup.session.handle("This is a test message");
+    setup.session.handle("\r");
+    let reply = setup.session.handle(".\r");
+    assert_eq!(line(&reply), "530 From/Sender name is not valid");
+}
+
+#[test]
 fn finish_stores_an_outgoing_message_and_resets_state() {
     let mut setup = TestSetup::new();
     setup.fixtures.verified_server_domain("example.com");

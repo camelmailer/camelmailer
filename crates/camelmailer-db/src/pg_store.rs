@@ -9,9 +9,10 @@ use async_trait::async_trait;
 use camelmailer_core::{
     store, token, ActivityEvent, AdminApiKey, AdminStore, Credential, CredentialType,
     DeliveryRecord, Domain, DomainOwner, Id, IpAddress, IpPool, MessageFilter, MessageRecord,
-    MessageScope, MessageSink, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewServer,
-    NewSuppression, NewUser, NewWebhook, Organization, QueuedMessage, ResolvedRoute, Route,
-    RouteMode, Server, ServerMode, Store, StoreError, Suppression, User, Webhook,
+    MessageScope, MessageSink, NewCredential, NewIpAddress, NewOrganization, NewRoute,
+    NewSenderAddress, NewServer, NewSuppression, NewUser, NewWebhook, Organization, QueuedMessage,
+    ResolvedRoute, Route, RouteMode, SenderAddress, Server, ServerMode, Store, StoreError,
+    Suppression, User, Webhook,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, QueryBuilder, Row};
@@ -190,6 +191,21 @@ fn webhook_from_row(row: &PgRow) -> Webhook {
         all_events: row.get("all_events"),
         enabled: row.get("enabled"),
         sign: row.get("sign"),
+        events: serde_json::from_value(row.get::<serde_json::Value, _>("events"))
+            .unwrap_or_default(),
+        headers: serde_json::from_value(row.get::<serde_json::Value, _>("headers"))
+            .unwrap_or_default(),
+    }
+}
+
+fn sender_address_from_row(row: &PgRow) -> SenderAddress {
+    SenderAddress {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        email_address: row.get("email_address"),
+        verified: row.get("verified"),
+        verification_token_hash: row.get("verification_token_hash"),
     }
 }
 
@@ -985,9 +1001,11 @@ impl AdminStore for PgStore {
 
     async fn create_webhook(&self, new: NewWebhook) -> Result<Webhook, StoreError> {
         let uuid = token::generate_uuid();
+        let events = serde_json::to_value(&new.events).unwrap_or_default();
+        let headers = serde_json::to_value(&new.headers).unwrap_or_default();
         let row = sqlx::query(
-            "INSERT INTO webhooks (uuid, server_id, name, url, all_events, sign)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            "INSERT INTO webhooks (uuid, server_id, name, url, all_events, sign, events, headers)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
         )
         .bind(&uuid)
         .bind(new.server_id as i64)
@@ -995,6 +1013,8 @@ impl AdminStore for PgStore {
         .bind(&new.url)
         .bind(new.all_events)
         .bind(new.sign)
+        .bind(&events)
+        .bind(&headers)
         .fetch_one(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -1007,12 +1027,17 @@ impl AdminStore for PgStore {
             all_events: new.all_events,
             enabled: true,
             sign: new.sign,
+            events: new.events,
+            headers: new.headers,
         })
     }
 
     async fn update_webhook(&self, webhook: Webhook) -> Result<Webhook, StoreError> {
+        let events = serde_json::to_value(&webhook.events).unwrap_or_default();
+        let headers = serde_json::to_value(&webhook.headers).unwrap_or_default();
         sqlx::query(
-            "UPDATE webhooks SET name = $2, url = $3, all_events = $4, enabled = $5, sign = $6
+            "UPDATE webhooks SET name = $2, url = $3, all_events = $4, enabled = $5, sign = $6,
+                 events = $7, headers = $8
              WHERE id = $1",
         )
         .bind(webhook.id as i64)
@@ -1021,6 +1046,8 @@ impl AdminStore for PgStore {
         .bind(webhook.all_events)
         .bind(webhook.enabled)
         .bind(webhook.sign)
+        .bind(&events)
+        .bind(&headers)
         .execute(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -1034,6 +1061,106 @@ impl AdminStore for PgStore {
             .await
             .map(|result| result.rows_affected() > 0)
             .map_err(Self::sqlx_error)
+    }
+
+    async fn list_sender_addresses(&self, server_id: Id) -> Result<Vec<SenderAddress>, StoreError> {
+        sqlx::query("SELECT * FROM sender_addresses WHERE server_id = $1 ORDER BY id")
+            .bind(server_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(sender_address_from_row).collect())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn sender_address_by_id(
+        &self,
+        server_id: Id,
+        id: Id,
+    ) -> Result<Option<SenderAddress>, StoreError> {
+        sqlx::query("SELECT * FROM sender_addresses WHERE server_id = $1 AND id = $2")
+            .bind(server_id as i64)
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.as_ref().map(sender_address_from_row))
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn create_sender_address(
+        &self,
+        new: NewSenderAddress,
+    ) -> Result<SenderAddress, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO sender_addresses (uuid, server_id, email_address, verification_token_hash)
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(new.server_id as i64)
+        .bind(&new.email_address)
+        .bind(&new.verification_token_hash)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            if let sqlx::Error::Database(db_error) = &error {
+                if db_error.code().as_deref() == Some("23505") {
+                    return StoreError::Conflict("Email address has already been added".into());
+                }
+            }
+            Self::sqlx_error(error)
+        })?;
+        Ok(SenderAddress {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            server_id: new.server_id,
+            email_address: new.email_address,
+            verified: false,
+            verification_token_hash: Some(new.verification_token_hash),
+        })
+    }
+
+    async fn confirm_sender_address(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<SenderAddress>, StoreError> {
+        sqlx::query(
+            "UPDATE sender_addresses
+             SET verified = TRUE, verification_token_hash = NULL
+             WHERE verification_token_hash = $1 AND NOT verified
+             RETURNING *",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.as_ref().map(sender_address_from_row))
+        .map_err(Self::sqlx_error)
+    }
+
+    async fn delete_sender_address(&self, id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM sender_addresses WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn confirmed_sender_address(
+        &self,
+        server_id: Id,
+        email: &str,
+    ) -> Result<bool, StoreError> {
+        sqlx::query(
+            "SELECT 1 AS one FROM sender_addresses
+             WHERE server_id = $1 AND verified AND LOWER(email_address) = LOWER($2)
+             LIMIT 1",
+        )
+        .bind(server_id as i64)
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.is_some())
+        .map_err(Self::sqlx_error)
     }
 
     async fn list_suppressions(&self, server_id: Id) -> Result<Vec<Suppression>, StoreError> {
@@ -1781,6 +1908,19 @@ impl Store for PgStore {
         if let Err(error) = result {
             tracing::warn!(%error, credential_id, "failed to record credential use");
         }
+    }
+
+    fn find_confirmed_sender_address(&self, server_id: Id, header_values: &[&str]) -> bool {
+        if header_values.is_empty() {
+            return false;
+        }
+        header_values.iter().all(|value| {
+            let address = store::strip_name_from_address(value);
+            self.wait(AdminStore::confirmed_sender_address(
+                self, server_id, address,
+            ))
+            .unwrap_or(false)
+        })
     }
 }
 

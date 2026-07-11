@@ -228,29 +228,46 @@ pub(crate) async fn enqueue_send(
         ));
     }
 
-    // From-domain authorization: the server (or its org) must own a verified
-    // domain matching the From address.
+    // From authorization: the server (or its org) must own a verified
+    // domain matching the From address, OR the exact From address must be
+    // a confirmed sender address of the server. SMTP submission applies
+    // the same two-step rule in the session state machine.
     let from_domain = domain_of(&from.email).ok_or((
         StatusCode::UNPROCESSABLE_ENTITY,
         "ValidationError".into(),
         "From address is not a valid email".into(),
     ))?;
-    let domain_id = state
+    let internal_error = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError".to_string(),
+            "An internal error occurred".to_string(),
+        )
+    };
+    let domain_id = match state
         .store
         .authenticated_domain(server.id, from_domain)
         .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalServerError".into(),
-                "An internal error occurred".into(),
-            )
-        })?
-        .ok_or((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "ValidationError".into(),
-            format!("From domain {from_domain:?} is not a verified sender for this server"),
-        ))?;
+        .map_err(|_| internal_error())?
+    {
+        Some(domain_id) => Some(domain_id),
+        None => {
+            let confirmed = state
+                .store
+                .confirmed_sender_address(server.id, &from.email)
+                .await
+                .map_err(|_| internal_error())?;
+            if !confirmed {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationError".into(),
+                    format!("From domain {from_domain:?} is not a verified sender for this server"),
+                ));
+            }
+            // authorized by the exact address; no DKIM domain to attach
+            None
+        }
+    };
 
     // Resolve the target stream: an explicit permalink (must exist and not be
     // archived) or the server's default stream.
@@ -331,7 +348,7 @@ pub(crate) async fn enqueue_send(
             received_with_ssl: false,
             scope: MessageScope::Outgoing,
             bounce: false,
-            domain_id: Some(domain_id),
+            domain_id,
             credential_id: None,
             route_id: None,
             tag: body.tag.clone(),

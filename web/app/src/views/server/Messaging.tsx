@@ -703,13 +703,105 @@ function TemplateEditor({
   )
 }
 
-export function Templates({ api }: { api: Api }) {
+/// "Copy to server…" — pushes the template to a sibling server of the same
+/// organization via the management API (member role or above).
+function CopyTemplateDialog({
+  org,
+  server,
+  template,
+  onClose,
+}: {
+  org: string
+  server: string
+  template: Template
+  onClose: () => void
+}) {
+  const servers = useQuery({
+    queryKey: ["servers", org],
+    queryFn: () => adminApi.servers(org).list(),
+  })
+  const targets =
+    servers.data?.servers.filter((candidate) => candidate.permalink !== server) ?? []
+  const [target, setTarget] = useState("")
+  const [overwrite, setOverwrite] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  async function copy() {
+    setBusy(true)
+    try {
+      await adminApi.templates(org, server).copyTo(template.permalink, target, overwrite)
+      toast.success(`Copied "${template.name}" to ${target}`)
+      onClose()
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 422 && !overwrite) {
+        toast.error(`${err.message} — enable "Overwrite" to replace it.`)
+      } else {
+        errorToast(err, "Could not copy the template")
+      }
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Copy “{template.name}” to another server</DialogTitle>
+        </DialogHeader>
+        {targets.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            This organization has no other server to copy to.
+          </p>
+        ) : (
+          <div className="grid gap-4">
+            <div className="grid gap-2">
+              <Label>Target server (same organization)</Label>
+              <Select value={target || undefined} onValueChange={setTarget}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Choose a server…" />
+                </SelectTrigger>
+                <SelectContent>
+                  {targets.map((candidate) => (
+                    <SelectItem key={candidate.id} value={candidate.permalink}>
+                      {candidate.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="size-4 accent-primary"
+                checked={overwrite}
+                onChange={(e) => setOverwrite(e.target.checked)}
+              />
+              Overwrite if “{template.permalink}” already exists there
+            </label>
+          </div>
+        )}
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={copy} disabled={busy || !target}>
+            Copy
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+export function Templates({ api, org, server }: { api: Api; org: string; server: string }) {
   const queryClient = useQueryClient()
   const templates = useQuery({ queryKey: ["sapi-templates"], queryFn: api.templates.list })
   const [editor, setEditor] = useState<{ open: boolean; template: Template | null }>({
     open: false,
     template: null,
   })
+  const [copying, setCopying] = useState<Template | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-templates"] })
 
   return (
@@ -759,6 +851,9 @@ export function Templates({ api }: { api: Api }) {
                   >
                     Edit
                   </Button>
+                  <Button variant="outline" size="sm" onClick={() => setCopying(template)}>
+                    Copy to server…
+                  </Button>
                   {!template.archived && (
                     <Button
                       variant="ghost"
@@ -787,6 +882,14 @@ export function Templates({ api }: { api: Api }) {
           template={editor.template}
           onClose={() => setEditor({ open: false, template: null })}
           onSaved={invalidate}
+        />
+      )}
+      {copying && (
+        <CopyTemplateDialog
+          org={org}
+          server={server}
+          template={copying}
+          onClose={() => setCopying(null)}
         />
       )}
     </div>

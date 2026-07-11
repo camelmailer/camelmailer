@@ -16,6 +16,9 @@ pub struct WebhookRequestRow {
     pub payload: String,
     pub sign: bool,
     pub attempts: i32,
+    /// Extra HTTP headers snapshotted from the webhook at enqueue time.
+    /// Values are secrets — never log them.
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 fn request_from_row(row: &PgRow) -> WebhookRequestRow {
@@ -29,6 +32,8 @@ fn request_from_row(row: &PgRow) -> WebhookRequestRow {
         payload: row.get("payload"),
         sign: row.get("sign"),
         attempts: row.get("attempts"),
+        headers: serde_json::from_value(row.get::<serde_json::Value, _>("headers"))
+            .unwrap_or_default(),
     }
 }
 
@@ -75,10 +80,13 @@ impl PgWebhookQueue {
         url: &str,
         payload: &str,
         sign: bool,
+        headers: &std::collections::BTreeMap<String, String>,
     ) -> Result<i64, sqlx::Error> {
+        let headers = serde_json::to_value(headers).unwrap_or_default();
         let row = sqlx::query(
-            "INSERT INTO webhook_requests (server_id, webhook_id, uuid, event, url, payload, sign)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+            "INSERT INTO webhook_requests
+                 (server_id, webhook_id, uuid, event, url, payload, sign, headers)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
         )
         .bind(server_id as i64)
         .bind(webhook_id as i64)
@@ -87,6 +95,7 @@ impl PgWebhookQueue {
         .bind(url)
         .bind(payload)
         .bind(sign)
+        .bind(&headers)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.get("id"))

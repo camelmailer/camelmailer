@@ -173,6 +173,16 @@ pub struct IpAddress {
     pub priority: i32,
 }
 
+/// The webhook event names the worker can fire. The only valid values for
+/// [`Webhook::events`]; API validation and the worker's filter both use
+/// this list, so it is the single source of truth.
+pub const WEBHOOK_EVENTS: [&str; 4] = [
+    "MessageSent",
+    "MessageDelayed",
+    "MessageDeliveryFailed",
+    "MessageHeld",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Webhook {
     pub id: Id,
@@ -183,6 +193,35 @@ pub struct Webhook {
     pub all_events: bool,
     pub enabled: bool,
     pub sign: bool,
+    /// Event names this webhook subscribes to (see [`WEBHOOK_EVENTS`]).
+    /// Empty = all events (backwards compatible).
+    pub events: Vec<String>,
+    /// Extra HTTP headers set on every delivery request (e.g.
+    /// `Authorization`). Values are secrets — never log them.
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+impl Webhook {
+    /// Should this webhook fire for `event`? (Enabled + subscribed; an
+    /// empty `events` list subscribes to everything.)
+    pub fn subscribes_to(&self, event: &str) -> bool {
+        self.enabled && (self.events.is_empty() || self.events.iter().any(|e| e == event))
+    }
+}
+
+/// A verified single sender address of a server: authorizes the exact
+/// From address even when its domain is not a verified sending domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SenderAddress {
+    pub id: Id,
+    pub uuid: String,
+    pub server_id: Id,
+    pub email_address: String,
+    /// Confirmed via the emailed verification token.
+    pub verified: bool,
+    /// Hash of the outstanding verification token (cleared on confirm).
+    #[serde(skip_serializing)]
+    pub verification_token_hash: Option<String>,
 }
 
 /// A message stream — a flat label grouping mail for a server

@@ -135,6 +135,18 @@ impl Fixtures {
         })
     }
 
+    /// A sender address of the fixture server, confirmed or pending.
+    pub fn sender_address(&self, email: &str, verified: bool) -> SenderAddress {
+        self.store.insert_sender_address(SenderAddress {
+            id: self.store.next_id(),
+            uuid: token::generate_uuid(),
+            server_id: self.server.id,
+            email_address: email.into(),
+            verified,
+            verification_token_hash: (!verified).then(|| token::generate_token(8)),
+        })
+    }
+
     pub fn route_with_endpoint(
         &self,
         name: &str,

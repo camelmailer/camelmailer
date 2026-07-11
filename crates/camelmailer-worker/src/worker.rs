@@ -481,8 +481,9 @@ impl Worker {
         })
     }
 
-    /// Enqueue an event for every enabled webhook of the server. Delivery,
-    /// signing, retrying and audit logging happen in
+    /// Enqueue an event for every enabled webhook of the server that
+    /// subscribes to it (an empty `events` list subscribes to everything).
+    /// Delivery, signing, retrying and audit logging happen in
     /// [`Worker::process_next_webhook`].
     async fn send_webhooks(&self, server_id: Id, event: &str, payload: serde_json::Value) {
         let webhooks = match self.store.list_webhooks(server_id).await {
@@ -492,7 +493,7 @@ impl Worker {
                 return;
             }
         };
-        for webhook in webhooks.into_iter().filter(|w| w.enabled) {
+        for webhook in webhooks.into_iter().filter(|w| w.subscribes_to(event)) {
             let uuid = camelmailer_core::token::generate_uuid();
             let body = json!({
                 "event": event,
@@ -510,6 +511,7 @@ impl Worker {
                     &webhook.url,
                     &body.to_string(),
                     webhook.sign,
+                    &webhook.headers,
                 )
                 .await
             {
@@ -530,7 +532,22 @@ impl Worker {
         let mut http_request = self
             .http
             .post(&request.url)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        // custom webhook headers first (values are secrets — never logged),
+        // then the platform headers, so the latter always win
+        for (name, value) in &request.headers {
+            use reqwest::header::{HeaderName, HeaderValue};
+            match (
+                HeaderName::try_from(name.as_str()),
+                HeaderValue::try_from(value.as_str()),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    http_request = http_request.header(name, value);
+                }
+                _ => tracing::warn!(header = %name, "skipping invalid webhook header"),
+            }
+        }
+        http_request = http_request
             .header("X-CamelMailer-Event", &request.event)
             .header("X-CamelMailer-UUID", &request.uuid);
         if request.sign {
