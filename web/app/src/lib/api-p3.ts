@@ -202,15 +202,24 @@ export function webhookSamplePayload(event: string): string {
 // ----------------------------------------------------------- credentials
 
 /** Credentials carry `last_used_at` (see openapi), not yet in the shared
- *  `Credential` type — widen it here rather than touch api.ts. */
-export type CredentialWithUsage = Credential & { last_used_at?: string | null }
+ *  `Credential` type — widen it here rather than touch api.ts. `key` is
+ *  also relaxed to optional: a listed credential may arrive without its
+ *  secret `key`, and every consumer must tolerate that (see `maskKey`). */
+export type CredentialWithUsage = Omit<Credential, "key"> & {
+  key?: string | null
+  last_used_at?: string | null
+}
 
 /** Mask a credential key to a leading + trailing fragment, keeping any
- *  `cm_` prefix visible so the key type stays recognizable. */
-export function maskKey(key: string): string {
-  const prefixMatch = key.match(/^([a-z]+_)/)
+ *  `cm_` prefix visible so the key type stays recognizable. Tolerates a
+ *  missing/empty key — a listed credential may arrive without its secret
+ *  `key` — and never throws (returns "" so the row still renders). */
+export function maskKey(key: string | null | undefined): string {
+  const value = key ?? ""
+  if (!value) return ""
+  const prefixMatch = value.match(/^([a-z]+_)/)
   const prefix = prefixMatch ? prefixMatch[1] : ""
-  const rest = key.slice(prefix.length)
+  const rest = value.slice(prefix.length)
   const tail = rest.slice(-4)
   return `${prefix}${"•".repeat(Math.min(8, Math.max(4, rest.length - 4)))}${tail}`
 }
@@ -234,13 +243,16 @@ export function smtpUsername(org: string, server: string): string {
 /** Best-effort SMTP hostname: parsed from a domain's SPF record (the
  *  backend embeds the real `smtp_hostname` there as `a:<host>`), falling
  *  back to the platform host the dashboard is served from. */
-export function deriveSmtpHost(domains: Domain[] | undefined, fallbackHost: string): string {
+export function deriveSmtpHost(
+  domains: Domain[] | null | undefined,
+  fallbackHost: string | null | undefined,
+): string {
   for (const domain of domains ?? []) {
-    const spf = domain.spf_record?.value ?? ""
+    const spf = domain?.spf_record?.value ?? ""
     const match = spf.match(/\ba:([A-Za-z0-9.-]+)/)
     if (match) return match[1]
   }
-  return fallbackHost.replace(/^app\./, "smtp.")
+  return (fallbackHost ?? "").replace(/^app\./, "smtp.")
 }
 
 // --------------------------------------------------------- send snippets

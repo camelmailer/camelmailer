@@ -288,7 +288,7 @@ function SmtpDialog({
             </div>
           </div>
           <CopyField label="Username" value={smtpUsername(org, server)} />
-          <CopyField label="Password" value={credential.key} />
+          <CopyField label="Password" value={credential.key ?? ""} />
           <p className="rounded-md border bg-muted/40 p-2 text-xs text-muted-foreground">
             Your password is this credential&apos;s key — there is no separate SMTP password. Use
             port 587 with STARTTLS unless your client needs implicit TLS (465).
@@ -407,11 +407,11 @@ export function Credentials({ org, server }: Scope) {
               </TableCell>
               <TableCell>
                 {credential.type === "SMTP-IP" ? (
-                  <span className="font-mono text-xs text-muted-foreground">{credential.key}</span>
+                  <span className="font-mono text-xs text-muted-foreground">{credential.key ?? ""}</span>
                 ) : (
                   <span className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
                     {maskKey(credential.key)}
-                    <CopyButton value={credential.key} />
+                    <CopyButton value={credential.key ?? ""} />
                   </span>
                 )}
               </TableCell>

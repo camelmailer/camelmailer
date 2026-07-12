@@ -15,6 +15,20 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Credentials page crash**: opening a server's API-keys & SMTP view
+  (`/orgs/<org>/servers/<server>/credentials`) could throw
+  `TypeError: Cannot read properties of undefined (reading 'length')` and
+  blank the page when a listed credential arrived without its secret `key`
+  or a dependent query had not loaded yet. The credential helpers
+  (`maskKey`, `deriveSmtpHost`) and the key/SMTP render sites are now
+  defensive: a missing/empty/`null`/`undefined` key masks to `""` instead
+  of throwing, `deriveSmtpHost` tolerates unloaded domains and a nullish
+  fallback host, and the page renders regardless. Added vitest unit tests
+  covering the empty/missing-field edge cases for `maskKey`,
+  `deriveSmtpHost` and `relativeTime`.
+
 ## [0.4.0] - 2026-07-12
 
 ### Added
