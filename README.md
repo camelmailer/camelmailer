@@ -181,10 +181,17 @@ unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
 ## Delivery, inspection and signing
 
-- **Outbound STARTTLS.** The SMTP client upgrades opportunistically when the
-  remote MX advertises STARTTLS, honoring `smtp.openssl_verify_mode`
-  (`none` accepts any certificate; otherwise the cert is verified against
-  the webpki roots). Deliveries over TLS are recorded with `sent_with_ssl`.
+- **Outbound STARTTLS.** For **direct-to-MX** delivery the SMTP client
+  upgrades opportunistically when the remote MX advertises STARTTLS but does
+  **not** verify the certificate (like `smtp_tls_security_level = may`): a
+  foreign MX's certificate is not issued for our benefit, so requiring a
+  webpki trust chain would fail against practically every real MX. If the
+  handshake fails, delivery falls back to a fresh plaintext connection rather
+  than stalling. `smtp.openssl_verify_mode` governs certificate verification
+  for **configured relays only** (a smarthost with a known identity): `peer`
+  verifies against the webpki roots, `none` accepts any certificate; `smtps://`
+  relays use implicit TLS with verification by default. Deliveries over TLS
+  are recorded with `sent_with_ssl`.
 - **IP-pool source addresses.** A server can be assigned an IP pool; the
   worker binds the highest-priority IPv4 of that pool as the local source
   address for outbound connections.

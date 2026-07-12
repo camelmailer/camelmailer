@@ -2,9 +2,15 @@
 //! `app/lib/smtp_client.rb` / the `send_message` path of the SMTP sender.
 //!
 //! Supports opportunistic STARTTLS: when the remote server advertises it,
-//! the connection is upgraded before MAIL FROM (honoring
-//! `smtp.openssl_verify_mode`; `"none"` accepts any certificate). An
-//! optional source IP binds the local socket for IP-pool-aware delivery.
+//! the connection is upgraded before MAIL FROM. For **direct-MX** delivery
+//! the certificate is deliberately *not* verified (`TlsMode::AcceptAny`) —
+//! this is opportunistic TLS in the MTA sense (`smtp_tls_security_level =
+//! may`): encrypt when offered, but never require a trust chain a foreign MX
+//! cannot provide. If the STARTTLS handshake fails, delivery falls back to a
+//! fresh plaintext connection instead of stalling forever on
+//! `invalid peer certificate: UnknownIssuer` (the Outlook/Microsoft bug).
+//! Certificate verification (`smtp.openssl_verify_mode`) only governs
+//! configured relays, whose identity is known.
 //!
 //! Relay endpoints can additionally demand more than opportunism (see
 //! [`ConnectionSecurity`]): mandatory STARTTLS (submission, port 587 —
@@ -264,11 +270,43 @@ async fn connect(params: &SendParams) -> std::io::Result<TcpStream> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?
 }
 
+/// Outcome of a single connection attempt: either a fully classified
+/// delivery result, or the signal that an *opportunistic* STARTTLS handshake
+/// failed so the caller should retry the delivery in plaintext.
+enum Attempt {
+    Complete(SendOutcome),
+    OpportunisticStartTlsHandshakeFailed,
+}
+
 /// Deliver a raw message over SMTP. Any I/O error is a soft failure
 /// (retryable); SMTP rejections are classified by status code.
+///
+/// Opportunistic STARTTLS (direct-MX delivery and `smtp://…:25` relays) is
+/// best-effort: if the STARTTLS handshake fails we retry once on a *fresh
+/// plaintext connection* rather than losing the mail to a permanent soft
+/// fail. This mirrors a normal MTA (`smtp_tls_security_level = may`) and is
+/// what keeps mail to Microsoft/Outlook and other MX hosts flowing.
 pub async fn send_message(params: &SendParams, raw_message: &[u8]) -> SendOutcome {
-    match try_send(params, raw_message).await {
-        Ok(outcome) => outcome,
+    match try_send(params, raw_message, true).await {
+        Ok(Attempt::Complete(outcome)) => outcome,
+        Ok(Attempt::OpportunisticStartTlsHandshakeFailed) => {
+            // The STARTTLS handshake failed on an opportunistic connection.
+            // That socket is mid-TLS and cannot be reused, so we open a new
+            // connection and deliver in plaintext. Reconnecting without
+            // STARTTLS is the most robust and least invasive fallback (the
+            // path most MTAs take) versus trying to un-wind TLS in place.
+            match try_send(params, raw_message, false).await {
+                Ok(Attempt::Complete(outcome)) => outcome,
+                // A plaintext attempt never enters the STARTTLS path.
+                Ok(Attempt::OpportunisticStartTlsHandshakeFailed) => unreachable!(),
+                Err(error) => SendOutcome::SoftFail {
+                    response: format!(
+                        "connection error to {}:{}: {error}",
+                        params.host, params.port
+                    ),
+                },
+            }
+        }
         Err(error) => SendOutcome::SoftFail {
             response: format!(
                 "connection error to {}:{}: {error}",
@@ -278,7 +316,13 @@ pub async fn send_message(params: &SendParams, raw_message: &[u8]) -> SendOutcom
     }
 }
 
-async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<SendOutcome> {
+/// Run one connection attempt. `allow_starttls == false` forces a plaintext
+/// session (the reconnect after an opportunistic handshake failure).
+async fn try_send(
+    params: &SendParams,
+    raw_message: &[u8],
+    allow_starttls: bool,
+) -> std::io::Result<Attempt> {
     let tcp = connect(params).await?;
     let mut tls = false;
     let stream: Stream = if params.security == ConnectionSecurity::ImplicitTls {
@@ -300,7 +344,7 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
 
     let (code, response) = connection.read_reply().await?;
     if code != 220 {
-        return Ok(classify(code, response, tls));
+        return Ok(Attempt::Complete(classify(code, response, tls)));
     }
 
     let (code, ehlo_response) = connection
@@ -311,9 +355,10 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
             .command(&format!("HELO {}", params.helo_hostname))
             .await?;
         if !(200..=299).contains(&code) {
-            return Ok(classify(code, response, tls));
+            return Ok(Attempt::Complete(classify(code, response, tls)));
         }
     } else if !tls
+        && allow_starttls
         && (params.tls_mode != TlsMode::Disabled
             || params.security == ConnectionSecurity::RequireStartTls)
         && ehlo_response.to_uppercase().contains("STARTTLS")
@@ -321,21 +366,33 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
         let (code, response) = connection.command("STARTTLS").await?;
         if (200..=299).contains(&code) {
             // upgrade the stream and re-EHLO
-            connection = upgrade(connection, params).await?;
+            connection = match upgrade(connection, params).await {
+                Ok(upgraded) => upgraded,
+                Err(error) => {
+                    // Handshake failed after the server accepted STARTTLS.
+                    // Opportunistic delivery retries in plaintext (signalled
+                    // to the caller); a mandatory-TLS relay must not, so it
+                    // soft-fails via the propagated error.
+                    if params.security == ConnectionSecurity::Opportunistic {
+                        return Ok(Attempt::OpportunisticStartTlsHandshakeFailed);
+                    }
+                    return Err(error);
+                }
+            };
             tls = true;
             let (code, response) = connection
                 .command(&format!("EHLO {}", params.helo_hostname))
                 .await?;
             if !(200..=299).contains(&code) {
-                return Ok(classify(code, response, tls));
+                return Ok(Attempt::Complete(classify(code, response, tls)));
             }
         } else if params.security == ConnectionSecurity::RequireStartTls {
-            return Ok(SendOutcome::SoftFail {
+            return Ok(Attempt::Complete(SendOutcome::SoftFail {
                 response: format!(
                     "relay {}:{} refused mandatory STARTTLS: {response}",
                     params.host, params.port
                 ),
-            });
+            }));
         } else {
             // STARTTLS refused mid-session: fall through in plaintext
             let _ = response;
@@ -345,12 +402,12 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
     // Submission relays (:587) must never fall back to plaintext: fail
     // (retryably) instead when the remote did not offer STARTTLS.
     if params.security == ConnectionSecurity::RequireStartTls && !tls {
-        return Ok(SendOutcome::SoftFail {
+        return Ok(Attempt::Complete(SendOutcome::SoftFail {
             response: format!(
                 "relay {}:{} does not offer STARTTLS, which is required for smtp:// relays on the submission port",
                 params.host, params.port
             ),
-        });
+        }));
     }
 
     if let Some(auth) = &params.auth {
@@ -359,7 +416,7 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
             .encode(format!("\0{}\0{}", auth.username, auth.password));
         let (code, response) = connection.command(&format!("AUTH PLAIN {token}")).await?;
         if code != 235 {
-            return Ok(classify(code, response, tls));
+            return Ok(Attempt::Complete(classify(code, response, tls)));
         }
     }
 
@@ -367,19 +424,19 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
         .command(&format!("MAIL FROM:<{}>", params.mail_from))
         .await?;
     if !(200..=299).contains(&code) {
-        return Ok(classify(code, response, tls));
+        return Ok(Attempt::Complete(classify(code, response, tls)));
     }
 
     let (code, response) = connection
         .command(&format!("RCPT TO:<{}>", params.rcpt_to))
         .await?;
     if !(200..=299).contains(&code) {
-        return Ok(classify(code, response, tls));
+        return Ok(Attempt::Complete(classify(code, response, tls)));
     }
 
     let (code, response) = connection.command("DATA").await?;
     if code != 354 {
-        return Ok(classify(code, response, tls));
+        return Ok(Attempt::Complete(classify(code, response, tls)));
     }
 
     let mut body = Vec::with_capacity(raw_message.len() + 64);
@@ -400,7 +457,7 @@ async fn try_send(params: &SendParams, raw_message: &[u8]) -> std::io::Result<Se
     let outcome = classify(code, response, tls);
 
     let _ = connection.send_line("QUIT").await;
-    Ok(outcome)
+    Ok(Attempt::Complete(outcome))
 }
 
 /// The certificate-verification mode actually used for a connection: when

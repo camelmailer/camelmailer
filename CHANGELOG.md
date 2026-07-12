@@ -15,6 +15,20 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Outbound direct-to-MX delivery no longer soft-fails on
+  `invalid peer certificate: UnknownIssuer`.** Direct-MX delivery now uses
+  opportunistic TLS *without* certificate verification (like an MTA's
+  `smtp_tls_security_level = may`) and falls back to a fresh plaintext
+  connection if the STARTTLS handshake fails, instead of forcing verification
+  against webpki roots — which failed against virtually every real MX
+  (Microsoft/Outlook and many others), stalling mail forever in retry.
+  `smtp.openssl_verify_mode` now governs certificate verification for
+  **configured relays only** (a smarthost with a known identity): `peer`
+  verifies, `none` accepts any; `smtps://` relays keep implicit TLS with
+  verification by default.
+
 ## [0.4.0] - 2026-07-12
 
 ### Added

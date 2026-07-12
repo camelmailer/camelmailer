@@ -35,8 +35,18 @@ enum RelayFlavor {
     PlainOnly,
     /// Plaintext greeting, STARTTLS advertised and honored.
     StartTls,
+    /// STARTTLS advertised and accepted (220), but the "TLS" that follows is
+    /// garbage — the client's handshake fails. Models an MX with a broken /
+    /// misconfigured STARTTLS. Plaintext delivery on a reconnect still works.
+    StartTlsBroken,
     /// TLS from the first byte (smtps).
     Smtps,
+}
+
+impl RelayFlavor {
+    fn advertises_starttls(self) -> bool {
+        matches!(self, RelayFlavor::StartTls | RelayFlavor::StartTlsBroken)
+    }
 }
 
 struct MockRelay {
@@ -107,7 +117,7 @@ async fn mock_relay(flavor: RelayFlavor) -> MockRelay {
                     }
                     let upper = line.to_ascii_uppercase();
                     if upper.starts_with("EHLO") {
-                        let reply: &[u8] = if flavor == RelayFlavor::StartTls {
+                        let reply: &[u8] = if flavor.advertises_starttls() {
                             b"250-mock\r\n250-STARTTLS\r\n250 OK\r\n"
                         } else {
                             b"250-mock\r\n250 OK\r\n"
@@ -122,6 +132,14 @@ async fn mock_relay(flavor: RelayFlavor) -> MockRelay {
                             return;
                         };
                         stream = Box::new(tls);
+                    } else if upper.starts_with("STARTTLS") && flavor == RelayFlavor::StartTlsBroken
+                    {
+                        // Accept STARTTLS, then drop the connection instead of
+                        // performing the handshake, so the client's TLS layer
+                        // fails on EOF. It should then reconnect and deliver in
+                        // plaintext.
+                        stream.write_all(b"220 Ready to start TLS\r\n").await.ok();
+                        return;
                     } else if upper.starts_with("AUTH PLAIN") {
                         stream.write_all(b"235 Authenticated\r\n").await.ok();
                     } else if upper.starts_with("DATA") {
@@ -246,5 +264,117 @@ async fn opportunistic_relays_still_fall_back_to_plaintext() {
     assert!(
         matches!(outcome, SendOutcome::Sent { tls: false, .. }),
         "got {outcome:?}"
+    );
+}
+
+/// Like [`params`] but with an explicit certificate-verification mode, so the
+/// direct-MX (AcceptAny) and relay (Verify) semantics can be exercised apart.
+fn params_verify(
+    port: u16,
+    security: ConnectionSecurity,
+    tls_mode: TlsMode,
+    auth: Option<SmtpAuth>,
+) -> SendParams {
+    SendParams {
+        tls_mode,
+        ..params(port, security, auth)
+    }
+}
+
+// Regression ("Outlook UnknownIssuer"): a direct-MX endpoint delivers over
+// STARTTLS to an MX presenting a self-signed / non-webpki certificate, with
+// verification OFF (AcceptAny) as `Endpoint::mx` now sets. Before the fix the
+// default `openssl_verify_mode = peer` forced Verify here and every such
+// handshake soft-failed with `invalid peer certificate: UnknownIssuer`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_mx_delivers_over_tls_without_verifying_certificate() {
+    let mx = mock_relay(RelayFlavor::StartTls).await;
+    let outcome = send_message(
+        &params_verify(
+            mx.port,
+            ConnectionSecurity::Opportunistic,
+            TlsMode::AcceptAny,
+            None,
+        ),
+        MESSAGE,
+    )
+    .await;
+    // Encrypted delivery: marked sent-with-ssl, not a UnknownIssuer soft fail.
+    assert!(
+        matches!(outcome, SendOutcome::Sent { tls: true, .. }),
+        "got {outcome:?}"
+    );
+    let seen = mx.lines.lock().unwrap().clone();
+    assert!(seen.iter().any(|l| l == "STARTTLS"));
+    assert!(seen.iter().any(|l| l.starts_with("MAIL FROM")));
+}
+
+// Opportunistic (direct-MX) delivery whose STARTTLS handshake fails must fall
+// back to a fresh plaintext connection rather than soft-failing forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_mx_falls_back_to_plaintext_when_tls_handshake_fails() {
+    let mx = mock_relay(RelayFlavor::StartTlsBroken).await;
+    let outcome = send_message(
+        &params_verify(
+            mx.port,
+            ConnectionSecurity::Opportunistic,
+            TlsMode::AcceptAny,
+            None,
+        ),
+        MESSAGE,
+    )
+    .await;
+    // Delivered, but in plaintext (the handshake could not complete).
+    assert!(
+        matches!(outcome, SendOutcome::Sent { tls: false, .. }),
+        "got {outcome:?}"
+    );
+    let seen = mx.lines.lock().unwrap().clone();
+    // STARTTLS was attempted on the first connection, then the envelope was
+    // delivered (on the plaintext reconnect).
+    assert!(seen.iter().any(|l| l == "STARTTLS"));
+    assert!(seen.iter().any(|l| l.starts_with("MAIL FROM")));
+}
+
+// Certificate verification still protects a *configured relay*: mandatory
+// STARTTLS with `openssl_verify_mode = peer` (Verify) against an untrusted
+// cert must fail — and never silently fall back to plaintext — whereas `none`
+// (AcceptAny) succeeds over TLS. This is the smarthost identity guarantee
+// that direct-MX delivery deliberately does not (and cannot) demand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_verify_rejects_untrusted_cert_but_accept_any_succeeds() {
+    let relay = mock_relay(RelayFlavor::StartTls).await;
+    let rejected = send_message(
+        &params_verify(
+            relay.port,
+            ConnectionSecurity::RequireStartTls,
+            TlsMode::Verify,
+            None,
+        ),
+        MESSAGE,
+    )
+    .await;
+    assert!(
+        matches!(rejected, SendOutcome::SoftFail { .. }),
+        "Verify against an untrusted relay cert must fail, got {rejected:?}"
+    );
+    // No plaintext fallback for a mandatory-STARTTLS relay.
+    let seen = relay.lines.lock().unwrap().clone();
+    assert!(!seen.iter().any(|l| l.starts_with("MAIL FROM")), "{seen:?}");
+
+    let relay = mock_relay(RelayFlavor::StartTls).await;
+    let accepted = send_message(
+        &params_verify(
+            relay.port,
+            ConnectionSecurity::RequireStartTls,
+            TlsMode::AcceptAny,
+            None,
+        ),
+        MESSAGE,
+    )
+    .await;
+    assert!(
+        matches!(accepted, SendOutcome::Sent { tls: true, .. }),
+        "AcceptAny must deliver over TLS, got {accepted:?}"
     );
 }

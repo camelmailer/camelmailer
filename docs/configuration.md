@@ -45,6 +45,16 @@ is the way to send when your provider blocks outbound port 25:
 | `smtps://host:465` | implicit TLS from the first byte |
 | `smtp://user:pass@host:587` | AUTH PLAIN after the TLS handshake (percent-encode special characters) |
 
+**Certificate verification** differs by target. **Direct-to-MX** delivery
+uses opportunistic TLS *without* verifying the remote certificate (like a
+normal MTA's `smtp_tls_security_level = may`) and falls back to plaintext if
+the handshake fails — a foreign MX's certificate is not issued for your
+benefit, so requiring a trust chain would fail against nearly every real MX.
+`smtp.openssl_verify_mode` (`peer` = verify against webpki roots, the default;
+`none` = accept any certificate) therefore applies to **configured relays
+only**, whose identity is known; `smtps://` relays use implicit TLS with
+verification by default.
+
 The **signing key** is one RSA private key used for webhook payload
 signing and as the DKIM fallback:
 
