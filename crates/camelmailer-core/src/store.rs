@@ -175,6 +175,10 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) auth_events: Vec<crate::auth::AuthEvent>,
     /// Per-server API request log (metadata only), in insertion order.
     pub(crate) api_requests: Vec<crate::server_store::ApiRequestRecord>,
+    /// Per-organization SSO connections (tenant OIDC/SAML/social).
+    pub(crate) org_sso_connections: HashMap<Id, crate::org_sso::OrgSsoConnection>,
+    /// Email domains organizations have claimed for SSO login routing.
+    pub(crate) org_email_domains: HashMap<Id, crate::org_sso::OrgEmailDomain>,
 }
 
 /// A thread-safe in-memory [`Store`].

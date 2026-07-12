@@ -13,6 +13,7 @@ pub mod dns;
 pub mod message;
 pub mod mime;
 pub mod model;
+pub mod org_sso;
 pub mod received_header;
 pub mod server_store;
 pub mod store;
@@ -39,6 +40,10 @@ pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,
 };
 pub use model::*;
+pub use org_sso::{
+    NewOrgEmailDomain, NewOrgSsoConnection, OrgEmailDomain, OrgSsoConnection,
+    OrgSsoConnectionUpdate, OrgSsoStore, SsoKind,
+};
 pub use server_store::{
     ActivityEvent, ApiRequestFilter, ApiRequestRecord, DeliveryRecord, DeliveryStats,
     MessageFilter, MessageShare, MessageStats, NewApiRequest, NewMessageShare, NewStream,
