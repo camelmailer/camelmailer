@@ -4,14 +4,8 @@ import { useEffect, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import { AuthShell } from "@/components/auth-shell"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { ApiError, authApi, ssoStartUrl, type SsoProviderInfo } from "@/lib/api"
@@ -68,17 +62,10 @@ export default function Register() {
   }
 
   return (
-    <div className="flex min-h-svh items-center justify-center bg-muted/40 p-4">
-      <Card className="w-full max-w-sm">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-xl">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src="/camelmailer-symbol.png" alt="" className="size-7" />
-            CamelMailer
-          </CardTitle>
-          <CardDescription>Create your account</CardDescription>
-        </CardHeader>
-        <CardContent>
+    <AuthShell
+      title="Create your account"
+      description="Start sending transactional email in minutes"
+    >
           {disabled ? (
             <div className="grid gap-4">
               <Alert>
@@ -164,8 +151,6 @@ export default function Register() {
               </p>
             </form>
           )}
-        </CardContent>
-      </Card>
-    </div>
+    </AuthShell>
   )
 }

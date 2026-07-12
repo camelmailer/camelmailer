@@ -7,8 +7,14 @@ export const metadata: Metadata = {
   description:
     "Transactional email, nothing else. Self-hosted or EU cloud. Open source, MIT.",
   icons: {
-    icon: 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐫</text></svg>',
+    icon: [
+      { url: "/favicon.ico", sizes: "any" },
+      { url: "/favicon.svg", type: "image/svg+xml" },
+      { url: "/favicon-96x96.png", type: "image/png", sizes: "96x96" },
+    ],
+    apple: "/apple-touch-icon.png",
   },
+  manifest: "/site.webmanifest",
 }
 
 // Applies the stored theme (see src/components/theme.tsx — key
@@ -18,7 +24,14 @@ const THEME_INIT_SCRIPT = `try{var t=localStorage.getItem("camelmailer.theme");v
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className="antialiased">
+      <head>
+        <link rel="preconnect" href="https://fonts.bunny.net" />
+        <link
+          rel="stylesheet"
+          href="https://fonts.bunny.net/css?family=dm-sans:400,500,600,700&display=swap"
+        />
+      </head>
+      <body className="font-sans antialiased">
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <Providers>{children}</Providers>
       </body>

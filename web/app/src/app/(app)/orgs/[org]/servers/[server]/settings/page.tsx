@@ -1,9 +1,9 @@
 "use client"
 
-import { ServerDashboard } from "@/views/server/ServerHome"
+import { ServerSettingsPage } from "@/views/server/ServerHome"
 import { useOrgParams } from "@/lib/params"
 
 export default function Page() {
   const { org, server } = useOrgParams()
-  return <ServerDashboard org={org} server={server} />
+  return <ServerSettingsPage org={org} server={server} />
 }

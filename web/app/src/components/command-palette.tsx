@@ -49,6 +49,7 @@ const SERVER_AREAS = [
   ["messaging", "Send a message", SendIcon],
   ["messaging/messages", "Messages", MailIcon],
   ["messaging/templates", "Templates", MailIcon],
+  ["settings", "Settings", SettingsIcon],
 ] as const
 
 export function CommandPalette({

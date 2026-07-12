@@ -70,11 +70,11 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
     <div>
       {!all && defaultOrg && <OnboardingChecklist org={defaultOrg} />}
       {!all && (
-        <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <Card className="gap-2 py-5">
+        <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4 *:data-[slot=card]:from-primary/5 *:data-[slot=card]:to-card *:data-[slot=card]:bg-gradient-to-t *:data-[slot=card]:shadow-xs">
+          <Card className="@container/card gap-2 py-5">
             <CardHeader>
               <CardDescription>Organizations</CardDescription>
-              <CardTitle className="text-2xl font-semibold tabular-nums">
+              <CardTitle className="text-2xl font-semibold tabular-nums @[180px]/card:text-3xl">
                 {items.length}
               </CardTitle>
             </CardHeader>
@@ -82,10 +82,10 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
               Organizations you are a member of
             </CardContent>
           </Card>
-          <Card className="gap-2 py-5">
+          <Card className="@container/card gap-2 py-5">
             <CardHeader>
               <CardDescription>Servers</CardDescription>
-              <CardTitle className="text-2xl font-semibold tabular-nums">
+              <CardTitle className="text-2xl font-semibold tabular-nums @[180px]/card:text-3xl">
                 {serverCount ?? "—"}
               </CardTitle>
             </CardHeader>
@@ -93,19 +93,23 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
               Mail servers across your organizations
             </CardContent>
           </Card>
-          <Card className="gap-2 py-5">
+          <Card className="@container/card gap-2 py-5">
             <CardHeader>
               <CardDescription>Messages (30d)</CardDescription>
-              <CardTitle className="text-2xl font-semibold tabular-nums">—</CardTitle>
+              <CardTitle className="text-2xl font-semibold tabular-nums @[180px]/card:text-3xl">
+                —
+              </CardTitle>
             </CardHeader>
             <CardContent className="text-xs text-muted-foreground">
               Available per server under Messaging → Statistics
             </CardContent>
           </Card>
-          <Card className="gap-2 py-5">
+          <Card className="@container/card gap-2 py-5">
             <CardHeader>
               <CardDescription>Delivery rate</CardDescription>
-              <CardTitle className="text-2xl font-semibold tabular-nums">—</CardTitle>
+              <CardTitle className="text-2xl font-semibold tabular-nums @[180px]/card:text-3xl">
+                —
+              </CardTitle>
             </CardHeader>
             <CardContent className="text-xs text-muted-foreground">
               Available per server under Messaging → Statistics

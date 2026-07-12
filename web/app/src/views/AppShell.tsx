@@ -11,16 +11,24 @@ import Link from "next/link"
 import { useParams, usePathname, useRouter } from "next/navigation"
 import { useQuery } from "@tanstack/react-query"
 import {
+  AtSignIcon,
   BadgeCheckIcon,
+  BanIcon,
   CreditCardIcon,
+  GaugeIcon,
+  GlobeIcon,
+  InboxIcon,
   KeyRoundIcon,
   LayoutDashboardIcon,
   LogOutIcon,
   NetworkIcon,
   ScrollTextIcon,
   SearchIcon,
+  SendIcon,
   SettingsIcon,
+  ShieldCheckIcon,
   UsersIcon,
+  WebhookIcon,
 } from "lucide-react"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import {
@@ -56,6 +64,9 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSkeleton,
+  SidebarMenuSub,
+  SidebarMenuSubButton,
+  SidebarMenuSubItem,
   SidebarProvider,
   SidebarTrigger,
   useSidebar,
@@ -108,6 +119,24 @@ function segmentLabel(segment: string) {
   // dynamic values (domain names, recipient addresses) render verbatim
   if (decoded.includes(".") || decoded.includes("@")) return decoded
   return decoded.charAt(0).toUpperCase() + decoded.slice(1).replaceAll("-", " ")
+}
+
+/// The areas of a single mail server, shown as a sub-menu beneath the
+/// active server in the sidebar (this replaces the old in-page tab bar).
+/// The server index is its Dashboard; everything else hangs off it.
+function serverAreas(base: string) {
+  return [
+    { href: base, label: "Dashboard", icon: GaugeIcon, match: "exact" as const },
+    { href: `${base}/messaging`, label: "Messaging", icon: SendIcon, match: "prefix" as const },
+    { href: `${base}/domains`, label: "Domains", icon: GlobeIcon, match: "prefix" as const },
+    { href: `${base}/credentials`, label: "Credentials", icon: KeyRoundIcon, match: "prefix" as const },
+    { href: `${base}/routes`, label: "Routes", icon: InboxIcon, match: "prefix" as const },
+    { href: `${base}/webhooks`, label: "Webhooks", icon: WebhookIcon, match: "prefix" as const },
+    { href: `${base}/sender-addresses`, label: "Senders", icon: AtSignIcon, match: "prefix" as const },
+    { href: `${base}/suppressions`, label: "Suppressions", icon: BanIcon, match: "prefix" as const },
+    { href: `${base}/dmarc`, label: "DMARC", icon: ShieldCheckIcon, match: "prefix" as const },
+    { href: `${base}/settings`, label: "Settings", icon: SettingsIcon, match: "prefix" as const },
+  ]
 }
 
 /// The servers of the active organization — shared (via the query key)
@@ -191,7 +220,7 @@ function AppBreadcrumbs() {
   } else if (segments[0] === "account") {
     crumbs.push({ label: "Account & security" })
   } else if (segments[0] === "admin") {
-    crumbs.push({ label: "Instance admin" })
+    crumbs.push({ label: "Administration" })
     if (segments[1]) crumbs.push({ label: segmentLabel(segments[1]) })
   }
 
@@ -331,7 +360,7 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
     : []
 
   return (
-    <Sidebar collapsible="icon">
+    <Sidebar collapsible="icon" variant="inset">
       <SidebarHeader>
         <SidebarMenu>
           <SidebarMenuItem>
@@ -362,13 +391,11 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
                   ))}
                 {(servers.data?.servers ?? []).map((server) => {
                   const href = `/orgs/${activeOrg}/servers/${server.permalink}`
+                  const isActive = pathname === href || pathname.startsWith(`${href}/`)
+                  const areas = serverAreas(href)
                   return (
                     <SidebarMenuItem key={server.id}>
-                      <SidebarMenuButton
-                        asChild
-                        isActive={pathname === href || pathname.startsWith(`${href}/`)}
-                        tooltip={server.name}
-                      >
+                      <SidebarMenuButton asChild isActive={isActive} tooltip={server.name}>
                         <Link href={href}>
                           <span
                             aria-hidden
@@ -378,6 +405,28 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
                           <span className="truncate">{server.name}</span>
                         </Link>
                       </SidebarMenuButton>
+                      {isActive && (
+                        <SidebarMenuSub>
+                          {areas.map(({ href: areaHref, label, icon: Icon, match }) => (
+                            <SidebarMenuSubItem key={label}>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={
+                                  match === "exact"
+                                    ? pathname === areaHref
+                                    : pathname === areaHref ||
+                                      pathname.startsWith(`${areaHref}/`)
+                                }
+                              >
+                                <Link href={areaHref}>
+                                  <Icon />
+                                  <span>{label}</span>
+                                </Link>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                          ))}
+                        </SidebarMenuSub>
+                      )}
                     </SidebarMenuItem>
                   )
                 })}
@@ -421,7 +470,7 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
         )}
         {isAdmin && (
           <SidebarGroup>
-            <SidebarGroupLabel>Instance admin</SidebarGroupLabel>
+            <SidebarGroupLabel>Administration</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 {(
@@ -475,6 +524,19 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     setBusy(true)
     try {
       const { organization } = await adminApi.organizations.create(newOrgName)
+      // Give every new org a Production (Live) and a Development server up
+      // front, so the dashboard is usable without a manual setup step. Best
+      // effort: a failure here must not lose the freshly-created org.
+      try {
+        await adminApi.servers(organization.permalink).create("Production", "Live")
+        await adminApi.servers(organization.permalink).create("Development", "Development")
+      } catch (serverErr) {
+        toast.error(
+          serverErr instanceof ApiError
+            ? serverErr.message
+            : "Organization created, but its servers could not be set up",
+        )
+      }
       await refresh()
       setNewOrgOpen(false)
       setNewOrgName("")
