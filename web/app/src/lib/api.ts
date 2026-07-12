@@ -855,9 +855,10 @@ export function serverApi(key: string) {
       api.post<MessageShare>(`/api/v2/server/messages/${id}/share`, { expires_in_hours }, h),
     insights: (id: number) =>
       api.get<MessageInsights>(`/api/v2/server/messages/${id}/insights`, h),
-    // inbound queue management
+    // inbound queue management — the endpoint returns the rows under the
+    // "inbound" key (not "messages"), matching the server API contract.
     inbound: (params = "") =>
-      api.get<{ messages: Message[]; pagination: Pagination }>(
+      api.get<{ inbound: Message[]; pagination: Pagination }>(
         `/api/v2/server/inbound${params}`,
         h,
       ),

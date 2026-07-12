@@ -1099,6 +1099,7 @@ export function InboundQueue({ api }: { api: Api }) {
     queryFn: () => api.inbound("?per_page=50"),
   })
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-inbound"] })
+  const rows = inbound.data?.inbound ?? []
 
   return (
     <div>
@@ -1106,7 +1107,7 @@ export function InboundQueue({ api }: { api: Api }) {
         title="Inbound & held messages"
         description="Retry failed inbound deliveries or bypass holds."
       />
-      {inbound.data?.messages.length === 0 ? (
+      {rows.length === 0 ? (
         <EmptyState
           icon={InboxIcon}
           title="Nothing waiting"
@@ -1124,7 +1125,7 @@ export function InboundQueue({ api }: { api: Api }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {inbound.data?.messages.map((message) => (
+            {rows.map((message) => (
               <TableRow key={message.id}>
                 <TableCell className="text-muted-foreground">{message.id}</TableCell>
                 <TableCell>{message.rcpt_to}</TableCell>
