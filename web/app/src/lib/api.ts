@@ -249,6 +249,7 @@ export type Features = {
   webauthn: boolean
   registration: boolean
   oidc: { enabled: boolean; name: string }
+  saml: { enabled: boolean; name: string }
   sso: SsoProviderInfo[]
 }
 

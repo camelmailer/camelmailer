@@ -145,6 +145,7 @@ async fn features_reflect_the_configuration() {
     assert_eq!(body["data"]["webauthn"], false);
     assert_eq!(body["data"]["registration"], false);
     assert_eq!(body["data"]["oidc"]["enabled"], false);
+    assert_eq!(body["data"]["saml"]["enabled"], false);
 
     let mut config = webauthn_config();
     config.auth.allow_registration = true;

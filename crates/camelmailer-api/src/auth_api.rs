@@ -1259,6 +1259,10 @@ async fn features(
                 "enabled": state.config.oidc.enabled,
                 "name": state.config.oidc.name,
             },
+            "saml": {
+                "enabled": state.config.saml.enabled,
+                "name": state.config.saml.name,
+            },
             "sso": state
                 .config
                 .auth

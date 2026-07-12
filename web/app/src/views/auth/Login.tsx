@@ -37,10 +37,12 @@ export default function Login() {
   const [ssoUrl, setSsoUrl] = useState<string | null>(null)
   const [ssoProviders, setSsoProviders] = useState<SsoProviderInfo[]>([])
   const [features, setFeatures] = useState<Features | null>(null)
+  const [saml, setSaml] = useState<{ url: string; name: string } | null>(null)
 
   // /features says which optional sign-in paths this instance exposes
-  // (passkeys, self-registration, SSO); the SSO URL is fetched only when
-  // OIDC is actually enabled.
+  // (passkeys, self-registration, SSO). The OIDC and SAML start URLs are
+  // fetched only when the feature flags report them enabled, so a plain
+  // instance never probes endpoints that would 404.
   useEffect(() => {
     authApi
       .features()
@@ -53,25 +55,16 @@ export default function Login() {
             .then((data) => setSsoUrl(data.authorization_url))
             .catch(() => setSsoUrl(null))
         }
+        if (loaded.saml.enabled) {
+          authApi
+            .samlStartUrl()
+            .then((data) =>
+              setSaml({ url: data.authorization_url, name: data.name || "SAML" }),
+            )
+            .catch(() => setSaml(null))
+        }
       })
       .catch(() => setFeatures(null))
-  }, [])
-
-  const [saml, setSaml] = useState<{ url: string; name: string } | null>(null)
-
-  // The SSO buttons only render when OIDC/SAML are enabled on the
-  // instance (the start endpoints 404 otherwise).
-  useEffect(() => {
-    authApi
-      .oidcStartUrl()
-      .then((data) => setSsoUrl(data.authorization_url))
-      .catch(() => setSsoUrl(null))
-    authApi
-      .samlStartUrl()
-      .then((data) =>
-        setSaml({ url: data.authorization_url, name: data.name || "SAML" }),
-      )
-      .catch(() => setSaml(null))
   }, [])
 
   async function passkeyLogin() {
