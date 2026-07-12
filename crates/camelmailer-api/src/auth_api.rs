@@ -406,7 +406,7 @@ async fn register(
         ),
     )
     .await;
-    // Starter workspace (auth.bootstrap_workspace, cloud): org + server +
+    // Starter workspace (auth.bootstrap_workspace, cloud): org + two servers +
     // one API credential whose key appears exactly once, right here. A
     // bootstrap failure is logged and never fails the registration.
     let workspace = crate::workspace::bootstrap_workspace(&state, &user, true).await;

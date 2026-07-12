@@ -372,6 +372,16 @@ async fn registration_bootstraps_a_workspace_with_a_one_time_api_key() {
     // the key really authenticates as that server
     let resolved = store.server_for_api_token(&api_key).await.unwrap().unwrap();
     assert_eq!(resolved.id, server.id);
+
+    // a companion "development" server was created alongside it
+    use camelmailer_core::ServerMode;
+    let dev = store
+        .server_by_permalink(org.id, "development")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dev.name, "development");
+    assert_eq!(dev.mode, ServerMode::Development);
 }
 
 #[tokio::test]

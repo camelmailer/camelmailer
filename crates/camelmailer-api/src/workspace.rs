@@ -2,7 +2,8 @@
 //! when a brand-new account is created — via `POST /api/v2/auth/register`
 //! or via SSO/SAML/OIDC auto-provisioning — it gets a ready-to-use
 //! workspace: an organization "<FirstName>'s Team" with the user as owner
-//! and a server "production" inside it.
+//! and two servers inside it, "production" (Live) and "development"
+//! (Development), so the dashboard is usable without a manual setup step.
 //!
 //! Only the registration path also creates an API credential "default":
 //! its response is the one channel where the key can be shown exactly
@@ -124,6 +125,28 @@ async fn try_bootstrap(
             mode: ServerMode::Live,
         })
         .await?;
+
+    // A companion "development" server, so testing and production are
+    // separated from the first minute. Best effort: production (which
+    // carries the API key and is the one the response points at) is the
+    // workspace that must exist, so a dev-server hiccup is logged, not
+    // propagated — it would otherwise discard the whole workspace.
+    if let Err(error) = state
+        .store
+        .create_server(NewServer {
+            organization_id: organization.id,
+            name: "development".into(),
+            permalink: "development".into(),
+            mode: ServerMode::Development,
+        })
+        .await
+    {
+        tracing::warn!(
+            organization = %organization.permalink,
+            %error,
+            "workspace bootstrap created production but not the development server"
+        );
+    }
 
     let api_key = if include_api_key {
         let credential = state
