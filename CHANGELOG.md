@@ -17,7 +17,6 @@ integration tests) is green.
 
 ### Fixed
 
-<<<<<<< HEAD
 - **Auth gate on the app root**: visiting the dashboard root while signed
   in no longer bounces to the login screen. `/` and `/login` now redirect
   an existing session straight to `/dashboard` (auth is client-side, so a
