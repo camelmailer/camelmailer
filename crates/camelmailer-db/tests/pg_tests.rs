@@ -7,8 +7,9 @@
 //! parallel without interfering.
 
 use camelmailer_core::{
-    AdminStore, CredentialType, DomainOwner, MessageScope, NewOrganization, NewServer,
-    QueuedMessage, RouteMode, ServerMode, Store,
+    AdminStore, CredentialType, DomainOwner, MessageScope, NewOrgEmailDomain, NewOrgSsoConnection,
+    NewOrganization, NewServer, OrgSsoConnectionUpdate, OrgSsoStore, QueuedMessage, Role,
+    RouteMode, ServerMode, SsoKind, Store,
 };
 use camelmailer_db::{PgMessageSink, PgStore};
 use rand::Rng;
@@ -3089,4 +3090,152 @@ async fn api_request_log_roundtrip_scoping_and_retention() {
         .unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, all[0].id);
+}
+
+// -------------------------------------------------------------- org SSO
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn org_sso_routes_verified_domains_and_manages_connections() {
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+    let store = &f.store;
+    let org_a = f.organization.id;
+    let org_b = store
+        .create_organization(NewOrganization {
+            name: "Other Org".into(),
+            permalink: "other-org".into(),
+        })
+        .await
+        .unwrap()
+        .id;
+
+    // Claim a domain for org A; it is normalized and does not route while
+    // unverified.
+    let domain = store
+        .create_org_email_domain(NewOrgEmailDomain {
+            organization_id: org_a,
+            domain: "Acme.COM".into(),
+            verification_token: "tok-a".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(domain.domain, "acme.com");
+    assert!(!domain.verified);
+    assert_eq!(
+        store
+            .organization_for_verified_email_domain("user@acme.com")
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Verify it: now it routes to org A (case-insensitive).
+    store
+        .mark_org_email_domain_verified(domain.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .organization_for_verified_email_domain("ACME.com")
+            .await
+            .unwrap(),
+        Some(org_a)
+    );
+
+    // Org B may claim the same domain, but the partial unique index blocks
+    // a second verification.
+    let dup = store
+        .create_org_email_domain(NewOrgEmailDomain {
+            organization_id: org_b,
+            domain: "acme.com".into(),
+            verification_token: "tok-b".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.mark_org_email_domain_verified(dup.id).await,
+        Err(camelmailer_core::StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        store
+            .organization_for_verified_email_domain("acme.com")
+            .await
+            .unwrap(),
+        Some(org_a)
+    );
+
+    // Connections are org-scoped; JSONB config round-trips.
+    let created = store
+        .create_org_sso_connection(NewOrgSsoConnection {
+            organization_id: org_a,
+            kind: SsoKind::Oidc,
+            name: "Acme Okta".into(),
+            enabled: true,
+            config: serde_json::json!({ "issuer": "https://acme.okta.com", "client_id": "abc" }),
+            default_role: Role::Member,
+            auto_provision: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.kind, SsoKind::Oidc);
+    assert_eq!(created.config["issuer"], "https://acme.okta.com");
+    assert_eq!(
+        store.list_org_sso_connections(org_a).await.unwrap().len(),
+        1
+    );
+    assert!(store
+        .list_org_sso_connections(org_b)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // COALESCE update: change name + disable, config left untouched.
+    let updated = store
+        .update_org_sso_connection(
+            created.id,
+            OrgSsoConnectionUpdate {
+                name: Some("Renamed".into()),
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.name, "Renamed");
+    assert!(!updated.enabled);
+    assert_eq!(updated.config, created.config);
+    assert_eq!(updated.default_role, Role::Member);
+
+    assert!(store.delete_org_sso_connection(created.id).await.unwrap());
+    assert!(store
+        .list_org_sso_connections(org_a)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Deleting the org cascades its SSO rows away.
+    store
+        .create_org_sso_connection(NewOrgSsoConnection {
+            organization_id: org_b,
+            kind: SsoKind::Saml,
+            name: "B SAML".into(),
+            enabled: true,
+            config: serde_json::json!({}),
+            default_role: Role::Member,
+            auto_provision: false,
+        })
+        .await
+        .unwrap();
+    assert!(store.delete_organization(org_b).await.unwrap());
+    assert!(store
+        .list_org_sso_connections(org_b)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .list_org_email_domains(org_b)
+        .await
+        .unwrap()
+        .is_empty());
 }

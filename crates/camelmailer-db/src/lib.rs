@@ -13,6 +13,7 @@
 //! table owner subject to the policy.
 
 mod auth_pg;
+mod org_sso_pg;
 mod pg_store;
 mod queue;
 mod tracking;
