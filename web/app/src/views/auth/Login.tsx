@@ -25,8 +25,15 @@ import { useAuth } from "@/lib/auth"
 import { getPasskeyAssertion, webAuthnSupported, type RequestOptionsJSON } from "@/lib/webauthn"
 
 export default function Login() {
-  const { adopt } = useAuth()
+  const { adopt, token, me, loading } = useAuth()
   const router = useRouter()
+
+  // Already signed in? Don't ask again — go to the dashboard. Covers
+  // returning to /login (or the root gate) with a live session.
+  useEffect(() => {
+    if (!loading && token && me) router.replace("/dashboard")
+  }, [loading, token, me, router])
+
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [totpCode, setTotpCode] = useState("")
