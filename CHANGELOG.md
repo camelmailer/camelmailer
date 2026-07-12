@@ -17,6 +17,7 @@ integration tests) is green.
 
 ### Fixed
 
+<<<<<<< HEAD
 - **Auth gate on the app root**: visiting the dashboard root while signed
   in no longer bounces to the login screen. `/` and `/login` now redirect
   an existing session straight to `/dashboard` (auth is client-side, so a
@@ -32,6 +33,17 @@ integration tests) is green.
   **configured relays only** (a smarthost with a known identity): `peer`
   verifies, `none` accepts any; `smtps://` relays keep implicit TLS with
   verification by default.
+- **Credentials page crash**: opening a server's API-keys & SMTP view
+  (`/orgs/<org>/servers/<server>/credentials`) could throw
+  `TypeError: Cannot read properties of undefined (reading 'length')` and
+  blank the page when a listed credential arrived without its secret `key`
+  or a dependent query had not loaded yet. The credential helpers
+  (`maskKey`, `deriveSmtpHost`) and the key/SMTP render sites are now
+  defensive: a missing/empty/`null`/`undefined` key masks to `""` instead
+  of throwing, `deriveSmtpHost` tolerates unloaded domains and a nullish
+  fallback host, and the page renders regardless. Added vitest unit tests
+  covering the empty/missing-field edge cases for `maskKey`,
+  `deriveSmtpHost` and `relativeTime`.
 
 ## [0.4.0] - 2026-07-12
 
