@@ -15,8 +15,33 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-12
+
 ### Added
 
+- **Redesigned dashboard** on the shadcn dashboard-01 layout: collapsible
+  icon sidebar with an organization switcher and per-server navigation, a
+  ⌘K command palette, breadcrumb header, dark mode, and empty states with
+  one-click actions across every resource list. New accounts land in a
+  ready-made workspace and are guided by an onboarding checklist.
+- **Activity, messages & analytics**: a lifecycle event stream with
+  omni-search and time/status/tag/stream filters; a message detail with a
+  Sent→Delivered→Opened→Clicked timeline and Preview / Plain text / HTML /
+  Raw / Insights tabs (deep-linkable); dashboard KPI cards and a stacked
+  delivery chart with bounce/complaint risk lines; an API request log view.
+- **Deliverability & trust**: a domain detail with grouped DNS records
+  (verification / SPF / DKIM), per-record status and a health check; a
+  DMARC compliance view; a recipient detail with a per-address event
+  timeline and SMTP delivery proof; suppression reactivation and CSV export.
+- **Tools**: a template gallery with a split code/live-preview editor and a
+  one-click starter library, a webhook editor with event selection, custom
+  headers, a live example payload and test-send, an API-keys view with
+  "last used" plus a copy-first SMTP settings panel, and a per-language
+  Setup tab with runnable snippets.
+- **Polish**: a deliverability insights coach on each message, a route-aware
+  `</>` API code panel (curl + SDK snippets), a statistics view with
+  sentence KPIs and a clickable bounce breakdown, and a usage & billing
+  page (Stripe portal on the cloud).
 - **Bootstrap workspace** (`auth.bootstrap_workspace`, default off; meant
   for the cloud): brand-new accounts — self-registration and the very
   first OIDC/SAML/social-SSO auto-provisioning — automatically get an
@@ -317,7 +342,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/camelmailer/camelmailer/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/camelmailer/camelmailer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/camelmailer/camelmailer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/camelmailer/camelmailer/releases/tag/v0.1.0
