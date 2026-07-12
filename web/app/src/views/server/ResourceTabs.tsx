@@ -272,7 +272,7 @@ function SmtpDialog({
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="max-w-lg">
         <DialogHeader>
-          <DialogTitle>SMTP settings — {credential.name}</DialogTitle>
+          <DialogTitle>SMTP settings for {credential.name}</DialogTitle>
         </DialogHeader>
         <div className="grid gap-3">
           <CopyField label="Host" value={smtpHost} />
@@ -290,7 +290,7 @@ function SmtpDialog({
           <CopyField label="Username" value={smtpUsername(org, server)} />
           <CopyField label="Password" value={credential.key ?? ""} />
           <p className="rounded-md border bg-muted/40 p-2 text-xs text-muted-foreground">
-            Your password is this credential&apos;s key — there is no separate SMTP password. Use
+            Your password is this credential&apos;s key. There is no separate SMTP password. Use
             port 587 with STARTTLS unless your client needs implicit TLS (465).
           </p>
         </div>
@@ -308,7 +308,7 @@ function SmtpDialog({
 function CredentialCapabilities() {
   const rows = [
     { name: "Server key (API / SMTP)", detail: "Sends mail and reads this one server's messaging API. What you create here." },
-    { name: "Admin key", detail: "Full management access across the whole installation — machine-to-machine. Created under Admin." },
+    { name: "Admin key", detail: "Full management access across the whole installation, machine to machine. Created under Admin." },
     { name: "User session", detail: "Your signed-in browser session, scoped by your organization role (viewer → owner)." },
   ]
   return (
@@ -566,7 +566,7 @@ export function Routes({ org, server }: Scope) {
         <EmptyState
           icon={InboxIcon}
           title="No inbound routes yet"
-          description="Without a route, inbound mail to this server is rejected — add one to accept or forward it."
+          description="Without a route, inbound mail to this server is rejected. Add one to accept or forward it."
           action={{ label: "New route", onClick: () => setOpen(true) }}
         />
       ) : (
@@ -763,7 +763,7 @@ function SendTestDialog({
         <div className="grid gap-4">
           <p className="text-sm text-muted-foreground">
             Delivers one sample payload to <code className="text-xs">{webhook.url}</code> right
-            now — with your custom headers{webhook.sign ? " and the RSA signature" : ""}, marked
+            now, with your custom headers{webhook.sign ? " and the RSA signature" : ""}, marked
             as <code className="text-xs">&quot;test&quot;: true</code>.
           </p>
           <div className="grid gap-2">
@@ -1186,7 +1186,7 @@ export function Suppressions({ org, server }: Scope) {
         open={reactivating !== null}
         onOpenChange={(open) => !open && setReactivating(null)}
         title={`Reactivate ${reactivating?.address}?`}
-        description="The suppression is removed and this server delivers to the address again — make sure the underlying problem (bounce, complaint) is resolved."
+        description="The suppression is removed and this server delivers to the address again. Make sure the underlying problem (bounce, complaint) is resolved."
         confirmLabel="Reactivate"
         onConfirm={async () => {
           try {
@@ -1258,7 +1258,7 @@ export function SenderAddresses({ org, server }: Scope) {
     <div>
       <PageHeader
         title="Sender addresses"
-        description="Individual addresses this server may send from once their owner confirms them — no domain verification needed."
+        description="Individual addresses this server may send from once their owner confirms them, without domain verification."
         action={
           <Button size="sm" onClick={() => { setIssuedToken(null); setOpen(true) }}>
             <PlusIcon className="size-4" /> Add address
@@ -1269,7 +1269,7 @@ export function SenderAddresses({ org, server }: Scope) {
         <EmptyState
           icon={AtSignIcon}
           title="No sender addresses yet"
-          description="Authorize a single address to send from — no domain verification required."
+          description="Authorize a single address to send from, without domain verification."
           action={{ label: "Add address", onClick: () => { setIssuedToken(null); setOpen(true) } }}
         />
       ) : (
@@ -1311,7 +1311,7 @@ export function SenderAddresses({ org, server }: Scope) {
             <div className="grid gap-2">
               <p className="text-sm text-muted-foreground">
                 This instance can&apos;t email the confirmation link. Relay this one-time
-                token to the address owner — they confirm at
+                token to the address owner, who confirms at
                 {" "}<code className="text-xs">/sender-addresses/confirm</code>.
               </p>
               <SecretReveal label="Verification token" value={issuedToken} />

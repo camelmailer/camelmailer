@@ -166,7 +166,7 @@ export function Send({ api }: { api: Api }) {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="none">No template — compose below</SelectItem>
+              <SelectItem value="none">No template (compose below)</SelectItem>
               {templates.data?.templates
                 .filter((template) => !template.archived)
                 .map((template) => (
@@ -243,8 +243,8 @@ function ShareDialog({ api, id, onClose }: { api: Api; id: number; onClose: () =
           <DialogTitle>Share message #{id}</DialogTitle>
         </DialogHeader>
         <p className="text-sm text-muted-foreground">
-          Anyone with the link can view this message — including its content and
-          delivery timeline — until the link expires. No account needed.
+          Anyone with the link can view this message, including its content and
+          delivery timeline, until the link expires. No account is needed.
         </p>
         {result ? (
           <div className="grid gap-2">
@@ -363,7 +363,7 @@ function InsightsPanel({ api, id }: { api: Api; id: number }) {
       {improve.length === 0 && (
         <div className="flex items-center gap-2 rounded-md border border-green-600/30 bg-green-600/10 p-3 text-sm text-green-700 dark:border-green-400/30 dark:bg-green-400/10 dark:text-green-400">
           <CircleCheckIcon className="size-4 shrink-0" />
-          No issues found — this message follows deliverability best practices.
+          No issues found. This message follows deliverability best practices.
         </div>
       )}
       {improve.length > 0 && (
@@ -725,7 +725,7 @@ export function MessageDetail({ api, id, onClose }: { api: Api; id: number; onCl
 function PrivacyNote() {
   return (
     <p className="text-sm text-muted-foreground">
-      This server runs in privacy mode — message content is not retained, so there is nothing
+      This server runs in privacy mode. Message content is not retained, so there is nothing
       to show here.
     </p>
   )
@@ -996,7 +996,7 @@ export function LogsView() {
     <div>
       <PageHeader
         title="API request log"
-        description="Every authenticated call to this server's API — method, endpoint, status and latency."
+        description="Every authenticated call to this server's API: method, endpoint, status and latency."
       />
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <Select value={range} onValueChange={setRange}>
@@ -1214,7 +1214,7 @@ export function StatsView({ api }: { api: Api }) {
           <EmptyState
             icon={CircleCheckIcon}
             title="No bounces recorded"
-            description="Your bounce list is clean — deliverability is looking good."
+            description="Your bounce list is clean. Deliverability is looking good."
           />
         ) : (
           <Table>
@@ -1437,7 +1437,7 @@ function LibraryWizard({
           <DialogTitle>Start from the library</DialogTitle>
         </DialogHeader>
         <p className="text-sm text-muted-foreground">
-          Twenty production-ready transactional templates — account lifecycle, security,
+          Twenty production-ready transactional templates: account lifecycle, security,
           collaboration and commerce. Import one to make it your own.
         </p>
         <div className="grid max-h-[65svh] grid-cols-2 gap-3 overflow-y-auto pr-1 sm:grid-cols-3">
@@ -1515,7 +1515,7 @@ function CopyTemplateDialog({
       onClose()
     } catch (err) {
       if (err instanceof ApiError && err.status === 422 && !overwrite) {
-        toast.error(`${err.message} — enable "Overwrite" to replace it.`)
+        toast.error(`${err.message}. Enable "Overwrite" to replace it.`)
       } else {
         errorToast(err, "Could not copy the template")
       }
@@ -1611,7 +1611,7 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
         <EmptyState
           icon={FileTextIcon}
           title="No templates yet"
-          description="Write a Mustache-style template once and render it with fresh data on every send — or start from one of 20 ready-made designs."
+          description="Write a Mustache-style template once and render it with fresh data on every send, or start from one of 20 ready-made designs."
           action={{ label: "New template", onClick: () => router.push(`${base}/new`) }}
           secondaryAction={{ label: "Start from library", onClick: () => setLibrary(true) }}
         />
@@ -1752,7 +1752,7 @@ export function MessagingShell({
       <EmptyState
         icon={KeyRoundIcon}
         title="Connect an API credential"
-        description="Messaging talks to the server's own API — create an API credential first, then come back here."
+        description="Messaging talks to the server's own API. Create an API credential first, then come back here."
         action={{
           label: "Create API credential",
           href: `/orgs/${org}/servers/${server}/credentials`,

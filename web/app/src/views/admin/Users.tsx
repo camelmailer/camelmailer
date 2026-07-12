@@ -142,7 +142,7 @@ export default function Users() {
                 autoComplete="new-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="min. 8 characters — empty for SSO-only accounts"
+                placeholder="min. 8 characters, or leave empty for SSO-only accounts"
               />
             </div>
             <div className="flex items-center gap-2">

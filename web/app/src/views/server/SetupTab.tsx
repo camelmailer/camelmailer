@@ -71,7 +71,7 @@ export function SetupTab({ org, server }: { org: string; server: string }) {
     <div className="space-y-5">
       <PageHeader
         title="Setup instructions"
-        description="Send your first message in under a minute — this server's endpoint and API key are already filled in."
+        description="Send your first message in under a minute. This server's endpoint and API key are already filled in."
       />
 
       {!hasKey && (
@@ -112,7 +112,7 @@ export function SetupTab({ org, server }: { org: string; server: string }) {
       <p className="text-sm text-muted-foreground">
         Sending to{" "}
         <code className="rounded bg-muted px-1.5 py-0.5 text-xs">{BLACKHOLE_ADDRESS}</code> is
-        risk-free — the Blackhole address accepts and silently discards every message, so you can
+        risk-free. The Blackhole address accepts and silently discards every message, so you can
         test the full pipeline without emailing a real person.
       </p>
 

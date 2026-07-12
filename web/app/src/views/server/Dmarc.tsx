@@ -153,7 +153,7 @@ export function Dmarc({ org, server }: Scope) {
   if (domains.data && domains.data.domains.length === 0) {
     return (
       <EmptyState>
-        DMARC monitoring works per sending domain — add one in the Domains tab first.
+        DMARC monitoring works per sending domain. Add one in the Domains tab first.
       </EmptyState>
     )
   }
@@ -239,7 +239,7 @@ export function Dmarc({ org, server }: Scope) {
         <CardContent className="space-y-4">
           {!sapi ? (
             <p className="text-sm text-muted-foreground">
-              Compliance data uses the server&apos;s API — create an API credential in the
+              Compliance data uses the server&apos;s API. Create an API credential in the
               Credentials tab first.
             </p>
           ) : summary.data && summary.data.summary.total > 0 ? (
@@ -250,7 +250,7 @@ export function Dmarc({ org, server }: Scope) {
                 <span className="font-semibold tabular-nums">
                   {summary.data.summary.total.toLocaleString()}
                 </span>{" "}
-                messages from {domain} —{" "}
+                messages from {domain}. Of those,{" "}
                 <span
                   className={cn(
                     "font-semibold tabular-nums",
@@ -271,7 +271,7 @@ export function Dmarc({ org, server }: Scope) {
                     failed.
                   </>
                 ) : (
-                  <> — no failures. Looking good.</>
+                  <>, with no failures. Looking good.</>
                 )}
               </p>
               <div className="flex flex-wrap gap-1.5">
@@ -342,7 +342,7 @@ export function Dmarc({ org, server }: Scope) {
             </>
           ) : (
             <p className="text-sm text-muted-foreground">
-              No aggregate reports yet — reports usually arrive once a day after the DMARC
+              No aggregate reports yet. They usually arrive once a day after the DMARC
               record points at your RUA address.
             </p>
           )}
@@ -355,16 +355,16 @@ export function Dmarc({ org, server }: Scope) {
             <InboxIcon className="size-4" /> Receive aggregate reports here
           </CardTitle>
           <CardDescription>
-            Two records and the reports flow straight into this dashboard — no external
-            DMARC service needed.
+            Two records and the reports flow straight into this dashboard, so you do not
+            need an external DMARC service.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3 text-sm">
           <div className="space-y-1">
             <p className="text-muted-foreground">
               1. Create an inbound route (Routes tab) for e.g.{" "}
-              <code>dmarc@{domain ?? "your-domain"}</code> with this endpoint — arriving
-              reports are parsed and stored instead of being forwarded:
+              <code>dmarc@{domain ?? "your-domain"}</code> with this endpoint, so arriving
+              reports are parsed and stored instead of forwarded:
             </p>
             <div className="flex items-center gap-2">
               <code className="rounded bg-muted px-2 py-1 text-xs">

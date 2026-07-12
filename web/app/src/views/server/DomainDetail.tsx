@@ -282,7 +282,7 @@ export function DomainDetail({ org, server, name }: Scope) {
             <section className="space-y-2">
               <h2 className="text-sm font-medium">Domain verification</h2>
               <p className="text-sm text-muted-foreground">
-                Proves you control the domain — publish this TXT record, then hit Verify.
+                Proves you control the domain. Publish this TXT record, then hit Verify.
               </p>
               <RecordRow
                 record={domain.verification_record}
@@ -315,7 +315,7 @@ export function DomainDetail({ org, server, name }: Scope) {
                   <Alert>
                     <AlertTitle>No DKIM key</AlertTitle>
                     <AlertDescription>
-                      Neither this domain nor the installation has a DKIM signing key —
+                      Neither this domain nor the installation has a DKIM signing key, so
                       outgoing mail will not be DKIM-signed.
                     </AlertDescription>
                   </Alert>
@@ -339,7 +339,7 @@ export function DomainDetail({ org, server, name }: Scope) {
         open={emailOpen}
         onOpenChange={setEmailOpen}
         title="Email the DNS records to a teammate"
-        description="Opens a prefilled draft in your mail client with all records as plain text — handy when someone else owns the DNS."
+        description="Opens a prefilled draft in your mail client with all records as plain text, which helps when someone else owns the DNS."
         submitLabel="Open draft"
         submitDisabled={!recipient.includes("@") || !domain}
         onSubmit={() => {
@@ -369,7 +369,7 @@ export function DomainDetail({ org, server, name }: Scope) {
             />
           </div>
           <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <SendIcon className="size-3.5" /> Sent from your own mail client — nothing
+            <SendIcon className="size-3.5" /> Sent from your own mail client, so nothing
             leaves this app.
           </p>
         </div>

@@ -73,7 +73,7 @@ export function SecretReveal({ label, value }: { label: string; value: string })
           </code>
           <CopyButton value={value} />
         </div>
-        <p className="mt-1 text-xs">Shown only once — copy it now.</p>
+        <p className="mt-1 text-xs">You see this only once, so copy it now.</p>
       </AlertDescription>
     </Alert>
   )

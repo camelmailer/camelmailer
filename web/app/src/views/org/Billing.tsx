@@ -142,7 +142,7 @@ export function BillingView({ org }: { org: string }) {
         <EmptyState
           icon={CreditCardIcon}
           title="Billing is not enabled"
-          description="This installation runs without the hosted billing add-on, so there is nothing to pay here — usage above is for your own reference."
+          description="This installation runs without the hosted billing add-on, so there is nothing to pay here. The usage above is for your own reference."
         />
       )}
     </div>

@@ -185,7 +185,7 @@ export function RecipientDetail({
         <EmptyState
           icon={KeyRoundIcon}
           title="Connect an API credential"
-          description="Recipient history talks to the server's own API — create an API credential first, then come back here."
+          description="Recipient history talks to the server's own API. Create an API credential first, then come back here."
           action={{
             label: "Create API credential",
             href: `/orgs/${org}/servers/${server}/credentials`,

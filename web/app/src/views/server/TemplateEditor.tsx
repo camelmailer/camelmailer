@@ -216,7 +216,7 @@ function EditorForm({
             <div className="rounded-md border bg-muted/30 p-3">
               <p className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
                 <InfoIcon className="size-3.5" />
-                Variables — fill them in the test model to preview
+                Variables: fill them in the test model to preview
               </p>
               <div className="flex flex-wrap gap-1">
                 {variables.map((v) => (
@@ -295,7 +295,7 @@ function EditorForm({
                 <p className="mt-1 text-xs text-red-600 dark:text-red-400">{modelError}</p>
               ) : (
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Edit the values — the preview updates as you type.
+                  Edit the values. The preview updates as you type.
                 </p>
               )}
             </TabsContent>

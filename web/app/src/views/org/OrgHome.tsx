@@ -116,7 +116,7 @@ export function Servers({ org }: { org: string }) {
         <EmptyState
           icon={ServerIcon}
           title="No servers yet"
-          description="A mail server holds your domains, credentials and messages — create one to start sending."
+          description="A mail server holds your domains, credentials and messages. Create one to start sending."
           action={
             canManage ? { label: "New server", onClick: () => setOpen(true) } : undefined
           }
@@ -405,7 +405,7 @@ export function Invitations({ org }: { org: string }) {
         <EmptyState
           icon={MailPlusIcon}
           title="No invitations yet"
-          description="Invite teammates by email — they get a one-time link to join this organization."
+          description="Invite teammates by email. Each one gets a one-time link to join this organization."
           action={
             canManage
               ? { label: "Invite", onClick: () => { setIssued(null); setOpen(true) } }
@@ -566,7 +566,7 @@ export function OrgSettings({ org }: { org: string }) {
               <p className="text-sm text-muted-foreground">
                 Every member must have two-factor authentication (an
                 authenticator app or a passkey) to access this organization.
-                Members without it are blocked until they enable it — that
+                Members without it are blocked until they enable it, and that
                 includes you.
               </p>
               <Switch
@@ -646,7 +646,7 @@ export function OrgTwoFactorGate({
           <p className="text-sm text-muted-foreground">
             This organization requires two-factor authentication. Set up an
             authenticator app or a passkey on your account and come right
-            back — access is restored immediately.
+            back. Access is restored immediately.
           </p>
           <Button asChild>
             <Link href="/account">Go to Account &amp; Security</Link>

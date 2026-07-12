@@ -122,7 +122,7 @@ export default function Account() {
       setToken(result.session_token)
       setCurrentPassword("")
       setNewPassword("")
-      toast.success("Password changed — other sessions were signed out")
+      toast.success("Password changed. Other sessions were signed out.")
     } catch (err) {
       errorToast(err, "Could not change the password")
     }

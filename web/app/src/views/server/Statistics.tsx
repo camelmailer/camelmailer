@@ -114,7 +114,7 @@ function BounceBar({ slices, total }: { slices: BounceSlice[]; total: number }) 
   if (total === 0) {
     return (
       <p className="text-sm text-muted-foreground">
-        No bounces in this window — your bounce rate is clean.
+        No bounces in this window. Your bounce rate is clean.
       </p>
     )
   }
@@ -173,8 +173,8 @@ function BounceBar({ slices, total }: { slices: BounceSlice[]; total: number }) 
 }
 
 const BOUNCE_HELP: Record<BounceSlice["key"], string> = {
-  hard: "Permanent failures — the address does not exist or rejected mail outright. These recipients are suppressed to protect your reputation.",
-  soft: "Transient failures — full mailbox, greylisting or a temporary server issue. The worker retries these before giving up.",
+  hard: "Permanent failures. The address does not exist or rejected mail outright. These recipients are suppressed to protect your reputation.",
+  soft: "Transient failures: a full mailbox, greylisting or a temporary server issue. The worker retries these before giving up.",
   undetermined:
     "The receiving server did not give a clear reason. Watch for a pattern before acting.",
 }
