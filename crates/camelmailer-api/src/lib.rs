@@ -7,6 +7,7 @@ pub mod cors;
 pub mod dns;
 mod memberships;
 pub mod oidc;
+pub mod org_sso_api;
 mod resources;
 pub mod saml;
 pub mod scim;

@@ -198,7 +198,8 @@ async fn web_server() -> std::io::Result<()> {
             global_key,
             config.clone(),
             billing,
-        );
+        )
+        .with_org_sso_store(pg.clone());
         let tracking: Arc<dyn TrackingStore> = pg;
         (state, Some(tracking))
     } else {
@@ -207,11 +208,12 @@ async fn web_server() -> std::io::Result<()> {
         let state = ApiState::full_with_billing(
             memory.clone(),
             Some(memory.clone()),
-            Some(memory),
+            Some(memory.clone()),
             global_key,
             config.clone(),
             billing,
-        );
+        )
+        .with_org_sso_store(memory);
         (state, None)
     };
 

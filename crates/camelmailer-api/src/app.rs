@@ -28,6 +28,7 @@ use subtle::ConstantTimeEq;
 
 use crate::resources;
 
+#[derive(Clone)]
 pub struct ApiState {
     /// Storage — in-memory for tests, PostgreSQL in production.
     pub store: Arc<dyn AdminStore>,
@@ -58,6 +59,10 @@ pub struct ApiState {
     /// — signs webhook test payloads exactly like the worker. `None` when
     /// the key file does not exist (signing is then skipped).
     pub installation_signing_key_pem: Option<String>,
+    /// Per-organization SSO configuration (tenant OIDC/SAML/social). `None`
+    /// when accounts storage is not enabled; the dashboard endpoints then
+    /// report the feature unavailable.
+    pub org_sso_store: Option<Arc<dyn camelmailer_core::OrgSsoStore>>,
 }
 
 impl ApiState {
@@ -87,6 +92,7 @@ impl ApiState {
             sso_github: Arc::new(crate::sso::HttpGithub::default()),
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
+            org_sso_store: None,
         })
     }
 
@@ -108,6 +114,7 @@ impl ApiState {
             sso_github: Arc::new(crate::sso::HttpGithub::default()),
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
+            org_sso_store: None,
         })
     }
 
@@ -274,7 +281,20 @@ impl ApiState {
             sso_github,
             webhook_sender,
             installation_signing_key_pem,
+            org_sso_store: None,
         })
+    }
+
+    /// Attach per-organization SSO storage (production and SSO-aware
+    /// tests). The state is otherwise immutable behind an `Arc`, so this
+    /// returns a fresh one with the store installed.
+    pub fn with_org_sso_store(
+        self: Arc<Self>,
+        org_sso_store: Arc<dyn camelmailer_core::OrgSsoStore>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.org_sso_store = Some(org_sso_store);
+        Arc::new(state)
     }
 
     async fn key_is_valid(&self, key: &str) -> bool {
@@ -455,6 +475,9 @@ fn required_role(rest: &[&str], method: &axum::http::Method) -> camelmailer_core
         }
         // billing (hosted cloud): reads and the portal are both admin+
         Some(&"billing") => Role::Admin,
+        // tenant SSO configuration holds provider secrets; only admins and
+        // owners may see or change it.
+        Some(&"sso") => Role::Admin,
         Some(&"servers") => match rest.get(2) {
             // server lifecycle (create/update/delete/suspend/ip_pool)
             None | Some(&"suspend") | Some(&"unsuspend") | Some(&"ip_pool") => {
@@ -1450,6 +1473,30 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/organizations/{permalink}/invitations/{id}",
             axum::routing::delete(crate::memberships::invitations_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/sso/domains",
+            get(crate::org_sso_api::sso_domains_index)
+                .post(crate::org_sso_api::sso_domains_create),
+        )
+        .route(
+            "/organizations/{permalink}/sso/domains/{id}/verify",
+            axum::routing::post(crate::org_sso_api::sso_domains_verify),
+        )
+        .route(
+            "/organizations/{permalink}/sso/domains/{id}",
+            axum::routing::delete(crate::org_sso_api::sso_domains_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/sso/connections",
+            get(crate::org_sso_api::sso_connections_index)
+                .post(crate::org_sso_api::sso_connections_create),
+        )
+        .route(
+            "/organizations/{permalink}/sso/connections/{id}",
+            get(crate::org_sso_api::sso_connections_show)
+                .patch(crate::org_sso_api::sso_connections_update)
+                .delete(crate::org_sso_api::sso_connections_destroy),
         )
         .route("/auth_events", get(crate::memberships::auth_events_index))
         .route(
