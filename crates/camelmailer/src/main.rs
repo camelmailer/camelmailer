@@ -2,9 +2,9 @@
 //! process roles from a single binary.
 
 use camelmailer_api::{
-    build_auth_router, build_oidc_router, build_router, build_saml_router, build_scim_router,
-    build_server_router, build_share_router, build_sso_router, cors_layer, tracking_router,
-    ApiState, TrackingState,
+    build_auth_router, build_oidc_router, build_org_sso_login_router, build_router,
+    build_saml_router, build_scim_router, build_server_router, build_share_router,
+    build_sso_router, cors_layer, tracking_router, ApiState, TrackingState,
 };
 use camelmailer_core::{AdminStore, MemorySink, MemoryStore, MessageSink, Store, TrackingStore};
 use camelmailer_db::{PgMessageSink, PgStore};
@@ -222,6 +222,7 @@ async fn web_server() -> std::io::Result<()> {
         .merge(build_share_router(state.clone()))
         .merge(build_auth_router(state.clone()))
         .merge(build_sso_router(state.clone()))
+        .merge(build_org_sso_login_router(state.clone()))
         .merge(build_oidc_router(state.clone()))
         .merge(build_saml_router(state.clone()))
         .merge(build_scim_router(state));
