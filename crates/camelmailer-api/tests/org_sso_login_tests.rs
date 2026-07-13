@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use camelmailer_api::{build_org_sso_login_router, ApiState};
+use camelmailer_api::{build_org_sso_login_router, ApiState, GithubEmail, GithubOauth, GithubUser};
 use camelmailer_core::{
     AdminStore, AuthStore, MemoryStore, NewOrgEmailDomain, NewOrgSsoConnection, NewOrganization,
     OrgSsoStore, Role, SsoKind,
@@ -337,4 +337,126 @@ async fn a_login_is_rejected_when_the_idp_email_domain_is_not_verified() {
         .await
         .unwrap()
         .is_none());
+}
+
+// ---------------------------------------------------------------- GitHub
+
+struct MockGithub;
+
+#[async_trait::async_trait]
+impl GithubOauth for MockGithub {
+    fn authorize_endpoint(&self) -> String {
+        "https://github.test/login/oauth/authorize".into()
+    }
+    async fn exchange_code(
+        &self,
+        _client_id: &str,
+        _client_secret: &str,
+        _code: &str,
+        _redirect_uri: &str,
+    ) -> Result<String, String> {
+        Ok("gh-token".into())
+    }
+    async fn fetch_user(&self, _token: &str) -> Result<GithubUser, String> {
+        Ok(GithubUser {
+            id: 42,
+            login: "octo".into(),
+            name: Some("Octo Cat".into()),
+        })
+    }
+    async fn fetch_emails(&self, _token: &str) -> Result<Vec<GithubEmail>, String> {
+        Ok(vec![GithubEmail {
+            email: "octo@acme.test".into(),
+            primary: true,
+            verified: true,
+        }])
+    }
+}
+
+async fn github_harness() -> Harness {
+    let store = Arc::new(MemoryStore::new());
+    let org = store
+        .create_organization(NewOrganization {
+            name: "Acme".into(),
+            permalink: "acme".into(),
+        })
+        .await
+        .unwrap();
+    let domain = store
+        .create_org_email_domain(NewOrgEmailDomain {
+            organization_id: org.id,
+            domain: "acme.test".into(),
+            verification_token: "tok".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .mark_org_email_domain_verified(domain.id)
+        .await
+        .unwrap();
+    store
+        .create_org_sso_connection(NewOrgSsoConnection {
+            organization_id: org.id,
+            kind: SsoKind::Github,
+            name: "GitHub".into(),
+            enabled: true,
+            config: json!({ "client_id": "gh-client", "client_secret": "gh-secret" }),
+            default_role: Role::Member,
+            auto_provision: true,
+        })
+        .await
+        .unwrap();
+    let config = camelmailer_config::Config::default();
+    let state = ApiState::full_with_github(
+        store.clone(),
+        None,
+        Some(store.clone()),
+        None,
+        config,
+        Arc::new(MockGithub),
+    )
+    .with_org_sso_store(store.clone());
+    Harness {
+        app: build_org_sso_login_router(state),
+        store,
+        org_id: org.id,
+    }
+}
+
+#[tokio::test]
+async fn a_github_login_provisions_and_joins_the_org() {
+    let h = github_harness().await;
+    let connection_id = h.store.list_org_sso_connections(h.org_id).await.unwrap()[0].id;
+
+    let (_, body) = get_req(
+        &h.app,
+        &format!("/api/v2/auth/org-sso/{connection_id}/start"),
+        true,
+    )
+    .await;
+    let url = body["data"]["authorization_url"].as_str().unwrap();
+    assert!(url.starts_with("https://github.test/login/oauth/authorize"));
+    let state = url_param(url, "state");
+
+    let (status, body) = get_req(
+        &h.app,
+        &format!("/api/v2/auth/org-sso/callback?code=any&state={state}"),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["data"]["user"]["email_address"], "octo@acme.test");
+
+    let user = h
+        .store
+        .user_by_email("octo@acme.test")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(h
+        .store
+        .membership(h.org_id, user.id)
+        .await
+        .unwrap()
+        .is_some());
 }

@@ -165,24 +165,12 @@ pub(crate) async fn org_start(
         Ok(connection) => connection,
         Err(response) => return response,
     };
-    let Some(issuer) = issuer_for(connection.kind, &connection.config) else {
-        return sso_error(
-            Some(&start),
-            "this connection type cannot be used for sign-in yet",
-        )
-        .into_response();
-    };
-    let discovery = match fetch_discovery(&issuer).await {
-        Ok(discovery) => discovery,
-        Err(message) => return sso_error(Some(&start), &message).into_response(),
-    };
-
     // The connection id travels in the opaque state so the single callback
-    // knows which connection redeemed it.
+    // knows which connection redeemed it. GitHub does not use PKCE or a
+    // nonce; the stored values still guard against CSRF and replay.
     let login_state = format!("{connection_id}~{}", auth::generate_auth_token());
     let nonce = auth::generate_auth_token();
     let pkce_verifier = auth::generate_auth_token();
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce_verifier.as_bytes()));
     if let Err(error) = auth_store
         .create_oidc_state(
             &login_state,
@@ -195,16 +183,42 @@ pub(crate) async fn org_start(
         return render_store_error(Some(&start), error).into_response();
     }
 
-    let url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
-        discovery.authorization_endpoint,
-        urlencode(&config_str(&connection.config, "client_id")),
-        urlencode(&org_redirect_uri(&state)),
-        urlencode("openid email profile"),
-        login_state,
-        nonce,
-        challenge,
-    );
+    let client_id = config_str(&connection.config, "client_id");
+    let redirect = org_redirect_uri(&state);
+    let url = match connection.kind {
+        SsoKind::Github => format!(
+            "{}?client_id={}&redirect_uri={}&scope={}&state={}",
+            state.sso_github.authorize_endpoint(),
+            urlencode(&client_id),
+            urlencode(&redirect),
+            urlencode("read:user user:email"),
+            login_state,
+        ),
+        _ => {
+            let Some(issuer) = issuer_for(connection.kind, &connection.config) else {
+                return sso_error(
+                    Some(&start),
+                    "this connection type cannot be used for sign-in yet",
+                )
+                .into_response();
+            };
+            let discovery = match fetch_discovery(&issuer).await {
+                Ok(discovery) => discovery,
+                Err(message) => return sso_error(Some(&start), &message).into_response(),
+            };
+            let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce_verifier.as_bytes()));
+            format!(
+                "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
+                discovery.authorization_endpoint,
+                urlencode(&client_id),
+                urlencode(&redirect),
+                urlencode("openid email profile"),
+                login_state,
+                nonce,
+                challenge,
+            )
+        }
+    };
 
     let wants_json = headers
         .get("accept")
@@ -282,91 +296,103 @@ pub(crate) async fn org_callback(
         Ok(connection) => connection,
         Err(response) => return response,
     };
-    let Some(issuer) = issuer_for(connection.kind, &connection.config) else {
-        return sso_error(
-            Some(&start),
-            "this connection type cannot be used for sign-in yet",
-        )
-        .into_response();
-    };
-    let client_id = config_str(&connection.config, "client_id");
-    let client_secret = config_str(&connection.config, "client_secret");
-
-    let discovery = match fetch_discovery(&issuer).await {
-        Ok(discovery) => discovery,
-        Err(message) => return sso_error(Some(&start), &message).into_response(),
-    };
-
-    let mut form: Vec<(&str, String)> = vec![
-        ("grant_type", "authorization_code".into()),
-        ("code", code),
-        ("redirect_uri", org_redirect_uri(&state)),
-        ("client_id", client_id.clone()),
-        ("code_verifier", pkce_verifier),
-    ];
-    if !client_secret.is_empty() {
-        form.push(("client_secret", client_secret));
-    }
-    let token_response = match reqwest::Client::new()
-        .post(&discovery.token_endpoint)
-        .form(&form)
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => {
-            match response.json::<TokenResponse>().await {
-                Ok(token_response) => token_response,
+    // Turn the provider's response into (uid, email, name), by protocol.
+    let (uid, email, name): (String, String, String) = match connection.kind {
+        SsoKind::Github => match github_identity(&state, &connection, code).await {
+            Ok(identity) => identity,
+            Err(response) => return *response,
+        },
+        _ => {
+            let Some(issuer) = issuer_for(connection.kind, &connection.config) else {
+                return sso_error(
+                    Some(&start),
+                    "this connection type cannot be used for sign-in yet",
+                )
+                .into_response();
+            };
+            let client_id = config_str(&connection.config, "client_id");
+            let client_secret = config_str(&connection.config, "client_secret");
+            let discovery = match fetch_discovery(&issuer).await {
+                Ok(discovery) => discovery,
+                Err(message) => return sso_error(Some(&start), &message).into_response(),
+            };
+            let mut form: Vec<(&str, String)> = vec![
+                ("grant_type", "authorization_code".into()),
+                ("code", code),
+                ("redirect_uri", org_redirect_uri(&state)),
+                ("client_id", client_id.clone()),
+                ("code_verifier", pkce_verifier),
+            ];
+            if !client_secret.is_empty() {
+                form.push(("client_secret", client_secret));
+            }
+            let token_response = match reqwest::Client::new()
+                .post(&discovery.token_endpoint)
+                .form(&form)
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    match response.json::<TokenResponse>().await {
+                        Ok(token_response) => token_response,
+                        Err(error) => {
+                            return sso_error(
+                                Some(&start),
+                                &format!("invalid token response: {error}"),
+                            )
+                            .into_response()
+                        }
+                    }
+                }
+                Ok(response) => {
+                    return sso_error(
+                        Some(&start),
+                        &format!("token exchange failed with HTTP {}", response.status()),
+                    )
+                    .into_response()
+                }
                 Err(error) => {
-                    return sso_error(Some(&start), &format!("invalid token response: {error}"))
+                    return sso_error(Some(&start), &format!("token exchange failed: {error}"))
                         .into_response()
                 }
-            }
+            };
+            let Some(id_token) = token_response.id_token else {
+                return sso_error(Some(&start), "the token response carried no id_token")
+                    .into_response();
+            };
+            let claims = match validate_id_token(&discovery, &id_token, &nonce, &client_id).await {
+                Ok(claims) => claims,
+                Err(message) => return sso_error(Some(&start), &message).into_response(),
+            };
+            let Some(uid) = claims
+                .get("sub")
+                .and_then(Value::as_str)
+                .filter(|uid| !uid.is_empty())
+            else {
+                return sso_error(Some(&start), "the id_token has no sub claim").into_response();
+            };
+            let email = claims
+                .get("email")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase();
+            let name = claims
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (uid.to_string(), email, name)
         }
-        Ok(response) => {
-            return sso_error(
-                Some(&start),
-                &format!("token exchange failed with HTTP {}", response.status()),
-            )
-            .into_response()
-        }
-        Err(error) => {
-            return sso_error(Some(&start), &format!("token exchange failed: {error}"))
-                .into_response()
-        }
     };
-    let Some(id_token) = token_response.id_token else {
-        return sso_error(Some(&start), "the token response carried no id_token").into_response();
-    };
-
-    let claims = match validate_id_token(&discovery, &id_token, &nonce, &client_id).await {
-        Ok(claims) => claims,
-        Err(message) => return sso_error(Some(&start), &message).into_response(),
-    };
-    let Some(uid) = claims
-        .get("sub")
-        .and_then(Value::as_str)
-        .filter(|uid| !uid.is_empty())
-    else {
-        return sso_error(Some(&start), "the id_token has no sub claim").into_response();
-    };
-    let email = claims
-        .get("email")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_lowercase();
-    let name = claims
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
 
     let user = match resolve_org_user(
         &state,
         &auth_store,
         &sso_store,
         &connection,
-        uid,
+        &uid,
         &email,
-        name,
+        &name,
     )
     .await
     {
@@ -407,6 +433,44 @@ pub(crate) async fn org_callback(
         }
         Err(error) => render_store_error(Some(&start), error).into_response(),
     }
+}
+
+/// Redeem a GitHub authorization code and return `(uid, email, name)`.
+/// GitHub is OAuth2 without an id_token, so the account is identified by
+/// its numeric user id and the primary verified email.
+async fn github_identity(
+    state: &Arc<ApiState>,
+    connection: &OrgSsoConnection,
+    code: String,
+) -> Result<(String, String, String), Box<Response>> {
+    let fail = |message: String| Box::new(sso_error(None, &message).into_response());
+    let github = &state.sso_github;
+    let client_id = config_str(&connection.config, "client_id");
+    let client_secret = config_str(&connection.config, "client_secret");
+    let access_token = github
+        .exchange_code(&client_id, &client_secret, &code, &org_redirect_uri(state))
+        .await
+        .map_err(fail)?;
+    let user = github.fetch_user(&access_token).await.map_err(fail)?;
+    let emails = github.fetch_emails(&access_token).await.map_err(fail)?;
+
+    // The primary verified address, or any verified one.
+    let Some(email) = emails
+        .iter()
+        .find(|email| email.primary && email.verified)
+        .or_else(|| emails.iter().find(|email| email.verified))
+    else {
+        return Err(Box::new(
+            sso_error(None, "the GitHub account has no verified email address").into_response(),
+        ));
+    };
+    let name = user
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&user.login)
+        .to_string();
+    Ok((user.id.to_string(), email.email.to_lowercase(), name))
 }
 
 /// Verify the id_token signature (JWKS), `iss`, `aud` and `nonce`.

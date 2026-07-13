@@ -31,6 +31,7 @@ webauthn-rs-proto = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+async-trait = { workspace = true }
 rcgen = { workspace = true }
 http-body-util = { workspace = true }
 serde_yaml = { workspace = true }

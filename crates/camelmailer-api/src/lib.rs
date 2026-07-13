@@ -34,6 +34,6 @@ pub use saml::build_saml_router;
 pub use scim::build_scim_router;
 pub use server_api::build_server_router;
 pub use share::build_share_router;
-pub use sso::{build_sso_router, GithubOauth, HttpGithub};
+pub use sso::{build_sso_router, GithubEmail, GithubOauth, GithubUser, HttpGithub};
 pub use tracking::{tracking_router, TrackingState};
 pub use webhook_send::{ReqwestWebhookSender, WebhookSender};
