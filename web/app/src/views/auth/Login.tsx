@@ -12,6 +12,7 @@ import {
   ApiError,
   authApi,
   ssoStartUrl,
+  type DiscoveredSsoConnection,
   type Features,
   type SsoProviderInfo,
 } from "@/lib/api"
@@ -38,6 +39,20 @@ export default function Login() {
   const [ssoProviders, setSsoProviders] = useState<SsoProviderInfo[]>([])
   const [features, setFeatures] = useState<Features | null>(null)
   const [saml, setSaml] = useState<{ url: string; name: string } | null>(null)
+  const [orgConnections, setOrgConnections] = useState<DiscoveredSsoConnection[]>([])
+
+  // Tenant SSO discovery: when the email's domain is verified by an
+  // organization, offer its connections. Silent on failure — the page
+  // simply keeps the password sign-in.
+  async function discoverOrgSso(address: string) {
+    if (!address.includes("@")) return
+    try {
+      const { connections } = await authApi.orgSsoDiscover(address)
+      setOrgConnections(connections)
+    } catch {
+      setOrgConnections([])
+    }
+  }
 
   // /features says which optional sign-in paths this instance exposes
   // (passkeys, self-registration, SSO). The OIDC and SAML start URLs are
@@ -138,7 +153,11 @@ export default function Login() {
                 type="email"
                 autoComplete="username"
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value)
+                  setOrgConnections([])
+                }}
+                onBlur={() => discoverOrgSso(email)}
                 required
                 autoFocus
               />
@@ -184,6 +203,16 @@ export default function Login() {
             <Button type="submit" disabled={busy}>
               {busy ? "Signing in…" : "Sign in"}
             </Button>
+            {orgConnections.map((connection) => (
+              <Button
+                key={connection.id}
+                type="button"
+                variant="outline"
+                onClick={() => (window.location.href = connection.start_url)}
+              >
+                Continue with {connection.name}
+              </Button>
+            ))}
             {features?.webauthn && (
               <Button
                 type="button"

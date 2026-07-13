@@ -15,6 +15,7 @@ import {
   BadgeCheckIcon,
   BanIcon,
   CreditCardIcon,
+  FingerprintIcon,
   GaugeIcon,
   GlobeIcon,
   InboxIcon,
@@ -98,6 +99,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   webhooks: "Webhooks",
   suppressions: "Suppressions",
   "sender-addresses": "Sender addresses",
+  sso: "Single sign-on",
   dmarc: "DMARC",
   recipients: "Recipients",
   messaging: "Messaging",
@@ -345,6 +347,17 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
     ? [
         { href: orgBase, label: "Overview", icon: LayoutDashboardIcon, match: "exact" },
         { href: `${orgBase}/members`, label: "Members", icon: UsersIcon, match: "prefix" },
+        // tenant SSO configuration carries provider secrets — admin+ only
+        ...(canBilling
+          ? [
+              {
+                href: `${orgBase}/sso`,
+                label: "Single sign-on",
+                icon: FingerprintIcon,
+                match: "prefix" as const,
+              },
+            ]
+          : []),
         { href: `${orgBase}/settings`, label: "Settings", icon: SettingsIcon, match: "prefix" },
         ...(showBilling
           ? [

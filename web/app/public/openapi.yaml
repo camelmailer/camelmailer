@@ -63,6 +63,7 @@ tags:
   - name: Sender addresses
   - name: Suppressions
   - name: People
+  - name: SSO
   - name: Instance
 
 security: []
@@ -877,12 +878,6 @@ paths:
       responses:
         "201": { $ref: "#/components/responses/Success" }
         "307": { description: Redirect to the frontend with the token in the fragment }
-  /api/v2/auth/features:
-    get:
-      tags: [Auth]
-      summary: Feature discovery for login/registration pages (public; sso providers as {id, name, type}, never secrets)
-      responses:
-        "200": { $ref: "#/components/responses/Success" }
   /api/v2/auth/sso/{id}/start:
     get:
       tags: [Auth]
@@ -904,6 +899,9 @@ paths:
         "307": { description: Redirect to the frontend with the token in the fragment }
         "404": { description: SSOProviderNotFound }
         "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/auth/features:
+    get:
+      tags: [Auth]
       summary: Which optional sign-in features this instance exposes (public)
       description: |
         Lets login pages decide what to render — the passkey button, the
@@ -928,6 +926,20 @@ paths:
                             properties:
                               enabled: { type: boolean }
                               name: { type: string }
+                          saml:
+                            type: object
+                            properties:
+                              enabled: { type: boolean }
+                              name: { type: string }
+                          sso:
+                            type: array
+                            description: Social providers as {id, name, type} — never secrets
+                            items:
+                              type: object
+                              properties:
+                                id: { type: string }
+                                name: { type: string }
+                                type: { type: string }
   /api/v2/auth/webauthn/register/start:
     post:
       tags: [Auth]
@@ -1225,6 +1237,120 @@ paths:
         - { $ref: "#/components/parameters/Id" }
       responses:
         "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/admin/organizations/{org}/sso/domains:
+    get:
+      tags: [SSO]
+      summary: List the organization's login email domains
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [SSO]
+      summary: Claim a login email domain (returns the DNS TXT challenge)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/sso/domains/{id}/verify:
+    post:
+      tags: [SSO]
+      summary: Verify a login domain by its DNS TXT record
+      description: |
+        A domain routes sign-ins only once verified, and exactly one
+        organization may verify a given domain. `{ "force": true }` skips
+        the DNS check and requires the machine key.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/sso/domains/{id}:
+    delete:
+      tags: [SSO]
+      summary: Remove a login email domain
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/sso/connections:
+    get:
+      tags: [SSO]
+      summary: List the organization's SSO connections (secrets masked)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [SSO]
+      summary: Create an SSO connection (oidc, saml, google, microsoft, github)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/sso/connections/{id}:
+    get:
+      tags: [SSO]
+      summary: Show an SSO connection (secrets masked)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [SSO]
+      summary: Update an SSO connection (an unchanged mask keeps the secret)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [SSO]
+      summary: Delete an SSO connection
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/auth/org-sso/discover:
+    post:
+      tags: [SSO]
+      summary: Which SSO connections apply to an email address
+      description: |
+        Unauthenticated. Resolves the address's domain to the organization
+        that verified it and returns that organization's enabled
+        connections; an empty list means password sign-in.
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/org-sso/{id}/start:
+    get:
+      tags: [SSO]
+      summary: Begin a tenant SSO login for a connection
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "307": { description: Redirect to the identity provider }
+  /api/v2/auth/org-sso/callback:
+    get:
+      tags: [SSO]
+      summary: OAuth2/OIDC callback for tenant SSO logins
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/auth/org-sso/acs:
+    post:
+      tags: [SSO]
+      summary: SAML assertion consumer service for tenant SSO logins
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
 
   /api/v2/admin/organizations/{org}/billing:
     get:

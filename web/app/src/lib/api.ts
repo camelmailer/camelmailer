@@ -119,6 +119,40 @@ export type MeResponse = {
   memberships: { role: Role; organization: Organization }[]
 }
 
+// Tenant SSO: an email domain the organization claims for login routing,
+// with the DNS TXT challenge that proves ownership.
+export type OrgSsoDomain = {
+  id: number
+  domain: string
+  verified: boolean
+  created_at: string
+  dns_record: DnsRecord
+}
+
+export type OrgSsoKind = "oidc" | "saml" | "google" | "microsoft" | "github"
+
+// One per-organization SSO connection. `config` holds the protocol
+// fields; secrets come back masked and an unchanged mask keeps the
+// stored secret on update.
+export type OrgSsoConnection = {
+  id: number
+  kind: OrgSsoKind
+  name: string
+  enabled: boolean
+  config: Record<string, string>
+  default_role: Role
+  auto_provision: boolean
+  created_at: string
+}
+
+// A connection offered to a signed-out user after email discovery.
+export type DiscoveredSsoConnection = {
+  id: number
+  kind: OrgSsoKind
+  name: string
+  start_url: string
+}
+
 export type Server = {
   id: number
   uuid: string
@@ -523,6 +557,12 @@ export const authApi = {
   // self-registration, OIDC, social sign-in) — unauthenticated, drives
   // the login page.
   features: () => api.get<Features>("/api/v2/auth/features"),
+  // Tenant SSO discovery: which connections apply to this email's domain.
+  // Empty when the domain is not verified by any organization.
+  orgSsoDiscover: (email: string) =>
+    api.post<{ connections: DiscoveredSsoConnection[] }>("/api/v2/auth/org-sso/discover", {
+      email,
+    }),
   // 404 SAMLDisabled when SAML is off — used to decide whether to render
   // the "Sign in with <name>" button.
   samlStartUrl: () =>
@@ -622,6 +662,45 @@ export const adminApi = {
     revoke: (id: number) =>
       api.delete<{ deleted: boolean }>(`/api/v2/admin/organizations/${org}/invitations/${id}`),
   }),
+  // Tenant SSO configuration (admin+): login-routing email domains and
+  // the organization's OIDC/SAML/social connections.
+  orgSso: (org: string) => {
+    const base = `/api/v2/admin/organizations/${org}/sso`
+    return {
+      domains: {
+        list: () => api.get<{ domains: OrgSsoDomain[] }>(`${base}/domains`),
+        create: (domain: string) =>
+          api.post<{ domain: OrgSsoDomain }>(`${base}/domains`, { domain }),
+        verify: (id: number) =>
+          api.post<{ domain: OrgSsoDomain }>(`${base}/domains/${id}/verify`, {}),
+        delete: (id: number) => api.delete<{ deleted: boolean }>(`${base}/domains/${id}`),
+      },
+      connections: {
+        list: () => api.get<{ connections: OrgSsoConnection[] }>(`${base}/connections`),
+        create: (fields: {
+          kind: OrgSsoKind
+          name: string
+          config: Record<string, string>
+          default_role?: Role
+          auto_provision?: boolean
+          enabled?: boolean
+        }) => api.post<{ connection: OrgSsoConnection }>(`${base}/connections`, fields),
+        update: (
+          id: number,
+          fields: Partial<{
+            name: string
+            enabled: boolean
+            config: Record<string, string>
+            default_role: Role
+            auto_provision: boolean
+          }>,
+        ) =>
+          api.patch<{ connection: OrgSsoConnection }>(`${base}/connections/${id}`, fields),
+        delete: (id: number) =>
+          api.delete<{ deleted: boolean }>(`${base}/connections/${id}`),
+      },
+    }
+  },
   servers: (org: string) => ({
     list: () =>
       api.get<{ servers: Server[]; pagination: Pagination }>(
