@@ -141,6 +141,9 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) message_streams: HashMap<Id, MessageStream>,
     /// Message templates (config; server-scoped).
     pub(crate) templates: HashMap<Id, Template>,
+    /// Reusable layouts wrapped around template bodies (config;
+    /// server-scoped).
+    pub(crate) layouts: HashMap<Id, crate::model::Layout>,
     /// Public message share links (cross-tenant lookup by token hash).
     pub(crate) message_shares: Vec<crate::server_store::MessageShare>,
     /// DMARC aggregate reports (tenant-scoped like messages).
@@ -839,6 +842,40 @@ impl MemoryStore {
             .templates
             .insert(template.id, template.clone());
         template
+    }
+
+    pub fn insert_layout(&self, layout: crate::model::Layout) -> crate::model::Layout {
+        self.inner
+            .write()
+            .unwrap()
+            .layouts
+            .insert(layout.id, layout.clone());
+        layout
+    }
+
+    /// A server's layouts, ordered by id.
+    pub fn layouts_for(&self, server_id: Id) -> Vec<crate::model::Layout> {
+        let mut layouts: Vec<crate::model::Layout> = self
+            .inner
+            .read()
+            .unwrap()
+            .layouts
+            .values()
+            .filter(|l| l.server_id == server_id)
+            .cloned()
+            .collect();
+        layouts.sort_by_key(|l| l.id);
+        layouts
+    }
+
+    pub fn find_layout(&self, server_id: Id, permalink: &str) -> Option<crate::model::Layout> {
+        self.inner
+            .read()
+            .unwrap()
+            .layouts
+            .values()
+            .find(|l| l.server_id == server_id && l.permalink == permalink)
+            .cloned()
     }
 
     /// A server's message templates, ordered by id.

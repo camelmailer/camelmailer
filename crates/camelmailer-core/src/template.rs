@@ -280,10 +280,60 @@ pub fn render(template: &str, model: &Value) -> Result<String, RenderError> {
     Ok(out)
 }
 
+/// Whether a layout wrapper embeds the body unescaped: `{{{ content }}}`
+/// or `{{& content }}`. Required for HTML wrappers — an escaped
+/// `{{ content }}` would show the mail's markup as text.
+pub fn wrapper_has_raw_content(wrapper: &str) -> bool {
+    parse(wrapper).is_ok_and(|nodes| {
+        nodes.iter().any(|node| {
+            matches!(
+                node,
+                Node::Var { path, escaped: false } if path.as_str() == "content"
+            )
+        })
+    })
+}
+
+/// Render a layout `wrapper` around an already-rendered `content` body:
+/// the wrapper sees the same `model` plus a `content` variable. The
+/// wrapper embeds it raw (`{{{ content }}}`), so the body's own HTML
+/// survives.
+pub fn render_in_layout(
+    wrapper: &str,
+    model: &Value,
+    content: &str,
+) -> Result<String, RenderError> {
+    let mut scoped = match model {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    scoped.insert("content".into(), Value::String(content.to_string()));
+    render(wrapper, &Value::Object(scoped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn layouts_wrap_rendered_content_raw_and_see_the_model() {
+        let wrapper = "<header>{{ product }}</header>{{{ content }}}<footer>Acme GmbH</footer>";
+        let out = render_in_layout(wrapper, &json!({ "product": "Acme" }), "<p>Hi</p>").unwrap();
+        assert_eq!(
+            out,
+            "<header>Acme</header><p>Hi</p><footer>Acme GmbH</footer>"
+        );
+    }
+
+    #[test]
+    fn wrapper_content_placeholder_detection() {
+        assert!(wrapper_has_raw_content("a {{{ content }}} b"));
+        assert!(wrapper_has_raw_content("a {{& content }} b"));
+        // escaped interpolation would mangle the body's HTML
+        assert!(!wrapper_has_raw_content("a {{ content }} b"));
+        assert!(!wrapper_has_raw_content("no placeholder at all"));
+    }
 
     #[test]
     fn interpolates_and_html_escapes_by_default() {

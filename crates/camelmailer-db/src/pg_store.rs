@@ -1727,8 +1727,8 @@ impl camelmailer_core::ServerStore for PgStore {
     ) -> Result<camelmailer_core::Template, StoreError> {
         let uuid = token::generate_uuid();
         let row = sqlx::query(
-            "INSERT INTO templates (uuid, server_id, name, permalink, subject, html_body, text_body)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+            "INSERT INTO templates (uuid, server_id, name, permalink, subject, html_body, text_body, layout_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
         )
         .bind(&uuid)
         .bind(new.server_id as i64)
@@ -1737,6 +1737,7 @@ impl camelmailer_core::ServerStore for PgStore {
         .bind(&new.subject)
         .bind(&new.html_body)
         .bind(&new.text_body)
+        .bind(new.layout_id.map(|id| id as i64))
         .fetch_one(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -1750,6 +1751,7 @@ impl camelmailer_core::ServerStore for PgStore {
             html_body: new.html_body,
             text_body: new.text_body,
             archived: false,
+            layout_id: new.layout_id,
         })
     }
 
@@ -1759,7 +1761,8 @@ impl camelmailer_core::ServerStore for PgStore {
     ) -> Result<camelmailer_core::Template, StoreError> {
         sqlx::query(
             "UPDATE templates
-             SET name = $2, subject = $3, html_body = $4, text_body = $5, archived = $6
+             SET name = $2, subject = $3, html_body = $4, text_body = $5, archived = $6,
+                 layout_id = $7
              WHERE id = $1",
         )
         .bind(template.id as i64)
@@ -1768,10 +1771,107 @@ impl camelmailer_core::ServerStore for PgStore {
         .bind(&template.html_body)
         .bind(&template.text_body)
         .bind(template.archived)
+        .bind(template.layout_id.map(|id| id as i64))
         .execute(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
         Ok(template)
+    }
+
+    async fn list_layouts(
+        &self,
+        server_id: Id,
+    ) -> Result<Vec<camelmailer_core::Layout>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM layouts WHERE server_id = $1 ORDER BY id")
+            .bind(server_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(layout_from_row).collect())
+    }
+
+    async fn layout_by_permalink(
+        &self,
+        server_id: Id,
+        permalink: &str,
+    ) -> Result<Option<camelmailer_core::Layout>, StoreError> {
+        let row = sqlx::query("SELECT * FROM layouts WHERE server_id = $1 AND permalink = $2")
+            .bind(server_id as i64)
+            .bind(permalink)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(row.as_ref().map(layout_from_row))
+    }
+
+    async fn layout_by_id(
+        &self,
+        server_id: Id,
+        layout_id: Id,
+    ) -> Result<Option<camelmailer_core::Layout>, StoreError> {
+        let row = sqlx::query("SELECT * FROM layouts WHERE server_id = $1 AND id = $2")
+            .bind(server_id as i64)
+            .bind(layout_id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(row.as_ref().map(layout_from_row))
+    }
+
+    async fn create_layout(
+        &self,
+        new: camelmailer_core::NewLayout,
+    ) -> Result<camelmailer_core::Layout, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO layouts (uuid, server_id, name, permalink, html_wrapper, text_wrapper)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(&uuid)
+        .bind(new.server_id as i64)
+        .bind(&new.name)
+        .bind(&new.permalink)
+        .bind(&new.html_wrapper)
+        .bind(&new.text_wrapper)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(camelmailer_core::Layout {
+            id: row.get::<i64, _>("id") as Id,
+            uuid,
+            server_id: new.server_id,
+            name: new.name,
+            permalink: new.permalink,
+            html_wrapper: new.html_wrapper,
+            text_wrapper: new.text_wrapper,
+        })
+    }
+
+    async fn update_layout(
+        &self,
+        layout: camelmailer_core::Layout,
+    ) -> Result<camelmailer_core::Layout, StoreError> {
+        sqlx::query(
+            "UPDATE layouts SET name = $2, html_wrapper = $3, text_wrapper = $4 WHERE id = $1",
+        )
+        .bind(layout.id as i64)
+        .bind(&layout.name)
+        .bind(&layout.html_wrapper)
+        .bind(&layout.text_wrapper)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(layout)
+    }
+
+    async fn delete_layout(&self, server_id: Id, layout_id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM layouts WHERE id = $1 AND server_id = $2")
+            .bind(layout_id as i64)
+            .bind(server_id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
     }
 
     // DMARC aggregate reports — tenant tables: every query runs inside a
@@ -3109,6 +3209,19 @@ fn template_from_row(row: &PgRow) -> camelmailer_core::Template {
         html_body: row.get("html_body"),
         text_body: row.get("text_body"),
         archived: row.get("archived"),
+        layout_id: row.get::<Option<i64>, _>("layout_id").map(|id| id as Id),
+    }
+}
+
+fn layout_from_row(row: &PgRow) -> camelmailer_core::Layout {
+    camelmailer_core::Layout {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        name: row.get("name"),
+        permalink: row.get("permalink"),
+        html_wrapper: row.get("html_wrapper"),
+        text_wrapper: row.get("text_wrapper"),
     }
 }
 

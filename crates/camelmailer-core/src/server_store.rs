@@ -50,6 +50,18 @@ pub struct NewTemplate {
     pub subject: Option<String>,
     pub html_body: Option<String>,
     pub text_body: Option<String>,
+    /// Layout to wrap the rendered bodies in (None = no layout).
+    pub layout_id: Option<Id>,
+}
+
+/// Fields for creating a layout (see [`crate::model::Layout`]).
+#[derive(Debug, Clone)]
+pub struct NewLayout {
+    pub server_id: Id,
+    pub name: String,
+    pub permalink: String,
+    pub html_wrapper: String,
+    pub text_wrapper: Option<String>,
 }
 
 /// A recorded open (pixel load) or click.
@@ -362,6 +374,25 @@ pub trait ServerStore: Send + Sync {
     async fn create_template(&self, new: NewTemplate) -> Result<Template, StoreError>;
     async fn update_template(&self, template: Template) -> Result<Template, StoreError>;
 
+    // layouts (config; server-scoped)
+    async fn list_layouts(&self, server_id: Id) -> Result<Vec<crate::model::Layout>, StoreError>;
+    async fn layout_by_permalink(
+        &self,
+        server_id: Id,
+        permalink: &str,
+    ) -> Result<Option<crate::model::Layout>, StoreError>;
+    async fn layout_by_id(
+        &self,
+        server_id: Id,
+        layout_id: Id,
+    ) -> Result<Option<crate::model::Layout>, StoreError>;
+    async fn create_layout(&self, new: NewLayout) -> Result<crate::model::Layout, StoreError>;
+    async fn update_layout(
+        &self,
+        layout: crate::model::Layout,
+    ) -> Result<crate::model::Layout, StoreError>;
+    async fn delete_layout(&self, server_id: Id, layout_id: Id) -> Result<bool, StoreError>;
+
     // DMARC aggregate reports (tenant-scoped: RLS in Postgres)
     /// Persist one parsed aggregate report with all its rows.
     async fn store_dmarc_report(&self, new: NewDmarcReport) -> Result<DmarcReport, StoreError>;
@@ -611,11 +642,82 @@ impl ServerStore for crate::store::MemoryStore {
             html_body: new.html_body,
             text_body: new.text_body,
             archived: false,
+            layout_id: new.layout_id,
         }))
     }
 
     async fn update_template(&self, template: Template) -> Result<Template, StoreError> {
         Ok(self.insert_template(template))
+    }
+
+    async fn list_layouts(&self, server_id: Id) -> Result<Vec<crate::model::Layout>, StoreError> {
+        Ok(self.layouts_for(server_id))
+    }
+
+    async fn layout_by_permalink(
+        &self,
+        server_id: Id,
+        permalink: &str,
+    ) -> Result<Option<crate::model::Layout>, StoreError> {
+        Ok(self.find_layout(server_id, permalink))
+    }
+
+    async fn layout_by_id(
+        &self,
+        server_id: Id,
+        layout_id: Id,
+    ) -> Result<Option<crate::model::Layout>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .layouts
+            .get(&layout_id)
+            .filter(|l| l.server_id == server_id)
+            .cloned())
+    }
+
+    async fn create_layout(&self, new: NewLayout) -> Result<crate::model::Layout, StoreError> {
+        if self.find_layout(new.server_id, &new.permalink).is_some() {
+            return Err(StoreError::Conflict(
+                "Permalink has already been taken".into(),
+            ));
+        }
+        Ok(self.insert_layout(crate::model::Layout {
+            id: self.next_id(),
+            uuid: crate::token::generate_uuid(),
+            server_id: new.server_id,
+            name: new.name,
+            permalink: new.permalink,
+            html_wrapper: new.html_wrapper,
+            text_wrapper: new.text_wrapper,
+        }))
+    }
+
+    async fn update_layout(
+        &self,
+        layout: crate::model::Layout,
+    ) -> Result<crate::model::Layout, StoreError> {
+        Ok(self.insert_layout(layout))
+    }
+
+    async fn delete_layout(&self, server_id: Id, layout_id: Id) -> Result<bool, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let existed = inner
+            .layouts
+            .get(&layout_id)
+            .is_some_and(|l| l.server_id == server_id);
+        if existed {
+            inner.layouts.remove(&layout_id);
+            // Mirror the Postgres FK: templates lose the reference, they
+            // are not deleted.
+            for template in inner.templates.values_mut() {
+                if template.layout_id == Some(layout_id) {
+                    template.layout_id = None;
+                }
+            }
+        }
+        Ok(existed)
     }
 
     async fn store_dmarc_report(&self, new: NewDmarcReport) -> Result<DmarcReport, StoreError> {

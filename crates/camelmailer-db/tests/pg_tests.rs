@@ -1402,6 +1402,7 @@ async fn templates_crud_and_scoping() {
             subject: Some("Hi {{ name }}".into()),
             html_body: Some("<p>{{ name }}</p>".into()),
             text_body: None,
+            layout_id: None,
         })
         .await
         .unwrap();
@@ -1417,6 +1418,7 @@ async fn templates_crud_and_scoping() {
             subject: None,
             html_body: None,
             text_body: None,
+            layout_id: None,
         })
         .await
         .is_err());
@@ -3238,4 +3240,67 @@ async fn org_sso_routes_verified_domains_and_manages_connections() {
         .await
         .unwrap()
         .is_empty());
+}
+
+// --------------------------------------------------------------- layouts
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn layouts_round_trip_and_unhook_templates_on_delete() {
+    use camelmailer_core::{NewLayout, NewTemplate, ServerStore};
+    let base = require_db!();
+    let f = fixtures(test_pool(&base).await).await;
+    let store = &f.store;
+
+    let layout = store
+        .create_layout(NewLayout {
+            server_id: f.server.id,
+            name: "Brand".into(),
+            permalink: "brand".into(),
+            html_wrapper: "<header>Acme</header>{{{ content }}}".into(),
+            text_wrapper: None,
+        })
+        .await
+        .unwrap();
+    // duplicate permalink on the same server is a conflict
+    assert!(store
+        .create_layout(NewLayout {
+            server_id: f.server.id,
+            name: "Dup".into(),
+            permalink: "brand".into(),
+            html_wrapper: "{{{ content }}}".into(),
+            text_wrapper: None,
+        })
+        .await
+        .is_err());
+
+    let template = store
+        .create_template(NewTemplate {
+            server_id: f.server.id,
+            name: "Wrapped".into(),
+            permalink: "wrapped".into(),
+            subject: None,
+            html_body: Some("<p>Hi</p>".into()),
+            text_body: None,
+            layout_id: Some(layout.id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(template.layout_id, Some(layout.id));
+    // round-trips through a fresh read
+    let read = store
+        .template_by_permalink(f.server.id, "wrapped")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.layout_id, Some(layout.id));
+
+    // deleting the layout unhooks the template (FK ON DELETE SET NULL)
+    assert!(store.delete_layout(f.server.id, layout.id).await.unwrap());
+    let read = store
+        .template_by_permalink(f.server.id, "wrapped")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.layout_id, None);
+    assert!(store.list_layouts(f.server.id).await.unwrap().is_empty());
 }

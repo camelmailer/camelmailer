@@ -1594,6 +1594,8 @@ pub(crate) async fn templates_copy_to(
                 html_body: source.html_body,
                 text_body: source.text_body,
                 archived: source.archived,
+                // the copy never imports the source server's layout wiring
+                layout_id: existing.layout_id,
             };
             from_result(
                 &start,
@@ -1616,6 +1618,8 @@ pub(crate) async fn templates_copy_to(
                     subject: source.subject,
                     html_body: source.html_body,
                     text_body: source.text_body,
+                    // layouts belong to the source server; the copy starts bare
+                    layout_id: None,
                 })
                 .await,
             |template| {

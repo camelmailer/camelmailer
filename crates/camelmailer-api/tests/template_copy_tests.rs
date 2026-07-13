@@ -86,6 +86,7 @@ async fn harness() -> Harness {
             subject: Some("Hello {{ name }}".into()),
             html_body: Some("<p>Hi {{ name }}</p>".into()),
             text_body: Some("Hi {{ name }}".into()),
+            layout_id: None,
         },
     )
     .await
@@ -249,6 +250,7 @@ async fn an_existing_permalink_conflicts_unless_overwrite_is_set() {
             subject: Some("Old subject".into()),
             html_body: None,
             text_body: Some("Old".into()),
+            layout_id: None,
         },
     )
     .await

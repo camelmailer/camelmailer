@@ -1525,3 +1525,125 @@ async fn request_log_is_tenant_scoped_and_skips_unauthenticated_requests() {
     assert_eq!(logged.len(), 1);
     let _ = store;
 }
+
+// --------------------------------------------------- P7: layouts
+
+#[tokio::test]
+async fn layouts_wrap_rendered_templates_and_unhook_on_delete() {
+    let (app, token_a, token_b, _) = build_two_with_domains().await;
+
+    // an HTML wrapper without raw {{{ content }}} is rejected
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/layouts",
+        &token_a,
+        json!({ "name": "Broken", "html_wrapper": "<div>{{ content }}</div>" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // create a proper layout with brand chrome
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/layouts",
+        &token_a,
+        json!({
+            "name": "Brand",
+            "html_wrapper": "<header>{{ product }}</header>{{{ content }}}<footer>Acme GmbH · Camelweg 1</footer>",
+            "text_wrapper": "{{& content }}\n--\nAcme GmbH"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["data"]["layout"]["permalink"], "brand");
+
+    // a template referencing the layout by permalink
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/templates",
+        &token_a,
+        json!({
+            "name": "Welcome",
+            "subject": "Hi {{ name }}",
+            "html_body": "<p>Hi {{ name }}</p>",
+            "text_body": "Hi {{ name }}",
+            "layout": "brand"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["data"]["template"]["layout_id"].as_u64().is_some());
+
+    // a bad layout reference is a validation error
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/templates",
+        &token_a,
+        json!({ "name": "Bad", "layout": "missing" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // the dry-run render wraps html and text, subject stays bare
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/templates/welcome/render",
+        &token_a,
+        json!({ "template_model": { "name": "Ada", "product": "Acme" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["rendered"]["html_body"],
+        "<header>Acme</header><p>Hi Ada</p><footer>Acme GmbH · Camelweg 1</footer>"
+    );
+    assert_eq!(
+        body["data"]["rendered"]["text_body"],
+        "Hi Ada\n--\nAcme GmbH"
+    );
+    assert_eq!(body["data"]["rendered"]["subject"], "Hi Ada");
+
+    // tenant B sees no layouts
+    let (_, body) = request(&app, "/api/v2/server/layouts", Some(&token_b)).await;
+    assert_eq!(body["data"]["layouts"].as_array().unwrap().len(), 0);
+
+    // detaching via PATCH layout: "" renders bare again
+    let (status, body) = patch_json(
+        &app,
+        "/api/v2/server/templates/welcome",
+        &token_a,
+        json!({ "layout": "" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["data"]["template"]["layout_id"].is_null());
+
+    // re-attach, then deleting the layout unhooks the template
+    patch_json(
+        &app,
+        "/api/v2/server/templates/welcome",
+        &token_a,
+        json!({ "layout": "brand" }),
+    )
+    .await;
+    let (status, _) = json_request(
+        &app,
+        "DELETE",
+        "/api/v2/server/layouts/brand",
+        &token_a,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = request(&app, "/api/v2/server/templates/welcome", Some(&token_a)).await;
+    assert!(body["data"]["template"]["layout_id"].is_null());
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/templates/welcome/render",
+        &token_a,
+        json!({ "template_model": { "name": "Ada" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["rendered"]["html_body"], "<p>Hi Ada</p>");
+}

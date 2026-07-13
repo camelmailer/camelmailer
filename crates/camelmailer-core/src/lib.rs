@@ -46,8 +46,10 @@ pub use org_sso::{
 };
 pub use server_store::{
     ActivityEvent, ApiRequestFilter, ApiRequestRecord, DeliveryRecord, DeliveryStats,
-    MessageFilter, MessageShare, MessageStats, NewApiRequest, NewMessageShare, NewStream,
-    NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter, TagCount,
+    MessageFilter, MessageShare, MessageStats, NewApiRequest, NewLayout, NewMessageShare,
+    NewStream, NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter, TagCount,
 };
 pub use store::{MemoryStore, Store};
-pub use template::{render as render_template, RenderError};
+pub use template::{
+    render as render_template, render_in_layout, wrapper_has_raw_content, RenderError,
+};

@@ -1501,7 +1501,220 @@ fn template_json(template: &Template) -> Value {
         "html_body": template.html_body,
         "text_body": template.text_body,
         "archived": template.archived,
+        "layout_id": template.layout_id,
     })
+}
+
+fn layout_json(layout: &camelmailer_core::Layout) -> Value {
+    json!({
+        "id": layout.id,
+        "uuid": layout.uuid,
+        "name": layout.name,
+        "permalink": layout.permalink,
+        "html_wrapper": layout.html_wrapper,
+        "text_wrapper": layout.text_wrapper,
+    })
+}
+
+// ------------------------------------------------------------- layouts
+
+#[derive(Debug, Deserialize)]
+struct CreateLayout {
+    name: Option<String>,
+    permalink: Option<String>,
+    html_wrapper: Option<String>,
+    text_wrapper: Option<String>,
+}
+
+/// The HTML wrapper must embed the body raw — `{{{ content }}}` or
+/// `{{& content }}` — or every mail would show its own markup as text.
+fn wrapper_error(start: &RequestStart) -> Response {
+    render_error(
+        Some(start),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "ValidationError",
+        "html_wrapper must embed the body with {{{ content }}} (raw interpolation)",
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/layouts`.
+async fn layouts_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.list_layouts(server.0.id).await {
+        Ok(layouts) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "layouts": layouts.iter().map(layout_json).collect::<Vec<_>>() }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `POST /api/v2/server/layouts`.
+async fn layouts_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Json(body): Json<CreateLayout>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let Some(name) = body.name.filter(|n| !n.is_empty()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::BAD_REQUEST,
+            "ParameterMissing",
+            "param is missing or the value is empty: name",
+        )
+        .into_response();
+    };
+    let Some(html_wrapper) = body.html_wrapper.filter(|w| !w.is_empty()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::BAD_REQUEST,
+            "ParameterMissing",
+            "param is missing or the value is empty: html_wrapper",
+        )
+        .into_response();
+    };
+    if !camelmailer_core::wrapper_has_raw_content(&html_wrapper) {
+        return wrapper_error(&start.0);
+    }
+    let permalink = body
+        .permalink
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| permalink_from(&name));
+
+    match store
+        .create_layout(camelmailer_core::NewLayout {
+            server_id: server.0.id,
+            name,
+            permalink,
+            html_wrapper,
+            text_wrapper: body.text_wrapper.filter(|w| !w.is_empty()),
+        })
+        .await
+    {
+        Ok(layout) => render_success(
+            Some(&start.0),
+            StatusCode::CREATED,
+            json!({ "layout": layout_json(&layout) }),
+        )
+        .into_response(),
+        Err(camelmailer_core::StoreError::Conflict(message)) => render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            &message,
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `GET /api/v2/server/layouts/{permalink}`.
+async fn layout_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.layout_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(layout)) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "layout": layout_json(&layout) }),
+        )
+        .into_response(),
+        Ok(None) => not_found(&start.0),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UpdateLayout {
+    name: Option<String>,
+    html_wrapper: Option<String>,
+    text_wrapper: Option<String>,
+}
+
+/// `PATCH /api/v2/server/layouts/{permalink}`.
+async fn layout_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+    Json(body): Json<UpdateLayout>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let mut layout = match store.layout_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(layout)) => layout,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    if let Some(name) = body.name.filter(|n| !n.is_empty()) {
+        layout.name = name;
+    }
+    if let Some(html_wrapper) = body.html_wrapper.filter(|w| !w.is_empty()) {
+        if !camelmailer_core::wrapper_has_raw_content(&html_wrapper) {
+            return wrapper_error(&start.0);
+        }
+        layout.html_wrapper = html_wrapper;
+    }
+    if body.text_wrapper.is_some() {
+        layout.text_wrapper = body.text_wrapper.filter(|w| !w.is_empty());
+    }
+    match store.update_layout(layout).await {
+        Ok(layout) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "layout": layout_json(&layout) }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `DELETE /api/v2/server/layouts/{permalink}` — templates keep working
+/// and simply lose the layout reference.
+async fn layout_destroy(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let layout = match store.layout_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(layout)) => layout,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    match store.delete_layout(server.0.id, layout.id).await {
+        Ok(_) => render_success(Some(&start.0), StatusCode::OK, json!({ "deleted": true }))
+            .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
 }
 
 /// `GET /api/v2/server/templates`.
@@ -1532,6 +1745,24 @@ struct CreateTemplate {
     subject: Option<String>,
     html_body: Option<String>,
     text_body: Option<String>,
+    /// Permalink of the layout to wrap this template in (optional).
+    layout: Option<String>,
+}
+
+/// Resolve a layout permalink to its id, `Ok(None)` for an empty value.
+async fn resolve_layout(
+    store: &std::sync::Arc<dyn camelmailer_core::ServerStore>,
+    server_id: camelmailer_core::Id,
+    permalink: &str,
+) -> Result<Option<camelmailer_core::Id>, String> {
+    if permalink.is_empty() {
+        return Ok(None);
+    }
+    match store.layout_by_permalink(server_id, permalink).await {
+        Ok(Some(layout)) => Ok(Some(layout.id)),
+        Ok(None) => Err(format!("Layout {permalink:?} does not exist")),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// `POST /api/v2/server/templates`.
@@ -1558,6 +1789,19 @@ async fn templates_create(
         .permalink
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| permalink_from(&name));
+    let layout_id =
+        match resolve_layout(store, server.0.id, body.layout.as_deref().unwrap_or("")).await {
+            Ok(layout_id) => layout_id,
+            Err(message) => {
+                return render_error(
+                    Some(&start.0),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationError",
+                    &message,
+                )
+                .into_response()
+            }
+        };
 
     match store
         .create_template(NewTemplate {
@@ -1567,6 +1811,7 @@ async fn templates_create(
             subject: body.subject,
             html_body: body.html_body,
             text_body: body.text_body,
+            layout_id,
         })
         .await
     {
@@ -1617,6 +1862,9 @@ struct UpdateTemplate {
     html_body: Option<String>,
     text_body: Option<String>,
     archived: Option<bool>,
+    /// Layout permalink; an empty string detaches the layout, absent
+    /// leaves it unchanged.
+    layout: Option<String>,
 }
 
 /// `PATCH /api/v2/server/templates/{permalink}`.
@@ -1650,6 +1898,20 @@ async fn template_update(
     }
     if let Some(archived) = body.archived {
         template.archived = archived;
+    }
+    if let Some(layout) = body.layout {
+        template.layout_id = match resolve_layout(store, server.0.id, &layout).await {
+            Ok(layout_id) => layout_id,
+            Err(message) => {
+                return render_error(
+                    Some(&start.0),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ValidationError",
+                    &message,
+                )
+                .into_response()
+            }
+        };
     }
     match store.update_template(template).await {
         Ok(template) => render_success(
@@ -1719,6 +1981,53 @@ fn render_template_fields(template: &Template, model: &Value) -> Result<Rendered
     ))
 }
 
+/// Render a template and, when it references a layout, wrap the rendered
+/// bodies in the layout's wrappers (the wrapper sees the same model plus
+/// `content`). Used by the preview endpoint and templated sends alike, so
+/// both always agree.
+async fn render_templated(
+    store: &std::sync::Arc<dyn camelmailer_core::ServerStore>,
+    server_id: camelmailer_core::Id,
+    template: &Template,
+    model: &Value,
+) -> Result<RenderedFields, ApiError> {
+    let (subject, mut html_body, mut text_body) = render_template_fields(template, model)?;
+    if let Some(layout_id) = template.layout_id {
+        let layout = store
+            .layout_by_id(server_id, layout_id)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError".to_string(),
+                    error.to_string(),
+                )
+            })?;
+        // A dangling reference (layout deleted concurrently) renders the
+        // template bare rather than failing the send.
+        if let Some(layout) = layout {
+            let wrap = |wrapper: &str, content: &str| -> Result<String, ApiError> {
+                camelmailer_core::render_in_layout(wrapper, model, content).map_err(|error| {
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "ValidationError".to_string(),
+                        format!("layout render failed: {error}"),
+                    )
+                })
+            };
+            if let Some(content) = html_body.as_deref() {
+                html_body = Some(wrap(&layout.html_wrapper, content)?);
+            }
+            if let (Some(content), Some(wrapper)) =
+                (text_body.as_deref(), layout.text_wrapper.as_deref())
+            {
+                text_body = Some(wrap(wrapper, content)?);
+            }
+        }
+    }
+    Ok((subject, html_body, text_body))
+}
+
 /// `POST /api/v2/server/templates/{permalink}/render` — dry-run preview.
 async fn template_render(
     State(state): State<Arc<ApiState>>,
@@ -1737,7 +2046,7 @@ async fn template_render(
         Err(error) => return internal_error(&start.0, &error.to_string()),
     };
     let model = body.template_model.unwrap_or_else(|| json!({}));
-    match render_template_fields(&template, &model) {
+    match render_templated(store, server.0.id, &template, &model).await {
         Ok((subject, html_body, text_body)) => render_success(
             Some(&start.0),
             StatusCode::OK,
@@ -1797,7 +2106,8 @@ async fn build_templated_message(
             format!("Message template {permalink:?} does not exist"),
         ))?;
     let model = body.template_model.unwrap_or_else(|| json!({}));
-    let (subject, html_body, text_body) = render_template_fields(&template, &model)?;
+    let (subject, html_body, text_body) =
+        render_templated(store, server.id, &template, &model).await?;
     let mut message = body.message;
     message.subject = subject.or(message.subject);
     message.html_body = html_body.or(message.html_body);
@@ -2039,6 +2349,11 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/inbound/{id}/bypass", post(inbound_bypass))
         .route("/inbound/{id}/retry", post(inbound_retry))
         .route("/templates", get(templates_index).post(templates_create))
+        .route("/layouts", get(layouts_index).post(layouts_create))
+        .route(
+            "/layouts/{permalink}",
+            get(layout_show).patch(layout_update).delete(layout_destroy),
+        )
         .route(
             "/templates/{permalink}",
             get(template_show).patch(template_update),

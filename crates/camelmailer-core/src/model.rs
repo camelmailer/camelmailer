@@ -269,6 +269,25 @@ pub struct Template {
     pub html_body: Option<String>,
     pub text_body: Option<String>,
     pub archived: bool,
+    /// Layout the rendered bodies are wrapped in (None = no layout).
+    pub layout_id: Option<Id>,
+}
+
+/// A reusable layout: wrapper HTML (and optionally text) around a
+/// template's rendered body — the place for logos, postal addresses and
+/// social links that every mail shares. The HTML wrapper must embed the
+/// body via raw interpolation (`{{{ content }}}`), so the rendered
+/// template HTML is not escaped a second time. A config record, filtered
+/// by `server_id`; not RLS-protected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Layout {
+    pub id: Id,
+    pub uuid: String,
+    pub server_id: Id,
+    pub name: String,
+    pub permalink: String,
+    pub html_wrapper: String,
+    pub text_wrapper: Option<String>,
 }
 
 /// A suppression-list entry. Tenant-scoped: lives under RLS in Postgres
