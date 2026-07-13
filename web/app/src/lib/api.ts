@@ -433,6 +433,18 @@ export type Template = {
   html_body: string | null
   text_body: string | null
   archived: boolean
+  layout_id: number | null
+}
+
+// A reusable wrapper around template bodies (logo, address, social links).
+// The HTML wrapper embeds the rendered body via {{{ content }}}.
+export type Layout = {
+  id: number
+  uuid: string
+  name: string
+  permalink: string
+  html_wrapper: string
+  text_wrapper: string | null
 }
 
 // message share links + deliverability insights
@@ -979,6 +991,7 @@ export function serverApi(key: string) {
         subject?: string
         html_body?: string
         text_body?: string
+        layout?: string
       }) => api.post<{ template: Template }>("/api/v2/server/templates", fields, h),
       update: (permalink: string, fields: Record<string, unknown>) =>
         api.patch<{ template: Template }>(`/api/v2/server/templates/${permalink}`, fields, h),
@@ -990,6 +1003,18 @@ export function serverApi(key: string) {
           { template_model: model },
           h,
         ),
+    },
+    layouts: {
+      list: () => api.get<{ layouts: Layout[] }>("/api/v2/server/layouts", h),
+      create: (fields: {
+        name: string
+        html_wrapper: string
+        text_wrapper?: string
+      }) => api.post<{ layout: Layout }>("/api/v2/server/layouts", fields, h),
+      update: (permalink: string, fields: Record<string, unknown>) =>
+        api.patch<{ layout: Layout }>(`/api/v2/server/layouts/${permalink}`, fields, h),
+      delete: (permalink: string) =>
+        api.delete<{ deleted: boolean }>(`/api/v2/server/layouts/${permalink}`, h),
     },
   }
 }

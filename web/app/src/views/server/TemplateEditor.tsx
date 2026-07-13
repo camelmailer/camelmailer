@@ -12,12 +12,19 @@ import { useRouter } from "next/navigation"
 import { useQuery } from "@tanstack/react-query"
 import { ArrowLeftIcon, InfoIcon } from "lucide-react"
 import { toast } from "sonner"
-import { ApiError, serverApi, type Template } from "@/lib/api"
+import { ApiError, serverApi, type Layout, type Template } from "@/lib/api"
 import { renderMustache, sampleModel, extractVariables } from "@/lib/api-p3"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 
@@ -86,6 +93,17 @@ function EditorForm({
   const [subject, setSubject] = useState(existing?.subject ?? "")
   const [htmlBody, setHtmlBody] = useState(existing?.html_body ?? "")
   const [textBody, setTextBody] = useState(existing?.text_body ?? "")
+  // Layout: "" = none; null = untouched (falls back to the template's
+  // stored layout once the layouts list has loaded).
+  const layouts = useQuery({ queryKey: ["sapi-layouts"], queryFn: api.layouts.list })
+  const [layoutChoice, setLayoutChoice] = useState<string | null>(null)
+  const layoutList: Layout[] = useMemo(() => layouts.data?.layouts ?? [], [layouts.data])
+  const layoutPermalink =
+    layoutChoice ??
+    (existing?.layout_id
+      ? (layoutList.find((l) => l.id === existing.layout_id)?.permalink ?? "")
+      : "")
+  const activeLayout = layoutList.find((l) => l.permalink === layoutPermalink) ?? null
   // Envelope fields — preview-only (not persisted; the API has no From /
   // preview-text on a template).
   const [from, setFrom] = useState("hello@yourdomain.com")
@@ -109,8 +127,21 @@ function EditorForm({
   }, [modelText])
 
   const renderedSubject = useMemo(() => renderMustache(subject, model), [subject, model])
-  const renderedHtml = useMemo(() => renderMustache(htmlBody, model), [htmlBody, model])
-  const renderedText = useMemo(() => renderMustache(textBody, model), [textBody, model])
+  // The preview wraps in the chosen layout exactly like the server does at
+  // send time: the wrapper sees the model plus the rendered body as
+  // `content`.
+  const renderedHtml = useMemo(() => {
+    const body = renderMustache(htmlBody, model)
+    if (!body || !activeLayout) return body
+    const scoped = { ...(typeof model === "object" && model !== null ? model : {}), content: body }
+    return renderMustache(activeLayout.html_wrapper, scoped)
+  }, [htmlBody, model, activeLayout])
+  const renderedText = useMemo(() => {
+    const body = renderMustache(textBody, model)
+    if (!body || !activeLayout?.text_wrapper) return body
+    const scoped = { ...(typeof model === "object" && model !== null ? model : {}), content: body }
+    return renderMustache(activeLayout.text_wrapper, scoped)
+  }, [textBody, model, activeLayout])
 
   async function save() {
     setBusy(true)
@@ -121,6 +152,7 @@ function EditorForm({
           subject,
           html_body: htmlBody,
           text_body: textBody,
+          layout: layoutPermalink,
         })
       } else {
         await api.templates.create({
@@ -128,6 +160,7 @@ function EditorForm({
           ...(subject ? { subject } : {}),
           ...(htmlBody ? { html_body: htmlBody } : {}),
           ...(textBody ? { text_body: textBody } : {}),
+          ...(layoutPermalink ? { layout: layoutPermalink } : {}),
         })
       }
       toast.success(existing ? "Template saved" : "Template published")
@@ -192,6 +225,30 @@ function EditorForm({
               />
             </div>
           </div>
+          {layoutList.length > 0 && (
+            <div className="grid gap-1.5">
+              <Label>Layout</Label>
+              <Select
+                value={layoutPermalink === "" ? "none" : layoutPermalink}
+                onValueChange={(value) => setLayoutChoice(value === "none" ? "" : value)}
+              >
+                <SelectTrigger className="w-64">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">No layout</SelectItem>
+                  {layoutList.map((layout) => (
+                    <SelectItem key={layout.id} value={layout.permalink}>
+                      {layout.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                The layout wraps the rendered body with your shared header and footer.
+              </p>
+            </div>
+          )}
           <div className="grid gap-1.5">
             <Label>HTML body</Label>
             <Textarea

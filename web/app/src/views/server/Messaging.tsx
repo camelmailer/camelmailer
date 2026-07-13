@@ -74,6 +74,7 @@ import {
   ApiError,
   serverApi,
   type InsightCheck,
+  type Layout,
   type Message,
   type Template,
 } from "@/lib/api"
@@ -1580,11 +1581,239 @@ function CopyTemplateDialog({
 /// slug badge and Published/Archived status; "New template" and Edit open
 /// the focus-mode split editor (a route), "Start from library" the
 /// gallery-wizard, "Copy to server…" the sibling-server push.
+/// Manage reusable layouts (the shared logo/address/social chrome that
+/// wraps template bodies). A default HTML wrapper seeds a new layout so
+/// the required {{{ content }}} placeholder is never forgotten.
+const DEFAULT_WRAPPER = `<table role="presentation" width="100%" style="background:#f4f4f5;padding:24px 0;font-family:Arial,sans-serif">
+  <tr><td align="center">
+    <table role="presentation" width="560" style="background:#fff;border-radius:12px;overflow:hidden">
+      <tr><td style="padding:24px 32px;font-size:18px;font-weight:700;color:#18181b">{{ product }}</td></tr>
+      <tr><td style="padding:0 32px 24px">{{{ content }}}</td></tr>
+      <tr><td style="padding:20px 32px;font-size:12px;color:#a1a1aa;border-top:1px solid #e4e4e7">
+        Acme GmbH · Camelweg 1 · 10115 Berlin<br>
+        <a href="{{ unsubscribe_url }}" style="color:#71717a">Unsubscribe</a>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>`
+
+function LayoutsDialog({ api, onClose }: { api: Api; onClose: () => void }) {
+  const queryClient = useQueryClient()
+  const layouts = useQuery({ queryKey: ["sapi-layouts"], queryFn: api.layouts.list })
+  const [editing, setEditing] = useState<Layout | "new" | null>(null)
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-layouts"] })
+  const rows = layouts.data?.layouts ?? []
+
+  if (editing) {
+    return (
+      <LayoutEditorDialog
+        api={api}
+        layout={editing === "new" ? null : editing}
+        onClose={() => setEditing(null)}
+        onSaved={() => {
+          invalidate()
+          setEditing(null)
+        }}
+      />
+    )
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Layouts</DialogTitle>
+        </DialogHeader>
+        <p className="text-sm text-muted-foreground">
+          Reusable wrappers for the logo, postal address and social links every mail shares.
+          Templates pick a layout, and it wraps their rendered body.
+        </p>
+        {rows.length === 0 ? (
+          <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
+            No layouts yet. Create one to share branding across templates.
+          </div>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>Slug</TableHead>
+                <TableHead />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((layout) => (
+                <TableRow key={layout.id}>
+                  <TableCell className="font-medium">{layout.name}</TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    {layout.permalink}
+                  </TableCell>
+                  <TableCell className="space-x-2 text-right">
+                    <Button variant="outline" size="sm" onClick={() => setEditing(layout)}>
+                      Edit
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={async () => {
+                        try {
+                          await api.layouts.delete(layout.permalink)
+                          invalidate()
+                        } catch (err) {
+                          errorToast(err, "Could not delete the layout")
+                        }
+                      }}
+                    >
+                      Delete
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Close
+          </Button>
+          <Button onClick={() => setEditing("new")}>
+            <PlusIcon className="size-4" /> New layout
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/// Create/edit one layout: an HTML wrapper (required, must embed
+/// {{{ content }}}) and an optional plain-text wrapper, with a live
+/// preview of a sample body wrapped by it.
+function LayoutEditorDialog({
+  api,
+  layout,
+  onClose,
+  onSaved,
+}: {
+  api: Api
+  layout: Layout | null
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [name, setName] = useState(layout?.name ?? "")
+  const [htmlWrapper, setHtmlWrapper] = useState(layout?.html_wrapper ?? DEFAULT_WRAPPER)
+  const [textWrapper, setTextWrapper] = useState(layout?.text_wrapper ?? "")
+  const [busy, setBusy] = useState(false)
+
+  const hasContent = /\{\{\{\s*content\s*\}\}\}|\{\{&\s*content\s*\}\}/.test(htmlWrapper)
+  const preview = hasContent
+    ? renderMustache(htmlWrapper, {
+        product: "Acme",
+        unsubscribe_url: "#",
+        content: "<p style='margin:0'>Your message body appears here.</p>",
+      })
+    : ""
+
+  async function save() {
+    setBusy(true)
+    try {
+      if (layout) {
+        await api.layouts.update(layout.permalink, {
+          name,
+          html_wrapper: htmlWrapper,
+          text_wrapper: textWrapper,
+        })
+      } else {
+        await api.layouts.create({
+          name,
+          html_wrapper: htmlWrapper,
+          ...(textWrapper ? { text_wrapper: textWrapper } : {}),
+        })
+      }
+      toast.success(layout ? "Layout saved" : "Layout created")
+      onSaved()
+    } catch (err) {
+      errorToast(err, "Could not save the layout")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-4xl">
+        <DialogHeader>
+          <DialogTitle>{layout ? `Edit ${layout.name}` : "New layout"}</DialogTitle>
+        </DialogHeader>
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="grid content-start gap-3">
+            <div className="grid gap-1.5">
+              <Label>Name</Label>
+              <Input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="Brand"
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label>HTML wrapper</Label>
+              <Textarea
+                rows={14}
+                value={htmlWrapper}
+                onChange={(e) => setHtmlWrapper(e.target.value)}
+                className="font-mono text-xs"
+              />
+              {!hasContent && (
+                <p className="text-xs text-red-600 dark:text-red-400">
+                  The wrapper must embed the body with {"{{{ content }}}"} (raw interpolation).
+                </p>
+              )}
+            </div>
+            <div className="grid gap-1.5">
+              <Label>Plain-text wrapper (optional)</Label>
+              <Textarea
+                rows={4}
+                value={textWrapper}
+                onChange={(e) => setTextWrapper(e.target.value)}
+                className="font-mono text-xs"
+                placeholder={"{{& content }}\n--\nAcme GmbH"}
+              />
+            </div>
+          </div>
+          <div className="grid content-start gap-1.5">
+            <Label>Preview</Label>
+            {preview ? (
+              <iframe
+                title="Layout preview"
+                sandbox=""
+                srcDoc={preview}
+                className="h-[60svh] w-full rounded-md border bg-white"
+              />
+            ) : (
+              <p className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
+                Add {"{{{ content }}}"} to see the preview.
+              </p>
+            )}
+          </div>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={save} disabled={busy || !name.trim() || !hasContent}>
+            {busy ? "Saving…" : layout ? "Save" : "Create"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function Templates({ api, org, server }: { api: Api; org: string; server: string }) {
   const router = useRouter()
   const queryClient = useQueryClient()
   const templates = useQuery({ queryKey: ["sapi-templates"], queryFn: api.templates.list })
   const [library, setLibrary] = useState(false)
+  const [layoutsOpen, setLayoutsOpen] = useState(false)
   const [copying, setCopying] = useState<Template | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-templates"] })
 
@@ -1599,6 +1828,9 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
         description="Mustache-style templates ({{ name }}) rendered per send."
         action={
           <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setLayoutsOpen(true)}>
+              <LayersIcon className="size-4" /> Layouts
+            </Button>
             <Button variant="outline" size="sm" onClick={() => setLibrary(true)}>
               <SparklesIcon className="size-4" /> Start from library
             </Button>
@@ -1673,6 +1905,7 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
           onImported={invalidate}
         />
       )}
+      {layoutsOpen && <LayoutsDialog api={api} onClose={() => setLayoutsOpen(false)} />}
       {copying && (
         <CopyTemplateDialog
           org={org}
