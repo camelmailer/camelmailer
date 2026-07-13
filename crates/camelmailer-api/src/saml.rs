@@ -50,8 +50,8 @@ use crate::app::{
 use crate::auth_api::{client_ip, issue_session, user_json};
 use crate::xmldsig;
 
-const NS_PROTOCOL: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
-const NS_ASSERTION: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+pub(crate) const NS_PROTOCOL: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+pub(crate) const NS_ASSERTION: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
 const STATUS_SUCCESS: &str = "urn:oasis:names:tc:SAML:2.0:status:Success";
 const METHOD_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 const NAMEID_EMAIL: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress";
@@ -80,7 +80,7 @@ fn acs_url(state: &ApiState) -> String {
     )
 }
 
-fn xml_escape(value: &str) -> String {
+pub(crate) fn xml_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
@@ -249,15 +249,15 @@ struct AcsForm {
 }
 
 /// Everything extracted from a fully validated SAML response.
-struct ValidatedAssertion {
-    assertion_id: String,
-    in_response_to: String,
-    name_id: Option<String>,
-    name_id_format: Option<String>,
+pub(crate) struct ValidatedAssertion {
+    pub(crate) assertion_id: String,
+    pub(crate) in_response_to: String,
+    pub(crate) name_id: Option<String>,
+    pub(crate) name_id_format: Option<String>,
     /// `(name-or-friendly-name, first value)` pairs, lowercased names.
-    attributes: Vec<(String, String)>,
+    pub(crate) attributes: Vec<(String, String)>,
     /// The assertion's own end of validity — the replay-cache lifetime.
-    not_on_or_after: DateTime<Utc>,
+    pub(crate) not_on_or_after: DateTime<Utc>,
 }
 
 /// `POST /api/v2/auth/saml/acs` — the assertion consumer service.
@@ -381,7 +381,7 @@ async fn saml_acs(
 
 /// Email resolution: NameID in emailAddress format first, then the
 /// common email attributes, then a NameID that merely looks like one.
-fn extract_email(validated: &ValidatedAssertion) -> Option<String> {
+pub(crate) fn extract_email(validated: &ValidatedAssertion) -> Option<String> {
     if validated.name_id_format.as_deref() == Some(NAMEID_EMAIL) {
         if let Some(name_id) = validated.name_id.as_deref().filter(|v| v.contains('@')) {
             return Some(name_id.to_lowercase());
@@ -409,7 +409,10 @@ fn extract_email(validated: &ValidatedAssertion) -> Option<String> {
 
 /// Look an attribute up by its short name (the part after the last `/`
 /// or `:` of the SAML attribute name, lowercased) or its full name.
-fn attribute_value(attributes: &[(String, String)], candidates: &[&str]) -> Option<String> {
+pub(crate) fn attribute_value(
+    attributes: &[(String, String)],
+    candidates: &[&str],
+) -> Option<String> {
     attributes
         .iter()
         .find(|(name, value)| {
@@ -538,7 +541,7 @@ fn parse_instant(value: &str) -> Result<DateTime<Utc>, String> {
 
 /// Validate a decoded SAML response end to end (see the module docs for
 /// the full checklist) and extract the identity it asserts.
-fn validate_response(
+pub(crate) fn validate_response(
     xml: &str,
     public_key: &rsa::RsaPublicKey,
     sp_entity_id: &str,

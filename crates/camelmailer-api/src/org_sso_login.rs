@@ -15,17 +15,20 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::{middleware, Json, Router};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use axum::{middleware, Form, Json, Router};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use camelmailer_core::{
     auth, AuthStore, Id, NewAuthEvent, NewUser, OrgSsoConnection, OrgSsoStore, Role, SsoKind,
     StoreError, User,
 };
 use chrono::{Duration, Utc};
+use flate2::write::DeflateEncoder;
+use flate2::Compression;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::sync::Arc;
 
 use crate::app::{
@@ -165,6 +168,9 @@ pub(crate) async fn org_start(
         Ok(connection) => connection,
         Err(response) => return response,
     };
+    if connection.kind == SsoKind::Saml {
+        return saml_org_start(&state, &auth_store, &start, &headers, &connection).await;
+    }
     // The connection id travels in the opaque state so the single callback
     // knows which connection redeemed it. GitHub does not use PKCE or a
     // nonce; the stored values still guard against CSRF and replay.
@@ -400,17 +406,29 @@ pub(crate) async fn org_callback(
         Err(response) => return response.into_response(),
     };
 
+    complete_login(&state, &auth_store, &start, &headers, &user).await
+}
+
+/// Record the audit event and issue the session — the shared tail of every
+/// tenant login (OIDC family, GitHub, SAML).
+async fn complete_login(
+    state: &Arc<ApiState>,
+    auth_store: &Arc<dyn AuthStore>,
+    start: &RequestStart,
+    headers: &HeaderMap,
+    user: &User,
+) -> Response {
     let _ = auth_store
         .record_auth_event(NewAuthEvent {
             user_id: Some(user.id),
             email_address: Some(user.email_address.clone()),
             event: "sso.login".into(),
-            ip_address: client_ip(&headers),
+            ip_address: client_ip(headers),
             user_agent: None,
         })
         .await;
 
-    match issue_session(&auth_store, &state, &user, &headers).await {
+    match issue_session(auth_store, state, user, headers).await {
         Ok((token, session)) => {
             if let Some(base) = state.config.auth.frontend_url.as_deref() {
                 let url = format!(
@@ -421,17 +439,17 @@ pub(crate) async fn org_callback(
                 return Redirect::temporary(&url).into_response();
             }
             render_success(
-                Some(&start),
+                Some(start),
                 StatusCode::CREATED,
                 json!({
                     "session_token": token,
                     "expires_at": session.expires_at,
-                    "user": user_json(&user),
+                    "user": user_json(user),
                 }),
             )
             .into_response()
         }
-        Err(error) => render_store_error(Some(&start), error).into_response(),
+        Err(error) => render_store_error(Some(start), error).into_response(),
     }
 }
 
@@ -635,6 +653,277 @@ async fn ensure_membership(
     Ok(())
 }
 
+// ----------------------------------------------------------------- SAML
+
+fn org_acs_url(state: &ApiState) -> String {
+    format!(
+        "{}://{}/api/v2/auth/org-sso/acs",
+        state.config.camelmailer.web_protocol, state.config.camelmailer.web_hostname
+    )
+}
+
+/// The SP entity id for a connection: its configured `sp_entity_id`, or
+/// the installation origin (matching the instance-wide default).
+fn sp_entity_for(state: &ApiState, connection: &OrgSsoConnection) -> String {
+    let configured = config_str(&connection.config, "sp_entity_id");
+    if configured.is_empty() {
+        format!(
+            "{}://{}",
+            state.config.camelmailer.web_protocol, state.config.camelmailer.web_hostname
+        )
+    } else {
+        configured
+    }
+}
+
+/// Begin a SAML login for a tenant connection: an AuthnRequest over the
+/// HTTP-Redirect binding, aimed at the connection's IdP. The request id
+/// carries a `_c{connection_id}.` prefix, so the signed `InResponseTo`
+/// later binds the response to this exact connection; RelayState carries
+/// the id for routing before validation.
+async fn saml_org_start(
+    state: &Arc<ApiState>,
+    auth_store: &Arc<dyn AuthStore>,
+    start: &RequestStart,
+    headers: &HeaderMap,
+    connection: &OrgSsoConnection,
+) -> Response {
+    use crate::saml::{xml_escape, NS_ASSERTION, NS_PROTOCOL};
+
+    let idp_sso_url = config_str(&connection.config, "idp_sso_url");
+    if idp_sso_url.is_empty() {
+        return sso_error(Some(start), "this connection has no idp_sso_url").into_response();
+    }
+
+    let request_id = format!("_c{}.{}", connection.id, auth::generate_auth_token());
+    if let Err(error) = auth_store
+        .create_saml_request(
+            &request_id,
+            Utc::now() + Duration::minutes(STATE_TTL_MINUTES),
+        )
+        .await
+    {
+        return render_store_error(Some(start), error).into_response();
+    }
+
+    let authn_request = format!(
+        "<samlp:AuthnRequest xmlns:samlp=\"{NS_PROTOCOL}\" xmlns:saml=\"{NS_ASSERTION}\" \
+         ID=\"{id}\" Version=\"2.0\" IssueInstant=\"{instant}\" Destination=\"{sso}\" \
+         AssertionConsumerServiceURL=\"{acs}\" \
+         ProtocolBinding=\"urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\">\
+         <saml:Issuer>{issuer}</saml:Issuer>\
+         </samlp:AuthnRequest>",
+        id = request_id,
+        instant = Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+        sso = xml_escape(&idp_sso_url),
+        acs = xml_escape(&org_acs_url(state)),
+        issuer = xml_escape(&sp_entity_for(state, connection)),
+    );
+
+    // HTTP-Redirect binding: raw deflate, then base64, then URL-encode.
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    let deflated = encoder
+        .write_all(authn_request.as_bytes())
+        .and_then(|()| encoder.finish());
+    let deflated = match deflated {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return sso_error(
+                Some(start),
+                &format!("could not encode the request: {error}"),
+            )
+            .into_response()
+        }
+    };
+    let separator = if idp_sso_url.contains('?') { '&' } else { '?' };
+    let url = format!(
+        "{idp_sso_url}{separator}SAMLRequest={}&RelayState={}",
+        urlencode(&STANDARD.encode(deflated)),
+        connection.id,
+    );
+
+    let wants_json = headers
+        .get("accept")
+        .and_then(|value| value.to_str().ok())
+        .map(|accept| accept.contains("application/json"))
+        .unwrap_or(false);
+    if wants_json {
+        render_success(
+            Some(start),
+            StatusCode::OK,
+            json!({ "authorization_url": url, "name": connection.name }),
+        )
+        .into_response()
+    } else {
+        Redirect::temporary(&url).into_response()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct OrgAcsForm {
+    #[serde(rename = "SAMLResponse")]
+    saml_response: Option<String>,
+    #[serde(rename = "RelayState")]
+    relay_state: Option<String>,
+}
+
+/// `POST /api/v2/auth/org-sso/acs` — the tenant assertion consumer
+/// service. RelayState routes to the connection whose certificate then
+/// validates the response; the signed `InResponseTo` must carry the same
+/// connection's request prefix, so a response can never be replayed
+/// against a different tenant's connection.
+pub(crate) async fn org_acs(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    headers: HeaderMap,
+    Form(form): Form<OrgAcsForm>,
+) -> Response {
+    use crate::saml::{attribute_value, extract_email, validate_response};
+
+    let (auth_store, sso_store) = match stores(&state, &start) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(connection_id) = form
+        .relay_state
+        .as_deref()
+        .and_then(|value| value.parse::<Id>().ok())
+    else {
+        return sso_error(Some(&start), "missing or malformed RelayState").into_response();
+    };
+    let connection = match load_enabled_connection(&sso_store, &start, connection_id).await {
+        Ok(connection) if connection.kind == SsoKind::Saml => connection,
+        Ok(_) => {
+            return sso_error(Some(&start), "this connection does not speak SAML").into_response()
+        }
+        Err(response) => return response,
+    };
+
+    let Some(encoded) = form.saml_response.filter(|value| !value.is_empty()) else {
+        return sso_error(Some(&start), "missing SAMLResponse parameter").into_response();
+    };
+    let xml = match crate::xmldsig::decode_base64(&encoded).map(String::from_utf8) {
+        Ok(Ok(xml)) => xml,
+        _ => {
+            return sso_error(Some(&start), "SAMLResponse is not valid base64 XML").into_response()
+        }
+    };
+
+    // The connection's own IdP certificate (inline PEM, or a path for
+    // parity with the instance-wide config).
+    let configured = config_str(&connection.config, "idp_certificate");
+    let pem = if configured.contains("-----BEGIN") {
+        configured
+    } else if configured.is_empty() {
+        return sso_error(Some(&start), "this connection has no idp_certificate").into_response();
+    } else {
+        match std::fs::read_to_string(&configured) {
+            Ok(pem) => pem,
+            Err(error) => {
+                return sso_error(
+                    Some(&start),
+                    &format!("could not read idp_certificate {configured:?}: {error}"),
+                )
+                .into_response()
+            }
+        }
+    };
+    let public_key = match crate::xmldsig::public_key_from_certificate_pem(&pem) {
+        Ok(key) => key,
+        Err(message) => return sso_error(Some(&start), &message).into_response(),
+    };
+
+    let now = Utc::now();
+    let validated = match validate_response(
+        &xml,
+        &public_key,
+        &sp_entity_for(&state, &connection),
+        &org_acs_url(&state),
+        now,
+    ) {
+        Ok(validated) => validated,
+        Err(message) => {
+            tracing::warn!(%message, connection = connection.id, "rejected tenant SAML response");
+            return sso_error(Some(&start), &message).into_response();
+        }
+    };
+
+    // The signed InResponseTo must name a request this connection issued …
+    if !validated
+        .in_response_to
+        .starts_with(&format!("_c{}.", connection.id))
+    {
+        return sso_error(
+            Some(&start),
+            "the response does not answer a login request of this connection",
+        )
+        .into_response();
+    }
+    // … that is still outstanding, and each assertion is single use.
+    match auth_store
+        .consume_saml_request(&validated.in_response_to, now)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return sso_error(
+                Some(&start),
+                "the login request is unknown, already used, or has expired",
+            )
+            .into_response()
+        }
+        Err(error) => return render_store_error(Some(&start), error).into_response(),
+    }
+    match auth_store
+        .register_saml_assertion(&validated.assertion_id, validated.not_on_or_after, now)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return sso_error(Some(&start), "this assertion has already been used").into_response()
+        }
+        Err(error) => return render_store_error(Some(&start), error).into_response(),
+    }
+
+    let Some(email) = extract_email(&validated) else {
+        return sso_error(
+            Some(&start),
+            "the assertion carries no email address (NameID or email attribute)",
+        )
+        .into_response();
+    };
+    // The stable subject: the NameID when present, the email otherwise.
+    let uid = validated
+        .name_id
+        .clone()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| email.clone());
+    let name = attribute_value(&validated.attributes, &["displayname", "cn", "name"])
+        .unwrap_or_else(|| {
+            let given = attribute_value(&validated.attributes, &["givenname"]).unwrap_or_default();
+            let surname =
+                attribute_value(&validated.attributes, &["sn", "surname"]).unwrap_or_default();
+            format!("{given} {surname}").trim().to_string()
+        });
+
+    let user = match resolve_org_user(
+        &state,
+        &auth_store,
+        &sso_store,
+        &connection,
+        &uid,
+        &email,
+        &name,
+    )
+    .await
+    {
+        Ok(user) => user,
+        Err(response) => return response.into_response(),
+    };
+
+    complete_login(&state, &auth_store, &start, &headers, &user).await
+}
+
 /// Build the public `/api/v2/auth/org-sso` router.
 pub fn build_org_sso_login_router(state: Arc<ApiState>) -> Router {
     Router::new()
@@ -644,6 +933,7 @@ pub fn build_org_sso_login_router(state: Arc<ApiState>) -> Router {
                 .route("/discover", post(sso_discover))
                 .route("/{connection_id}/start", get(org_start))
                 .route("/callback", get(org_callback))
+                .route("/acs", post(org_acs))
                 .with_state(state),
         )
         .layer(middleware::from_fn(

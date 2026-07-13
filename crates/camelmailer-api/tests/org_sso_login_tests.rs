@@ -460,3 +460,328 @@ async fn a_github_login_provisions_and_joins_the_org() {
         .unwrap()
         .is_some());
 }
+
+// ------------------------------------------------------------------ SAML
+
+const ORG_ACS: &str = "https://postal.example.com/api/v2/auth/org-sso/acs";
+const ORG_AUDIENCE: &str = "https://postal.example.com";
+
+/// Self-signed X.509 certificate for `idp_key()`, as pasted-in PEM.
+fn idp_certificate_pem() -> &'static str {
+    use rsa::pkcs8::EncodePrivateKey;
+    static PEM: OnceLock<String> = OnceLock::new();
+    PEM.get_or_init(|| {
+        let pkcs8 = idp_key().to_pkcs8_der().unwrap();
+        let key_pair = rcgen::KeyPair::try_from(pkcs8.as_bytes()).unwrap();
+        rcgen::CertificateParams::new(vec!["idp.example.com".into()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap()
+            .pem()
+    })
+}
+
+fn instant(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Build a signed SAML response the way the IdP would (the same shape the
+/// instance-wide SAML tests use, pointed at the tenant ACS).
+fn build_saml_response(in_response_to: &str, email: &str) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::sha2::Sha256;
+    use rsa::signature::{SignatureEncoding, Signer};
+    use sha2::Digest;
+
+    let now = chrono::Utc::now();
+    let assertion_id = format!("_a{}", camelmailer_core::auth::generate_auth_token());
+    let assertion_open = format!(
+        "<saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"{assertion_id}\" IssueInstant=\"{}\" Version=\"2.0\">",
+        instant(now),
+    );
+    let issuer = "<saml:Issuer>https://idp.example.com</saml:Issuer>";
+    let body = format!(
+        "<saml:Subject>\
+         <saml:NameID Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">{email}</saml:NameID>\
+         <saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">\
+         <saml:SubjectConfirmationData InResponseTo=\"{irt}\" NotOnOrAfter=\"{nooa}\" Recipient=\"{acs}\"></saml:SubjectConfirmationData>\
+         </saml:SubjectConfirmation>\
+         </saml:Subject>\
+         <saml:Conditions NotBefore=\"{nb}\" NotOnOrAfter=\"{nooa}\">\
+         <saml:AudienceRestriction><saml:Audience>{audience}</saml:Audience></saml:AudienceRestriction>\
+         </saml:Conditions>\
+         <saml:AttributeStatement>\
+         <saml:Attribute Name=\"givenName\"><saml:AttributeValue>Ada</saml:AttributeValue></saml:Attribute>\
+         <saml:Attribute Name=\"sn\"><saml:AttributeValue>Lovelace</saml:AttributeValue></saml:Attribute>\
+         </saml:AttributeStatement>",
+        irt = in_response_to,
+        nb = instant(now - chrono::Duration::minutes(5)),
+        nooa = instant(now + chrono::Duration::minutes(5)),
+        acs = ORG_ACS,
+        audience = ORG_AUDIENCE,
+    );
+    let unsigned_assertion = format!("{assertion_open}{issuer}{body}</saml:Assertion>");
+    let digest = STANDARD.encode(sha2::Sha256::digest(unsigned_assertion.as_bytes()));
+    let signed_info = format!(
+        "<ds:SignedInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
+         <ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"></ds:CanonicalizationMethod>\
+         <ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"></ds:SignatureMethod>\
+         <ds:Reference URI=\"#{assertion_id}\">\
+         <ds:Transforms>\
+         <ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"></ds:Transform>\
+         <ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"></ds:Transform>\
+         </ds:Transforms>\
+         <ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"></ds:DigestMethod>\
+         <ds:DigestValue>{digest}</ds:DigestValue>\
+         </ds:Reference>\
+         </ds:SignedInfo>",
+    );
+    let signing_key = SigningKey::<Sha256>::new(idp_key().clone());
+    let signature = STANDARD.encode(signing_key.sign(signed_info.as_bytes()).to_bytes());
+    let signature_element = format!(
+        "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">{signed_info}\
+         <ds:SignatureValue>{signature}</ds:SignatureValue></ds:Signature>"
+    );
+    let assertion = format!("{assertion_open}{issuer}{signature_element}{body}</saml:Assertion>");
+    format!(
+        "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" \
+         Destination=\"{ORG_ACS}\" ID=\"_r{irt}\" InResponseTo=\"{irt}\" \
+         IssueInstant=\"{}\" Version=\"2.0\">\
+         <samlp:Status><samlp:StatusCode Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"></samlp:StatusCode></samlp:Status>\
+         {assertion}\
+         </samlp:Response>",
+        instant(now),
+        irt = in_response_to,
+    )
+}
+
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+fn percent_decode(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() + 1 => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                index += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+async fn saml_harness() -> Harness {
+    let store = Arc::new(MemoryStore::new());
+    let org = store
+        .create_organization(NewOrganization {
+            name: "Acme".into(),
+            permalink: "acme".into(),
+        })
+        .await
+        .unwrap();
+    let domain = store
+        .create_org_email_domain(NewOrgEmailDomain {
+            organization_id: org.id,
+            domain: "acme.test".into(),
+            verification_token: "tok".into(),
+        })
+        .await
+        .unwrap();
+    store
+        .mark_org_email_domain_verified(domain.id)
+        .await
+        .unwrap();
+    store
+        .create_org_sso_connection(NewOrgSsoConnection {
+            organization_id: org.id,
+            kind: SsoKind::Saml,
+            name: "Acme Okta SAML".into(),
+            enabled: true,
+            config: json!({
+                "idp_sso_url": "https://idp.example.com/sso",
+                "idp_certificate": idp_certificate_pem(),
+            }),
+            default_role: Role::Member,
+            auto_provision: true,
+        })
+        .await
+        .unwrap();
+    let config = camelmailer_config::Config::default();
+    let state = ApiState::full(store.clone(), None, Some(store.clone()), None, config)
+        .with_org_sso_store(store.clone());
+    Harness {
+        app: build_org_sso_login_router(state),
+        store,
+        org_id: org.id,
+    }
+}
+
+async fn post_org_acs(app: &Router, response_xml: &str, relay_state: &str) -> (StatusCode, Value) {
+    use base64::engine::general_purpose::STANDARD;
+    let body = format!(
+        "SAMLResponse={}&RelayState={relay_state}",
+        percent_encode(&STANDARD.encode(response_xml))
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v2/auth/org-sso/acs")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn a_saml_login_provisions_and_joins_the_org() {
+    use base64::engine::general_purpose::STANDARD;
+    use std::io::Read;
+
+    let h = saml_harness().await;
+    let connection_id = h.store.list_org_sso_connections(h.org_id).await.unwrap()[0].id;
+
+    // start: the authorization URL points at the connection's IdP and
+    // carries the connection id as RelayState
+    let (status, body) = get_req(
+        &h.app,
+        &format!("/api/v2/auth/org-sso/{connection_id}/start"),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["data"]["authorization_url"].as_str().unwrap();
+    assert!(
+        url.starts_with("https://idp.example.com/sso?SAMLRequest="),
+        "{url}"
+    );
+    assert!(
+        url.ends_with(&format!("&RelayState={connection_id}")),
+        "{url}"
+    );
+
+    // pull the request id out of the deflated AuthnRequest
+    let encoded = url.split("SAMLRequest=").nth(1).unwrap();
+    let encoded = encoded.split('&').next().unwrap();
+    let deflated = STANDARD.decode(percent_decode(encoded)).unwrap();
+    let mut xml = String::new();
+    flate2::read::DeflateDecoder::new(deflated.as_slice())
+        .read_to_string(&mut xml)
+        .unwrap();
+    assert!(
+        xml.contains(&format!("AssertionConsumerServiceURL=\"{ORG_ACS}\"")),
+        "{xml}"
+    );
+    let request_id = xml
+        .split("ID=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert!(
+        request_id.starts_with(&format!("_c{connection_id}.")),
+        "{request_id}"
+    );
+
+    // a correctly signed response signs the user in and joins the org
+    let response_xml = build_saml_response(request_id, "ada@acme.test");
+    let (status, body) = post_org_acs(&h.app, &response_xml, &connection_id.to_string()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["data"]["user"]["email_address"], "ada@acme.test");
+    assert_eq!(body["data"]["user"]["first_name"], "Ada");
+
+    let user = h
+        .store
+        .user_by_email("ada@acme.test")
+        .await
+        .unwrap()
+        .unwrap();
+    let membership = h
+        .store
+        .membership(h.org_id, user.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(membership.role, Role::Member);
+
+    // replaying the same response is rejected (request already consumed)
+    let (status, body) = post_org_acs(&h.app, &response_xml, &connection_id.to_string()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn a_saml_login_with_an_unverified_email_domain_is_rejected() {
+    use base64::engine::general_purpose::STANDARD;
+    use std::io::Read;
+
+    let h = saml_harness().await;
+    let connection_id = h.store.list_org_sso_connections(h.org_id).await.unwrap()[0].id;
+    let (_, body) = get_req(
+        &h.app,
+        &format!("/api/v2/auth/org-sso/{connection_id}/start"),
+        true,
+    )
+    .await;
+    let url = body["data"]["authorization_url"].as_str().unwrap();
+    let encoded = url
+        .split("SAMLRequest=")
+        .nth(1)
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
+    let deflated = STANDARD.decode(percent_decode(encoded)).unwrap();
+    let mut xml = String::new();
+    flate2::read::DeflateDecoder::new(deflated.as_slice())
+        .read_to_string(&mut xml)
+        .unwrap();
+    let request_id = xml
+        .split("ID=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+
+    let response_xml = build_saml_response(request_id, "mallory@evil.test");
+    let (status, body) = post_org_acs(&h.app, &response_xml, &connection_id.to_string()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(h
+        .store
+        .user_by_email("mallory@evil.test")
+        .await
+        .unwrap()
+        .is_none());
+}
