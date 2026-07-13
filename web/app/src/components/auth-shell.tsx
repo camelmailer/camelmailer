@@ -12,20 +12,21 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 
-/// The warm gradient backdrop. Two blurred glows using the Radiant palette
-/// (#fff3d6 → #f3ab41 → #bb5d20), plus a faint top wash tinted with the
-/// theme's primary so it stays on-brand in both light and dark.
+/// The warm gradient backdrop. Two blurred glows in the brand palette
+/// (Cashmere #FFFDF1 → Butterscotch #FFCE99 → Whiskey #562F00), plus a
+/// faint top wash tinted with the theme's primary so it stays on-brand in
+/// both light and dark.
 function AuthBackdrop() {
   return (
     <div aria-hidden className="pointer-events-none absolute inset-0 -z-10 overflow-hidden">
       <div className="absolute inset-0 bg-gradient-to-b from-primary/[0.05] to-transparent" />
       <div
         className="absolute -top-40 left-1/2 h-[32rem] w-[64rem] -translate-x-1/2 rounded-full opacity-20 blur-3xl dark:opacity-[0.12]"
-        style={{ backgroundImage: "linear-gradient(115deg,#fff3d6 28%,#f3ab41 70%,#bb5d20)" }}
+        style={{ backgroundImage: "linear-gradient(115deg,#FFFDF1 28%,#FFCE99 70%,#562F00)" }}
       />
       <div
         className="absolute right-[-10%] -bottom-32 h-80 w-80 rounded-full opacity-10 blur-3xl dark:opacity-[0.07]"
-        style={{ backgroundImage: "linear-gradient(115deg,#f3ab41,#bb5d20)" }}
+        style={{ backgroundImage: "linear-gradient(115deg,#FFCE99,#562F00)" }}
       />
     </div>
   )
