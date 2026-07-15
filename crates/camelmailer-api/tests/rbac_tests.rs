@@ -1463,3 +1463,87 @@ async fn servers_stats_hides_the_org_from_non_members() {
     assert_eq!(status, StatusCode::NOT_FOUND, "unexpected body: {body}");
     assert_eq!(body["error"]["code"], "NotFound");
 }
+
+// ---------------------------------------------- single-server full 30-day stats
+
+#[tokio::test]
+async fn server_stats_returns_full_counters_for_one_server() {
+    let h = harness_with_server_store().await;
+    let org = h.org("Acme").await;
+    let owner = h.member(&org, "owner@acme.test", Role::Owner).await;
+
+    let alpha = h
+        .store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "Alpha".into(),
+            permalink: "alpha".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    // Two outgoing (one bounced) and one incoming message.
+    seed_message(&h.store, alpha.id, MessageScope::Outgoing);
+    let bounced = seed_message(&h.store, alpha.id, MessageScope::Outgoing);
+    h.store.set_message_status(bounced, "Bounced");
+    seed_message(&h.store, alpha.id, MessageScope::Incoming);
+
+    let token = h.login(&owner.email_address).await;
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers/alpha/stats",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+
+    let stats = &body["data"]["stats"];
+    assert_eq!(stats["total"], 3);
+    assert_eq!(stats["outgoing"], 2);
+    assert_eq!(stats["incoming"], 1);
+    assert_eq!(stats["bounced"], 1);
+    // The full serialization exposes the detailed fields the servers-table
+    // aggregate omits (engagement + a nested bounces breakdown).
+    assert!(stats["sent"].is_number());
+    assert!(stats["held"].is_number());
+    assert!(stats["soft_fail"].is_number());
+    assert!(stats["hard_fail"].is_number());
+    assert!(stats["opens"].is_number());
+    assert!(stats["unique_opens"].is_number());
+    assert!(stats["clicks"].is_number());
+    assert!(stats["unique_clicks"].is_number());
+    assert!(stats["bounces"]["hard"].is_number());
+    assert!(stats["bounces"]["soft"].is_number());
+    assert!(stats["bounces"]["undetermined"].is_number());
+}
+
+#[tokio::test]
+async fn server_stats_hides_the_org_from_non_members() {
+    let h = harness_with_server_store().await;
+    let org = h.org("Acme").await;
+    h.store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "Alpha".into(),
+            permalink: "alpha".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    // A user who is not a member of Acme.
+    let outsider = h.user("outsider@example.test", false).await;
+
+    let token = h.login(&outsider.email_address).await;
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers/alpha/stats",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected body: {body}");
+    assert_eq!(body["error"]["code"], "NotFound");
+}

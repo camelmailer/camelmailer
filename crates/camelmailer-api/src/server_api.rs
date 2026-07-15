@@ -819,13 +819,13 @@ async fn message_insights(
 /// Query params for `GET /stats`: an optional `created_at` time window
 /// plus an optional tag to scope every counter to.
 #[derive(Debug, Deserialize, Default)]
-struct StatsParams {
-    from: Option<chrono::DateTime<chrono::Utc>>,
-    to: Option<chrono::DateTime<chrono::Utc>>,
-    tag: Option<String>,
+pub(crate) struct StatsParams {
+    pub(crate) from: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) to: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) tag: Option<String>,
 }
 
-fn stats_json(stats: &camelmailer_core::MessageStats) -> Value {
+pub(crate) fn stats_json(stats: &camelmailer_core::MessageStats) -> Value {
     json!({
         "total": stats.total,
         "incoming": stats.incoming,

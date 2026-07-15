@@ -1009,6 +1009,50 @@ async fn servers_stats(
     render_success(Some(&start.0), StatusCode::OK, json!({ "stats": stats }))
 }
 
+/// `GET /organizations/{permalink}/servers/{server_permalink}/stats` — the
+/// full 30-day (windowed) message + engagement counters for a single server,
+/// for the admin dashboard's detailed delivery/bounce/engagement view. RBAC
+/// is a read any org member may perform (Viewer), enforced centrally by
+/// [`auth_middleware`]; non-members get 404. Optional `from`/`to` RFC3339
+/// query params scope the window; without `from` it defaults to the last 30
+/// days. The JSON shape is identical to `GET /api/v2/server/stats` — it reuses
+/// the same [`crate::server_api::stats_json`] serialization.
+async fn server_stats_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org_permalink, server_permalink)): Path<(String, String)>,
+    Query(params): Query<crate::server_api::StatsParams>,
+) -> ApiResponse {
+    let server = match find_server(&state, &org_permalink, &server_permalink).await {
+        Ok(Some(server)) => server,
+        Ok(None) => return render_not_found(Some(&start.0)),
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    let Some(server_store) = state.server_store.as_ref() else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "StorageUnavailable",
+            "Per-server statistics storage is not configured",
+        );
+    };
+    let filter = camelmailer_core::StatsFilter {
+        from: params
+            .from
+            .or_else(|| Some(chrono::Utc::now() - chrono::Duration::days(30))),
+        to: params.to,
+        tag: params.tag.filter(|t| !t.is_empty()),
+    };
+    match server_store.message_stats(server.id, &filter).await {
+        Ok(stats) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "stats": crate::server_api::stats_json(&stats) }),
+        ),
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateServer {
     name: Option<String>,
@@ -1409,6 +1453,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/ip_pool",
             axum::routing::post(servers_set_ip_pool),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/stats",
+            get(server_stats_show),
         )
         .route(
             "/admin_api_keys",
