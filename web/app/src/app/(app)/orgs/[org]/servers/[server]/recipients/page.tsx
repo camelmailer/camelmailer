@@ -9,5 +9,5 @@ import { useOrgParams } from "@/lib/params"
 
 export default function Page() {
   const { org, server } = useOrgParams()
-  redirect(`/orgs/${org}/servers/${server}/messaging/messages`)
+  redirect(`/orgs/${org}/servers/${server}/messaging`)
 }

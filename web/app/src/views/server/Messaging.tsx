@@ -4,11 +4,19 @@
 // (`X-Server-API-Key`). The key is picked from the server's API
 // credentials — no credential, no messaging.
 
-import { createContext, useContext, useEffect, useMemo, useState } from "react"
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from "react"
 import Link from "next/link"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { type ColumnDef } from "@tanstack/react-table"
-import { usePathname, useRouter } from "next/navigation"
+import { useRouter } from "next/navigation"
 import {
   ChevronRightIcon,
   CircleCheckIcon,
@@ -22,6 +30,7 @@ import {
   RefreshCwIcon,
   ScrollTextIcon,
   SearchIcon,
+  SendIcon,
   SparklesIcon,
   TriangleAlertIcon,
 } from "lucide-react"
@@ -32,12 +41,7 @@ import { FormDialog } from "@/components/form-dialog"
 import { MessagePill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
 import {
   Dialog,
   DialogContent,
@@ -63,6 +67,8 @@ import {
 import { DataTable } from "@/components/ui/data-table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
+import { Switch } from "@/components/ui/switch"
+import { cn } from "@/lib/utils"
 import {
   adminApi,
   ApiError,
@@ -82,9 +88,19 @@ import {
   type ParsedEmail,
 } from "@/lib/api-p1"
 import { recipientHref } from "@/lib/api-p2"
-import { renderMustache, sampleModel, TEMPLATE_LIBRARY, type LibraryTemplate } from "@/lib/api-p3"
+import {
+  extractVariables,
+  renderMustache,
+  sampleModel,
+  sampleValue,
+  TEMPLATE_LIBRARY,
+  type LibraryTemplate,
+} from "@/lib/api-p3"
 import { StatusPill } from "@/components/status-pill"
 import { useOrgParams } from "@/lib/params"
+// Standalone import (kept off the contended lucide block above): the
+// back-arrow used by the message detail page's "All messages" link.
+import { ArrowLeftIcon } from "lucide-react"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -96,26 +112,389 @@ type Api = ReturnType<typeof serverApi>
 
 // ---------------------------------------------------------------- send
 
-export function Send({ api }: { api: Api }) {
-  const [from, setFrom] = useState("")
-  const [to, setTo] = useState("")
+// The Messaging landing page: the activity list, with a "Send a message"
+// CTA (top-right) that opens the send form in a dialog.
+export function MessagingHome({ api }: { api: Api }) {
+  const { org, server } = useOrgParams()
+  return (
+    <div>
+      <PageHeader
+        title="Messaging"
+        description="Every message this server has sent and received."
+        action={<SendMessageButton org={org} server={server} />}
+      />
+      <Messages api={api} />
+    </div>
+  )
+}
+
+// A self-contained "Send a message" launcher: the button plus the send
+// form in a dialog — the same lightbox on every server screen. It brings
+// its own messaging API context, so it drops in anywhere (the Messaging
+// page, an empty state, a recipient view) given just org + server.
+export function SendMessageButton({
+  org,
+  server,
+  variant,
+  size = "sm",
+  className,
+  label = "Send a message",
+  defaultTo,
+}: {
+  org: string
+  server: string
+  variant?: ComponentProps<typeof Button>["variant"]
+  size?: ComponentProps<typeof Button>["size"]
+  className?: string
+  label?: ReactNode
+  defaultTo?: string
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <Button
+        variant={variant}
+        size={size}
+        className={className}
+        onClick={() => setOpen(true)}
+      >
+        <SendIcon className="size-4" /> {label}
+      </Button>
+      <SendMessageDialog
+        org={org}
+        server={server}
+        open={open}
+        onOpenChange={setOpen}
+        defaultTo={defaultTo}
+      />
+    </>
+  )
+}
+
+// The send form in a dialog, controlled by the caller. Self-contained:
+// wraps the form in its own messaging API context so it needs no wiring.
+// `defaultTo` pre-fills the recipient (e.g. opened from a recipient view).
+export function SendMessageDialog({
+  org,
+  server,
+  open,
+  onOpenChange,
+  defaultTo,
+}: {
+  org: string
+  server: string
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  defaultTo?: string
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Send a message</DialogTitle>
+        </DialogHeader>
+        <MessagingApiProvider org={org} server={server}>
+          <SendBound
+            org={org}
+            server={server}
+            defaultTo={defaultTo}
+            onSent={() => onOpenChange(false)}
+          />
+        </MessagingApiProvider>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function SendBound({
+  org,
+  server,
+  defaultTo,
+  onSent,
+}: {
+  org: string
+  server: string
+  defaultTo?: string
+  onSent?: () => void
+}) {
+  const api = useMessagingApi()
+  return <Send api={api} org={org} server={server} defaultTo={defaultTo} onSent={onSent} />
+}
+
+// A message has settled once it is delivered, held, or has failed —
+// until then the delivery flow keeps polling.
+function messageTerminal(message: Message | undefined): boolean {
+  if (!message) return false
+  if (message.held) return true
+  if (message.status === "Sent") return true
+  return (
+    message.status === "Bounced" || message.status === "HardFail" || message.bounce === true
+  )
+}
+
+// The post-send view inside the dialog: instead of closing, we show what
+// happened to the message — the recipients it went to, and each delivery
+// attempt as the worker processes it, including the failure reason if the
+// receiving server rejected it. Polls until the message settles.
+function SentFlow({
+  api,
+  org,
+  server,
+  messageId,
+  recipients,
+  onReset,
+  onClose,
+}: {
+  api: Api
+  org: string
+  server: string
+  messageId: number
+  recipients: string[]
+  onReset: () => void
+  onClose?: () => void
+}) {
+  const messageQuery = useQuery({
+    queryKey: ["sapi-message", messageId],
+    queryFn: () => api.message(messageId),
+    refetchInterval: (query) =>
+      messageTerminal(query.state.data?.message) ? false : 2500,
+  })
+  const message = messageQuery.data?.message
+  const isDelivered = !!message && message.status === "Sent" && !message.held
+  const isFailed =
+    !!message &&
+    (message.status === "Bounced" || message.status === "HardFail" || message.bounce === true)
+  const isHeld = message?.held === true
+  const isTerminal = isDelivered || isFailed || isHeld
+
+  const deliveriesQuery = useQuery({
+    queryKey: ["sapi-deliveries", messageId],
+    queryFn: () => api.deliveries(messageId),
+    refetchInterval: isTerminal ? false : 2500,
+  })
+  const deliveries = deliveriesQuery.data?.deliveries ?? []
+
+  const tone = isFailed ? "failed" : isDelivered ? "ok" : isHeld ? "held" : "pending"
+  const StatusIcon = tone === "ok" ? CircleCheckIcon : tone === "pending" ? RefreshCwIcon : TriangleAlertIcon
+  const iconClass =
+    tone === "ok"
+      ? "text-emerald-600"
+      : tone === "failed"
+        ? "text-red-600"
+        : tone === "held"
+          ? "text-amber-600"
+          : "text-muted-foreground animate-spin"
+  const headline =
+    tone === "ok"
+      ? "Message delivered"
+      : tone === "failed"
+        ? "Delivery failed"
+        : tone === "held"
+          ? "Held for review"
+          : "Message queued"
+  const subline =
+    tone === "ok"
+      ? "The receiving server accepted the message."
+      : tone === "failed"
+        ? "The receiving server rejected the message — see the attempt below."
+        : tone === "held"
+          ? "The message was held and needs review before it can be delivered."
+          : "Queued for delivery. This updates automatically as it goes out."
+
+  return (
+    <div className="grid gap-4">
+      <div className="flex items-start gap-3 rounded-lg border p-4">
+        <StatusIcon className={cn("mt-0.5 size-5 shrink-0", iconClass)} />
+        <div className="min-w-0">
+          <p className="font-medium">{headline}</p>
+          <p className="text-sm text-muted-foreground">{subline}</p>
+        </div>
+      </div>
+
+      {recipients.length > 0 && (
+        <div className="grid gap-2">
+          <Label>Recipients</Label>
+          <ul className="grid gap-1.5">
+            {recipients.map((address) => (
+              <li key={address} className="flex items-center justify-between gap-2 text-sm">
+                <span className="truncate">{address}</span>
+                {message ? (
+                  <MessagePill message={message} />
+                ) : (
+                  <Badge variant="outline">Queued</Badge>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div className="grid gap-2">
+        <div className="flex items-center gap-2">
+          <Label>Delivery attempts</Label>
+          {!isTerminal && (
+            <RefreshCwIcon className="size-3.5 animate-spin text-muted-foreground" />
+          )}
+        </div>
+        {deliveries.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            {isTerminal
+              ? "No delivery attempts were recorded."
+              : "Waiting for the delivery worker to pick this up…"}
+          </p>
+        ) : (
+          <div className="grid gap-2">
+            {deliveries.map((delivery) => (
+              <div key={delivery.id} className="rounded-md border p-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <MessagePill message={{ status: delivery.status, held: false }} />
+                  <span className="text-muted-foreground">{formatDate(delivery.timestamp)}</span>
+                  {delivery.sent_with_ssl && <Badge variant="outline">TLS</Badge>}
+                </div>
+                {delivery.details && <p className="mt-1.5">{delivery.details}</p>}
+                {delivery.output && (
+                  <pre className="mt-1.5 overflow-x-auto rounded bg-muted p-2 font-mono">
+                    {delivery.output}
+                  </pre>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2">
+        <Button variant="outline" onClick={onReset}>
+          <SendIcon className="size-4" /> Send another
+        </Button>
+        <Button asChild variant="ghost">
+          <Link href={`/orgs/${org}/servers/${server}/messaging/${messageId}`}>View details</Link>
+        </Button>
+        {onClose && (
+          <Button className="ml-auto" onClick={onClose}>
+            Done
+          </Button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export function Send({
+  api,
+  org,
+  server,
+  defaultTo = "",
+  onSent,
+}: {
+  api: Api
+  org: string
+  server: string
+  defaultTo?: string
+  onSent?: () => void
+}) {
+  // You can only send from a verified identity: a confirmed sender
+  // address, or any local part on a verified domain.
+  const senders = useQuery({
+    queryKey: ["senders", org, server],
+    queryFn: () => adminApi.senderAddresses(org, server).list(),
+  })
+  const domainsQuery = useQuery({
+    queryKey: ["domains", org, server],
+    queryFn: () => adminApi.domains(org, server).list(),
+  })
+  const confirmedSenders = (senders.data?.sender_addresses ?? []).filter(
+    (s) => s.verified || s.status === "confirmed",
+  )
+  const verifiedDomains = (domainsQuery.data?.domains ?? []).filter((d) => d.verified)
+
+  // The From picker holds either `addr:<email>` (a ready-made sender
+  // address) or `domain:<name>` (compose a custom local part on a
+  // verified domain); `from` is derived from the two.
+  const [fromChoice, setFromChoice] = useState("")
+  const [fromLocal, setFromLocal] = useState("")
+  const fromDomain = fromChoice.startsWith("domain:") ? fromChoice.slice("domain:".length) : null
+  const from = fromChoice.startsWith("addr:")
+    ? fromChoice.slice("addr:".length)
+    : fromDomain && fromLocal.trim()
+      ? `${fromLocal.trim()}@${fromDomain}`
+      : ""
+
+  const [to, setTo] = useState(defaultTo)
   const [subject, setSubject] = useState("")
   const [textBody, setTextBody] = useState("")
   const [htmlBody, setHtmlBody] = useState("")
+  const [htmlMode, setHtmlMode] = useState(false)
+
   const [templatePermalink, setTemplatePermalink] = useState("none")
-  const [templateModel, setTemplateModel] = useState("{}")
-  const [result, setResult] = useState<string | null>(null)
   const templates = useQuery({ queryKey: ["sapi-templates"], queryFn: api.templates.list })
+  const activeTemplate = templates.data?.templates.find((t) => t.permalink === templatePermalink)
+  const templateVars = useMemo(
+    () =>
+      activeTemplate
+        ? extractVariables(
+            activeTemplate.subject,
+            activeTemplate.html_body,
+            activeTemplate.text_body,
+          )
+        : [],
+    [activeTemplate],
+  )
+
+  // The template model, filled through one form field per variable — or
+  // as raw JSON in expert mode.
+  const [modelFields, setModelFields] = useState<Record<string, string>>({})
+  const [expertModel, setExpertModel] = useState(false)
+  const [modelJson, setModelJson] = useState("{}")
+
+  // Start from a clean model whenever the selected template changes.
+  useEffect(() => {
+    setModelFields({})
+    setExpertModel(false)
+    setModelJson("{}")
+  }, [templatePermalink])
+
+  // Toggling expert mode carries the values across: fields → JSON on the
+  // way in, best-effort JSON → fields on the way out.
+  function toggleExpertModel(on: boolean) {
+    if (on) {
+      setModelJson(JSON.stringify(modelFields, null, 2))
+    } else {
+      try {
+        const parsed = JSON.parse(modelJson || "{}")
+        if (parsed && typeof parsed === "object") {
+          setModelFields(
+            Object.fromEntries(
+              Object.entries(parsed as Record<string, unknown>).map(([k, v]) => [
+                k,
+                typeof v === "string" ? v : JSON.stringify(v),
+              ]),
+            ),
+          )
+        }
+      } catch {
+        // Unparseable JSON — keep the fields as they were.
+      }
+    }
+    setExpertModel(on)
+  }
+
+  // After a successful send we keep the dialog open and switch to the
+  // delivery flow (below) instead of closing.
+  const queryClient = useQueryClient()
+  const [sent, setSent] = useState<{ messageId: number; recipients: string[] } | null>(null)
 
   const send = useMutation({
     mutationFn: async () => {
       const recipients = to.split(",").map((address) => address.trim()).filter(Boolean)
       if (templatePermalink !== "none") {
-        let model: unknown = {}
-        try {
-          model = JSON.parse(templateModel || "{}")
-        } catch {
-          throw new ApiError("ValidationError", "The template model is not valid JSON", 422)
+        let model: unknown = modelFields
+        if (expertModel) {
+          try {
+            model = JSON.parse(modelJson || "{}")
+          } catch {
+            throw new ApiError("ValidationError", "The template model is not valid JSON", 422)
+          }
         }
         return api.sendWithTemplate({
           from,
@@ -129,86 +508,210 @@ export function Send({ api }: { api: Api }) {
         to: recipients,
         subject,
         ...(textBody ? { text_body: textBody } : {}),
-        ...(htmlBody ? { html_body: htmlBody } : {}),
+        ...(htmlMode && htmlBody ? { html_body: htmlBody } : {}),
       })
     },
     onSuccess: (data) => {
-      setResult(`Queued as message #${(data as { message_id: number }).message_id}`)
+      const messageId = (data as { message_id: number }).message_id
+      const recipients = to.split(",").map((address) => address.trim()).filter(Boolean)
+      setSent({ messageId, recipients })
       toast.success("Message queued")
+      // The activity list, recipient history and stats behind the dialog
+      // are now stale — refresh them so the new message shows up.
+      queryClient.invalidateQueries({ queryKey: ["sapi-messages"] })
+      queryClient.invalidateQueries({ queryKey: ["recipient-messages"] })
+      queryClient.invalidateQueries({ queryKey: ["sapi-stats"] })
     },
     onError: (err) => errorToast(err, "Sending failed"),
   })
 
+  const identityLoading = senders.isLoading || domainsQuery.isLoading
+  const hasIdentity = confirmedSenders.length > 0 || verifiedDomains.length > 0
+  const canSend = from.includes("@") && to.includes("@")
+
+  // Sent: hand off to the live delivery flow.
+  if (sent) {
+    return (
+      <SentFlow
+        api={api}
+        org={org}
+        server={server}
+        messageId={sent.messageId}
+        recipients={sent.recipients}
+        onClose={onSent}
+        onReset={() => {
+          setSent(null)
+          setTo("")
+          setSubject("")
+          setTextBody("")
+          setHtmlBody("")
+          setHtmlMode(false)
+          setTemplatePermalink("none")
+        }}
+      />
+    )
+  }
+
   return (
-    <Card className="max-w-2xl">
-      <CardHeader>
-        <CardTitle className="text-base">Send a message</CardTitle>
-      </CardHeader>
-      <CardContent className="grid gap-4">
-        <div className="grid grid-cols-2 gap-2">
-          <div className="grid gap-2">
-            <Label>From</Label>
-            <Input value={from} onChange={(e) => setFrom(e.target.value)} placeholder="hello@yourdomain.com" />
-          </div>
-          <div className="grid gap-2">
-            <Label>To (comma-separated)</Label>
-            <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder="a@x.com, b@y.com" />
-          </div>
-        </div>
-        <div className="grid gap-2">
-          <Label>Template (optional)</Label>
-          <Select value={templatePermalink} onValueChange={setTemplatePermalink}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="none">No template (compose below)</SelectItem>
-              {templates.data?.templates
-                .filter((template) => !template.archived)
-                .map((template) => (
-                  <SelectItem key={template.id} value={template.permalink}>
-                    {template.name}
-                  </SelectItem>
-                ))}
-            </SelectContent>
-          </Select>
-        </div>
-        {templatePermalink === "none" ? (
-          <>
-            <div className="grid gap-2">
-              <Label>Subject</Label>
-              <Input value={subject} onChange={(e) => setSubject(e.target.value)} />
-            </div>
-            <div className="grid gap-2">
-              <Label>Text body</Label>
-              <Textarea rows={5} value={textBody} onChange={(e) => setTextBody(e.target.value)} />
-            </div>
-            <div className="grid gap-2">
-              <Label>HTML body (optional)</Label>
-              <Textarea rows={5} value={htmlBody} onChange={(e) => setHtmlBody(e.target.value)} />
-            </div>
-          </>
-        ) : (
-          <div className="grid gap-2">
-            <Label>Template model (JSON)</Label>
-            <Textarea
-              rows={5}
-              value={templateModel}
-              onChange={(e) => setTemplateModel(e.target.value)}
-              className="font-mono text-xs"
+    <div className="grid gap-4">
+      {!hasIdentity && !identityLoading && (
+        <p className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+          You need a verified domain or sender address before you can send.{" "}
+          <Link
+            href={`/orgs/${org}/servers/${server}/domains`}
+            className="font-medium text-foreground underline underline-offset-2"
+          >
+            Verify a domain
+          </Link>
+          .
+        </p>
+      )}
+
+      <div className="grid gap-2">
+        <Label>From</Label>
+        <Select
+          value={fromChoice}
+          onValueChange={(value) => {
+            setFromChoice(value)
+            setFromLocal("")
+          }}
+        >
+          <SelectTrigger>
+            <SelectValue placeholder="Choose a verified address" />
+          </SelectTrigger>
+          <SelectContent>
+            {confirmedSenders.map((sender) => (
+              <SelectItem key={`addr:${sender.email_address}`} value={`addr:${sender.email_address}`}>
+                {sender.email_address}
+              </SelectItem>
+            ))}
+            {verifiedDomains.map((domain) => (
+              <SelectItem key={`domain:${domain.name}`} value={`domain:${domain.name}`}>
+                Custom address on @{domain.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {fromDomain && (
+          <div className="flex items-center gap-2">
+            <Input
+              value={fromLocal}
+              onChange={(e) => setFromLocal(e.target.value)}
+              placeholder="hello"
+              className="max-w-[12rem]"
             />
+            <span className="text-sm text-muted-foreground">@{fromDomain}</span>
           </div>
         )}
-        {result && <p className="text-sm text-muted-foreground">{result}</p>}
-        <Button
-          className="justify-self-start"
-          onClick={() => send.mutate()}
-          disabled={send.isPending || !from.includes("@") || !to.includes("@")}
-        >
-          {send.isPending ? "Sending…" : "Send"}
-        </Button>
-      </CardContent>
-    </Card>
+      </div>
+
+      <div className="grid gap-2">
+        <Label>To</Label>
+        <Input
+          value={to}
+          onChange={(e) => setTo(e.target.value)}
+          placeholder="recipient@example.com, another@example.com"
+        />
+        <p className="text-xs text-muted-foreground">Separate multiple recipients with commas.</p>
+      </div>
+
+      <div className="grid gap-2">
+        <Label>Template</Label>
+        <Select value={templatePermalink} onValueChange={setTemplatePermalink}>
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="none">No template — compose below</SelectItem>
+            {templates.data?.templates
+              .filter((template) => !template.archived)
+              .map((template) => (
+                <SelectItem key={template.id} value={template.permalink}>
+                  {template.name}
+                </SelectItem>
+              ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {templatePermalink === "none" ? (
+        <>
+          <div className="grid gap-2">
+            <Label>Subject</Label>
+            <Input value={subject} onChange={(e) => setSubject(e.target.value)} />
+          </div>
+          <div className="grid gap-2">
+            <Label>Text body</Label>
+            <Textarea rows={6} value={textBody} onChange={(e) => setTextBody(e.target.value)} />
+          </div>
+          <div className="flex items-center justify-between rounded-md border p-3">
+            <div className="grid gap-0.5">
+              <Label htmlFor="html-mode">Send HTML email (expert mode)</Label>
+              <p className="text-xs text-muted-foreground">
+                Add a hand-written HTML body alongside the plain text.
+              </p>
+            </div>
+            <Switch id="html-mode" checked={htmlMode} onCheckedChange={setHtmlMode} />
+          </div>
+          {htmlMode && (
+            <div className="grid gap-2">
+              <Label>HTML body</Label>
+              <Textarea
+                rows={8}
+                value={htmlBody}
+                onChange={(e) => setHtmlBody(e.target.value)}
+                className="font-mono text-xs"
+              />
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="grid gap-3">
+          <div className="flex items-center justify-between">
+            <Label>Template variables</Label>
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              Edit as JSON (expert mode)
+              <Switch checked={expertModel} onCheckedChange={toggleExpertModel} />
+            </label>
+          </div>
+          {expertModel ? (
+            <Textarea
+              rows={8}
+              value={modelJson}
+              onChange={(e) => setModelJson(e.target.value)}
+              className="font-mono text-xs"
+            />
+          ) : templateVars.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              This template has no variables — nothing to fill in.
+            </p>
+          ) : (
+            <div className="grid gap-3">
+              {templateVars.map((name) => (
+                <div key={name} className="grid gap-1.5">
+                  <Label className="font-mono text-xs">{`{{ ${name} }}`}</Label>
+                  <Input
+                    value={modelFields[name] ?? ""}
+                    onChange={(e) =>
+                      setModelFields((prev) => ({ ...prev, [name]: e.target.value }))
+                    }
+                    placeholder={sampleValue(name)}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <Button
+        className="justify-self-start"
+        onClick={() => send.mutate()}
+        disabled={send.isPending || !canSend}
+      >
+        {send.isPending ? "Sending…" : "Send message"}
+      </Button>
+    </div>
   )
 }
 
@@ -537,8 +1040,11 @@ function initialTab(fallback: string): string {
   return new URLSearchParams(window.location.search).get("tab") || fallback
 }
 
-/// Message detail dialog — also reused by the recipient-detail view.
-export function MessageDetail({ api, id, onClose }: { api: Api; id: number; onClose: () => void }) {
+/// The rich message-detail content — metadata grid, lifecycle timeline
+/// and the Preview / Plain Text / HTML / Raw / Insights tabs. It owns all
+/// the per-message queries and reads everything from the message id, so it
+/// drops straight into the detail page below.
+function MessageDetailBody({ api, id }: { api: Api; id: number }) {
   const p1 = useMessagingApiP1()
   const message = useQuery({ queryKey: ["sapi-message", id], queryFn: () => api.message(id) })
   const deliveries = useQuery({
@@ -564,7 +1070,6 @@ export function MessageDetail({ api, id, onClose }: { api: Api; id: number; onCl
   const privacyMode =
     raw.error instanceof ApiError && raw.error.code === "NotAvailable"
 
-  const [sharing, setSharing] = useState(false)
   const [tab, setTab] = useState(() => initialTab("preview"))
 
   // Reflect the active tab in the URL for a shareable deep link.
@@ -583,138 +1088,177 @@ export function MessageDetail({ api, id, onClose }: { api: Api; id: number; onCl
   const replyTo = parsed?.headers["reply-to"] ?? null
   const attachments = parsed?.attachments ?? []
 
+  if (!m) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        {message.isLoading ? "Loading…" : "This message could not be loaded."}
+      </p>
+    )
+  }
+
   return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-3xl">
-        <DialogHeader>
-          <div className="flex items-start justify-between gap-2 pr-6">
-            <div className="min-w-0">
-              <DialogTitle className="truncate">{m?.subject || `Message #${id}`}</DialogTitle>
-              <p className="mt-0.5 flex items-center gap-1.5 text-sm text-muted-foreground">
-                To {m?.rcpt_to ?? "…"} {m && <MessagePill message={m} />}
+    <div className="space-y-4">
+      <div className="grid grid-cols-[5.5rem_1fr] gap-x-3 gap-y-1.5 text-sm sm:grid-cols-[5.5rem_1fr_5.5rem_1fr]">
+        <MetaRow label="From" value={m.mail_from} />
+        <MetaRow label="Subject" value={m.subject} />
+        <MetaRow label="To" value={m.rcpt_to} />
+        <MetaRow label="ID" value={m.message_id ?? String(m.id)} copy />
+        <MetaRow label="Reply-To" value={replyTo} />
+        <MetaRow
+          label="Attach."
+          value={
+            attachments.length
+              ? attachments.map((a) => a.filename ?? a.contentType).join(", ")
+              : "None"
+          }
+        />
+      </div>
+
+      <div className="rounded-md border bg-muted/30 px-2">
+        <EventTimeline
+          message={m}
+          deliveries={deliveries.data?.deliveries ?? []}
+          opens={opens.data?.opens ?? []}
+          clicks={clicks.data?.clicks ?? []}
+        />
+      </div>
+
+      <Tabs value={tab} onValueChange={setTab}>
+        <TabsList className="mb-2 flex-wrap">
+          <TabsTrigger value="preview">Preview</TabsTrigger>
+          <TabsTrigger value="text">Plain Text</TabsTrigger>
+          <TabsTrigger value="html">HTML</TabsTrigger>
+          <TabsTrigger value="raw">Raw</TabsTrigger>
+          <TabsTrigger value="insights">
+            Insights
+            {warnings > 0 && (
+              <Badge variant="destructive" className="ml-1 px-1.5">
+                {warnings}
+              </Badge>
+            )}
+          </TabsTrigger>
+        </TabsList>
+
+        <div>
+          <TabsContent value="preview">
+            {privacyMode ? (
+              <PrivacyNote />
+            ) : html ? (
+              <iframe
+                title="Message preview"
+                sandbox=""
+                srcDoc={html}
+                className="h-[60svh] w-full rounded-md border bg-white"
+              />
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {raw.isLoading ? "Loading…" : "No HTML part to preview."}
               </p>
-            </div>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" aria-label="Message actions">
-                  <MoreVerticalIcon className="size-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => setSharing(true)}>Share email…</DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-        </DialogHeader>
-        {m && (
-          <div className="space-y-4">
-            <div className="grid grid-cols-[5.5rem_1fr] gap-x-3 gap-y-1.5 text-sm sm:grid-cols-[5.5rem_1fr_5.5rem_1fr]">
-              <MetaRow label="From" value={m.mail_from} />
-              <MetaRow label="Subject" value={m.subject} />
-              <MetaRow label="To" value={m.rcpt_to} />
-              <MetaRow label="ID" value={m.message_id ?? String(m.id)} copy />
-              <MetaRow label="Reply-To" value={replyTo} />
-              <MetaRow
-                label="Attach."
-                value={
-                  attachments.length
-                    ? attachments.map((a) => a.filename ?? a.contentType).join(", ")
-                    : "None"
-                }
-              />
-            </div>
-
-            <div className="rounded-md border bg-muted/30 px-2">
-              <EventTimeline
-                message={m}
-                deliveries={deliveries.data?.deliveries ?? []}
-                opens={opens.data?.opens ?? []}
-                clicks={clicks.data?.clicks ?? []}
-              />
-            </div>
-
-            <Tabs value={tab} onValueChange={setTab}>
-              <TabsList className="mb-2 flex-wrap">
-                <TabsTrigger value="preview">Preview</TabsTrigger>
-                <TabsTrigger value="text">Plain Text</TabsTrigger>
-                <TabsTrigger value="html">HTML</TabsTrigger>
-                <TabsTrigger value="raw">Raw</TabsTrigger>
-                <TabsTrigger value="insights">
-                  Insights
-                  {warnings > 0 && (
-                    <Badge variant="destructive" className="ml-1 px-1.5">
-                      {warnings}
-                    </Badge>
-                  )}
-                </TabsTrigger>
-              </TabsList>
-
-              <div className="max-h-[55svh] overflow-y-auto pr-1">
-                <TabsContent value="preview">
-                  {privacyMode ? (
-                    <PrivacyNote />
-                  ) : html ? (
-                    <iframe
-                      title="Message preview"
-                      sandbox=""
-                      srcDoc={html}
-                      className="h-[45svh] w-full rounded-md border bg-white"
-                    />
-                  ) : (
-                    <p className="text-sm text-muted-foreground">
-                      {raw.isLoading ? "Loading…" : "No HTML part to preview."}
-                    </p>
-                  )}
-                </TabsContent>
-                <TabsContent value="text">
-                  {privacyMode ? (
-                    <PrivacyNote />
-                  ) : text ? (
-                    <pre className="overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 text-xs">
-                      {text}
-                    </pre>
-                  ) : (
-                    <p className="text-sm text-muted-foreground">
-                      {raw.isLoading ? "Loading…" : "No plain-text part."}
-                    </p>
-                  )}
-                </TabsContent>
-                <TabsContent value="html">
-                  {privacyMode ? (
-                    <PrivacyNote />
-                  ) : html ? (
-                    <div className="relative">
-                      <div className="absolute right-2 top-2">
-                        <CopyButton value={html} />
-                      </div>
-                      <pre className="overflow-auto rounded-md bg-muted p-3 text-xs">{html}</pre>
-                    </div>
-                  ) : (
-                    <p className="text-sm text-muted-foreground">
-                      {raw.isLoading ? "Loading…" : "No HTML part."}
-                    </p>
-                  )}
-                </TabsContent>
-                <TabsContent value="raw">
-                  <div className="relative">
-                    <div className="absolute right-2 top-2">
-                      <CopyButton value={JSON.stringify(m, null, 2)} />
-                    </div>
-                    <pre className="overflow-auto rounded-md bg-muted p-3 text-xs">
-                      {JSON.stringify(m, null, 2)}
-                    </pre>
-                  </div>
-                </TabsContent>
-                <TabsContent value="insights">
-                  <InsightsPanel api={api} id={id} />
-                </TabsContent>
+            )}
+          </TabsContent>
+          <TabsContent value="text">
+            {privacyMode ? (
+              <PrivacyNote />
+            ) : text ? (
+              <pre className="overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 text-xs">
+                {text}
+              </pre>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {raw.isLoading ? "Loading…" : "No plain-text part."}
+              </p>
+            )}
+          </TabsContent>
+          <TabsContent value="html">
+            {privacyMode ? (
+              <PrivacyNote />
+            ) : html ? (
+              <div className="relative">
+                <div className="absolute right-2 top-2">
+                  <CopyButton value={html} />
+                </div>
+                <pre className="overflow-auto rounded-md bg-muted p-3 text-xs">{html}</pre>
               </div>
-            </Tabs>
-          </div>
-        )}
-        {sharing && <ShareDialog api={api} id={id} onClose={() => setSharing(false)} />}
-      </DialogContent>
-    </Dialog>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {raw.isLoading ? "Loading…" : "No HTML part."}
+              </p>
+            )}
+          </TabsContent>
+          <TabsContent value="raw">
+            <div className="relative">
+              <div className="absolute right-2 top-2">
+                <CopyButton value={JSON.stringify(m, null, 2)} />
+              </div>
+              <pre className="overflow-auto rounded-md bg-muted p-3 text-xs">
+                {JSON.stringify(m, null, 2)}
+              </pre>
+            </div>
+          </TabsContent>
+          <TabsContent value="insights">
+            <InsightsPanel api={api} id={id} />
+          </TabsContent>
+        </div>
+      </Tabs>
+    </div>
+  )
+}
+
+/// The message detail as a full page (its own route): a back link to the
+/// activity list, a header (subject as title, sender / recipient / date as
+/// the subline, plus the Share action), then the rich detail body.
+export function MessageDetailPage({
+  api,
+  org,
+  server,
+  id,
+}: {
+  api: Api
+  org: string
+  server: string
+  id: number
+}) {
+  // Same query key as the body — react-query dedupes the fetch; here it
+  // only feeds the header (subject, addresses, status, date).
+  const message = useQuery({ queryKey: ["sapi-message", id], queryFn: () => api.message(id) })
+  const [sharing, setSharing] = useState(false)
+  const m = message.data?.message
+
+  return (
+    <div className="space-y-4">
+      <Link
+        href={`/orgs/${org}/servers/${server}/messaging`}
+        className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
+      >
+        <ArrowLeftIcon className="size-3.5" /> All messages
+      </Link>
+
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="truncate text-xl font-semibold">{m?.subject || `Message #${id}`}</h1>
+          <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
+            {m && <MessagePill message={m} />}
+            <span>From {m?.mail_from ?? "…"}</span>
+            <span>To {m?.rcpt_to ?? "…"}</span>
+            {m && <span>{formatDate(m.created_at)}</span>}
+          </p>
+        </div>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon" aria-label="Message actions">
+              <MoreVerticalIcon className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={() => setSharing(true)}>Share email…</DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+
+      <MessageDetailBody api={api} id={id} />
+
+      {sharing && <ShareDialog api={api} id={id} onClose={() => setSharing(false)} />}
+    </div>
   )
 }
 
@@ -752,21 +1296,23 @@ const STATUS_FILTERS = [
 export function Messages({ api }: { api: Api }) {
   const p1 = useMessagingApiP1()
   const { org, server } = useOrgParams()
-  const pathname = usePathname() ?? ""
-  const messagingBase = pathname.replace(/\/messages$/, "")
-  const [scope, setScope] = useState("outgoing")
+  const [scope, setScope] = useState("all")
   const [query, setQuery] = useState("")
   const [status, setStatus] = useState("all")
   const [tag, setTag] = useState("all")
   const [stream, setStream] = useState("all")
   const [range, setRange] = useState("all")
-  const [selected, setSelected] = useState<number | null>(null)
+
+  // Opening a message now navigates to its own detail page (not a dialog).
+  const messageHref = (id: number) => `/orgs/${org}/servers/${server}/messaging/${id}`
 
   const tags = useQuery({ queryKey: ["p1-tags"], queryFn: p1.tags })
   const streams = useQuery({ queryKey: ["sapi-streams"], queryFn: api.streams.list })
 
   const params = useMemo(() => {
-    const q = new URLSearchParams({ scope, per_page: "50" })
+    const q = new URLSearchParams({ per_page: "50" })
+    // Omitting scope returns both directions — that's "All".
+    if (scope !== "all") q.set("scope", scope)
     if (query) q.set("query", query)
     if (status !== "all") q.set("status", status)
     if (tag !== "all") q.set("tag", tag)
@@ -777,6 +1323,8 @@ export function Messages({ api }: { api: Api }) {
   const messages = useQuery({
     queryKey: ["sapi-messages", params],
     queryFn: () => api.messages(params),
+    // Keep the activity list current on its own — no manual reload.
+    refetchInterval: 15_000,
   })
 
   // Time window is not a server-side filter on /messages, so it applies
@@ -817,13 +1365,12 @@ export function Messages({ api }: { api: Api }) {
       header: "Subject",
       accessorFn: (m) => m.subject ?? "",
       cell: ({ row }) => (
-        <button
-          type="button"
-          onClick={() => setSelected(row.original.id)}
+        <Link
+          href={messageHref(row.original.id)}
           className="block max-w-64 truncate text-left transition-colors group-hover:text-primary hover:underline"
         >
           {row.original.subject ?? "—"}
-        </button>
+        </Link>
       ),
     },
     {
@@ -859,13 +1406,10 @@ export function Messages({ api }: { api: Api }) {
       enableSorting: false,
       meta: { align: "right" },
       cell: ({ row }) => (
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="View message"
-          onClick={() => setSelected(row.original.id)}
-        >
-          <ChevronRightIcon className="size-4" />
+        <Button variant="ghost" size="icon" aria-label="View message" asChild>
+          <Link href={messageHref(row.original.id)}>
+            <ChevronRightIcon className="size-4" />
+          </Link>
         </Button>
       ),
     },
@@ -873,26 +1417,22 @@ export function Messages({ api }: { api: Api }) {
 
   return (
     <div>
-      <div className="mb-3 flex items-center gap-2">
-        <div className="relative flex-1">
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        <div className="relative w-full md:w-1/3">
           <SearchIcon className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            className="pl-8"
+            className="h-8 pl-8"
             placeholder="Search sender, subject, recipient, tag…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
         </div>
-        <Button variant="outline" size="icon" onClick={() => messages.refetch()}>
-          <RefreshCwIcon className="size-4" />
-        </Button>
-      </div>
-      <div className="mb-4 flex flex-wrap items-center gap-2">
         <Select value={scope} onValueChange={setScope}>
           <SelectTrigger size="sm" className="w-32">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
+            <SelectItem value="all">All</SelectItem>
             <SelectItem value="outgoing">Outgoing</SelectItem>
             <SelectItem value="incoming">Incoming</SelectItem>
           </SelectContent>
@@ -962,8 +1502,9 @@ export function Messages({ api }: { api: Api }) {
             icon={MailIcon}
             title="No activity yet"
             description="Send your first message and watch every delivery, open and click stream in here."
-            action={{ label: "Send a message", href: messagingBase }}
-          />
+          >
+            <SendMessageButton org={org} server={server} />
+          </EmptyState>
         )
       ) : (
         // Search + Time/Status/Tag/Stream above hit the API (server-side);
@@ -972,13 +1513,10 @@ export function Messages({ api }: { api: Api }) {
           columns={columns}
           data={rows}
           loading={messages.isPending}
-          searchPlaceholder="Filter these results…"
+          searchable={false}
           emptyText="No events match."
           initialPageSize={20}
         />
-      )}
-      {selected !== null && (
-        <MessageDetail api={api} id={selected} onClose={() => setSelected(null)} />
       )}
     </div>
   )
@@ -1008,6 +1546,7 @@ function LogStatusPill({ code }: { code: number }) {
 /// Time, filterable by time range, method and status class.
 export function LogsView() {
   const p1 = useMessagingApiP1()
+  const [query, setQuery] = useState("")
   const [method, setMethod] = useState("all")
   const [status, setStatus] = useState("all")
   const [range, setRange] = useState("24h")
@@ -1027,6 +1566,9 @@ export function LogsView() {
     refetchInterval: 30_000,
   })
   const rows: ApiRequestEntry[] = logs.data?.requests ?? []
+  const filtered = query
+    ? rows.filter((r) => r.path.toLowerCase().includes(query.toLowerCase()))
+    : rows
   const hasFilters = method !== "all" || status !== "all"
 
   const columns: ColumnDef<ApiRequestEntry>[] = [
@@ -1088,6 +1630,15 @@ export function LogsView() {
         description="Every authenticated call to this server's API: method, endpoint, status and latency."
       />
       <div className="mb-4 flex flex-wrap items-center gap-2">
+        <div className="relative w-full md:w-1/3">
+          <SearchIcon className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            className="h-8 pl-8"
+            placeholder="Search endpoints…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
         <Select value={range} onValueChange={setRange}>
           <SelectTrigger size="sm" className="w-36">
             <SelectValue />
@@ -1124,9 +1675,6 @@ export function LogsView() {
             ))}
           </SelectContent>
         </Select>
-        <Button variant="outline" size="icon" onClick={() => logs.refetch()}>
-          <RefreshCwIcon className="size-4" />
-        </Button>
       </div>
       {rows.length === 0 ? (
         <EmptyState
@@ -1141,10 +1689,9 @@ export function LogsView() {
       ) : (
         <DataTable
           columns={columns}
-          data={rows}
+          data={filtered}
           loading={logs.isPending}
-          searchKeys={["path"]}
-          searchPlaceholder="Search endpoints…"
+          searchable={false}
           emptyText="No requests match your search."
           initialPageSize={20}
         />
@@ -1163,6 +1710,14 @@ export function InboundQueue({ api }: { api: Api }) {
   })
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-inbound"] })
   const rows = inbound.data?.inbound ?? []
+  const statusOptions = useMemo(
+    () =>
+      [...new Set(rows.map((m) => m.status ?? "").filter(Boolean))].map((s) => ({
+        label: s,
+        value: s,
+      })),
+    [rows],
+  )
 
   const columns: ColumnDef<Message>[] = [
     {
@@ -1194,6 +1749,7 @@ export function InboundQueue({ api }: { api: Api }) {
       id: "status",
       header: "Status",
       accessorFn: (m) => m.status ?? "",
+      filterFn: "equalsString",
       cell: ({ row }) => <MessagePill message={row.original} />,
     },
     {
@@ -1259,6 +1815,11 @@ export function InboundQueue({ api }: { api: Api }) {
           loading={inbound.isPending}
           searchKeys={["rcpt_to", "subject"]}
           searchPlaceholder="Search held & inbound…"
+          filters={
+            statusOptions.length > 1
+              ? [{ columnId: "status", label: "Any status", options: statusOptions }]
+              : []
+          }
           emptyText="Nothing matches your search."
           initialPageSize={20}
         />
@@ -1984,7 +2545,7 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
   const [copying, setCopying] = useState<Template | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-templates"] })
 
-  const base = `/orgs/${org}/servers/${server}/messaging/templates`
+  const base = `/orgs/${org}/servers/${server}/templates`
   const editorHref = (permalink: string) => `${base}/${encodeURIComponent(permalink)}`
   const existingPermalinks = new Set(templates.data?.templates.map((t) => t.permalink) ?? [])
 
@@ -2107,19 +2668,12 @@ export function useMessagingApiP1(): ApiP1 {
   return api
 }
 
-const SUBTABS = [
-  { value: "send", label: "Send" },
-  { value: "messages", label: "Activity" },
-  { value: "statistics", label: "Statistics" },
-  { value: "stats", label: "Summary" },
-  { value: "streams", label: "Streams" },
-  { value: "templates", label: "Templates" },
-  { value: "setup", label: "Setup" },
-  { value: "queue", label: "Queue" },
-  { value: "logs", label: "Logs" },
-]
 
-export function MessagingShell({
+// Provides the server messaging API contexts (base + P1), bound to an
+// active API credential — or a "connect a credential" prompt if none.
+// Reusable outside the messaging tabs (e.g. the Statistics block on the
+// server dashboard).
+export function MessagingApiProvider({
   org,
   server,
   children,
@@ -2128,22 +2682,17 @@ export function MessagingShell({
   server: string
   children: React.ReactNode
 }) {
-  const router = useRouter()
-  const pathname = usePathname() ?? ""
   const credentials = useQuery({
     queryKey: ["credentials", org, server],
     queryFn: () => adminApi.credentials(org, server).list(),
   })
   const apiKey = useMemo(
     () =>
-      credentials.data?.credentials.find(
-        (credential) => credential.type === "API" && !credential.hold,
-      )?.key ?? null,
+      credentials.data?.credentials.find((c) => c.type === "API" && !c.hold)?.key ?? null,
     [credentials.data],
   )
   const api = useMemo(() => (apiKey ? serverApi(apiKey) : null), [apiKey])
   const apiP1 = useMemo(() => (apiKey ? serverApiP1(apiKey) : null), [apiKey])
-  const subtab = pathname.split("/messaging")[1]?.split("/")[1] || "send"
 
   if (credentials.isLoading) {
     return <p className="text-sm text-muted-foreground">Loading…</p>
@@ -2153,7 +2702,7 @@ export function MessagingShell({
       <EmptyState
         icon={KeyRoundIcon}
         title="Connect an API credential"
-        description="Messaging talks to the server's own API. Create an API credential first, then come back here."
+        description="Delivery stats come from the server's own API. Create an API credential to light this up."
         action={{
           label: "Create API credential",
           href: `/orgs/${org}/servers/${server}/credentials`,
@@ -2162,24 +2711,87 @@ export function MessagingShell({
     )
   }
   return (
-    <div>
-      <Tabs
-        value={subtab}
-        onValueChange={(value) =>
-          router.push(`/orgs/${org}/servers/${server}/messaging${value === "send" ? "" : `/${value}`}`)
-        }
-      >
-        <TabsList className="mb-4">
-          {SUBTABS.map((t) => (
-            <TabsTrigger key={t.value} value={t.value}>
-              {t.label}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-      </Tabs>
-      <MessagingContext.Provider value={api}>
-        <MessagingP1Context.Provider value={apiP1}>{children}</MessagingP1Context.Provider>
-      </MessagingContext.Provider>
-    </div>
+    <MessagingContext.Provider value={api}>
+      <MessagingP1Context.Provider value={apiP1}>{children}</MessagingP1Context.Provider>
+    </MessagingContext.Provider>
+  )
+}
+
+// The messaging "Summary" (delivery counters + recent bounces), self-
+// contained for use outside the messaging tabs (e.g. the server dashboard).
+function StatsViewBound() {
+  const api = useMessagingApi()
+  return <StatsView api={api} />
+}
+
+export function ServerSummary({ org, server }: { org: string; server: string }) {
+  return (
+    <MessagingApiProvider org={org} server={server}>
+      <StatsViewBound />
+    </MessagingApiProvider>
+  )
+}
+
+// Standalone (own server-nav item) wrappers for messaging resources that
+// moved out of the messaging tab bar. Each binds the messaging API.
+function StreamsBound() {
+  const api = useMessagingApi()
+  return <Streams api={api} />
+}
+export function ServerStreams({ org, server }: { org: string; server: string }) {
+  return (
+    <MessagingApiProvider org={org} server={server}>
+      <StreamsBound />
+    </MessagingApiProvider>
+  )
+}
+
+function QueueBound() {
+  const api = useMessagingApi()
+  return <InboundQueue api={api} />
+}
+export function ServerQueue({ org, server }: { org: string; server: string }) {
+  return (
+    <MessagingApiProvider org={org} server={server}>
+      <QueueBound />
+    </MessagingApiProvider>
+  )
+}
+
+export function ServerLogs({ org, server }: { org: string; server: string }) {
+  return (
+    <MessagingApiProvider org={org} server={server}>
+      <LogsView />
+    </MessagingApiProvider>
+  )
+}
+
+function TemplatesBound({ org, server }: { org: string; server: string }) {
+  const api = useMessagingApi()
+  return <Templates api={api} org={org} server={server} />
+}
+export function ServerTemplates({ org, server }: { org: string; server: string }) {
+  return (
+    <MessagingApiProvider org={org} server={server}>
+      <TemplatesBound org={org} server={server} />
+    </MessagingApiProvider>
+  )
+}
+
+// The messaging area no longer has a tab bar — it just provides the
+// server messaging API context to its (single) page.
+export function MessagingShell({
+  org,
+  server,
+  children,
+}: {
+  org: string
+  server: string
+  children: React.ReactNode
+}) {
+  return (
+    <MessagingApiProvider org={org} server={server}>
+      {children}
+    </MessagingApiProvider>
   )
 }

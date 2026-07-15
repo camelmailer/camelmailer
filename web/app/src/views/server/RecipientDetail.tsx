@@ -8,6 +8,7 @@
 
 import { useMemo, useState } from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import { useQuery } from "@tanstack/react-query"
 import {
   ArrowLeftIcon,
@@ -20,12 +21,11 @@ import { formatDate } from "@/components/shared"
 import { EmptyState } from "@/components/empty-state"
 import { MessagePill, messageStatus, statusDotClass } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { cn } from "@/lib/utils"
 import { serverApi, type Message } from "@/lib/api"
 import { useServerMessagingApi } from "@/lib/api-p2"
-import { MessageDetail } from "@/views/server/Messaging"
+import { SendMessageButton } from "@/views/server/Messaging"
 
 type Api = ReturnType<typeof serverApi>
 
@@ -135,7 +135,7 @@ export function RecipientDetail({
   email: string
 }) {
   const { api, isLoading } = useServerMessagingApi(org, server)
-  const [selected, setSelected] = useState<number | null>(null)
+  const router = useRouter()
 
   const messagesQuery = useQuery({
     queryKey: ["recipient-messages", org, server, email],
@@ -163,7 +163,7 @@ export function RecipientDetail({
   return (
     <div className="space-y-4">
       <Link
-        href={`/orgs/${org}/servers/${server}/messaging/messages`}
+        href={`/orgs/${org}/servers/${server}/messaging`}
         className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
       >
         <ArrowLeftIcon className="size-3.5" /> All messages
@@ -214,9 +214,7 @@ export function RecipientDetail({
               title="No messages to this address"
               description="Nothing in the recent history of this server was sent to this recipient."
             >
-              <Button asChild variant="outline" size="sm">
-                <Link href={`/orgs/${org}/servers/${server}/messaging`}>Send a message</Link>
-              </Button>
+              <SendMessageButton org={org} server={server} variant="outline" defaultTo={email} />
             </EmptyState>
           ) : (
             api && (
@@ -226,17 +224,15 @@ export function RecipientDetail({
                     key={message.id}
                     api={api}
                     message={message}
-                    onOpen={() => setSelected(message.id)}
+                    onOpen={() =>
+                      router.push(`/orgs/${org}/servers/${server}/messaging/${message.id}`)
+                    }
                   />
                 ))}
               </ol>
             )
           )}
         </>
-      )}
-
-      {selected !== null && api && (
-        <MessageDetail api={api} id={selected} onClose={() => setSelected(null)} />
       )}
     </div>
   )
