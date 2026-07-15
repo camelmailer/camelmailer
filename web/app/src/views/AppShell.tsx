@@ -14,6 +14,10 @@ import {
   AtSignIcon,
   BadgeCheckIcon,
   BanIcon,
+  BookOpenIcon,
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronsUpDownIcon,
   CreditCardIcon,
   FingerprintIcon,
   GaugeIcon,
@@ -23,9 +27,11 @@ import {
   LayoutDashboardIcon,
   LogOutIcon,
   NetworkIcon,
+  NewspaperIcon,
   ScrollTextIcon,
   SearchIcon,
   SendIcon,
+  ServerIcon,
   SettingsIcon,
   ShieldCheckIcon,
   UsersIcon,
@@ -40,7 +46,7 @@ import {
   BreadcrumbPage,
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb"
-import { Button } from "@/components/ui/button"
+import { Button, interactiveCard } from "@/components/ui/button"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -51,7 +57,6 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Separator } from "@/components/ui/separator"
 import {
   Sidebar,
   SidebarContent,
@@ -65,18 +70,12 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSkeleton,
-  SidebarMenuSub,
-  SidebarMenuSubButton,
-  SidebarMenuSubItem,
   SidebarProvider,
-  SidebarTrigger,
-  useSidebar,
 } from "@/components/ui/sidebar"
 import { CodePanel } from "@/components/code-panel"
 import { CommandPalette } from "@/components/command-palette"
 import { FormDialog, Kbd } from "@/components/form-dialog"
 import { NEW_ORG_EVENT, OrgSwitcher } from "@/components/org-switcher"
-import { ThemeSubMenu } from "@/components/theme"
 import { adminApi, ApiError } from "@/lib/api"
 import {
   getLastActiveOrg,
@@ -253,10 +252,11 @@ function AppBreadcrumbs() {
   )
 }
 
+// The signed-in user menu, rendered compactly in the top bar (right side):
+// name + email to the left of the avatar, opening a dropdown downward.
 function NavUser() {
   const { me, logout } = useAuth()
   const router = useRouter()
-  const { isMobile } = useSidebar()
 
   const isAdmin = me?.user.admin ?? false
   const name = [me?.user.first_name, me?.user.last_name].filter(Boolean).join(" ")
@@ -266,62 +266,65 @@ function NavUser() {
     "?"
 
   return (
-    <SidebarMenu>
-      <SidebarMenuItem>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <SidebarMenuButton
-              size="lg"
-              className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
-            >
-              <Avatar className="size-8 rounded-lg">
-                <AvatarFallback className="rounded-lg">{initials}</AvatarFallback>
-              </Avatar>
-              <div className="grid flex-1 text-left text-sm leading-tight">
-                <span className="truncate font-medium">{name}</span>
-                <span className="truncate text-xs text-muted-foreground">
-                  {me?.user.email_address}
-                </span>
-              </div>
-            </SidebarMenuButton>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent
-            className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-lg"
-            side={isMobile ? "bottom" : "right"}
-            align="end"
-            sideOffset={4}
-          >
-            <DropdownMenuLabel>
-              {name}
-              {isAdmin && <span className="ml-1 text-xs text-muted-foreground">(admin)</span>}
-            </DropdownMenuLabel>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={() => router.push("/account")}>
-              <BadgeCheckIcon /> Account & security
-            </DropdownMenuItem>
-            <ThemeSubMenu />
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              onClick={async () => {
-                await logout()
-                router.push("/login")
-              }}
-            >
-              <LogOutIcon /> Sign out
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </SidebarMenuItem>
-    </SidebarMenu>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="sm"
+          className={`gap-2 ${interactiveCard}`}
+        >
+          <Avatar className="size-5 rounded-md">
+            <AvatarFallback className="rounded-md text-[10px]">{initials}</AvatarFallback>
+          </Avatar>
+          <span className="hidden max-w-40 truncate font-medium sm:inline">{name}</span>
+          <ChevronDownIcon className="size-4 text-muted-foreground" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent className="min-w-56 rounded-lg" side="bottom" align="end" sideOffset={8}>
+        <DropdownMenuLabel>
+          {name}
+          {isAdmin && <span className="ml-1 text-xs text-muted-foreground">(admin)</span>}
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => router.push("/account")}>
+          <BadgeCheckIcon /> Account & security
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onClick={async () => {
+            await logout()
+            router.push("/login")
+          }}
+        >
+          <LogOutIcon /> Sign out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
 function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
   const { me } = useAuth()
+  const router = useRouter()
   const pathname = usePathname() ?? ""
   const servers = useOrgServers(activeOrg)
 
   const isAdmin = me?.user.admin ?? false
+  // Admin mode: the /admin/* area swaps the whole sidebar for the
+  // instance-administration nav (entered via the "Admin" pill in the top
+  // bar); the org/server nav is hidden until you leave it.
+  const isAdminMode = pathname.startsWith("/admin")
+
+  // The server whose nav fills the sidebar: the one in the URL, else the
+  // first available. The header switcher changes it; its areas render as
+  // the sidebar's primary nav.
+  const serverList = servers.data?.servers ?? []
+  const activeServerPermalink = pathname.match(/\/orgs\/[^/]+\/servers\/([^/]+)/)?.[1]
+  const activeServer =
+    serverList.find((s) => s.permalink === activeServerPermalink) ?? serverList[0]
+  const serverBase =
+    activeOrg && activeServer ? `/orgs/${activeOrg}/servers/${activeServer.permalink}` : null
+  const serverNav = serverBase ? serverAreas(serverBase) : []
   const role = me?.memberships.find(
     (m) => m.organization.permalink === activeOrg,
   )?.role
@@ -345,7 +348,8 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
   }
   const orgAreas: OrgArea[] = orgBase
     ? [
-        { href: orgBase, label: "Overview", icon: LayoutDashboardIcon, match: "exact" },
+        { href: orgBase, label: "Dashboard", icon: LayoutDashboardIcon, match: "exact" },
+        { href: `${orgBase}/servers`, label: "Servers", icon: ServerIcon, match: "prefix" },
         { href: `${orgBase}/members`, label: "Members", icon: UsersIcon, match: "prefix" },
         // tenant SSO configuration carries provider secrets — admin+ only
         ...(canBilling
@@ -373,77 +377,114 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
     : []
 
   return (
-    <Sidebar collapsible="icon" variant="inset">
+    <Sidebar
+      collapsible="icon"
+      variant="inset"
+      className="md:[&_[data-slot=sidebar-inner]]:bg-transparent"
+    >
       <SidebarHeader>
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton size="lg" asChild tooltip="Dashboard">
-              <Link href="/dashboard">
-                <div className="flex aspect-square size-8 items-center justify-center">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src="/camelmailer-symbol.png" alt="" className="size-6" />
-                </div>
-                <span className="truncate text-base font-semibold">CamelMailer</span>
-              </Link>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
-        <OrgSwitcher activeOrg={activeOrg} />
+        {/* The official wordmark — a plain link to /dashboard, no button
+            chrome. Dark-slate PNG flipped to white in dark mode. */}
+        <Link href="/dashboard" className="inline-block px-2 pt-0 pb-[3px]">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/camelmailer-logo.png"
+            alt="CamelMailer"
+            className="block h-auto w-44 dark:brightness-0 dark:invert"
+          />
+        </Link>
+        {!isAdminMode && activeOrg && (
+          <>
+            <div aria-hidden className="mt-1.5 mb-2 border-b border-black/5 dark:border-white/10" />
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <SidebarMenuButton
+                      size="lg"
+                      tooltip="Switch server"
+                    className="rounded-lg border border-border bg-card shadow-sm data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
+                  >
+                    <div className="flex aspect-square size-8 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
+                      <ServerIcon className="size-4" />
+                    </div>
+                    <div className="grid flex-1 text-left text-sm leading-tight">
+                      <span className="truncate font-medium">
+                        {activeServer?.name ?? "Select server"}
+                      </span>
+                      <span className="truncate text-xs text-muted-foreground">Server</span>
+                    </div>
+                    <ChevronsUpDownIcon className="ml-auto size-4" />
+                  </SidebarMenuButton>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-lg"
+                  side="right"
+                  align="start"
+                  sideOffset={4}
+                >
+                  <DropdownMenuLabel className="text-xs text-muted-foreground">
+                    Servers
+                  </DropdownMenuLabel>
+                  {serverList.map((s) => (
+                    <DropdownMenuItem
+                      key={s.id}
+                      onClick={() => router.push(`/orgs/${activeOrg}/servers/${s.permalink}`)}
+                    >
+                      <span
+                        aria-hidden
+                        className="size-2 shrink-0 rounded-full"
+                        style={{ backgroundColor: serverDotColor(s) }}
+                      />
+                      <span className="truncate">{s.name}</span>
+                      {activeServer?.permalink === s.permalink && (
+                        <CheckIcon className="ml-auto size-4" />
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                    {serverList.length === 0 && (
+                      <p className="px-2 py-1.5 text-xs text-muted-foreground">No servers yet.</p>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </>
+        )}
       </SidebarHeader>
-      <SidebarContent>
-        {activeOrg && (
+      <SidebarContent className="overflow-x-hidden">
+        {!isAdminMode && activeOrg && (
           <SidebarGroup>
-            <SidebarGroupLabel>Servers</SidebarGroupLabel>
+            <SidebarGroupLabel className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+              {activeServer?.name ?? "Server"}
+            </SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 {servers.isPending &&
-                  Array.from({ length: 2 }).map((_, i) => (
+                  Array.from({ length: 5 }).map((_, i) => (
                     <SidebarMenuItem key={i}>
                       <SidebarMenuSkeleton showIcon />
                     </SidebarMenuItem>
                   ))}
-                {(servers.data?.servers ?? []).map((server) => {
-                  const href = `/orgs/${activeOrg}/servers/${server.permalink}`
-                  const isActive = pathname === href || pathname.startsWith(`${href}/`)
-                  const areas = serverAreas(href)
-                  return (
-                    <SidebarMenuItem key={server.id}>
-                      <SidebarMenuButton asChild isActive={isActive} tooltip={server.name}>
-                        <Link href={href}>
-                          <span
-                            aria-hidden
-                            className="ml-1 size-2 shrink-0 rounded-full"
-                            style={{ backgroundColor: serverDotColor(server) }}
-                          />
-                          <span className="truncate">{server.name}</span>
-                        </Link>
-                      </SidebarMenuButton>
-                      {isActive && (
-                        <SidebarMenuSub>
-                          {areas.map(({ href: areaHref, label, icon: Icon, match }) => (
-                            <SidebarMenuSubItem key={label}>
-                              <SidebarMenuSubButton
-                                asChild
-                                isActive={
-                                  match === "exact"
-                                    ? pathname === areaHref
-                                    : pathname === areaHref ||
-                                      pathname.startsWith(`${areaHref}/`)
-                                }
-                              >
-                                <Link href={areaHref}>
-                                  <Icon />
-                                  <span>{label}</span>
-                                </Link>
-                              </SidebarMenuSubButton>
-                            </SidebarMenuSubItem>
-                          ))}
-                        </SidebarMenuSub>
-                      )}
-                    </SidebarMenuItem>
-                  )
-                })}
-                {servers.isSuccess && servers.data.servers.length === 0 && (
+                {serverNav.map(({ href, label, icon: Icon, match }) => (
+                  <SidebarMenuItem key={label}>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={
+                        match === "exact"
+                          ? pathname === href
+                          : pathname === href || pathname.startsWith(`${href}/`)
+                      }
+                      tooltip={label}
+                    >
+                      <Link href={href}>
+                        <Icon />
+                        <span>{label}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                ))}
+                {servers.isSuccess && serverList.length === 0 && (
                   <p className="px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
                     No servers yet.
                   </p>
@@ -452,9 +493,14 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
             </SidebarGroupContent>
           </SidebarGroup>
         )}
-        {activeOrg && (
+        {!isAdminMode && activeOrg && (
+          <div aria-hidden className="mx-3 my-0 border-b border-black/5 dark:border-white/10" />
+        )}
+        {!isAdminMode && activeOrg && (
           <SidebarGroup>
-            <SidebarGroupLabel>Organization</SidebarGroupLabel>
+            <SidebarGroupLabel className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+              Organization
+            </SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 {orgAreas.map(({ href, label, icon: Icon, match }) => (
@@ -481,9 +527,11 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
             </SidebarGroupContent>
           </SidebarGroup>
         )}
-        {isAdmin && (
+        {isAdminMode && (
           <SidebarGroup>
-            <SidebarGroupLabel>Administration</SidebarGroupLabel>
+            <SidebarGroupLabel className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
+              Administration
+            </SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 {(
@@ -509,7 +557,38 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
         )}
       </SidebarContent>
       <SidebarFooter>
-        <NavUser />
+        <SidebarMenu>
+          {isAdmin && (
+            <SidebarMenuItem>
+              <SidebarMenuButton asChild isActive={isAdminMode} tooltip="Admin">
+                <Link href="/admin/users">
+                  <ShieldCheckIcon />
+                  <span>Admin</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          )}
+          <SidebarMenuItem>
+            <SidebarMenuButton asChild tooltip="Docs">
+              <a href="https://camelmailer.com/docs" target="_blank" rel="noreferrer">
+                <BookOpenIcon />
+                <span>Docs</span>
+              </a>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+          <SidebarMenuItem>
+            <SidebarMenuButton asChild tooltip="Changelog">
+              <a
+                href="https://github.com/camelmailer/camelmailer/releases"
+                target="_blank"
+                rel="noreferrer"
+              >
+                <NewspaperIcon />
+                <span>Changelog</span>
+              </a>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
       </SidebarFooter>
     </Sidebar>
   )
@@ -563,33 +642,53 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <SidebarProvider>
+    <SidebarProvider className="h-svh overflow-hidden has-data-[variant=inset]:bg-background">
       <AppSidebar activeOrg={activeOrg} />
-      <SidebarInset>
-        <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
-          <SidebarTrigger className="-ml-1" />
-          <Separator
-            orientation="vertical"
-            className="mr-2 data-[orientation=vertical]:h-4"
-          />
-          <AppBreadcrumbs />
+      <SidebarInset className="flex min-h-0 min-w-0 flex-col gap-3 p-3 md:peer-data-[variant=inset]:m-0 md:peer-data-[variant=inset]:rounded-none md:peer-data-[variant=inset]:shadow-none">
+        {/* Top bar over the halo: search far left, signed-in user far right.
+            No horizontal padding so the search edge lines up exactly with
+            the halo frame's left edge below it. */}
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            className={`w-80 max-w-full justify-start gap-2 text-muted-foreground ${interactiveCard}`}
+            onClick={() => setPaletteOpen(true)}
+          >
+            <SearchIcon className="size-4" />
+            <span>Search…</span>
+            <Kbd className="ml-auto">⌘K</Kbd>
+          </Button>
           <div className="ml-auto flex items-center gap-2">
-            <CodePanel />
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-2 text-muted-foreground"
-              onClick={() => setPaletteOpen(true)}
-            >
-              <SearchIcon className="size-3.5" />
-              <span className="hidden sm:inline">Search…</span>
-              <Kbd>⌘K</Kbd>
-            </Button>
+            <OrgSwitcher activeOrg={activeOrg} />
+            <NavUser />
           </div>
-        </header>
-        <main className="min-w-0 flex-1 p-6" key={org ?? "-"}>
-          {children}
-        </main>
+        </div>
+        {/* The workspace lives inside a halo frame — the same treatment as
+            the auth cards and dialogs. It fills the remaining height; only
+            the content body inside scrolls, never the page. */}
+        <div className="-mr-3 flex min-h-0 min-w-0 flex-1 flex-col rounded-l-[1.875rem] shadow-[inset_0_0_2px_1px_#ffffff4d] ring-1 ring-black/5 dark:shadow-[inset_0_0_2px_1px_rgba(255,255,255,0.12)] dark:ring-white/10">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col rounded-l-[1.875rem] py-1.5 pl-1.5 shadow-md shadow-black/5">
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-l-3xl bg-card text-card-foreground ring-1 ring-black/5 shadow-[0_8px_24px_-12px_rgba(86,47,0,0.22)] dark:shadow-[0_8px_24px_-12px_rgba(0,0,0,0.5)] dark:ring-white/10">
+              {/* Fixed breadcrumb row. */}
+              <div className="flex shrink-0 items-center gap-2 border-b px-6 py-3">
+                <AppBreadcrumbs />
+                <div className="ml-auto">
+                  <CodePanel />
+                </div>
+              </div>
+              {/* Scrollable content body — flush with the window edge on the
+                  right, with the scrollbar always reserved so the layout
+                  never shifts when content grows/shrinks. */}
+              <div
+                className="app-scrollbar min-h-0 min-w-0 flex-1 overflow-y-scroll p-6"
+                key={org ?? "-"}
+              >
+                {children}
+              </div>
+            </div>
+          </div>
+        </div>
       </SidebarInset>
 
       <CommandPalette

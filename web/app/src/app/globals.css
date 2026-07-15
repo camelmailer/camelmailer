@@ -1,6 +1,9 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/* Dark mode was removed — the app is light-only. This keeps any leftover
+   `dark:` utility classes inert: they resolve against a `.dark` ancestor
+   that is never applied (rather than reacting to the OS colour scheme). */
 @custom-variant dark (&:is(.dark *));
 
 /* CamelMailer theme — the brand palette (see camelmailer.com/BRANDING.md):
@@ -42,41 +45,6 @@
   --sidebar-accent-foreground: oklch(0.32 0.07 58);
   --sidebar-border: oklch(0.9 0.022 82);
   --sidebar-ring: oklch(0.55 0.09 65);
-}
-
-.dark {
-  --background: oklch(0.22 0.03 58); /* deep whiskey canvas */
-  --foreground: oklch(0.97 0.014 92); /* cashmere */
-  --card: oklch(0.27 0.035 58);
-  --card-foreground: oklch(0.97 0.014 92);
-  --popover: oklch(0.27 0.035 58);
-  --popover-foreground: oklch(0.97 0.014 92);
-  --primary: oklch(0.83 0.09 72); /* butterscotch bloom */
-  --primary-foreground: oklch(0.28 0.06 58);
-  --secondary: oklch(0.33 0.03 58);
-  --secondary-foreground: oklch(0.97 0.014 92);
-  --muted: oklch(0.33 0.03 58);
-  --muted-foreground: oklch(0.76 0.045 80);
-  --accent: oklch(0.37 0.05 62);
-  --accent-foreground: oklch(0.97 0.014 92);
-  --destructive: oklch(0.704 0.191 22.216);
-  --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(1 0 0 / 12%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.83 0.09 72);
-  --chart-1: oklch(0.83 0.09 72);
-  --chart-2: oklch(0.7 0.09 66);
-  --chart-3: oklch(0.88 0.07 80);
-  --chart-4: oklch(0.6 0.08 62);
-  --chart-5: oklch(0.75 0.09 74);
-  --sidebar: oklch(0.25 0.03 58);
-  --sidebar-foreground: oklch(0.97 0.014 92);
-  --sidebar-primary: oklch(0.83 0.09 72);
-  --sidebar-primary-foreground: oklch(0.28 0.06 58);
-  --sidebar-accent: oklch(0.37 0.05 62);
-  --sidebar-accent-foreground: oklch(0.97 0.014 92);
-  --sidebar-border: oklch(1 0 0 / 12%);
-  --sidebar-ring: oklch(0.83 0.09 72);
 }
 
 @theme inline {
@@ -128,4 +96,28 @@
   body {
     @apply bg-background text-foreground;
   }
+}
+
+/* Square, grey scrollbar on the light panel (à la Preline). Styling the
+   WebKit scrollbar also forces the classic, always-visible bar on macOS,
+   so the layout never shifts. `scrollbar-gutter: stable` reserves the
+   track for Firefox / non-WebKit too. */
+.app-scrollbar {
+  scrollbar-gutter: stable;
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: rgb(0 0 0 / 0.22) transparent; /* Firefox: thumb / track */
+}
+.app-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.app-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.app-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgb(0 0 0 / 0.22);
+  border-radius: 0; /* kantig */
+}
+.app-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(0 0 0 / 0.38);
 }

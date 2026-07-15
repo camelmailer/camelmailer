@@ -7,6 +7,7 @@
 
 import { useRouter } from "next/navigation"
 import { CheckIcon, ChevronsUpDownIcon, ListIcon, PlusIcon } from "lucide-react"
+import { Button, interactiveCard } from "@/components/ui/button"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -15,12 +16,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import {
-  SidebarMenu,
-  SidebarMenuButton,
-  SidebarMenuItem,
-  useSidebar,
-} from "@/components/ui/sidebar"
 import { setLastActiveOrg } from "@/lib/api-extras"
 import { useAuth } from "@/lib/auth"
 
@@ -42,10 +37,12 @@ export function orgInitials(name: string): string {
   )
 }
 
+// Compact, top-bar organization switcher, styled as a card to match the
+// search / admin / account controls: org initials, name, and a caret,
+// with the full membership list in a dropdown.
 export function OrgSwitcher({ activeOrg }: { activeOrg: string | undefined }) {
   const { me } = useAuth()
   const router = useRouter()
-  const { isMobile } = useSidebar()
 
   const memberships = me?.memberships ?? []
   const isAdmin = me?.user.admin ?? false
@@ -57,70 +54,44 @@ export function OrgSwitcher({ activeOrg }: { activeOrg: string | undefined }) {
   }
 
   return (
-    <SidebarMenu>
-      <SidebarMenuItem>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <SidebarMenuButton
-              size="lg"
-              tooltip="Switch organization"
-              className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
-            >
-              <div className="flex aspect-square size-8 items-center justify-center rounded-lg bg-sidebar-primary text-xs font-semibold text-sidebar-primary-foreground">
-                {active ? orgInitials(active.organization.name) : "—"}
-              </div>
-              <div className="grid flex-1 text-left text-sm leading-tight">
-                <span className="truncate font-medium">
-                  {active?.organization.name ?? activeOrg ?? "Select organization"}
-                </span>
-                <span className="truncate text-xs text-muted-foreground">
-                  {active ? active.role : "Organization"}
-                </span>
-              </div>
-              <ChevronsUpDownIcon className="ml-auto size-4" />
-            </SidebarMenuButton>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent
-            className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-lg"
-            side={isMobile ? "bottom" : "right"}
-            align="start"
-            sideOffset={4}
-          >
-            <DropdownMenuLabel className="text-xs text-muted-foreground">
-              Organizations
-            </DropdownMenuLabel>
-            {memberships.map(({ organization }) => (
-              <DropdownMenuItem
-                key={organization.id}
-                onClick={() => switchTo(organization.permalink)}
-              >
-                <div className="flex size-6 items-center justify-center rounded-md border text-[10px] font-semibold">
-                  {orgInitials(organization.name)}
-                </div>
-                <span className="truncate">{organization.name}</span>
-                {organization.permalink === activeOrg && (
-                  <CheckIcon className="ml-auto size-4" />
-                )}
-              </DropdownMenuItem>
-            ))}
-            {memberships.length === 0 && (
-              <p className="px-2 py-1.5 text-xs text-muted-foreground">
-                No memberships yet.
-              </p>
-            )}
-            {isAdmin && (
-              <DropdownMenuItem onClick={() => router.push("/orgs")}>
-                <ListIcon className="size-4" />
-                <span className="text-muted-foreground">All organizations…</span>
-              </DropdownMenuItem>
-            )}
-            <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={requestNewOrganization}>
-              <PlusIcon className="size-4" /> Create organization
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </SidebarMenuItem>
-    </SidebarMenu>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="sm" className={`gap-2 ${interactiveCard}`}>
+          <div className="flex size-5 items-center justify-center rounded-md bg-primary text-[10px] font-semibold text-primary-foreground">
+            {active ? orgInitials(active.organization.name) : "—"}
+          </div>
+          <span className="hidden max-w-40 truncate font-medium sm:inline">
+            {active?.organization.name ?? activeOrg ?? "Select organization"}
+          </span>
+          <ChevronsUpDownIcon className="size-4 text-muted-foreground" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent className="min-w-56 rounded-lg" side="bottom" align="end" sideOffset={8}>
+        <DropdownMenuLabel className="text-xs text-muted-foreground">
+          Organizations
+        </DropdownMenuLabel>
+        {memberships.map(({ organization }) => (
+          <DropdownMenuItem key={organization.id} onClick={() => switchTo(organization.permalink)}>
+            <div className="flex size-6 items-center justify-center rounded-md border text-[10px] font-semibold">
+              {orgInitials(organization.name)}
+            </div>
+            <span className="truncate">{organization.name}</span>
+            {organization.permalink === activeOrg && <CheckIcon className="ml-auto size-4" />}
+          </DropdownMenuItem>
+        ))}
+        {memberships.length === 0 && (
+          <p className="px-2 py-1.5 text-xs text-muted-foreground">No memberships yet.</p>
+        )}
+        <DropdownMenuSeparator />
+        {isAdmin && (
+          <DropdownMenuItem onClick={() => router.push("/orgs")}>
+            <ListIcon className="size-4" /> All organizations…
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem onClick={requestNewOrganization}>
+          <PlusIcon className="size-4" /> Create organization
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
