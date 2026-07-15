@@ -184,6 +184,26 @@ export type ServerStat = {
   bounced: number
 }
 
+/// Full windowed message counters (GET .../servers/{server}/stats and the
+/// per-server /api/v2/server/stats). `bounces` breaks the bounced total
+/// into hard/soft/undetermined.
+export type WindowStats = {
+  total: number
+  incoming: number
+  outgoing: number
+  sent: number
+  pending: number
+  held: number
+  bounced: number
+  soft_fail: number
+  hard_fail: number
+  opens: number
+  clicks: number
+  unique_opens: number
+  unique_clicks: number
+  bounces?: { hard: number; soft: number; undetermined: number }
+}
+
 export type DnsRecord = { name: string; type: string; value: string }
 
 export type Domain = {
@@ -734,6 +754,14 @@ export const adminApi = {
     stats: () =>
       api.get<{ stats: ServerStat[] }>(
         `/api/v2/admin/organizations/${org}/servers/stats`,
+      ),
+    // Full windowed message statistics for one server (admin/Bearer, no
+    // server API key) — powers the detailed stats on the server dashboard.
+    statsWindow: (server: string, from: Date, to: Date) =>
+      api.get<{ stats: WindowStats }>(
+        `/api/v2/admin/organizations/${org}/servers/${server}/stats?from=${encodeURIComponent(
+          from.toISOString(),
+        )}&to=${encodeURIComponent(to.toISOString())}`,
       ),
     get: (server: string) =>
       api.get<{ server: Server }>(`/api/v2/admin/organizations/${org}/servers/${server}`),

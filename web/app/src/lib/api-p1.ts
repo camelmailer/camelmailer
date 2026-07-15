@@ -7,7 +7,7 @@
 // small presentation helpers (relative times, status-pill classes, MIME
 // body extraction for the message-detail tabs).
 
-import { api, type Pagination } from "@/lib/api"
+import { api, type Pagination, type WindowStats } from "@/lib/api"
 
 // ------------------------------------------------------------- types
 
@@ -31,24 +31,6 @@ export type MessageActivityEvent = {
   user_agent: string | null
   url: string | null
   created_at: string
-}
-
-/** The counters of GET /api/v2/server/stats (with a from/to window). */
-export type WindowStats = {
-  total: number
-  incoming: number
-  outgoing: number
-  sent: number
-  pending: number
-  held: number
-  bounced: number
-  soft_fail: number
-  hard_fail: number
-  opens: number
-  clicks: number
-  unique_opens: number
-  unique_clicks: number
-  bounces?: { hard: number; soft: number; undetermined: number }
 }
 
 /** Pending outbound queue depth (GET /api/v2/server/stats/deliveries). */

@@ -13,7 +13,8 @@
 //     descriptors mirror public/openapi.yaml (paths, methods, examples).
 
 import { adminApi, type Role } from "@/lib/api"
-import { serverApiP1, type WindowStats } from "@/lib/api-p1"
+import { serverApiP1 } from "@/lib/api-p1"
+import { type WindowStats } from "@/lib/api"
 import { firstApiCredentialKey } from "@/lib/api-extras"
 
 // --------------------------------------------------------- statistics
@@ -239,9 +240,8 @@ export function endpointCatalog(): Record<string, ApiEndpoint> {
 export function resolveApiSection(pathname: string): string {
   if (pathname.includes("/webhooks")) return "webhooks"
   if (pathname.includes("/domains")) return "domains"
-  if (pathname.includes("/messaging/templates")) return "templates"
-  if (pathname.includes("/messaging/messages")) return "messages"
-  if (pathname.includes("/messaging/stats") || pathname.includes("/statistics")) return "stats"
+  if (pathname.includes("/templates")) return "templates"
+  if (pathname.includes("/messaging")) return "messages"
   // Send is the hero surface and the default for the messaging root.
   return "send"
 }
