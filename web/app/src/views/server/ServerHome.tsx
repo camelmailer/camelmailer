@@ -9,7 +9,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useRouter } from "next/navigation"
 import {
   ArrowRightIcon,
-  BarChart3Icon,
   CircleCheckIcon,
   CircleIcon,
   GlobeIcon,
@@ -41,6 +40,9 @@ import {
 import { Switch } from "@/components/ui/switch"
 import { adminApi, ApiError, type Server } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
+import { ServerSummary } from "@/views/server/Messaging"
+import { SetupTab } from "@/views/server/SetupTab"
+import { Statistics } from "@/views/server/Statistics"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -465,6 +467,13 @@ export function ServerDashboard({ org, server }: { org: string; server: string }
       )}
 
       <div>
+        <h2 className="mb-3 text-sm font-medium text-muted-foreground">Setup</h2>
+        <SetupTab org={org} server={server} />
+      </div>
+
+      <Statistics org={org} server={server} />
+
+      <div>
         <h2 className="mb-3 text-sm font-medium text-muted-foreground">Manage this server</h2>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <AreaCard
@@ -472,12 +481,6 @@ export function ServerDashboard({ org, server }: { org: string; server: string }
             icon={SendIcon}
             title="Messaging"
             description="Messages, queue, streams and templates."
-          />
-          <AreaCard
-            href={`${base}/messaging/statistics`}
-            icon={BarChart3Icon}
-            title="Statistics"
-            description="Delivery, bounce and engagement rates."
           />
           <AreaCard
             href={`${base}/domains`}
@@ -504,6 +507,11 @@ export function ServerDashboard({ org, server }: { org: string; server: string }
             description="Mode, tracking, IP pool and deletion."
           />
         </div>
+      </div>
+
+      <div>
+        <h2 className="mb-3 text-sm font-medium text-muted-foreground">Summary</h2>
+        <ServerSummary org={org} server={server} />
       </div>
     </div>
   )

@@ -15,7 +15,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
 import { EmptyState } from "@/components/empty-state"
-import { useMessagingApiP1 } from "@/views/server/Messaging"
+import { adminApi } from "@/lib/api"
 import {
   bounceBreakdown,
   formatPct,
@@ -264,8 +264,7 @@ const statVars = {
   "--stat-neither": STAT_COLORS.neither.light,
 } as CSSProperties
 
-export function Statistics() {
-  const p1 = useMessagingApiP1()
+export function Statistics({ org, server }: { org: string; server: string }) {
   const today = useMemo(() => new Date(), [])
   const [preset, setPreset] = useState<Preset>("30")
   const [customFrom, setCustomFrom] = useState(
@@ -285,8 +284,8 @@ export function Statistics() {
   }, [preset, customFrom, customTo])
 
   const stats = useQuery({
-    queryKey: ["p4-stats", from.toISOString(), to.toISOString()],
-    queryFn: () => p1.statsWindow(from, to).then((r) => r.stats),
+    queryKey: ["admin-server-stats", org, server, from.toISOString(), to.toISOString()],
+    queryFn: () => adminApi.servers(org).statsWindow(server, from, to).then((r) => r.stats),
   })
 
   const s = stats.data
