@@ -7,6 +7,7 @@ import { useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { type ColumnDef } from "@tanstack/react-table"
 import {
   AtSignIcon,
   BanIcon,
@@ -49,18 +50,14 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
+import { DataTable } from "@/components/ui/data-table"
 import {
   adminApi,
   ApiError,
   WEBHOOK_EVENTS,
+  type Domain,
+  type Route,
+  type SenderAddress,
   type Suppression,
   type Webhook,
   type WebhookTestResult,
@@ -119,6 +116,71 @@ export function Domains({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not add the domain"),
   })
 
+  const columns: ColumnDef<Domain>[] = [
+    {
+      id: "domain",
+      header: "Domain",
+      accessorFn: (d) => d.name,
+      cell: ({ row }) => (
+        <Link
+          href={domainHref(org, server, row.original.name)}
+          className="block max-w-[24rem] truncate font-medium transition-colors group-hover:text-primary hover:underline"
+        >
+          {row.original.name}
+        </Link>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      enableSorting: false,
+      accessorFn: (d) => (d.verified ? "verified" : "unverified"),
+      filterFn: (row, _id, value) =>
+        (row.original.verified ? "verified" : "unverified") === value,
+      cell: ({ row }) => (
+        <div className="flex flex-wrap gap-1.5">
+          <StatusPill status={row.original.verified ? "verified" : "unverified"} />
+          {row.original.dkim_record === null && <StatusPill status="no key" tone="amber" />}
+        </div>
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => {
+        const domain = row.original
+        return (
+          <div className="space-x-2">
+            <Button variant="outline" size="sm" asChild>
+              <Link href={domainHref(org, server, domain.name)}>Records &amp; health</Link>
+            </Button>
+            {!domain.verified && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await adminApi.domains(org, server).verify(domain.name)
+                    invalidate()
+                  } catch (err) {
+                    errorToast(err, "Verification failed")
+                  }
+                }}
+              >
+                Verify
+              </Button>
+            )}
+            <Button variant="ghost" size="sm" onClick={() => setDeleteName(domain.name)}>
+              Delete
+            </Button>
+          </div>
+        )
+      },
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -138,59 +200,25 @@ export function Domains({ org, server }: Scope) {
           action={{ label: "Add domain", onClick: () => setOpen(true) }}
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Domain</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {domains.data?.domains.map((domain) => (
-              <TableRow key={domain.id}>
-                <TableCell>
-                  <Link
-                    href={domainHref(org, server, domain.name)}
-                    className="font-medium hover:underline"
-                  >
-                    {domain.name}
-                  </Link>
-                </TableCell>
-                <TableCell>
-                  <div className="flex flex-wrap gap-1.5">
-                    <StatusPill status={domain.verified ? "verified" : "unverified"} />
-                    {domain.dkim_record === null && <StatusPill status="no key" tone="amber" />}
-                  </div>
-                </TableCell>
-                <TableCell className="space-x-2 text-right">
-                  <Button variant="outline" size="sm" asChild>
-                    <Link href={domainHref(org, server, domain.name)}>Records &amp; health</Link>
-                  </Button>
-                  {!domain.verified && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={async () => {
-                        try {
-                          await adminApi.domains(org, server).verify(domain.name)
-                          invalidate()
-                        } catch (err) {
-                          errorToast(err, "Verification failed")
-                        }
-                      }}
-                    >
-                      Verify
-                    </Button>
-                  )}
-                  <Button variant="ghost" size="sm" onClick={() => setDeleteName(domain.name)}>
-                    Delete
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <DataTable
+          columns={columns}
+          data={domains.data?.domains ?? []}
+          loading={domains.isPending}
+          searchKeys={["name"]}
+          searchPlaceholder="Search domains…"
+          emptyText="No domains match your search."
+          initialPageSize={20}
+          filters={[
+            {
+              columnId: "status",
+              label: "Status",
+              options: [
+                { label: "Verified", value: "verified" },
+                { label: "Unverified", value: "unverified" },
+              ],
+            },
+          ]}
+        />
       )}
       <FormDialog
         open={open}
@@ -367,6 +395,88 @@ export function Credentials({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not create the credential"),
   })
 
+  const columns: ColumnDef<CredentialWithUsage>[] = [
+    {
+      id: "name",
+      header: "Name",
+      accessorFn: (c) => c.name,
+      cell: ({ row }) => (
+        <span className="block max-w-[20rem] truncate font-medium">{row.original.name}</span>
+      ),
+    },
+    {
+      id: "type",
+      header: "Type",
+      accessorFn: (c) => c.type,
+      filterFn: (row, _id, value) => row.original.type === value,
+      cell: ({ row }) => <Badge variant="outline">{row.original.type}</Badge>,
+    },
+    {
+      id: "key",
+      header: "Key",
+      enableSorting: false,
+      cell: ({ row }) => {
+        const credential = row.original
+        return credential.type === "SMTP-IP" ? (
+          <span className="font-mono text-xs text-muted-foreground">{credential.key ?? ""}</span>
+        ) : (
+          <span className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
+            {maskKey(credential.key)}
+            <CopyButton value={credential.key ?? ""} />
+          </span>
+        )
+      },
+    },
+    {
+      id: "lastUsed",
+      header: "Last used",
+      accessorFn: (c) => c.last_used_at ?? "",
+      cell: ({ row }) => <LastUsed at={row.original.last_used_at} />,
+    },
+    {
+      id: "hold",
+      header: "Hold",
+      enableSorting: false,
+      cell: ({ row }) => {
+        const credential = row.original
+        return (
+          <Switch
+            checked={credential.hold}
+            onCheckedChange={async (checked) => {
+              try {
+                await adminApi.credentials(org, server).update(credential.id, { hold: checked })
+                invalidate()
+              } catch (err) {
+                errorToast(err, "Could not update the credential")
+              }
+            }}
+          />
+        )
+      },
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => {
+        const credential = row.original
+        return (
+          <div className="space-x-2">
+            {credential.type === "SMTP" && (
+              <Button variant="outline" size="sm" onClick={() => setSmtpFor(credential)}>
+                <ServerIcon className="size-4" /> SMTP settings
+              </Button>
+            )}
+            <Button variant="ghost" size="sm" onClick={() => setDeleteId(credential.id)}>
+              Delete
+            </Button>
+          </div>
+        )
+      },
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -387,64 +497,26 @@ export function Credentials({ org, server }: Scope) {
           action={{ label: "New credential", onClick: () => { setIssued(null); setOpen(true) } }}
         />
       ) : (
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Name</TableHead>
-            <TableHead>Type</TableHead>
-            <TableHead>Key</TableHead>
-            <TableHead>Last used</TableHead>
-            <TableHead>Hold</TableHead>
-            <TableHead />
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {rows.map((credential) => (
-            <TableRow key={credential.id}>
-              <TableCell className="font-medium">{credential.name}</TableCell>
-              <TableCell>
-                <Badge variant="outline">{credential.type}</Badge>
-              </TableCell>
-              <TableCell>
-                {credential.type === "SMTP-IP" ? (
-                  <span className="font-mono text-xs text-muted-foreground">{credential.key ?? ""}</span>
-                ) : (
-                  <span className="inline-flex items-center gap-1 font-mono text-xs text-muted-foreground">
-                    {maskKey(credential.key)}
-                    <CopyButton value={credential.key ?? ""} />
-                  </span>
-                )}
-              </TableCell>
-              <TableCell>
-                <LastUsed at={credential.last_used_at} />
-              </TableCell>
-              <TableCell>
-                <Switch
-                  checked={credential.hold}
-                  onCheckedChange={async (checked) => {
-                    try {
-                      await adminApi.credentials(org, server).update(credential.id, { hold: checked })
-                      invalidate()
-                    } catch (err) {
-                      errorToast(err, "Could not update the credential")
-                    }
-                  }}
-                />
-              </TableCell>
-              <TableCell className="space-x-2 text-right">
-                {credential.type === "SMTP" && (
-                  <Button variant="outline" size="sm" onClick={() => setSmtpFor(credential)}>
-                    <ServerIcon className="size-4" /> SMTP settings
-                  </Button>
-                )}
-                <Button variant="ghost" size="sm" onClick={() => setDeleteId(credential.id)}>
-                  Delete
-                </Button>
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+        <DataTable
+          columns={columns}
+          data={rows}
+          loading={credentials.isPending}
+          searchKeys={["name"]}
+          searchPlaceholder="Search credentials…"
+          emptyText="No credentials match your search."
+          initialPageSize={20}
+          filters={[
+            {
+              columnId: "type",
+              label: "Type",
+              options: [
+                { label: "API", value: "API" },
+                { label: "SMTP", value: "SMTP" },
+                { label: "SMTP-IP", value: "SMTP-IP" },
+              ],
+            },
+          ]}
+        />
       )}
       {smtpFor && (
         <SmtpDialog
@@ -551,6 +623,48 @@ export function Routes({ org, server }: Scope) {
   const domainName = (id: number | null) =>
     domains.data?.domains.find((domain) => domain.id === id)?.name ?? "route domain"
 
+  const columns: ColumnDef<Route>[] = [
+    {
+      id: "address",
+      header: "Address",
+      accessorFn: (r) => `${r.name}@${domainName(r.domain_id)}`,
+      cell: ({ row }) => (
+        <span className="block max-w-[24rem] truncate font-medium">
+          {row.original.name}@{domainName(row.original.domain_id)}
+        </span>
+      ),
+    },
+    {
+      id: "mode",
+      header: "Mode",
+      accessorFn: (r) => r.mode,
+      filterFn: (row, _id, value) => row.original.mode === value,
+      cell: ({ row }) => <Badge variant="outline">{row.original.mode}</Badge>,
+    },
+    {
+      id: "endpoint",
+      header: "Endpoint",
+      enableSorting: false,
+      accessorFn: (r) => r.endpoint_url ?? "",
+      cell: ({ row }) => (
+        <span className="block max-w-64 truncate text-muted-foreground">
+          {row.original.endpoint_url ?? "—"}
+        </span>
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <Button variant="ghost" size="sm" onClick={() => setDeleteId(row.original.id)}>
+          Delete
+        </Button>
+      ),
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -570,36 +684,25 @@ export function Routes({ org, server }: Scope) {
           action={{ label: "New route", onClick: () => setOpen(true) }}
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Address</TableHead>
-              <TableHead>Mode</TableHead>
-              <TableHead>Endpoint</TableHead>
-              <TableHead />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {routes.data?.routes.map((route) => (
-              <TableRow key={route.id}>
-                <TableCell className="font-medium">
-                  {route.name}@{domainName(route.domain_id)}
-                </TableCell>
-                <TableCell>
-                  <Badge variant="outline">{route.mode}</Badge>
-                </TableCell>
-                <TableCell className="max-w-64 truncate text-muted-foreground">
-                  {route.endpoint_url ?? "—"}
-                </TableCell>
-                <TableCell className="text-right">
-                  <Button variant="ghost" size="sm" onClick={() => setDeleteId(route.id)}>
-                    Delete
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <DataTable
+          columns={columns}
+          data={routes.data?.routes ?? []}
+          loading={routes.isPending}
+          searchKeys={["name", "endpoint_url"]}
+          searchPlaceholder="Search routes…"
+          emptyText="No routes match your search."
+          initialPageSize={20}
+          filters={[
+            {
+              columnId: "mode",
+              label: "Mode",
+              options: ["Endpoint", "Accept", "Hold", "Bounce", "Reject"].map((m) => ({
+                label: m,
+                value: m,
+              })),
+            },
+          ]}
+        />
       )}
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
@@ -866,6 +969,104 @@ export function Webhooks({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not create the webhook"),
   })
 
+  const columns: ColumnDef<Webhook>[] = [
+    {
+      id: "name",
+      header: "Name",
+      accessorFn: (w) => w.name,
+      cell: ({ row }) => (
+        <span className="block max-w-[16rem] truncate font-medium">{row.original.name}</span>
+      ),
+    },
+    {
+      id: "url",
+      header: "URL",
+      enableSorting: false,
+      accessorFn: (w) => w.url,
+      cell: ({ row }) => (
+        <span className="block max-w-64 truncate text-muted-foreground">{row.original.url}</span>
+      ),
+    },
+    {
+      id: "events",
+      header: "Events",
+      enableSorting: false,
+      cell: ({ row }) =>
+        row.original.events.length === 0 ? (
+          <Badge variant="secondary">all events</Badge>
+        ) : (
+          <div className="flex max-w-56 flex-wrap gap-1">
+            {row.original.events.map((event) => (
+              <EventPill key={event} event={event} />
+            ))}
+          </div>
+        ),
+    },
+    {
+      id: "headers",
+      header: "Headers",
+      enableSorting: false,
+      cell: ({ row }) => (
+        <span className="text-muted-foreground">
+          {Object.keys(row.original.headers ?? {}).length === 0
+            ? "—"
+            : Object.keys(row.original.headers).join(", ")}
+        </span>
+      ),
+    },
+    {
+      id: "signed",
+      header: "Signed",
+      enableSorting: false,
+      cell: ({ row }) =>
+        row.original.sign ? <Badge variant="outline">RSA</Badge> : <span>—</span>,
+    },
+    {
+      id: "enabled",
+      header: "Enabled",
+      enableSorting: false,
+      accessorFn: (w) => (w.enabled ? "enabled" : "disabled"),
+      filterFn: (row, _id, value) =>
+        (row.original.enabled ? "enabled" : "disabled") === value,
+      cell: ({ row }) => {
+        const webhook = row.original
+        return (
+          <Switch
+            checked={webhook.enabled}
+            onCheckedChange={async (checked) => {
+              try {
+                if (checked) await adminApi.webhooks(org, server).enable(webhook.id)
+                else await adminApi.webhooks(org, server).disable(webhook.id)
+                invalidate()
+              } catch (err) {
+                errorToast(err, "Could not toggle the webhook")
+              }
+            }}
+          />
+        )
+      },
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => {
+        const webhook = row.original
+        return (
+          <div className="space-x-2">
+            <Button variant="outline" size="sm" onClick={() => setTesting(webhook)}>
+              Send test
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => setDeleteId(webhook.id)}>
+              Delete
+            </Button>
+          </div>
+        )
+      },
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -885,68 +1086,25 @@ export function Webhooks({ org, server }: Scope) {
           action={{ label: "New webhook", onClick: () => setOpen(true) }}
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Name</TableHead>
-              <TableHead>URL</TableHead>
-              <TableHead>Events</TableHead>
-              <TableHead>Headers</TableHead>
-              <TableHead>Signed</TableHead>
-              <TableHead>Enabled</TableHead>
-              <TableHead />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {webhooks.data?.webhooks.map((webhook) => (
-              <TableRow key={webhook.id}>
-                <TableCell className="font-medium">{webhook.name}</TableCell>
-                <TableCell className="max-w-64 truncate text-muted-foreground">
-                  {webhook.url}
-                </TableCell>
-                <TableCell>
-                  {webhook.events.length === 0 ? (
-                    <Badge variant="secondary">all events</Badge>
-                  ) : (
-                    <div className="flex max-w-56 flex-wrap gap-1">
-                      {webhook.events.map((event) => (
-                        <EventPill key={event} event={event} />
-                      ))}
-                    </div>
-                  )}
-                </TableCell>
-                <TableCell className="text-muted-foreground">
-                  {Object.keys(webhook.headers ?? {}).length === 0
-                    ? "—"
-                    : Object.keys(webhook.headers).join(", ")}
-                </TableCell>
-                <TableCell>{webhook.sign ? <Badge variant="outline">RSA</Badge> : "—"}</TableCell>
-                <TableCell>
-                  <Switch
-                    checked={webhook.enabled}
-                    onCheckedChange={async (checked) => {
-                      try {
-                        if (checked) await adminApi.webhooks(org, server).enable(webhook.id)
-                        else await adminApi.webhooks(org, server).disable(webhook.id)
-                        invalidate()
-                      } catch (err) {
-                        errorToast(err, "Could not toggle the webhook")
-                      }
-                    }}
-                  />
-                </TableCell>
-                <TableCell className="space-x-2 text-right">
-                  <Button variant="outline" size="sm" onClick={() => setTesting(webhook)}>
-                    Send test
-                  </Button>
-                  <Button variant="ghost" size="sm" onClick={() => setDeleteId(webhook.id)}>
-                    Delete
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <DataTable
+          columns={columns}
+          data={webhooks.data?.webhooks ?? []}
+          loading={webhooks.isPending}
+          searchKeys={["name", "url"]}
+          searchPlaceholder="Search webhooks…"
+          emptyText="No webhooks match your search."
+          initialPageSize={20}
+          filters={[
+            {
+              columnId: "enabled",
+              label: "State",
+              options: [
+                { label: "Enabled", value: "enabled" },
+                { label: "Disabled", value: "disabled" },
+              ],
+            },
+          ]}
+        />
       )}
       <FormDialog
         open={open}
@@ -1106,6 +1264,59 @@ export function Suppressions({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not add the suppression"),
   })
 
+  const columns: ColumnDef<SuppressionWithDate>[] = [
+    {
+      id: "address",
+      header: "Address",
+      accessorFn: (s) => s.address,
+      cell: ({ row }) => (
+        <Link
+          href={recipientHref(org, server, row.original.address)}
+          className="block max-w-[24rem] truncate font-medium transition-colors group-hover:text-primary hover:underline"
+        >
+          {row.original.address}
+        </Link>
+      ),
+    },
+    {
+      id: "type",
+      header: "Type",
+      accessorFn: (s) => s.type,
+      filterFn: (row, _id, value) => row.original.type === value,
+      cell: ({ row }) => <Badge variant="outline">{row.original.type}</Badge>,
+    },
+    {
+      id: "reason",
+      header: "Reason",
+      enableSorting: false,
+      accessorFn: (s) => suppressionReasonText(s),
+      cell: ({ row }) => (
+        <span className="text-muted-foreground">{suppressionReasonText(row.original)}</span>
+      ),
+    },
+    {
+      id: "created_at",
+      header: "Date added",
+      accessorFn: (s) => s.created_at ?? "",
+      cell: ({ row }) => (
+        <span className="whitespace-nowrap text-muted-foreground">
+          {formatDate(row.original.created_at)}
+        </span>
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <Button variant="outline" size="sm" onClick={() => setReactivating(row.original)}>
+          Reactivate
+        </Button>
+      ),
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -1138,49 +1349,15 @@ export function Suppressions({ org, server }: Scope) {
           action={{ label: "Suppress address", onClick: () => setOpen(true) }}
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Address</TableHead>
-              <TableHead>Type</TableHead>
-              <TableHead>Reason</TableHead>
-              <TableHead>Date added</TableHead>
-              <TableHead />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((suppression) => (
-              <TableRow key={suppression.id}>
-                <TableCell>
-                  <Link
-                    href={recipientHref(org, server, suppression.address)}
-                    className="font-medium hover:underline"
-                  >
-                    {suppression.address}
-                  </Link>
-                </TableCell>
-                <TableCell>
-                  <Badge variant="outline">{suppression.type}</Badge>
-                </TableCell>
-                <TableCell className="text-muted-foreground">
-                  {suppressionReasonText(suppression)}
-                </TableCell>
-                <TableCell className="whitespace-nowrap text-muted-foreground">
-                  {formatDate(suppression.created_at)}
-                </TableCell>
-                <TableCell className="text-right">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setReactivating(suppression)}
-                  >
-                    Reactivate
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <DataTable
+          columns={columns}
+          data={rows}
+          loading={suppressions.isPending}
+          searchKeys={["address"]}
+          searchPlaceholder="Search addresses…"
+          emptyText="No suppressions match your search."
+          initialPageSize={20}
+        />
       )}
       <ConfirmDialog
         open={reactivating !== null}
@@ -1254,6 +1431,44 @@ export function SenderAddresses({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not add the sender address"),
   })
 
+  const columns: ColumnDef<SenderAddress>[] = [
+    {
+      id: "email",
+      header: "Email address",
+      accessorFn: (a) => a.email_address,
+      cell: ({ row }) => (
+        <span className="block max-w-[24rem] truncate font-medium">
+          {row.original.email_address}
+        </span>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      enableSorting: false,
+      accessorFn: (a) => (a.verified ? "confirmed" : "pending"),
+      filterFn: (row, _id, value) =>
+        (row.original.verified ? "confirmed" : "pending") === value,
+      cell: ({ row }) =>
+        row.original.verified ? (
+          <StatusPill status="confirmed" />
+        ) : (
+          <StatusPill status="pending" />
+        ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <Button variant="ghost" size="sm" onClick={() => setDeleteId(row.original.id)}>
+          Delete
+        </Button>
+      ),
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -1273,34 +1488,25 @@ export function SenderAddresses({ org, server }: Scope) {
           action={{ label: "Add address", onClick: () => { setIssuedToken(null); setOpen(true) } }}
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Email address</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {addresses.data?.sender_addresses.map((address) => (
-              <TableRow key={address.id}>
-                <TableCell className="font-medium">{address.email_address}</TableCell>
-                <TableCell>
-                  {address.verified ? (
-                    <Badge>confirmed</Badge>
-                  ) : (
-                    <Badge variant="secondary">pending</Badge>
-                  )}
-                </TableCell>
-                <TableCell className="text-right">
-                  <Button variant="ghost" size="sm" onClick={() => setDeleteId(address.id)}>
-                    Delete
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <DataTable
+          columns={columns}
+          data={addresses.data?.sender_addresses ?? []}
+          loading={addresses.isPending}
+          searchKeys={["email_address"]}
+          searchPlaceholder="Search addresses…"
+          emptyText="No sender addresses match your search."
+          initialPageSize={20}
+          filters={[
+            {
+              columnId: "status",
+              label: "Status",
+              options: [
+                { label: "Confirmed", value: "confirmed" },
+                { label: "Pending", value: "pending" },
+              ],
+            },
+          ]}
+        />
       )}
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>

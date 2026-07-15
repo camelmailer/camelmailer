@@ -4,10 +4,12 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { PlusIcon } from "lucide-react"
+import { type ColumnDef } from "@tanstack/react-table"
+import { PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, PageHeader } from "@/components/shared"
 import { Button } from "@/components/ui/button"
+import { DataTable } from "@/components/ui/data-table"
 import {
   Dialog,
   DialogContent,
@@ -18,15 +20,9 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { adminApi, ApiError } from "@/lib/api"
+import { adminApi, ApiError, type User } from "@/lib/api"
+
+type UserRow = User & { name: string }
 
 export default function Users() {
   const queryClient = useQueryClient()
@@ -63,6 +59,69 @@ export default function Users() {
       toast.error(err instanceof ApiError ? err.message : "Could not create the user"),
   })
 
+  const rows: UserRow[] = (users.data?.users ?? []).map((user) => ({
+    ...user,
+    name: `${user.first_name} ${user.last_name}`.trim(),
+  }))
+
+  const columns: ColumnDef<UserRow>[] = [
+    {
+      id: "name",
+      header: "Name",
+      accessorFn: (r) => r.name,
+      cell: ({ row }) => (
+        <span className="block truncate font-medium">{row.original.name || "—"}</span>
+      ),
+    },
+    {
+      id: "email",
+      header: "Email",
+      accessorFn: (r) => r.email_address,
+      cell: ({ row }) => (
+        <span className="text-muted-foreground">{row.original.email_address}</span>
+      ),
+    },
+    {
+      id: "admin",
+      header: "Admin",
+      accessorFn: (r) => r.admin,
+      enableSorting: false,
+      filterFn: (row, _id, value) =>
+        value === "admin" ? row.original.admin : !row.original.admin,
+      cell: ({ row }) => (
+        <div onClick={(e) => e.stopPropagation()}>
+          <Switch
+            checked={row.original.admin}
+            onCheckedChange={async (checked) => {
+              try {
+                await adminApi.users.update(row.original.id, { admin: checked })
+                invalidate()
+              } catch (err) {
+                toast.error(
+                  err instanceof ApiError ? err.message : "Could not update the user",
+                )
+              }
+            }}
+          />
+        </div>
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <div onClick={(e) => e.stopPropagation()}>
+          <Button variant="ghost" size="icon" onClick={() => setDeleteId(row.original.id)}>
+            <Trash2Icon className="size-4" />
+            <span className="sr-only">Delete</span>
+          </Button>
+        </div>
+      ),
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -74,46 +133,25 @@ export default function Users() {
           </Button>
         }
       />
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Name</TableHead>
-            <TableHead>Email</TableHead>
-            <TableHead>Admin</TableHead>
-            <TableHead />
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {users.data?.users.map((user) => (
-            <TableRow key={user.id}>
-              <TableCell>
-                {user.first_name} {user.last_name}
-              </TableCell>
-              <TableCell className="text-muted-foreground">{user.email_address}</TableCell>
-              <TableCell>
-                <Switch
-                  checked={user.admin}
-                  onCheckedChange={async (checked) => {
-                    try {
-                      await adminApi.users.update(user.id, { admin: checked })
-                      invalidate()
-                    } catch (err) {
-                      toast.error(
-                        err instanceof ApiError ? err.message : "Could not update the user",
-                      )
-                    }
-                  }}
-                />
-              </TableCell>
-              <TableCell className="text-right">
-                <Button variant="ghost" size="sm" onClick={() => setDeleteId(user.id)}>
-                  Delete
-                </Button>
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+      <DataTable
+        columns={columns}
+        data={rows}
+        loading={users.isPending}
+        searchKeys={["name", "email_address"]}
+        searchPlaceholder="Search users…"
+        emptyText="No users on this instance yet."
+        filters={[
+          {
+            columnId: "admin",
+            label: "Role",
+            options: [
+              { label: "Admin", value: "admin" },
+              { label: "Member", value: "member" },
+            ],
+          },
+        ]}
+        initialPageSize={20}
+      />
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>

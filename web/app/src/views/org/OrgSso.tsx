@@ -7,10 +7,10 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { FingerprintIcon, GlobeIcon, PlusIcon } from "lucide-react"
+import { type ColumnDef } from "@tanstack/react-table"
+import { PlusIcon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, CopyButton, PageHeader } from "@/components/shared"
-import { EmptyState } from "@/components/empty-state"
 import { FormDialog } from "@/components/form-dialog"
 import { StatusPill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
@@ -22,6 +22,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import { DataTable } from "@/components/ui/data-table"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -32,19 +33,12 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
 import {
   adminApi,
   ApiError,
   type OrgSsoConnection,
+  type OrgSsoDomain,
   type OrgSsoKind,
   type Role,
 } from "@/lib/api"
@@ -141,6 +135,84 @@ function EmailDomains({ org }: { org: string }) {
 
   const rows = domains.data?.domains ?? []
 
+  const columns: ColumnDef<OrgSsoDomain>[] = [
+    {
+      id: "domain",
+      header: "Domain",
+      accessorFn: (r) => r.domain,
+      cell: ({ row }) => (
+        <span className="block truncate font-medium">{row.original.domain}</span>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      accessorFn: (r) => (r.verified ? "verified" : "unverified"),
+      cell: ({ row }) => (
+        <StatusPill status={row.original.verified ? "verified" : "unverified"} />
+      ),
+    },
+    {
+      id: "dns",
+      header: "DNS record",
+      enableSorting: false,
+      cell: ({ row }) => {
+        const domain = row.original
+        return domain.verified ? (
+          <span className="text-muted-foreground">—</span>
+        ) : (
+          <div className="grid gap-1 text-xs">
+            <span className="inline-flex items-center gap-1">
+              <code className="rounded bg-muted px-1.5 py-0.5 font-mono">
+                {domain.dns_record.name}
+              </code>
+              <CopyButton value={domain.dns_record.name} />
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <code className="max-w-72 truncate rounded bg-muted px-1.5 py-0.5 font-mono">
+                {domain.dns_record.value}
+              </code>
+              <CopyButton value={domain.dns_record.value} />
+            </span>
+          </div>
+        )
+      },
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => {
+        const domain = row.original
+        return (
+          <div className="space-x-2 text-right">
+            {!domain.verified && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await adminApi.orgSso(org).domains.verify(domain.id)
+                    invalidate()
+                    toast.success(`${domain.domain} verified`)
+                  } catch (err) {
+                    errorToast(err, "Verification failed")
+                  }
+                }}
+              >
+                Verify
+              </Button>
+            )}
+            <Button variant="ghost" size="sm" onClick={() => setDeleteId(domain.id)}>
+              Delete
+            </Button>
+          </div>
+        )
+      },
+    },
+  ]
+
   return (
     <Card>
       <CardHeader className="flex flex-row items-start justify-between space-y-0">
@@ -156,77 +228,15 @@ function EmailDomains({ org }: { org: string }) {
         </Button>
       </CardHeader>
       <CardContent>
-        {domains.isSuccess && rows.length === 0 ? (
-          <EmptyState
-            icon={GlobeIcon}
-            title="No login domains yet"
-            description="Verify a domain like acme.com so your team's sign-ins route to this organization."
-            action={{ label: "Add domain", onClick: () => setOpen(true) }}
-          />
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Domain</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>DNS record</TableHead>
-                <TableHead />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((domain) => (
-                <TableRow key={domain.id}>
-                  <TableCell className="font-medium">{domain.domain}</TableCell>
-                  <TableCell>
-                    <StatusPill status={domain.verified ? "verified" : "unverified"} />
-                  </TableCell>
-                  <TableCell>
-                    {domain.verified ? (
-                      <span className="text-muted-foreground">—</span>
-                    ) : (
-                      <div className="grid gap-1 text-xs">
-                        <span className="inline-flex items-center gap-1">
-                          <code className="rounded bg-muted px-1.5 py-0.5 font-mono">
-                            {domain.dns_record.name}
-                          </code>
-                          <CopyButton value={domain.dns_record.name} />
-                        </span>
-                        <span className="inline-flex items-center gap-1">
-                          <code className="max-w-72 truncate rounded bg-muted px-1.5 py-0.5 font-mono">
-                            {domain.dns_record.value}
-                          </code>
-                          <CopyButton value={domain.dns_record.value} />
-                        </span>
-                      </div>
-                    )}
-                  </TableCell>
-                  <TableCell className="space-x-2 text-right">
-                    {!domain.verified && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={async () => {
-                          try {
-                            await adminApi.orgSso(org).domains.verify(domain.id)
-                            invalidate()
-                            toast.success(`${domain.domain} verified`)
-                          } catch (err) {
-                            errorToast(err, "Verification failed")
-                          }
-                        }}
-                      >
-                        Verify
-                      </Button>
-                    )}
-                    <Button variant="ghost" size="sm" onClick={() => setDeleteId(domain.id)}>
-                      Delete
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
+        <DataTable
+          columns={columns}
+          data={rows}
+          loading={domains.isPending}
+          searchKeys={["domain"]}
+          searchPlaceholder="Search domains…"
+          emptyText="No login domains yet. Add a domain like acme.com so your team's sign-ins route to this organization."
+          initialPageSize={20}
+        />
       </CardContent>
       <FormDialog
         open={open}
@@ -441,6 +451,80 @@ function Connections({ org }: { org: string }) {
 
   const rows = connections.data?.connections ?? []
 
+  const columns: ColumnDef<OrgSsoConnection>[] = [
+    {
+      id: "name",
+      header: "Name",
+      accessorFn: (r) => r.name,
+      cell: ({ row }) => (
+        <span className="block truncate font-medium">{row.original.name}</span>
+      ),
+    },
+    {
+      id: "type",
+      header: "Type",
+      accessorFn: (r) => kindLabel(r.kind),
+      cell: ({ row }) => <Badge variant="outline">{kindLabel(row.original.kind)}</Badge>,
+    },
+    {
+      id: "new-members",
+      header: "New members",
+      enableSorting: false,
+      cell: ({ row }) => {
+        const connection = row.original
+        return (
+          <span className="text-muted-foreground">
+            {connection.auto_provision
+              ? `join as ${connection.default_role}`
+              : "existing members only"}
+          </span>
+        )
+      },
+    },
+    {
+      id: "enabled",
+      header: "Enabled",
+      enableSorting: false,
+      cell: ({ row }) => {
+        const connection = row.original
+        return (
+          <Switch
+            checked={connection.enabled}
+            onCheckedChange={async (checked) => {
+              try {
+                await adminApi
+                  .orgSso(org)
+                  .connections.update(connection.id, { enabled: checked })
+                invalidate()
+              } catch (err) {
+                errorToast(err, "Could not toggle the connection")
+              }
+            }}
+          />
+        )
+      },
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => {
+        const connection = row.original
+        return (
+          <div className="space-x-2 text-right">
+            <Button variant="outline" size="sm" onClick={() => openEdit(connection)}>
+              Edit
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => setDeleteId(connection.id)}>
+              Delete
+            </Button>
+          </div>
+        )
+      },
+    },
+  ]
+
   return (
     <Card>
       <CardHeader className="flex flex-row items-start justify-between space-y-0">
@@ -456,68 +540,15 @@ function Connections({ org }: { org: string }) {
         </Button>
       </CardHeader>
       <CardContent>
-        {connections.isSuccess && rows.length === 0 ? (
-          <EmptyState
-            icon={FingerprintIcon}
-            title="No SSO connections yet"
-            description="Connect your identity provider (Okta, Entra ID, Google Workspace, GitHub) so your team signs in with one click."
-            action={{ label: "New connection", onClick: openCreate }}
-          />
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Name</TableHead>
-                <TableHead>Type</TableHead>
-                <TableHead>New members</TableHead>
-                <TableHead>Enabled</TableHead>
-                <TableHead />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((connection) => (
-                <TableRow key={connection.id}>
-                  <TableCell className="font-medium">{connection.name}</TableCell>
-                  <TableCell>
-                    <Badge variant="outline">{kindLabel(connection.kind)}</Badge>
-                  </TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {connection.auto_provision
-                      ? `join as ${connection.default_role}`
-                      : "existing members only"}
-                  </TableCell>
-                  <TableCell>
-                    <Switch
-                      checked={connection.enabled}
-                      onCheckedChange={async (checked) => {
-                        try {
-                          await adminApi
-                            .orgSso(org)
-                            .connections.update(connection.id, { enabled: checked })
-                          invalidate()
-                        } catch (err) {
-                          errorToast(err, "Could not toggle the connection")
-                        }
-                      }}
-                    />
-                  </TableCell>
-                  <TableCell className="space-x-2 text-right">
-                    <Button variant="outline" size="sm" onClick={() => openEdit(connection)}>
-                      Edit
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setDeleteId(connection.id)}
-                    >
-                      Delete
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
+        <DataTable
+          columns={columns}
+          data={rows}
+          loading={connections.isPending}
+          searchKeys={["name"]}
+          searchPlaceholder="Search connections…"
+          emptyText="No SSO connections yet. Connect Okta, Entra ID, Google Workspace or GitHub so your team signs in with one click."
+          initialPageSize={20}
+        />
       </CardContent>
       <FormDialog
         open={open}

@@ -7,6 +7,7 @@
 import { createContext, useContext, useEffect, useMemo, useState } from "react"
 import Link from "next/link"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { type ColumnDef } from "@tanstack/react-table"
 import { usePathname, useRouter } from "next/navigation"
 import {
   ChevronRightIcon,
@@ -59,14 +60,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
+import { DataTable } from "@/components/ui/data-table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import {
@@ -76,6 +70,7 @@ import {
   type InsightCheck,
   type Layout,
   type Message,
+  type Stream,
   type Template,
 } from "@/lib/api"
 import {
@@ -795,6 +790,87 @@ export function Messages({ api }: { api: Api }) {
   }, [messages.data, cutoff])
   const hasFilters = query || status !== "all" || tag !== "all" || stream !== "all" || range !== "all"
 
+  const columns: ColumnDef<Message>[] = [
+    {
+      id: "event",
+      header: "Event",
+      accessorFn: (m) => m.status ?? "",
+      cell: ({ row }) => <MessagePill message={row.original} />,
+    },
+    {
+      id: "recipient",
+      header: "Recipient",
+      accessorFn: (m) => m.rcpt_to,
+      cell: ({ row }) => (
+        // recipient history, not the message — hence stopPropagation
+        <Link
+          href={recipientHref(org, server, row.original.rcpt_to)}
+          className="block max-w-48 truncate font-medium text-primary underline-offset-2 hover:underline"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {row.original.rcpt_to}
+        </Link>
+      ),
+    },
+    {
+      id: "subject",
+      header: "Subject",
+      accessorFn: (m) => m.subject ?? "",
+      cell: ({ row }) => (
+        <button
+          type="button"
+          onClick={() => setSelected(row.original.id)}
+          className="block max-w-64 truncate text-left transition-colors group-hover:text-primary hover:underline"
+        >
+          {row.original.subject ?? "—"}
+        </button>
+      ),
+    },
+    {
+      id: "tag",
+      header: "Tag",
+      accessorFn: (m) => m.tag ?? "",
+      cell: ({ row }) =>
+        row.original.tag ? (
+          <Badge variant="secondary" className="font-normal">
+            {row.original.tag}
+          </Badge>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
+    },
+    {
+      id: "time",
+      header: "Time",
+      accessorFn: (m) => m.created_at,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <span
+          className="whitespace-nowrap text-muted-foreground"
+          title={formatDate(row.original.created_at)}
+        >
+          {relativeTime(row.original.created_at)}
+        </span>
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <Button
+          variant="ghost"
+          size="icon"
+          aria-label="View message"
+          onClick={() => setSelected(row.original.id)}
+        >
+          <ChevronRightIcon className="size-4" />
+        </Button>
+      ),
+    },
+  ]
+
   return (
     <div>
       <div className="mb-3 flex items-center gap-2">
@@ -890,56 +966,16 @@ export function Messages({ api }: { api: Api }) {
           />
         )
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-28">Event</TableHead>
-              <TableHead>Recipient</TableHead>
-              <TableHead>Subject</TableHead>
-              <TableHead className="w-32">Tag</TableHead>
-              <TableHead className="w-24 text-right">Time</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((message) => (
-              <TableRow
-                key={message.id}
-                className="cursor-pointer"
-                onClick={() => setSelected(message.id)}
-              >
-                <TableCell>
-                  <MessagePill message={message} />
-                </TableCell>
-                <TableCell className="max-w-48 truncate">
-                  {/* recipient history, not the message — hence stopPropagation */}
-                  <Link
-                    href={recipientHref(org, server, message.rcpt_to)}
-                    className="font-medium text-primary underline-offset-2 hover:underline"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {message.rcpt_to}
-                  </Link>
-                </TableCell>
-                <TableCell className="max-w-64 truncate">{message.subject ?? "—"}</TableCell>
-                <TableCell>
-                  {message.tag ? (
-                    <Badge variant="secondary" className="font-normal">
-                      {message.tag}
-                    </Badge>
-                  ) : (
-                    <span className="text-muted-foreground">—</span>
-                  )}
-                </TableCell>
-                <TableCell
-                  className="whitespace-nowrap text-right text-muted-foreground"
-                  title={formatDate(message.created_at)}
-                >
-                  {relativeTime(message.created_at)}
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        // Search + Time/Status/Tag/Stream above hit the API (server-side);
+        // the DataTable's own search is a local refine over the loaded page.
+        <DataTable
+          columns={columns}
+          data={rows}
+          loading={messages.isPending}
+          searchPlaceholder="Filter these results…"
+          emptyText="No events match."
+          initialPageSize={20}
+        />
       )}
       {selected !== null && (
         <MessageDetail api={api} id={selected} onClose={() => setSelected(null)} />
@@ -992,6 +1028,58 @@ export function LogsView() {
   })
   const rows: ApiRequestEntry[] = logs.data?.requests ?? []
   const hasFilters = method !== "all" || status !== "all"
+
+  const columns: ColumnDef<ApiRequestEntry>[] = [
+    {
+      id: "method",
+      header: "Method",
+      accessorFn: (e) => e.method,
+      cell: ({ row }) => (
+        <Badge variant="outline" className="font-mono text-[10px]">
+          {row.original.method}
+        </Badge>
+      ),
+    },
+    {
+      id: "endpoint",
+      header: "Endpoint",
+      accessorFn: (e) => e.path,
+      cell: ({ row }) => (
+        <span className="block max-w-80 truncate font-mono text-xs transition-colors group-hover:text-primary">
+          {row.original.path}
+        </span>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      accessorFn: (e) => e.status_code,
+      cell: ({ row }) => <LogStatusPill code={row.original.status_code} />,
+    },
+    {
+      id: "latency",
+      header: "Latency",
+      accessorFn: (e) => e.duration_ms,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <span className="text-muted-foreground">{row.original.duration_ms}ms</span>
+      ),
+    },
+    {
+      id: "time",
+      header: "Time",
+      accessorFn: (e) => e.created_at,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <span
+          className="whitespace-nowrap text-muted-foreground"
+          title={formatDate(row.original.created_at)}
+        >
+          {relativeTime(row.original.created_at)}
+        </span>
+      ),
+    },
+  ]
 
   return (
     <div>
@@ -1051,41 +1139,15 @@ export function LogsView() {
           }
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-20">Method</TableHead>
-              <TableHead>Endpoint</TableHead>
-              <TableHead className="w-20">Status</TableHead>
-              <TableHead className="w-24 text-right">Latency</TableHead>
-              <TableHead className="w-24 text-right">Time</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((entry) => (
-              <TableRow key={entry.id}>
-                <TableCell>
-                  <Badge variant="outline" className="font-mono text-[10px]">
-                    {entry.method}
-                  </Badge>
-                </TableCell>
-                <TableCell className="max-w-80 truncate font-mono text-xs">{entry.path}</TableCell>
-                <TableCell>
-                  <LogStatusPill code={entry.status_code} />
-                </TableCell>
-                <TableCell className="text-right tabular-nums text-muted-foreground">
-                  {entry.duration_ms}ms
-                </TableCell>
-                <TableCell
-                  className="whitespace-nowrap text-right text-muted-foreground"
-                  title={formatDate(entry.created_at)}
-                >
-                  {relativeTime(entry.created_at)}
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <DataTable
+          columns={columns}
+          data={rows}
+          loading={logs.isPending}
+          searchKeys={["path"]}
+          searchPlaceholder="Search endpoints…"
+          emptyText="No requests match your search."
+          initialPageSize={20}
+        />
       )}
     </div>
   )
@@ -1102,6 +1164,82 @@ export function InboundQueue({ api }: { api: Api }) {
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-inbound"] })
   const rows = inbound.data?.inbound ?? []
 
+  const columns: ColumnDef<Message>[] = [
+    {
+      id: "id",
+      header: "#",
+      accessorFn: (m) => m.id,
+      meta: { align: "right" },
+      cell: ({ row }) => <span className="text-muted-foreground">{row.original.id}</span>,
+    },
+    {
+      id: "to",
+      header: "To",
+      accessorFn: (m) => m.rcpt_to,
+      cell: ({ row }) => (
+        <span className="block max-w-48 truncate">{row.original.rcpt_to}</span>
+      ),
+    },
+    {
+      id: "subject",
+      header: "Subject",
+      accessorFn: (m) => m.subject ?? "",
+      cell: ({ row }) => (
+        <span className="block max-w-64 truncate font-medium transition-colors group-hover:text-primary">
+          {row.original.subject ?? "—"}
+        </span>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      accessorFn: (m) => m.status ?? "",
+      cell: ({ row }) => <MessagePill message={row.original} />,
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <div className="space-x-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={async () => {
+              try {
+                await api.inboundRetry(row.original.id)
+                invalidate()
+                toast.success("Requeued")
+              } catch (err) {
+                errorToast(err, "Retry failed")
+              }
+            }}
+          >
+            Retry
+          </Button>
+          {row.original.held && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={async () => {
+                try {
+                  await api.inboundBypass(row.original.id)
+                  invalidate()
+                  toast.success("Hold bypassed")
+                } catch (err) {
+                  errorToast(err, "Bypass failed")
+                }
+              }}
+            >
+              Bypass hold
+            </Button>
+          )}
+        </div>
+      ),
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -1115,63 +1253,15 @@ export function InboundQueue({ api }: { api: Api }) {
           description="Failed inbound deliveries and held messages show up here for retry or bypass."
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>#</TableHead>
-              <TableHead>To</TableHead>
-              <TableHead>Subject</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((message) => (
-              <TableRow key={message.id}>
-                <TableCell className="text-muted-foreground">{message.id}</TableCell>
-                <TableCell>{message.rcpt_to}</TableCell>
-                <TableCell className="max-w-64 truncate">{message.subject ?? "—"}</TableCell>
-                <TableCell>
-                  <MessagePill message={message} />
-                </TableCell>
-                <TableCell className="space-x-2 text-right">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={async () => {
-                      try {
-                        await api.inboundRetry(message.id)
-                        invalidate()
-                        toast.success("Requeued")
-                      } catch (err) {
-                        errorToast(err, "Retry failed")
-                      }
-                    }}
-                  >
-                    Retry
-                  </Button>
-                  {message.held && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={async () => {
-                        try {
-                          await api.inboundBypass(message.id)
-                          invalidate()
-                          toast.success("Hold bypassed")
-                        } catch (err) {
-                          errorToast(err, "Bypass failed")
-                        }
-                      }}
-                    >
-                      Bypass hold
-                    </Button>
-                  )}
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <DataTable
+          columns={columns}
+          data={rows}
+          loading={inbound.isPending}
+          searchKeys={["rcpt_to", "subject"]}
+          searchPlaceholder="Search held & inbound…"
+          emptyText="Nothing matches your search."
+          initialPageSize={20}
+        />
       )}
     </div>
   )
@@ -1183,6 +1273,38 @@ export function StatsView({ api }: { api: Api }) {
   const stats = useQuery({ queryKey: ["sapi-stats"], queryFn: api.stats, refetchInterval: 15_000 })
   const bounces = useQuery({ queryKey: ["sapi-bounces"], queryFn: api.bounces })
   const s = stats.data?.stats
+
+  const bounceColumns: ColumnDef<Message>[] = [
+    {
+      id: "to",
+      header: "To",
+      accessorFn: (m) => m.rcpt_to,
+      cell: ({ row }) => (
+        <span className="block max-w-64 truncate font-medium transition-colors group-hover:text-primary">
+          {row.original.rcpt_to}
+        </span>
+      ),
+    },
+    {
+      id: "subject",
+      header: "Subject",
+      accessorFn: (m) => m.subject ?? "",
+      cell: ({ row }) => (
+        <span className="block max-w-64 truncate">{row.original.subject ?? "—"}</span>
+      ),
+    },
+    {
+      id: "created",
+      header: "Created",
+      accessorFn: (m) => m.created_at,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <span className="whitespace-nowrap text-muted-foreground">
+          {formatDate(row.original.created_at)}
+        </span>
+      ),
+    },
+  ]
 
   const tiles: [string, number | undefined][] = [
     ["Total", s?.total],
@@ -1219,26 +1341,15 @@ export function StatsView({ api }: { api: Api }) {
             description="Your bounce list is clean. Deliverability is looking good."
           />
         ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>To</TableHead>
-                <TableHead>Subject</TableHead>
-                <TableHead>Created</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {bounces.data?.bounces.map((message) => (
-                <TableRow key={message.id}>
-                  <TableCell>{message.rcpt_to}</TableCell>
-                  <TableCell className="max-w-64 truncate">{message.subject ?? "—"}</TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {formatDate(message.created_at)}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+          <DataTable
+            columns={bounceColumns}
+            data={bounces.data?.bounces ?? []}
+            loading={bounces.isPending}
+            searchKeys={["rcpt_to", "subject"]}
+            searchPlaceholder="Search bounces…"
+            emptyText="No bounces match your search."
+            initialPageSize={20}
+          />
         )}
       </div>
     </div>
@@ -1265,6 +1376,69 @@ export function Streams({ api }: { api: Api }) {
     onError: (err) => errorToast(err, "Could not create the stream"),
   })
 
+  const columns: ColumnDef<Stream>[] = [
+    {
+      id: "name",
+      header: "Name",
+      accessorFn: (s) => s.name,
+      cell: ({ row }) => (
+        <span className="block max-w-64 truncate font-medium transition-colors group-hover:text-primary">
+          {row.original.name}
+        </span>
+      ),
+    },
+    {
+      id: "permalink",
+      header: "Permalink",
+      accessorFn: (s) => s.permalink,
+      cell: ({ row }) => (
+        <span className="font-mono text-xs text-muted-foreground">{row.original.permalink}</span>
+      ),
+    },
+    {
+      id: "type",
+      header: "Type",
+      accessorFn: (s) => s.stream_type,
+      cell: ({ row }) => <Badge variant="outline">{row.original.stream_type}</Badge>,
+    },
+    {
+      id: "status",
+      header: "Status",
+      enableSorting: false,
+      accessorFn: (s) => (s.archived ? "archived" : "active"),
+      filterFn: (row, _id, value) => (row.original.archived ? "archived" : "active") === value,
+      cell: ({ row }) =>
+        row.original.archived ? (
+          <Badge variant="secondary">archived</Badge>
+        ) : (
+          <Badge>active</Badge>
+        ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) =>
+        row.original.archived ? null : (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={async () => {
+              try {
+                await api.streams.archive(row.original.permalink)
+                invalidate()
+              } catch (err) {
+                errorToast(err, "Could not archive the stream")
+              }
+            }}
+          >
+            Archive
+          </Button>
+        ),
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -1284,51 +1458,25 @@ export function Streams({ api }: { api: Api }) {
           action={{ label: "New stream", onClick: () => setOpen(true) }}
         />
       ) : (
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Name</TableHead>
-            <TableHead>Permalink</TableHead>
-            <TableHead>Type</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead />
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {streams.data?.streams.map((stream) => (
-            <TableRow key={stream.id}>
-              <TableCell className="font-medium">{stream.name}</TableCell>
-              <TableCell className="font-mono text-xs text-muted-foreground">
-                {stream.permalink}
-              </TableCell>
-              <TableCell>
-                <Badge variant="outline">{stream.stream_type}</Badge>
-              </TableCell>
-              <TableCell>
-                {stream.archived ? <Badge variant="secondary">archived</Badge> : <Badge>active</Badge>}
-              </TableCell>
-              <TableCell className="text-right">
-                {!stream.archived && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={async () => {
-                      try {
-                        await api.streams.archive(stream.permalink)
-                        invalidate()
-                      } catch (err) {
-                        errorToast(err, "Could not archive the stream")
-                      }
-                    }}
-                  >
-                    Archive
-                  </Button>
-                )}
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+        <DataTable
+          columns={columns}
+          data={streams.data?.streams ?? []}
+          loading={streams.isPending}
+          searchKeys={["name", "permalink"]}
+          searchPlaceholder="Search streams…"
+          emptyText="No streams match your search."
+          initialPageSize={20}
+          filters={[
+            {
+              columnId: "status",
+              label: "Status",
+              options: [
+                { label: "Active", value: "active" },
+                { label: "Archived", value: "archived" },
+              ],
+            },
+          ]}
+        />
       )}
       <FormDialog
         open={open}
@@ -1604,6 +1752,54 @@ function LayoutsDialog({ api, onClose }: { api: Api; onClose: () => void }) {
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-layouts"] })
   const rows = layouts.data?.layouts ?? []
 
+  const columns: ColumnDef<Layout>[] = [
+    {
+      id: "name",
+      header: "Name",
+      accessorFn: (l) => l.name,
+      cell: ({ row }) => (
+        <span className="block max-w-64 truncate font-medium transition-colors group-hover:text-primary">
+          {row.original.name}
+        </span>
+      ),
+    },
+    {
+      id: "slug",
+      header: "Slug",
+      accessorFn: (l) => l.permalink,
+      cell: ({ row }) => (
+        <span className="font-mono text-xs text-muted-foreground">{row.original.permalink}</span>
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <div className="space-x-2">
+          <Button variant="outline" size="sm" onClick={() => setEditing(row.original)}>
+            Edit
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={async () => {
+              try {
+                await api.layouts.delete(row.original.permalink)
+                invalidate()
+              } catch (err) {
+                errorToast(err, "Could not delete the layout")
+              }
+            }}
+          >
+            Delete
+          </Button>
+        </div>
+      ),
+    },
+  ]
+
   if (editing) {
     return (
       <LayoutEditorDialog
@@ -1633,44 +1829,15 @@ function LayoutsDialog({ api, onClose }: { api: Api; onClose: () => void }) {
             No layouts yet. Create one to share branding across templates.
           </div>
         ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Name</TableHead>
-                <TableHead>Slug</TableHead>
-                <TableHead />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((layout) => (
-                <TableRow key={layout.id}>
-                  <TableCell className="font-medium">{layout.name}</TableCell>
-                  <TableCell className="font-mono text-xs text-muted-foreground">
-                    {layout.permalink}
-                  </TableCell>
-                  <TableCell className="space-x-2 text-right">
-                    <Button variant="outline" size="sm" onClick={() => setEditing(layout)}>
-                      Edit
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={async () => {
-                        try {
-                          await api.layouts.delete(layout.permalink)
-                          invalidate()
-                        } catch (err) {
-                          errorToast(err, "Could not delete the layout")
-                        }
-                      }}
-                    >
-                      Delete
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+          <DataTable
+            columns={columns}
+            data={rows}
+            loading={layouts.isPending}
+            searchKeys={["name", "permalink"]}
+            searchPlaceholder="Search layouts…"
+            emptyText="No layouts match your search."
+            initialPageSize={10}
+          />
         )}
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>

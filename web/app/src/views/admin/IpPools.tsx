@@ -4,7 +4,8 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { PlusIcon } from "lucide-react"
+import { type ColumnDef } from "@tanstack/react-table"
+import { PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, EmptyState, PageHeader } from "@/components/shared"
 import { Badge } from "@/components/ui/badge"
@@ -15,6 +16,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import { DataTable } from "@/components/ui/data-table"
 import {
   Dialog,
   DialogContent,
@@ -25,15 +27,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { adminApi, ApiError, type IpPool } from "@/lib/api"
+import { adminApi, ApiError, type IpAddress, type IpPool } from "@/lib/api"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -75,6 +69,63 @@ function PoolCard({ pool }: { pool: IpPool }) {
     onError: (err) => errorToast(err, "Could not add the address"),
   })
 
+  const columns: ColumnDef<IpAddress>[] = [
+    {
+      id: "ipv4",
+      header: "IPv4",
+      accessorFn: (r) => r.ipv4,
+      cell: ({ row }) => (
+        <span className="block truncate font-mono text-xs font-medium">{row.original.ipv4}</span>
+      ),
+    },
+    {
+      id: "ipv6",
+      header: "IPv6",
+      accessorFn: (r) => r.ipv6 ?? "",
+      cell: ({ row }) => (
+        <span className="font-mono text-xs text-muted-foreground">{row.original.ipv6 ?? "—"}</span>
+      ),
+    },
+    {
+      id: "hostname",
+      header: "Hostname (EHLO)",
+      accessorFn: (r) => r.hostname,
+      cell: ({ row }) => <span>{row.original.hostname}</span>,
+    },
+    {
+      id: "priority",
+      header: "Priority",
+      accessorFn: (r) => r.priority,
+      meta: { align: "right" },
+      cell: ({ row }) => <span>{row.original.priority}</span>,
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <div onClick={(e) => e.stopPropagation()}>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={async () => {
+              try {
+                await adminApi.ipPools.addresses(pool.id).delete(row.original.id)
+                invalidate()
+              } catch (err) {
+                errorToast(err, "Could not delete the address")
+              }
+            }}
+          >
+            <Trash2Icon className="size-4" />
+            <span className="sr-only">Delete</span>
+          </Button>
+        </div>
+      ),
+    },
+  ]
+
   return (
     <Card>
       <CardHeader className="flex-row items-center justify-between">
@@ -92,47 +143,15 @@ function PoolCard({ pool }: { pool: IpPool }) {
         </div>
       </CardHeader>
       <CardContent>
-        {addresses.data?.ip_addresses.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No addresses in this pool.</p>
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>IPv4</TableHead>
-                <TableHead>IPv6</TableHead>
-                <TableHead>Hostname (EHLO)</TableHead>
-                <TableHead>Priority</TableHead>
-                <TableHead />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {addresses.data?.ip_addresses.map((address) => (
-                <TableRow key={address.id}>
-                  <TableCell className="font-mono text-xs">{address.ipv4}</TableCell>
-                  <TableCell className="font-mono text-xs">{address.ipv6 ?? "—"}</TableCell>
-                  <TableCell>{address.hostname}</TableCell>
-                  <TableCell>{address.priority}</TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={async () => {
-                        try {
-                          await adminApi.ipPools.addresses(pool.id).delete(address.id)
-                          invalidate()
-                        } catch (err) {
-                          errorToast(err, "Could not delete the address")
-                        }
-                      }}
-                    >
-                      Delete
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
+        <DataTable
+          columns={columns}
+          data={addresses.data?.ip_addresses ?? []}
+          loading={addresses.isPending}
+          searchKeys={["ipv4", "ipv6", "hostname"]}
+          searchPlaceholder="Search addresses…"
+          emptyText="No addresses in this pool."
+          initialPageSize={20}
+        />
       </CardContent>
 
       <Dialog open={open} onOpenChange={setOpen}>

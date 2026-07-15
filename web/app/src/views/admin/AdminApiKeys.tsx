@@ -4,10 +4,12 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { PlusIcon } from "lucide-react"
+import { type ColumnDef } from "@tanstack/react-table"
+import { PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, PageHeader, SecretReveal } from "@/components/shared"
 import { Button } from "@/components/ui/button"
+import { DataTable } from "@/components/ui/data-table"
 import {
   Dialog,
   DialogContent,
@@ -17,15 +19,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { adminApi, ApiError } from "@/lib/api"
+import { adminApi, ApiError, type AdminApiKey } from "@/lib/api"
 
 export default function AdminApiKeys() {
   const queryClient = useQueryClient()
@@ -48,6 +42,37 @@ export default function AdminApiKeys() {
       toast.error(err instanceof ApiError ? err.message : "Could not create the key"),
   })
 
+  const columns: ColumnDef<AdminApiKey>[] = [
+    {
+      id: "name",
+      header: "Name",
+      accessorFn: (r) => r.name,
+      cell: ({ row }) => <span className="block truncate font-medium">{row.original.name}</span>,
+    },
+    {
+      id: "key",
+      header: "Key",
+      accessorFn: (r) => r.key_prefix,
+      cell: ({ row }) => (
+        <span className="font-mono text-xs text-muted-foreground">{row.original.key_prefix}…</span>
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <div onClick={(e) => e.stopPropagation()}>
+          <Button variant="ghost" size="icon" onClick={() => setDeleteId(row.original.id)}>
+            <Trash2Icon className="size-4" />
+            <span className="sr-only">Revoke</span>
+          </Button>
+        </div>
+      ),
+    },
+  ]
+
   return (
     <div>
       <PageHeader
@@ -59,30 +84,15 @@ export default function AdminApiKeys() {
           </Button>
         }
       />
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Name</TableHead>
-            <TableHead>Key</TableHead>
-            <TableHead />
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {keys.data?.admin_api_keys.map((key) => (
-            <TableRow key={key.id}>
-              <TableCell>{key.name}</TableCell>
-              <TableCell className="font-mono text-xs text-muted-foreground">
-                {key.key_prefix}…
-              </TableCell>
-              <TableCell className="text-right">
-                <Button variant="ghost" size="sm" onClick={() => setDeleteId(key.id)}>
-                  Revoke
-                </Button>
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+      <DataTable
+        columns={columns}
+        data={keys.data?.admin_api_keys ?? []}
+        loading={keys.isPending}
+        searchKeys={["name", "key_prefix"]}
+        searchPlaceholder="Search keys…"
+        emptyText="No admin API keys yet."
+        initialPageSize={20}
+      />
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>

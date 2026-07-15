@@ -7,6 +7,7 @@
 
 import { useMemo, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
+import { type ColumnDef } from "@tanstack/react-table"
 import { InboxIcon, RefreshCwIcon } from "lucide-react"
 import { CopyButton, EmptyState, formatDate, PageHeader } from "@/components/shared"
 import { StatusPill } from "@/components/status-pill"
@@ -26,16 +27,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
+import { DataTable } from "@/components/ui/data-table"
 import { cn } from "@/lib/utils"
-import { adminApi, serverApi, type DomainHealthCheck } from "@/lib/api"
+import {
+  adminApi,
+  serverApi,
+  type DmarcReport,
+  type DmarcSummary,
+  type DomainHealthCheck,
+} from "@/lib/api"
+
+type DmarcSource = DmarcSummary["by_source"][number]
 
 type Scope = { org: string; server: string }
 
@@ -109,6 +111,86 @@ function HealthCheckCard({
     </Card>
   )
 }
+
+const sourceColumns: ColumnDef<DmarcSource>[] = [
+  {
+    id: "source_ip",
+    header: "Source IP",
+    accessorFn: (s) => s.source_ip,
+    cell: ({ row }) => (
+      <span className="block max-w-[16rem] truncate font-mono text-xs font-medium transition-colors group-hover:text-primary">
+        {row.original.source_ip}
+      </span>
+    ),
+  },
+  {
+    id: "messages",
+    header: "Messages",
+    accessorFn: (s) => s.count,
+    meta: { align: "right" },
+    cell: ({ row }) => <span>{row.original.count}</span>,
+  },
+  {
+    id: "spf",
+    header: "SPF aligned",
+    accessorFn: (s) => s.spf_aligned_pct,
+    meta: { align: "right" },
+    cell: ({ row }) => <UnderlineBar pct={row.original.spf_aligned_pct} />,
+  },
+  {
+    id: "dkim",
+    header: "DKIM aligned",
+    accessorFn: (s) => s.dkim_aligned_pct,
+    meta: { align: "right" },
+    cell: ({ row }) => <UnderlineBar pct={row.original.dkim_aligned_pct} />,
+  },
+  {
+    id: "dispositions",
+    header: "Dispositions",
+    enableSorting: false,
+    accessorFn: (s) =>
+      Object.entries(s.disposition_counts)
+        .map(([disposition, count]) => `${disposition}: ${count}`)
+        .join(", "),
+    cell: ({ row }) => (
+      <span className="text-muted-foreground">
+        {Object.entries(row.original.disposition_counts)
+          .map(([disposition, count]) => `${disposition}: ${count}`)
+          .join(", ")}
+      </span>
+    ),
+  },
+]
+
+const reportColumns: ColumnDef<DmarcReport>[] = [
+  {
+    id: "reporter",
+    header: "Reporter",
+    accessorFn: (r) => r.org_name ?? r.org_email ?? "unknown",
+    cell: ({ row }) => (
+      <span className="block max-w-64 truncate font-medium transition-colors group-hover:text-primary">
+        {row.original.org_name ?? row.original.org_email ?? "unknown"}
+      </span>
+    ),
+  },
+  {
+    id: "period",
+    header: "Period",
+    accessorFn: (r) => r.date_range_begin,
+    cell: ({ row }) => (
+      <span className="whitespace-nowrap text-muted-foreground">
+        {formatDate(row.original.date_range_begin)} – {formatDate(row.original.date_range_end)}
+      </span>
+    ),
+  },
+  {
+    id: "rows",
+    header: "Rows",
+    accessorFn: (r) => r.record_count,
+    meta: { align: "right" },
+    cell: ({ row }) => <span>{row.original.record_count}</span>,
+  },
+]
 
 export function Dmarc({ org, server }: Scope) {
   const domains = useQuery({
@@ -283,60 +365,27 @@ export function Dmarc({ org, server }: Scope) {
                   ),
                 )}
               </div>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Source IP</TableHead>
-                    <TableHead className="text-right">Messages</TableHead>
-                    <TableHead className="text-right">SPF aligned</TableHead>
-                    <TableHead className="text-right">DKIM aligned</TableHead>
-                    <TableHead>Dispositions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {summary.data.summary.by_source.map((source) => (
-                    <TableRow key={source.source_ip}>
-                      <TableCell className="font-mono text-xs">{source.source_ip}</TableCell>
-                      <TableCell className="text-right tabular-nums">{source.count}</TableCell>
-                      <TableCell>
-                        <UnderlineBar pct={source.spf_aligned_pct} />
-                      </TableCell>
-                      <TableCell>
-                        <UnderlineBar pct={source.dkim_aligned_pct} />
-                      </TableCell>
-                      <TableCell className="text-muted-foreground">
-                        {Object.entries(source.disposition_counts)
-                          .map(([disposition, count]) => `${disposition}: ${count}`)
-                          .join(", ")}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+              <DataTable
+                columns={sourceColumns}
+                data={summary.data.summary.by_source}
+                loading={summary.isPending}
+                searchKeys={["source_ip"]}
+                searchPlaceholder="Search source IPs…"
+                emptyText="No sources match your search."
+                initialPageSize={20}
+              />
               {reports.data && reports.data.reports.length > 0 && (
                 <div>
                   <div className="mb-1 text-sm font-medium">Latest reports</div>
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Reporter</TableHead>
-                        <TableHead>Period</TableHead>
-                        <TableHead className="text-right">Rows</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {reports.data.reports.map((report) => (
-                        <TableRow key={report.id}>
-                          <TableCell>{report.org_name ?? report.org_email ?? "unknown"}</TableCell>
-                          <TableCell className="text-muted-foreground">
-                            {formatDate(report.date_range_begin)} –{" "}
-                            {formatDate(report.date_range_end)}
-                          </TableCell>
-                          <TableCell className="text-right">{report.record_count}</TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
+                  <DataTable
+                    columns={reportColumns}
+                    data={reports.data.reports}
+                    loading={reports.isPending}
+                    searchKeys={["org_name", "org_email"]}
+                    searchPlaceholder="Search reporters…"
+                    emptyText="No reports match your search."
+                    initialPageSize={10}
+                  />
                 </div>
               )}
             </>
