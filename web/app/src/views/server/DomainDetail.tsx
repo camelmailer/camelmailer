@@ -7,17 +7,16 @@
 // and the delegation flow ("email the records to whoever owns the DNS").
 
 import { useState } from "react"
-import Link from "next/link"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
-  ArrowLeftIcon,
   BadgeCheckIcon,
   MailIcon,
   RefreshCwIcon,
   SendIcon,
 } from "lucide-react"
 import { toast } from "sonner"
-import { CopyButton } from "@/components/shared"
+import { CopyButton, PageHeader } from "@/components/shared"
+import { Page } from "@/components/page"
 import { FormDialog } from "@/components/form-dialog"
 import { StatusPill } from "@/components/status-pill"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -231,37 +230,51 @@ export function DomainDetail({ org, server, name }: Scope) {
     status ? healthPill(status) : <StatusPill status="unchecked" />
 
   return (
-    <div className="space-y-4">
-      <Link
-        href={`/orgs/${org}/servers/${server}/domains`}
-        className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
-      >
-        <ArrowLeftIcon className="size-3.5" /> All domains
-      </Link>
-
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <h1 className="text-lg font-semibold">{name}</h1>
-          {domain &&
+    <Page
+      header={
+        <PageHeader
+          className="mb-0 items-start"
+          backHref={`/orgs/${org}/servers/${server}/domains`}
+          backLabel="Domains"
+          title={name}
+          description={
+            domain &&
             (domain.verified ? (
               <StatusPill status="verified" />
             ) : (
               <StatusPill status="unverified" />
-            ))}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline" size="sm" onClick={() => setEmailOpen(true)}>
-            <MailIcon className="size-4" /> Email instructions to a teammate
-          </Button>
-          {domain && !domain.verified && (
-            <Button size="sm" onClick={() => verify.mutate()} disabled={verify.isPending}>
-              <BadgeCheckIcon className="size-4" />
-              {verify.isPending ? "Verifying…" : "Verify"}
-            </Button>
-          )}
-        </div>
-      </div>
-
+            ))
+          }
+          action={
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => health.refetch()}
+                disabled={health.isFetching}
+              >
+                <RefreshCwIcon className="size-4" /> Re-check DNS
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setEmailOpen(true)}>
+                <MailIcon className="size-4" /> Email instructions to a teammate
+              </Button>
+              {domain && !domain.verified && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => verify.mutate()}
+                  disabled={verify.isPending}
+                >
+                  <BadgeCheckIcon className="size-4" />
+                  {verify.isPending ? "Verifying…" : "Verify"}
+                </Button>
+              )}
+            </>
+          }
+        />
+      }
+    >
+      <div className="space-y-4">
       {verifyError && (
         <Alert variant="destructive">
           <AlertTitle>Not verified yet</AlertTitle>
@@ -374,6 +387,7 @@ export function DomainDetail({ org, server, name }: Scope) {
           </p>
         </div>
       </FormDialog>
-    </div>
+      </div>
+    </Page>
   )
 }

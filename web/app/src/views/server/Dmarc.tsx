@@ -10,6 +10,7 @@ import { useQuery } from "@tanstack/react-query"
 import { type ColumnDef } from "@tanstack/react-table"
 import { InboxIcon, RefreshCwIcon } from "lucide-react"
 import { CopyButton, EmptyState, formatDate, PageHeader } from "@/components/shared"
+import { Page } from "@/components/page"
 import { StatusPill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -244,36 +245,40 @@ export function Dmarc({ org, server }: Scope) {
   const ruaAddress = result?.rua_address ?? "dmarc@<your-domain>"
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="DMARC"
-        description="Authentication health and aggregate-report compliance per sending domain."
-        action={
-          <div className="flex items-center gap-2">
-            <Select value={domain ?? undefined} onValueChange={setSelected}>
-              <SelectTrigger className="w-56">
-                <SelectValue placeholder="Pick a domain" />
-              </SelectTrigger>
-              <SelectContent>
-                {domains.data?.domains.map((d) => (
-                  <SelectItem key={d.id} value={d.name}>
-                    {d.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => health.refetch()}
-              disabled={health.isFetching || domain === null}
-            >
-              <RefreshCwIcon className="size-4" /> Re-check
-            </Button>
-          </div>
-        }
-      />
-
+    <Page
+      header={
+        <PageHeader
+          title="DMARC"
+          description="Authentication health and aggregate-report compliance per sending domain."
+          className="mb-0"
+          action={
+            <div className="flex items-center gap-2">
+              <Select value={domain ?? undefined} onValueChange={setSelected}>
+                <SelectTrigger className="w-56">
+                  <SelectValue placeholder="Pick a domain" />
+                </SelectTrigger>
+                <SelectContent>
+                  {domains.data?.domains.map((d) => (
+                    <SelectItem key={d.id} value={d.name}>
+                      {d.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => health.refetch()}
+                disabled={health.isFetching || domain === null}
+              >
+                <RefreshCwIcon className="size-4" /> Re-check
+              </Button>
+            </div>
+          }
+        />
+      }
+    >
+      <div className="space-y-6">
       {health.isLoading && <p className="text-sm text-muted-foreground">Checking DNS…</p>}
 
       {result && (
@@ -439,6 +444,7 @@ export function Dmarc({ org, server }: Scope) {
           </p>
         </CardContent>
       </Card>
-    </div>
+      </div>
+    </Page>
   )
 }

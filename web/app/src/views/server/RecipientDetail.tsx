@@ -7,17 +7,16 @@
 // and the suppression list.
 
 import { useMemo, useState } from "react"
-import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useQuery } from "@tanstack/react-query"
 import {
-  ArrowLeftIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   KeyRoundIcon,
   MailIcon,
 } from "lucide-react"
-import { formatDate } from "@/components/shared"
+import { formatDate, PageHeader } from "@/components/shared"
+import { Page } from "@/components/page"
 import { EmptyState } from "@/components/empty-state"
 import { MessagePill, messageStatus, statusDotClass } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
@@ -161,26 +160,29 @@ export function RecipientDetail({
   ]
 
   return (
-    <div className="space-y-4">
-      <Link
-        href={`/orgs/${org}/servers/${server}/messaging`}
-        className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
-      >
-        <ArrowLeftIcon className="size-3.5" /> All messages
-      </Link>
-
-      <div className="flex items-center gap-3">
-        <div className="flex size-10 shrink-0 items-center justify-center rounded-full bg-muted text-base font-semibold uppercase">
-          {email.charAt(0)}
-        </div>
-        <div className="min-w-0">
-          <h1 className="truncate text-lg font-semibold">{email}</h1>
-          <p className="text-sm text-muted-foreground">
-            Delivery history on this server (last {messagesQuery.data ? 100 : "…"} messages)
-          </p>
-        </div>
-      </div>
-
+    <Page
+      header={
+        <PageHeader
+          className="mb-0 items-start"
+          backHref={`/orgs/${org}/servers/${server}/messaging`}
+          backLabel="Messages"
+          title={email}
+          description={`Delivery history on this server (last ${
+            messagesQuery.data ? 100 : "…"
+          } messages)`}
+          action={
+            <SendMessageButton
+              org={org}
+              server={server}
+              variant="outline"
+              size="sm"
+              defaultTo={email}
+            />
+          }
+        />
+      }
+    >
+      <div className="space-y-4">
       {!api && !isLoading ? (
         <EmptyState
           icon={KeyRoundIcon}
@@ -234,6 +236,7 @@ export function RecipientDetail({
           )}
         </>
       )}
-    </div>
+      </div>
+    </Page>
   )
 }

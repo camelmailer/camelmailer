@@ -31,6 +31,7 @@ import {
   ScrollTextIcon,
   SearchIcon,
   SendIcon,
+  Share2Icon,
   SparklesIcon,
   TriangleAlertIcon,
 } from "lucide-react"
@@ -65,6 +66,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { DataTable } from "@/components/ui/data-table"
+import { Page } from "@/components/page"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { Switch } from "@/components/ui/switch"
@@ -98,9 +100,6 @@ import {
 } from "@/lib/api-p3"
 import { StatusPill } from "@/components/status-pill"
 import { useOrgParams } from "@/lib/params"
-// Standalone import (kept off the contended lucide block above): the
-// back-arrow used by the message detail page's "All messages" link.
-import { ArrowLeftIcon } from "lucide-react"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -117,14 +116,19 @@ type Api = ReturnType<typeof serverApi>
 export function MessagingHome({ api }: { api: Api }) {
   const { org, server } = useOrgParams()
   return (
-    <div>
-      <PageHeader
-        title="Messaging"
-        description="Every message this server has sent and received."
-        action={<SendMessageButton org={org} server={server} />}
-      />
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Messaging"
+          description="Every message this server has sent and received."
+          action={<SendMessageButton org={org} server={server} />}
+          className="mb-0"
+        />
+      }
+    >
       <Messages api={api} />
-    </div>
+    </Page>
   )
 }
 
@@ -1225,40 +1229,33 @@ export function MessageDetailPage({
   const m = message.data?.message
 
   return (
-    <div className="space-y-4">
-      <Link
-        href={`/orgs/${org}/servers/${server}/messaging`}
-        className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
-      >
-        <ArrowLeftIcon className="size-3.5" /> All messages
-      </Link>
-
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="truncate text-xl font-semibold">{m?.subject || `Message #${id}`}</h1>
-          <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
-            {m && <MessagePill message={m} />}
-            <span>From {m?.mail_from ?? "…"}</span>
-            <span>To {m?.rcpt_to ?? "…"}</span>
-            {m && <span>{formatDate(m.created_at)}</span>}
-          </p>
-        </div>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon" aria-label="Message actions">
-              <MoreVerticalIcon className="size-4" />
+    <Page
+      header={
+        <PageHeader
+          className="mb-0 items-start"
+          backHref={`/orgs/${org}/servers/${server}/messaging`}
+          backLabel="Messages"
+          title={m?.subject || `Message #${id}`}
+          description={
+            <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              {m && <MessagePill message={m} />}
+              <span>From {m?.mail_from ?? "…"}</span>
+              <span>To {m?.rcpt_to ?? "…"}</span>
+              {m && <span>{formatDate(m.created_at)}</span>}
+            </span>
+          }
+          action={
+            <Button variant="outline" size="sm" onClick={() => setSharing(true)}>
+              <Share2Icon className="size-4" /> Share email
             </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            <DropdownMenuItem onClick={() => setSharing(true)}>Share email…</DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
-
+          }
+        />
+      }
+    >
       <MessageDetailBody api={api} id={id} />
 
       {sharing && <ShareDialog api={api} id={id} onClose={() => setSharing(false)} />}
-    </div>
+    </Page>
   )
 }
 
@@ -1416,8 +1413,8 @@ export function Messages({ api }: { api: Api }) {
   ]
 
   return (
-    <div>
-      <div className="mb-4 flex flex-wrap items-center gap-2">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="mb-4 flex shrink-0 flex-wrap items-center gap-2">
         <div className="relative w-full md:w-1/3">
           <SearchIcon className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -1514,6 +1511,7 @@ export function Messages({ api }: { api: Api }) {
           data={rows}
           loading={messages.isPending}
           searchable={false}
+          fillHeight
           emptyText="No events match."
           initialPageSize={20}
         />
@@ -1624,13 +1622,19 @@ export function LogsView() {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="API request log"
-        description="Every authenticated call to this server's API: method, endpoint, status and latency."
-      />
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <div className="relative w-full md:w-1/3">
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="API request log"
+          description="Every authenticated call to this server's API: method, endpoint, status and latency."
+          className="mb-0"
+        />
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="mb-4 flex shrink-0 flex-wrap items-center gap-2">
+          <div className="relative w-full md:w-1/3">
           <SearchIcon className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             className="h-8 pl-8"
@@ -1675,28 +1679,30 @@ export function LogsView() {
             ))}
           </SelectContent>
         </Select>
+        </div>
+        {rows.length === 0 ? (
+          <EmptyState
+            icon={ScrollTextIcon}
+            title={hasFilters ? "No requests match" : "No requests logged yet"}
+            description={
+              hasFilters
+                ? "Widen the time range or clear a filter."
+                : "Calls to this server's messaging API show up here as soon as they arrive."
+            }
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            data={filtered}
+            loading={logs.isPending}
+            searchable={false}
+            fillHeight
+            emptyText="No requests match your search."
+            initialPageSize={20}
+          />
+        )}
       </div>
-      {rows.length === 0 ? (
-        <EmptyState
-          icon={ScrollTextIcon}
-          title={hasFilters ? "No requests match" : "No requests logged yet"}
-          description={
-            hasFilters
-              ? "Widen the time range or clear a filter."
-              : "Calls to this server's messaging API show up here as soon as they arrive."
-          }
-        />
-      ) : (
-        <DataTable
-          columns={columns}
-          data={filtered}
-          loading={logs.isPending}
-          searchable={false}
-          emptyText="No requests match your search."
-          initialPageSize={20}
-        />
-      )}
-    </div>
+    </Page>
   )
 }
 
@@ -1797,34 +1803,42 @@ export function InboundQueue({ api }: { api: Api }) {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Inbound & held messages"
-        description="Retry failed inbound deliveries or bypass holds."
-      />
-      {rows.length === 0 ? (
-        <EmptyState
-          icon={InboxIcon}
-          title="Nothing waiting"
-          description="Failed inbound deliveries and held messages show up here for retry or bypass."
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Inbound & held messages"
+          description="Retry failed inbound deliveries or bypass holds."
+          className="mb-0"
         />
-      ) : (
-        <DataTable
-          columns={columns}
-          data={rows}
-          loading={inbound.isPending}
-          searchKeys={["rcpt_to", "subject"]}
-          searchPlaceholder="Search held & inbound…"
-          filters={
-            statusOptions.length > 1
-              ? [{ columnId: "status", label: "Any status", options: statusOptions }]
-              : []
-          }
-          emptyText="Nothing matches your search."
-          initialPageSize={20}
-        />
-      )}
-    </div>
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        {rows.length === 0 ? (
+          <EmptyState
+            icon={InboxIcon}
+            title="Nothing waiting"
+            description="Failed inbound deliveries and held messages show up here for retry or bypass."
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            data={rows}
+            loading={inbound.isPending}
+            searchKeys={["rcpt_to", "subject"]}
+            searchPlaceholder="Search held & inbound…"
+            filters={
+              statusOptions.length > 1
+                ? [{ columnId: "status", label: "Any status", options: statusOptions }]
+                : []
+            }
+            fillHeight
+            emptyText="Nothing matches your search."
+            initialPageSize={20}
+          />
+        )}
+      </div>
+    </Page>
   )
 }
 
@@ -1921,11 +1935,16 @@ export function StatsView({ api }: { api: Api }) {
 
 export function Streams({ api }: { api: Api }) {
   const queryClient = useQueryClient()
+  const { org, server } = useOrgParams()
   const streams = useQuery({ queryKey: ["sapi-streams"], queryFn: api.streams.list })
   const [open, setOpen] = useState(false)
   const [name, setName] = useState("")
   const [type, setType] = useState("transactional")
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-streams"] })
+
+  // Opening a stream navigates to its own detail page (like the message list).
+  const detailHref = (permalink: string) =>
+    `/orgs/${org}/servers/${server}/streams/${encodeURIComponent(permalink)}`
 
   const create = useMutation({
     mutationFn: () => api.streams.create({ name, stream_type: type }),
@@ -1943,9 +1962,12 @@ export function Streams({ api }: { api: Api }) {
       header: "Name",
       accessorFn: (s) => s.name,
       cell: ({ row }) => (
-        <span className="block max-w-64 truncate font-medium transition-colors group-hover:text-primary">
+        <Link
+          href={detailHref(row.original.permalink)}
+          className="block max-w-64 truncate font-medium transition-colors group-hover:text-primary hover:underline"
+        >
           {row.original.name}
-        </span>
+        </Link>
       ),
     },
     {
@@ -1980,65 +2002,81 @@ export function Streams({ api }: { api: Api }) {
       header: "",
       enableSorting: false,
       meta: { align: "right" },
-      cell: ({ row }) =>
-        row.original.archived ? null : (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={async () => {
-              try {
-                await api.streams.archive(row.original.permalink)
-                invalidate()
-              } catch (err) {
-                errorToast(err, "Could not archive the stream")
-              }
-            }}
-          >
-            Archive
+      cell: ({ row }) => (
+        <div className="flex items-center justify-end gap-1">
+          {!row.original.archived && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={async () => {
+                try {
+                  await api.streams.archive(row.original.permalink)
+                  invalidate()
+                } catch (err) {
+                  errorToast(err, "Could not archive the stream")
+                }
+              }}
+            >
+              Archive
+            </Button>
+          )}
+          <Button variant="ghost" size="icon" aria-label="View stream" asChild>
+            <Link href={detailHref(row.original.permalink)}>
+              <ChevronRightIcon className="size-4" />
+            </Link>
           </Button>
-        ),
+        </div>
+      ),
     },
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Message streams"
-        description="Group outgoing mail (transactional / broadcast) for stats and policies."
-        action={
-          <Button size="sm" onClick={() => setOpen(true)}>
-            <PlusIcon className="size-4" /> New stream
-          </Button>
-        }
-      />
-      {streams.isSuccess && streams.data.streams.length === 0 ? (
-        <EmptyState
-          icon={LayersIcon}
-          title="No streams yet"
-          description="Streams separate transactional from broadcast mail for cleaner stats and policies."
-          action={{ label: "New stream", onClick: () => setOpen(true) }}
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Message streams"
+          description="Group outgoing mail (transactional / broadcast) for stats and policies."
+          action={
+            <Button size="sm" onClick={() => setOpen(true)}>
+              <PlusIcon className="size-4" /> New stream
+            </Button>
+          }
+          className="mb-0"
         />
-      ) : (
-        <DataTable
-          columns={columns}
-          data={streams.data?.streams ?? []}
-          loading={streams.isPending}
-          searchKeys={["name", "permalink"]}
-          searchPlaceholder="Search streams…"
-          emptyText="No streams match your search."
-          initialPageSize={20}
-          filters={[
-            {
-              columnId: "status",
-              label: "Status",
-              options: [
-                { label: "Active", value: "active" },
-                { label: "Archived", value: "archived" },
-              ],
-            },
-          ]}
-        />
-      )}
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        {streams.isSuccess && streams.data.streams.length === 0 ? (
+          <EmptyState
+            icon={LayersIcon}
+            title="No streams yet"
+            description="Streams separate transactional from broadcast mail for cleaner stats and policies."
+            action={{ label: "New stream", onClick: () => setOpen(true) }}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            data={streams.data?.streams ?? []}
+            loading={streams.isPending}
+            searchKeys={["name", "permalink"]}
+            searchPlaceholder="Search streams…"
+            fillHeight
+            emptyText="No streams match your search."
+            initialPageSize={20}
+            filters={[
+              {
+                columnId: "status",
+                label: "Status",
+                options: [
+                  { label: "Active", value: "active" },
+                  { label: "Archived", value: "archived" },
+                ],
+              },
+            ]}
+          />
+        )}
+      </div>
       <FormDialog
         open={open}
         onOpenChange={setOpen}
@@ -2066,7 +2104,108 @@ export function Streams({ api }: { api: Api }) {
           </div>
         </div>
       </FormDialog>
-    </div>
+    </Page>
+  )
+}
+
+/// One message stream as a full page (its own route): a back link to the
+/// streams list, a header (stream name as title, type / permalink as the
+/// subline, plus the archive + "view messages" actions), then a details
+/// section. The messaging API has no single-get for a stream, so we read
+/// the list and find by permalink — the same shape Templates/TemplateEditor
+/// use for a single template.
+export function StreamDetail({
+  api,
+  org,
+  server,
+  permalink,
+}: {
+  api: Api
+  org: string
+  server: string
+  permalink: string
+}) {
+  const queryClient = useQueryClient()
+  const streams = useQuery({ queryKey: ["sapi-streams"], queryFn: api.streams.list })
+  const stream = streams.data?.streams.find((s) => s.permalink === permalink)
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-streams"] })
+
+  const archive = useMutation({
+    mutationFn: () => api.streams.archive(permalink),
+    onSuccess: () => {
+      invalidate()
+      toast.success("Stream archived")
+    },
+    onError: (err) => errorToast(err, "Could not archive the stream"),
+  })
+
+  const backHref = `/orgs/${org}/servers/${server}/streams`
+
+  // Same list query as the streams list — react-query dedupes the fetch;
+  // until it settles (or if the permalink is unknown) show a light state.
+  if (!stream) {
+    return (
+      <Page
+        header={
+          <PageHeader
+            className="mb-0"
+            backHref={backHref}
+            backLabel="Streams"
+            title={permalink}
+          />
+        }
+      >
+        <p className="text-sm text-muted-foreground">
+          {streams.isLoading ? "Loading…" : "This stream could not be found."}
+        </p>
+      </Page>
+    )
+  }
+
+  return (
+    <Page
+      header={
+        <PageHeader
+          className="mb-0 items-start"
+          backHref={backHref}
+          backLabel="Streams"
+          title={stream.name}
+          description={`${stream.stream_type} · ${stream.permalink}`}
+          action={
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="outline" size="sm" asChild>
+                <Link
+                  href={`/orgs/${org}/servers/${server}/messaging?stream=${encodeURIComponent(
+                    stream.permalink,
+                  )}`}
+                >
+                  <MailIcon className="size-4" /> View messages in this stream
+                </Link>
+              </Button>
+              {!stream.archived && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => archive.mutate()}
+                  disabled={archive.isPending}
+                >
+                  {archive.isPending ? "Archiving…" : "Archive"}
+                </Button>
+              )}
+            </div>
+          }
+        />
+      }
+    >
+      <div className="rounded-md border p-4">
+        <div className="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-2 text-sm">
+          <MetaRow label="Name" value={stream.name} />
+          <MetaRow label="Type" value={stream.stream_type} />
+          <MetaRow label="Permalink" value={stream.permalink} copy />
+          <MetaRow label="Status" value={stream.archived ? "Archived" : "Active"} />
+        </div>
+      </div>
+    </Page>
   )
 }
 
@@ -2550,24 +2689,29 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
   const existingPermalinks = new Set(templates.data?.templates.map((t) => t.permalink) ?? [])
 
   return (
-    <div>
-      <PageHeader
-        title="Templates"
-        description="Mustache-style templates ({{ name }}) rendered per send."
-        action={
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={() => setLayoutsOpen(true)}>
-              <LayersIcon className="size-4" /> Layouts
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => setLibrary(true)}>
-              <SparklesIcon className="size-4" /> Start from library
-            </Button>
-            <Button size="sm" onClick={() => router.push(`${base}/new`)}>
-              <PlusIcon className="size-4" /> New template
-            </Button>
-          </div>
-        }
-      />
+    <Page
+      variant="scroll"
+      header={
+        <PageHeader
+          title="Templates"
+          description="Mustache-style templates ({{ name }}) rendered per send."
+          action={
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => setLayoutsOpen(true)}>
+                <LayersIcon className="size-4" /> Layouts
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setLibrary(true)}>
+                <SparklesIcon className="size-4" /> Start from library
+              </Button>
+              <Button size="sm" onClick={() => router.push(`${base}/new`)}>
+                <PlusIcon className="size-4" /> New template
+              </Button>
+            </div>
+          }
+          className="mb-0"
+        />
+      }
+    >
       {templates.data?.templates.length === 0 ? (
         <EmptyState
           icon={FileTextIcon}
@@ -2588,7 +2732,12 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
               <CardContent className="grid gap-2 p-3">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
-                    <p className="truncate text-sm font-medium">{template.name}</p>
+                    <Link
+                      href={editorHref(template.permalink)}
+                      className="block truncate text-sm font-medium transition-colors hover:text-primary hover:underline"
+                    >
+                      {template.name}
+                    </Link>
                     <p className="truncate font-mono text-xs text-muted-foreground">
                       {template.permalink}
                     </p>
@@ -2642,7 +2791,7 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
           onClose={() => setCopying(null)}
         />
       )}
-    </div>
+    </Page>
   )
 }
 

@@ -3,7 +3,7 @@
 // The admin-API resource tabs of a mail server: domains, credentials,
 // routes, webhooks, suppressions.
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
@@ -51,6 +51,7 @@ import {
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { DataTable } from "@/components/ui/data-table"
+import { Page } from "@/components/page"
 import {
   adminApi,
   ApiError,
@@ -182,44 +183,52 @@ export function Domains({ org, server }: Scope) {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Sending domains"
-        description="Domains this server is allowed to send from (From/Sender authentication)."
-        action={
-          <Button size="sm" onClick={() => setOpen(true)}>
-            <PlusIcon className="size-4" /> Add domain
-          </Button>
-        }
-      />
-      {domains.data?.domains.length === 0 ? (
-        <EmptyState
-          icon={GlobeIcon}
-          title="No domains yet"
-          description="Verify a domain so your mail authenticates with SPF and DKIM and lands in the inbox."
-          action={{ label: "Add domain", onClick: () => setOpen(true) }}
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Sending domains"
+          description="Domains this server is allowed to send from (From/Sender authentication)."
+          className="mb-0"
+          action={
+            <Button size="sm" onClick={() => setOpen(true)}>
+              <PlusIcon className="size-4" /> Add domain
+            </Button>
+          }
         />
-      ) : (
-        <DataTable
-          columns={columns}
-          data={domains.data?.domains ?? []}
-          loading={domains.isPending}
-          searchKeys={["name"]}
-          searchPlaceholder="Search domains…"
-          emptyText="No domains match your search."
-          initialPageSize={20}
-          filters={[
-            {
-              columnId: "status",
-              label: "Status",
-              options: [
-                { label: "Verified", value: "verified" },
-                { label: "Unverified", value: "unverified" },
-              ],
-            },
-          ]}
-        />
-      )}
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        {domains.data?.domains.length === 0 ? (
+          <EmptyState
+            icon={GlobeIcon}
+            title="No domains yet"
+            description="Verify a domain so your mail authenticates with SPF and DKIM and lands in the inbox."
+            action={{ label: "Add domain", onClick: () => setOpen(true) }}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            data={domains.data?.domains ?? []}
+            loading={domains.isPending}
+            searchKeys={["name"]}
+            searchPlaceholder="Search domains…"
+            emptyText="No domains match your search."
+            initialPageSize={20}
+            fillHeight
+            filters={[
+              {
+                columnId: "status",
+                label: "Status",
+                options: [
+                  { label: "Verified", value: "verified" },
+                  { label: "Unverified", value: "unverified" },
+                ],
+              },
+            ]}
+          />
+        )}
+      </div>
       <FormDialog
         open={open}
         onOpenChange={setOpen}
@@ -248,11 +257,16 @@ export function Domains({ org, server }: Scope) {
           }
         }}
       />
-    </div>
+    </Page>
   )
 }
 
 // --------------------------------------------------------- credentials
+
+/// App route of the credential-detail view (type, masked key, hold, SMTP).
+function credentialHref(org: string, server: string, id: number): string {
+  return `/orgs/${org}/servers/${server}/credentials/${id}`
+}
 
 /// The last-used cell: relative time, or "No activity" for a key that has
 /// never authenticated a request (masterplan §4.9 key hygiene).
@@ -340,7 +354,7 @@ function CredentialCapabilities() {
     { name: "User session", detail: "Your signed-in browser session, scoped by your organization role (viewer → owner)." },
   ]
   return (
-    <Card className="mb-4">
+    <Card className="mb-4 shrink-0">
       <CardContent className="grid gap-2 p-4 text-sm sm:grid-cols-3">
         {rows.map((r) => (
           <div key={r.name} className="grid gap-0.5">
@@ -401,7 +415,12 @@ export function Credentials({ org, server }: Scope) {
       header: "Name",
       accessorFn: (c) => c.name,
       cell: ({ row }) => (
-        <span className="block max-w-[20rem] truncate font-medium">{row.original.name}</span>
+        <Link
+          href={credentialHref(org, server, row.original.id)}
+          className="block max-w-[20rem] truncate font-medium transition-colors group-hover:text-primary hover:underline"
+        >
+          {row.original.name}
+        </Link>
       ),
     },
     {
@@ -478,46 +497,54 @@ export function Credentials({ org, server }: Scope) {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="API keys & SMTP"
-        description="API keys (HTTP sending + messaging API) and SMTP credentials for this server."
-        action={
-          <Button size="sm" onClick={() => { setIssued(null); setOpen(true) }}>
-            <PlusIcon className="size-4" /> New credential
-          </Button>
-        }
-      />
-      <CredentialCapabilities />
-      {credentials.isSuccess && rows.length === 0 ? (
-        <EmptyState
-          icon={KeyRoundIcon}
-          title="No credentials yet"
-          description="Create an API key or SMTP credential so your application can send through this server."
-          action={{ label: "New credential", onClick: () => { setIssued(null); setOpen(true) } }}
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="API keys & SMTP"
+          description="API keys (HTTP sending + messaging API) and SMTP credentials for this server."
+          className="mb-0"
+          action={
+            <Button size="sm" onClick={() => { setIssued(null); setOpen(true) }}>
+              <PlusIcon className="size-4" /> New credential
+            </Button>
+          }
         />
-      ) : (
-        <DataTable
-          columns={columns}
-          data={rows}
-          loading={credentials.isPending}
-          searchKeys={["name"]}
-          searchPlaceholder="Search credentials…"
-          emptyText="No credentials match your search."
-          initialPageSize={20}
-          filters={[
-            {
-              columnId: "type",
-              label: "Type",
-              options: [
-                { label: "API", value: "API" },
-                { label: "SMTP", value: "SMTP" },
-                { label: "SMTP-IP", value: "SMTP-IP" },
-              ],
-            },
-          ]}
-        />
-      )}
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        <CredentialCapabilities />
+        {credentials.isSuccess && rows.length === 0 ? (
+          <EmptyState
+            icon={KeyRoundIcon}
+            title="No credentials yet"
+            description="Create an API key or SMTP credential so your application can send through this server."
+            action={{ label: "New credential", onClick: () => { setIssued(null); setOpen(true) } }}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            data={rows}
+            loading={credentials.isPending}
+            searchKeys={["name"]}
+            searchPlaceholder="Search credentials…"
+            emptyText="No credentials match your search."
+            initialPageSize={20}
+            fillHeight
+            filters={[
+              {
+                columnId: "type",
+                label: "Type",
+                options: [
+                  { label: "API", value: "API" },
+                  { label: "SMTP", value: "SMTP" },
+                  { label: "SMTP-IP", value: "SMTP-IP" },
+                ],
+              },
+            ]}
+          />
+        )}
+      </div>
       {smtpFor && (
         <SmtpDialog
           org={org}
@@ -581,7 +608,157 @@ export function Credentials({ org, server }: Scope) {
           }
         }}
       />
-    </div>
+    </Page>
+  )
+}
+
+// --------------------------------------------------- credential detail
+
+/// Single-credential detail page: type, the (masked, never revealed) key,
+/// the Hold toggle and — for SMTP credentials — the copy-first connection
+/// facts that the list surfaces in a dialog, shown inline here. There is
+/// no single-GET, so the credential is picked out of the (cached) list.
+export function CredentialDetail({ org, server, id }: Scope & { id: number }) {
+  const router = useRouter()
+  const queryClient = useQueryClient()
+  const key = ["credentials", org, server]
+  const credentials = useQuery({
+    queryKey: key,
+    queryFn: () => adminApi.credentials(org, server).list(),
+  })
+  const domains = useQuery({
+    queryKey: ["domains", org, server],
+    queryFn: () => adminApi.domains(org, server).list(),
+  })
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
+  const [deleteOpen, setDeleteOpen] = useState(false)
+
+  const rows = (credentials.data?.credentials ?? []) as CredentialWithUsage[]
+  const credential = rows.find((c) => c.id === id)
+
+  const smtpHost =
+    typeof window !== "undefined"
+      ? deriveSmtpHost(domains.data?.domains, window.location.hostname)
+      : deriveSmtpHost(domains.data?.domains, "smtp.camelmailer.com")
+
+  return (
+    <Page
+      variant="scroll"
+      header={
+        <PageHeader
+          className="mb-0 items-start"
+          backHref={`/orgs/${org}/servers/${server}/credentials`}
+          backLabel="Credentials"
+          title={credential?.name ?? "Credential"}
+          description={
+            credential && (
+              <span className="flex items-center gap-2">
+                <Badge variant="outline">{credential.type}</Badge>
+                {credential.type === "API" ? "HTTP + messaging API key" : "SMTP credential"}
+              </span>
+            )
+          }
+          action={
+            credential && (
+              <Button variant="outline" size="sm" onClick={() => setDeleteOpen(true)}>
+                Delete
+              </Button>
+            )
+          }
+        />
+      }
+    >
+      {credentials.isSuccess && !credential ? (
+        <p className="text-sm text-muted-foreground">This credential no longer exists.</p>
+      ) : !credential ? (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : (
+        <div className="space-y-6">
+          <section className="grid gap-3">
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div>
+                <p className="text-sm font-medium">Hold</p>
+                <p className="text-xs text-muted-foreground">
+                  While held, clients using this credential are rejected.
+                </p>
+              </div>
+              <Switch
+                checked={credential.hold}
+                onCheckedChange={async (checked) => {
+                  try {
+                    await adminApi.credentials(org, server).update(credential.id, { hold: checked })
+                    invalidate()
+                  } catch (err) {
+                    errorToast(err, "Could not update the credential")
+                  }
+                }}
+              />
+            </div>
+          </section>
+
+          <section className="space-y-3">
+            <h2 className="text-sm font-medium">Key</h2>
+            {credential.type === "SMTP-IP" ? (
+              <CopyField label="Allowed CIDR" value={credential.key ?? ""} />
+            ) : (
+              <div className="grid gap-1">
+                <Label className="text-xs text-muted-foreground">Secret key</Label>
+                <code className="w-fit rounded bg-muted px-2 py-1.5 font-mono text-xs">
+                  {maskKey(credential.key) || "••••••••"}
+                </code>
+                <p className="text-xs text-muted-foreground">
+                  The full key is shown only once, at creation, and can&apos;t be revealed again.
+                  Delete and recreate the credential if it is lost.
+                </p>
+              </div>
+            )}
+          </section>
+
+          {credential.type === "SMTP" && (
+            <section className="space-y-2">
+              <h2 className="text-sm font-medium">SMTP settings</h2>
+              <div className="grid max-w-lg gap-3">
+                <CopyField label="Host" value={smtpHost} />
+                <div className="grid gap-1">
+                  <Label className="text-xs text-muted-foreground">Ports</Label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {SMTP_PORTS.map((p) => (
+                      <Badge key={p.port} variant="outline" className="font-mono">
+                        {p.port}
+                        <span className="ml-1 font-sans font-normal text-muted-foreground">
+                          {p.note}
+                        </span>
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+                <CopyField label="Username" value={smtpUsername(org, server)} />
+                <p className="rounded-md border bg-muted/40 p-2 text-xs text-muted-foreground">
+                  Your SMTP password is this credential&apos;s key, shown only at creation. Use port
+                  587 with STARTTLS unless your client needs implicit TLS (465).
+                </p>
+              </div>
+            </section>
+          )}
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title="Delete credential"
+        description="Clients using this credential will be rejected immediately."
+        onConfirm={async () => {
+          try {
+            await adminApi.credentials(org, server).delete(id)
+            invalidate()
+            router.push(`/orgs/${org}/servers/${server}/credentials`)
+          } catch (err) {
+            errorToast(err, "Could not delete the credential")
+          }
+        }}
+      />
+    </Page>
   )
 }
 
@@ -666,44 +843,52 @@ export function Routes({ org, server }: Scope) {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Inbound routes"
-        description="What happens to mail arriving for an address on this server."
-        action={
-          <Button size="sm" onClick={() => setOpen(true)}>
-            <PlusIcon className="size-4" /> New route
-          </Button>
-        }
-      />
-      {routes.data?.routes.length === 0 ? (
-        <EmptyState
-          icon={InboxIcon}
-          title="No inbound routes yet"
-          description="Without a route, inbound mail to this server is rejected. Add one to accept or forward it."
-          action={{ label: "New route", onClick: () => setOpen(true) }}
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Inbound routes"
+          description="What happens to mail arriving for an address on this server."
+          className="mb-0"
+          action={
+            <Button size="sm" onClick={() => setOpen(true)}>
+              <PlusIcon className="size-4" /> New route
+            </Button>
+          }
         />
-      ) : (
-        <DataTable
-          columns={columns}
-          data={routes.data?.routes ?? []}
-          loading={routes.isPending}
-          searchKeys={["name", "endpoint_url"]}
-          searchPlaceholder="Search routes…"
-          emptyText="No routes match your search."
-          initialPageSize={20}
-          filters={[
-            {
-              columnId: "mode",
-              label: "Mode",
-              options: ["Endpoint", "Accept", "Hold", "Bounce", "Reject"].map((m) => ({
-                label: m,
-                value: m,
-              })),
-            },
-          ]}
-        />
-      )}
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        {routes.data?.routes.length === 0 ? (
+          <EmptyState
+            icon={InboxIcon}
+            title="No inbound routes yet"
+            description="Without a route, inbound mail to this server is rejected. Add one to accept or forward it."
+            action={{ label: "New route", onClick: () => setOpen(true) }}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            data={routes.data?.routes ?? []}
+            loading={routes.isPending}
+            searchKeys={["name", "endpoint_url"]}
+            searchPlaceholder="Search routes…"
+            emptyText="No routes match your search."
+            initialPageSize={20}
+            fillHeight
+            filters={[
+              {
+                columnId: "mode",
+                label: "Mode",
+                options: ["Endpoint", "Accept", "Hold", "Bounce", "Reject"].map((m) => ({
+                  label: m,
+                  value: m,
+                })),
+              },
+            ]}
+          />
+        )}
+      </div>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
           <DialogHeader>
@@ -782,11 +967,16 @@ export function Routes({ org, server }: Scope) {
           }
         }}
       />
-    </div>
+    </Page>
   )
 }
 
 // ------------------------------------------------------------ webhooks
+
+/// App route of the webhook-detail view (endpoint, events, headers, edit).
+function webhookHref(org: string, server: string, id: number): string {
+  return `/orgs/${org}/servers/${server}/webhooks/${id}`
+}
 
 /// A soft, tinted event chip using the shared lifecycle color semantics
 /// (sent green · delayed/held amber · failed red).
@@ -975,7 +1165,12 @@ export function Webhooks({ org, server }: Scope) {
       header: "Name",
       accessorFn: (w) => w.name,
       cell: ({ row }) => (
-        <span className="block max-w-[16rem] truncate font-medium">{row.original.name}</span>
+        <Link
+          href={webhookHref(org, server, row.original.id)}
+          className="block max-w-[16rem] truncate font-medium transition-colors group-hover:text-primary hover:underline"
+        >
+          {row.original.name}
+        </Link>
       ),
     },
     {
@@ -1068,44 +1263,52 @@ export function Webhooks({ org, server }: Scope) {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Webhooks"
-        description="HTTP callbacks for message events (sent, delayed, failed, held)."
-        action={
-          <Button size="sm" onClick={() => setOpen(true)}>
-            <PlusIcon className="size-4" /> New webhook
-          </Button>
-        }
-      />
-      {webhooks.data?.webhooks.length === 0 ? (
-        <EmptyState
-          icon={WebhookIcon}
-          title="No webhooks yet"
-          description="Get an HTTP callback the moment a message is sent, delayed, failed or held."
-          action={{ label: "New webhook", onClick: () => setOpen(true) }}
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Webhooks"
+          description="HTTP callbacks for message events (sent, delayed, failed, held)."
+          className="mb-0"
+          action={
+            <Button size="sm" onClick={() => setOpen(true)}>
+              <PlusIcon className="size-4" /> New webhook
+            </Button>
+          }
         />
-      ) : (
-        <DataTable
-          columns={columns}
-          data={webhooks.data?.webhooks ?? []}
-          loading={webhooks.isPending}
-          searchKeys={["name", "url"]}
-          searchPlaceholder="Search webhooks…"
-          emptyText="No webhooks match your search."
-          initialPageSize={20}
-          filters={[
-            {
-              columnId: "enabled",
-              label: "State",
-              options: [
-                { label: "Enabled", value: "enabled" },
-                { label: "Disabled", value: "disabled" },
-              ],
-            },
-          ]}
-        />
-      )}
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        {webhooks.data?.webhooks.length === 0 ? (
+          <EmptyState
+            icon={WebhookIcon}
+            title="No webhooks yet"
+            description="Get an HTTP callback the moment a message is sent, delayed, failed or held."
+            action={{ label: "New webhook", onClick: () => setOpen(true) }}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            data={webhooks.data?.webhooks ?? []}
+            loading={webhooks.isPending}
+            searchKeys={["name", "url"]}
+            searchPlaceholder="Search webhooks…"
+            emptyText="No webhooks match your search."
+            initialPageSize={20}
+            fillHeight
+            filters={[
+              {
+                columnId: "enabled",
+                label: "State",
+                options: [
+                  { label: "Enabled", value: "enabled" },
+                  { label: "Disabled", value: "disabled" },
+                ],
+              },
+            ]}
+          />
+        )}
+      </div>
       <FormDialog
         open={open}
         onOpenChange={setOpen}
@@ -1228,7 +1431,272 @@ export function Webhooks({ org, server }: Scope) {
           }
         }}
       />
-    </div>
+    </Page>
+  )
+}
+
+// ------------------------------------------------------ webhook detail
+
+/// Single-webhook detail + editor: the endpoint, the enabled/signed
+/// toggles, the subscribed-events picker and the custom headers, all
+/// editable in place (the editing the list used to do in a dialog). There
+/// is no single-GET, so the webhook is picked out of the (cached) list.
+export function WebhookDetail({ org, server, id }: Scope & { id: number }) {
+  const router = useRouter()
+  const queryClient = useQueryClient()
+  const key = ["webhooks", org, server]
+  const webhooks = useQuery({ queryKey: key, queryFn: () => adminApi.webhooks(org, server).list() })
+  const webhook = webhooks.data?.webhooks.find((w) => w.id === id)
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
+
+  const [name, setName] = useState("")
+  const [url, setUrl] = useState("")
+  const [sign, setSign] = useState(true)
+  const [events, setEvents] = useState<string[]>([])
+  const [eventSearch, setEventSearch] = useState("")
+  const [headerRows, setHeaderRows] = useState<{ name: string; value: string }[]>([])
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [testing, setTesting] = useState(false)
+
+  // Seed the editor from the webhook once it arrives (or the id changes).
+  useEffect(() => {
+    if (!webhook) return
+    setName(webhook.name)
+    setUrl(webhook.url)
+    setSign(webhook.sign)
+    setEvents(webhook.events)
+    setHeaderRows(
+      Object.entries(webhook.headers ?? {}).map(([name, value]) => ({ name, value })),
+    )
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [webhook?.id])
+
+  const toggleEvent = (event: string, checked: boolean) =>
+    setEvents((current) =>
+      checked ? [...current, event] : current.filter((e) => e !== event),
+    )
+  const headersObject = () =>
+    Object.fromEntries(
+      headerRows
+        .filter((row) => row.name.trim())
+        .map((row) => [row.name.trim(), row.value]),
+    )
+
+  const save = useMutation({
+    mutationFn: () =>
+      adminApi.webhooks(org, server).update(id, {
+        name,
+        url,
+        sign,
+        events,
+        headers: headersObject(),
+      }),
+    onSuccess: () => {
+      invalidate()
+      toast.success("Webhook saved")
+    },
+    onError: (err) => errorToast(err, "Could not save the webhook"),
+  })
+
+  return (
+    <Page
+      variant="scroll"
+      header={
+        <PageHeader
+          className="mb-0 items-start"
+          backHref={`/orgs/${org}/servers/${server}/webhooks`}
+          backLabel="Webhooks"
+          title={webhook?.name ?? "Webhook"}
+          description={<code className="text-xs">{webhook?.url ?? "…"}</code>}
+          action={
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => save.mutate()}
+                disabled={save.isPending || !webhook || !name.trim() || !url.startsWith("http")}
+              >
+                {save.isPending ? "Saving…" : "Save changes"}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setTesting(true)}
+                disabled={!webhook}
+              >
+                Send test
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setDeleteOpen(true)}
+                disabled={!webhook}
+              >
+                Delete
+              </Button>
+            </>
+          }
+        />
+      }
+    >
+      {webhooks.isSuccess && !webhook ? (
+        <p className="text-sm text-muted-foreground">This webhook no longer exists.</p>
+      ) : !webhook ? (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : (
+        <div className="space-y-6">
+          <section className="grid gap-3">
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div>
+                <p className="text-sm font-medium">Enabled</p>
+                <p className="text-xs text-muted-foreground">Deliver events to this endpoint.</p>
+              </div>
+              <Switch
+                checked={webhook.enabled}
+                onCheckedChange={async (checked) => {
+                  try {
+                    if (checked) await adminApi.webhooks(org, server).enable(webhook.id)
+                    else await adminApi.webhooks(org, server).disable(webhook.id)
+                    invalidate()
+                  } catch (err) {
+                    errorToast(err, "Could not toggle the webhook")
+                  }
+                }}
+              />
+            </div>
+          </section>
+
+          <section className="space-y-4">
+            <h2 className="text-sm font-medium">Endpoint</h2>
+            <div className="grid gap-2">
+              <Label>Name</Label>
+              <Input value={name} onChange={(e) => setName(e.target.value)} />
+            </div>
+            <div className="grid gap-2">
+              <Label>URL</Label>
+              <div className="flex items-center gap-2">
+                <Input
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder="https://…"
+                />
+                <CopyButton value={url} />
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Switch checked={sign} onCheckedChange={setSign} id="sign" />
+              <Label htmlFor="sign">Sign payloads (RSA)</Label>
+            </div>
+          </section>
+
+          <section className="space-y-2">
+            <h2 className="text-sm font-medium">Subscribed events</h2>
+            <p className="text-sm text-muted-foreground">
+              {events.length === 0
+                ? "Nothing selected, so every event is delivered."
+                : "None selected = all events."}
+            </p>
+            <div className="relative">
+              <SearchIcon className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                className="pl-8"
+                placeholder="Search events…"
+                value={eventSearch}
+                onChange={(e) => setEventSearch(e.target.value)}
+              />
+            </div>
+            <div className="grid gap-1 rounded-md border p-2">
+              {WEBHOOK_EVENTS.filter((event) =>
+                event.toLowerCase().includes(eventSearch.toLowerCase()),
+              ).map((event) => (
+                <label
+                  key={event}
+                  className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-sm hover:bg-muted/60"
+                >
+                  <input
+                    type="checkbox"
+                    className="size-4 accent-primary"
+                    checked={events.includes(event)}
+                    onChange={(e) => toggleEvent(event, e.target.checked)}
+                  />
+                  <EventPill event={event} />
+                  <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                    {WEBHOOK_EVENT_META[event]?.description}
+                  </span>
+                </label>
+              ))}
+            </div>
+            <WebhookPayloadPreview events={events} />
+          </section>
+
+          <section className="space-y-2">
+            <h2 className="text-sm font-medium">Custom headers</h2>
+            {headerRows.map((row, index) => (
+              <div key={index} className="flex items-center gap-2">
+                <Input
+                  className="w-2/5"
+                  placeholder="Header name"
+                  value={row.name}
+                  onChange={(e) =>
+                    setHeaderRows((rows) =>
+                      rows.map((r, i) => (i === index ? { ...r, name: e.target.value } : r)),
+                    )
+                  }
+                />
+                <Input
+                  placeholder="Value"
+                  value={row.value}
+                  onChange={(e) =>
+                    setHeaderRows((rows) =>
+                      rows.map((r, i) => (i === index ? { ...r, value: e.target.value } : r)),
+                    )
+                  }
+                />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setHeaderRows((rows) => rows.filter((_, i) => i !== index))}
+                >
+                  Remove
+                </Button>
+              </div>
+            ))}
+            <Button
+              variant="outline"
+              size="sm"
+              className="justify-self-start"
+              onClick={() => setHeaderRows((rows) => [...rows, { name: "", value: "" }])}
+            >
+              <PlusIcon className="size-4" /> Add header
+            </Button>
+          </section>
+        </div>
+      )}
+
+      {testing && webhook && (
+        <SendTestDialog
+          org={org}
+          server={server}
+          webhook={webhook}
+          onClose={() => setTesting(false)}
+        />
+      )}
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title="Delete webhook"
+        description="No further events will be delivered to this URL."
+        onConfirm={async () => {
+          try {
+            await adminApi.webhooks(org, server).delete(id)
+            invalidate()
+            router.push(`/orgs/${org}/servers/${server}/webhooks`)
+          } catch (err) {
+            errorToast(err, "Could not delete the webhook")
+          }
+        }}
+      />
+    </Page>
   )
 }
 
@@ -1318,47 +1786,55 @@ export function Suppressions({ org, server }: Scope) {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Suppression list"
-        description="Addresses this server will not deliver to (holds instead)."
-        action={
-          <div className="flex items-center gap-2">
-            {rows.length > 0 && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() =>
-                  downloadFile(`suppressions-${server}.csv`, suppressionsCsv(rows))
-                }
-              >
-                <DownloadIcon className="size-4" /> Export CSV
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Suppression list"
+          description="Addresses this server will not deliver to (holds instead)."
+          className="mb-0"
+          action={
+            <div className="flex items-center gap-2">
+              {rows.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    downloadFile(`suppressions-${server}.csv`, suppressionsCsv(rows))
+                  }
+                >
+                  <DownloadIcon className="size-4" /> Export CSV
+                </Button>
+              )}
+              <Button size="sm" onClick={() => setOpen(true)}>
+                <PlusIcon className="size-4" /> Suppress address
               </Button>
-            )}
-            <Button size="sm" onClick={() => setOpen(true)}>
-              <PlusIcon className="size-4" /> Suppress address
-            </Button>
-          </div>
-        }
-      />
-      {suppressions.data?.suppressions.length === 0 ? (
-        <EmptyState
-          icon={BanIcon}
-          title="No suppressions yet"
-          description="Hard-bouncing addresses land here automatically; you can also suppress addresses by hand."
-          action={{ label: "Suppress address", onClick: () => setOpen(true) }}
+            </div>
+          }
         />
-      ) : (
-        <DataTable
-          columns={columns}
-          data={rows}
-          loading={suppressions.isPending}
-          searchKeys={["address"]}
-          searchPlaceholder="Search addresses…"
-          emptyText="No suppressions match your search."
-          initialPageSize={20}
-        />
-      )}
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        {suppressions.data?.suppressions.length === 0 ? (
+          <EmptyState
+            icon={BanIcon}
+            title="No suppressions yet"
+            description="Hard-bouncing addresses land here automatically; you can also suppress addresses by hand."
+            action={{ label: "Suppress address", onClick: () => setOpen(true) }}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            data={rows}
+            loading={suppressions.isPending}
+            searchKeys={["address"]}
+            searchPlaceholder="Search addresses…"
+            emptyText="No suppressions match your search."
+            initialPageSize={20}
+            fillHeight
+          />
+        )}
+      </div>
       <ConfirmDialog
         open={reactivating !== null}
         onOpenChange={(open) => !open && setReactivating(null)}
@@ -1395,7 +1871,7 @@ export function Suppressions({ org, server }: Scope) {
           </div>
         </div>
       </FormDialog>
-    </div>
+    </Page>
   )
 }
 
@@ -1470,44 +1946,52 @@ export function SenderAddresses({ org, server }: Scope) {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Sender addresses"
-        description="Individual addresses this server may send from once their owner confirms them, without domain verification."
-        action={
-          <Button size="sm" onClick={() => { setIssuedToken(null); setOpen(true) }}>
-            <PlusIcon className="size-4" /> Add address
-          </Button>
-        }
-      />
-      {addresses.data?.sender_addresses.length === 0 ? (
-        <EmptyState
-          icon={AtSignIcon}
-          title="No sender addresses yet"
-          description="Authorize a single address to send from, without domain verification."
-          action={{ label: "Add address", onClick: () => { setIssuedToken(null); setOpen(true) } }}
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Sender addresses"
+          description="Individual addresses this server may send from once their owner confirms them, without domain verification."
+          className="mb-0"
+          action={
+            <Button size="sm" onClick={() => { setIssuedToken(null); setOpen(true) }}>
+              <PlusIcon className="size-4" /> Add address
+            </Button>
+          }
         />
-      ) : (
-        <DataTable
-          columns={columns}
-          data={addresses.data?.sender_addresses ?? []}
-          loading={addresses.isPending}
-          searchKeys={["email_address"]}
-          searchPlaceholder="Search addresses…"
-          emptyText="No sender addresses match your search."
-          initialPageSize={20}
-          filters={[
-            {
-              columnId: "status",
-              label: "Status",
-              options: [
-                { label: "Confirmed", value: "confirmed" },
-                { label: "Pending", value: "pending" },
-              ],
-            },
-          ]}
-        />
-      )}
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        {addresses.data?.sender_addresses.length === 0 ? (
+          <EmptyState
+            icon={AtSignIcon}
+            title="No sender addresses yet"
+            description="Authorize a single address to send from, without domain verification."
+            action={{ label: "Add address", onClick: () => { setIssuedToken(null); setOpen(true) } }}
+          />
+        ) : (
+          <DataTable
+            columns={columns}
+            data={addresses.data?.sender_addresses ?? []}
+            loading={addresses.isPending}
+            searchKeys={["email_address"]}
+            searchPlaceholder="Search addresses…"
+            emptyText="No sender addresses match your search."
+            initialPageSize={20}
+            fillHeight
+            filters={[
+              {
+                columnId: "status",
+                label: "Status",
+                options: [
+                  { label: "Confirmed", value: "confirmed" },
+                  { label: "Pending", value: "pending" },
+                ],
+              },
+            ]}
+          />
+        )}
+      </div>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
           <DialogHeader>
@@ -1565,6 +2049,6 @@ export function SenderAddresses({ org, server }: Scope) {
           }
         }}
       />
-    </div>
+    </Page>
   )
 }

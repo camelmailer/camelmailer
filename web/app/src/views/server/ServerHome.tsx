@@ -19,6 +19,8 @@ import {
 } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, PageHeader } from "@/components/shared"
+import { Field, FormActions, FormSection, FormSections } from "@/components/form-section"
+import { Page } from "@/components/page"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -90,171 +92,171 @@ function Settings({ org, server }: { org: string; server: Server }) {
   })
 
   return (
-    <div className="max-w-2xl space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">General</CardTitle>
-        </CardHeader>
-        <CardContent className="grid gap-4">
-          <div className="grid grid-cols-2 gap-2">
-            <div className="grid gap-2">
-              <Label>Name</Label>
-              <Input
-                value={fields.name}
-                onChange={(e) => setFields({ ...fields, name: e.target.value })}
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label>Mode</Label>
-              <Select
-                value={fields.mode}
-                onValueChange={(value) => setFields({ ...fields, mode: value })}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="Live">Live</SelectItem>
-                  <SelectItem value="Development">Development</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          <div className="flex items-center gap-6">
-            <div className="flex items-center gap-2">
-              <Switch
-                checked={fields.track_opens}
-                onCheckedChange={(checked) => setFields({ ...fields, track_opens: checked })}
-                id="track-opens"
-              />
-              <Label htmlFor="track-opens">Track opens</Label>
-            </div>
-            <div className="flex items-center gap-2">
-              <Switch
-                checked={fields.track_clicks}
-                onCheckedChange={(checked) => setFields({ ...fields, track_clicks: checked })}
-                id="track-clicks"
-              />
-              <Label htmlFor="track-clicks">Track clicks</Label>
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <div className="grid gap-2">
-              <Label>Bounce webhook URL</Label>
-              <Input
-                value={fields.bounce_hook_url}
-                onChange={(e) => setFields({ ...fields, bounce_hook_url: e.target.value })}
-                placeholder="https://…"
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label>Delivery webhook URL</Label>
-              <Input
-                value={fields.delivery_hook_url}
-                onChange={(e) => setFields({ ...fields, delivery_hook_url: e.target.value })}
-                placeholder="https://…"
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <div className="grid gap-2">
-              <Label>Inbound domain</Label>
-              <Input
-                value={fields.inbound_domain}
-                onChange={(e) => setFields({ ...fields, inbound_domain: e.target.value })}
-                placeholder="in.example.com"
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label>Spam threshold</Label>
-              <Input
-                value={fields.spam_threshold}
-                onChange={(e) => setFields({ ...fields, spam_threshold: e.target.value })}
-                placeholder="5"
-              />
-            </div>
-          </div>
-          <Button className="justify-self-start" onClick={() => save.mutate()} disabled={save.isPending}>
-            Save changes
-          </Button>
-        </CardContent>
-      </Card>
-
-      {me?.user.admin && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">IP pool</CardTitle>
-            <CardDescription>Source addresses for this server's outbound mail.</CardDescription>
-          </CardHeader>
-          <CardContent>
+    <Page
+      header={
+        <PageHeader
+          title="Settings"
+          description="Configuration for this server."
+          className="mb-0"
+        />
+      }
+    >
+      <FormSections>
+        <FormSection
+          title="General"
+          description="Name, sending mode, open/click tracking and the webhooks this server calls."
+        >
+          <Field label="Name" span={3} htmlFor="srv-name">
+            <Input
+              id="srv-name"
+              value={fields.name}
+              onChange={(e) => setFields({ ...fields, name: e.target.value })}
+            />
+          </Field>
+          <Field label="Mode" span={3}>
             <Select
-              value={server.ip_pool_id?.toString() ?? "none"}
-              onValueChange={async (value) => {
-                try {
-                  await adminApi
-                    .servers(org)
-                    .setIpPool(server.permalink, value === "none" ? null : Number(value))
-                  invalidate()
-                } catch (err) {
-                  errorToast(err, "Could not assign the IP pool")
-                }
-              }}
+              value={fields.mode}
+              onValueChange={(value) => setFields({ ...fields, mode: value })}
             >
-              <SelectTrigger className="w-64">
+              <SelectTrigger className="w-full">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="none">Default pool</SelectItem>
-                {pools.data?.ip_pools.map((pool) => (
-                  <SelectItem key={pool.id} value={pool.id.toString()}>
-                    {pool.name}
-                  </SelectItem>
-                ))}
+                <SelectItem value="Live">Live</SelectItem>
+                <SelectItem value="Development">Development</SelectItem>
               </SelectContent>
             </Select>
-          </CardContent>
-        </Card>
-      )}
+          </Field>
+          <Field label="Tracking" span={6}>
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+              <div className="flex items-center gap-2">
+                <Switch
+                  checked={fields.track_opens}
+                  onCheckedChange={(checked) => setFields({ ...fields, track_opens: checked })}
+                  id="track-opens"
+                />
+                <Label htmlFor="track-opens">Track opens</Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <Switch
+                  checked={fields.track_clicks}
+                  onCheckedChange={(checked) => setFields({ ...fields, track_clicks: checked })}
+                  id="track-clicks"
+                />
+                <Label htmlFor="track-clicks">Track clicks</Label>
+              </div>
+            </div>
+          </Field>
+          <Field label="Bounce webhook URL" span={3}>
+            <Input
+              value={fields.bounce_hook_url}
+              onChange={(e) => setFields({ ...fields, bounce_hook_url: e.target.value })}
+              placeholder="https://…"
+            />
+          </Field>
+          <Field label="Delivery webhook URL" span={3}>
+            <Input
+              value={fields.delivery_hook_url}
+              onChange={(e) => setFields({ ...fields, delivery_hook_url: e.target.value })}
+              placeholder="https://…"
+            />
+          </Field>
+          <Field label="Inbound domain" span={3}>
+            <Input
+              value={fields.inbound_domain}
+              onChange={(e) => setFields({ ...fields, inbound_domain: e.target.value })}
+              placeholder="in.example.com"
+            />
+          </Field>
+          <Field label="Spam threshold" span={3}>
+            <Input
+              value={fields.spam_threshold}
+              onChange={(e) => setFields({ ...fields, spam_threshold: e.target.value })}
+              placeholder="5"
+            />
+          </Field>
+          <FormActions>
+            <Button onClick={() => save.mutate()} disabled={save.isPending}>
+              Save changes
+            </Button>
+          </FormActions>
+        </FormSection>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Suspension & deletion</CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-wrap gap-2">
-          {server.suspended ? (
-            <Button
-              variant="outline"
-              onClick={async () => {
-                try {
-                  await adminApi.servers(org).unsuspend(server.permalink)
-                  invalidate()
-                } catch (err) {
-                  errorToast(err, "Could not unsuspend")
-                }
-              }}
-            >
-              Unsuspend
+        {me?.user.admin && (
+          <FormSection
+            title="IP pool"
+            description="Source addresses for this server's outbound mail."
+          >
+            <Field label="Pool" span={4}>
+              <Select
+                value={server.ip_pool_id?.toString() ?? "none"}
+                onValueChange={async (value) => {
+                  try {
+                    await adminApi
+                      .servers(org)
+                      .setIpPool(server.permalink, value === "none" ? null : Number(value))
+                    invalidate()
+                  } catch (err) {
+                    errorToast(err, "Could not assign the IP pool")
+                  }
+                }}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Default pool</SelectItem>
+                  {pools.data?.ip_pools.map((pool) => (
+                    <SelectItem key={pool.id} value={pool.id.toString()}>
+                      {pool.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+          </FormSection>
+        )}
+
+        <FormSection
+          title="Suspension & deletion"
+          description="Pause sending temporarily, or permanently remove this server and all its data."
+        >
+          <FormActions>
+            {server.suspended ? (
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  try {
+                    await adminApi.servers(org).unsuspend(server.permalink)
+                    invalidate()
+                  } catch (err) {
+                    errorToast(err, "Could not unsuspend")
+                  }
+                }}
+              >
+                Unsuspend
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  try {
+                    await adminApi.servers(org).suspend(server.permalink)
+                    invalidate()
+                  } catch (err) {
+                    errorToast(err, "Could not suspend")
+                  }
+                }}
+              >
+                Suspend sending
+              </Button>
+            )}
+            <Button variant="destructive" onClick={() => setDeleteOpen(true)}>
+              Delete server
             </Button>
-          ) : (
-            <Button
-              variant="outline"
-              onClick={async () => {
-                try {
-                  await adminApi.servers(org).suspend(server.permalink)
-                  invalidate()
-                } catch (err) {
-                  errorToast(err, "Could not suspend")
-                }
-              }}
-            >
-              Suspend sending
-            </Button>
-          )}
-          <Button variant="destructive" onClick={() => setDeleteOpen(true)}>
-            Delete server
-          </Button>
-        </CardContent>
-      </Card>
+          </FormActions>
+        </FormSection>
+      </FormSections>
 
       <ConfirmDialog
         open={deleteOpen}
@@ -270,7 +272,7 @@ function Settings({ org, server }: { org: string; server: Server }) {
           }
         }}
       />
-    </div>
+    </Page>
   )
 }
 
