@@ -680,18 +680,21 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <div className="-mr-3 flex min-h-0 min-w-0 flex-1 flex-col rounded-l-[1.875rem] shadow-[inset_0_0_2px_1px_#ffffff4d] ring-1 ring-black/5 dark:shadow-[inset_0_0_2px_1px_rgba(255,255,255,0.12)] dark:ring-white/10">
           <div className="flex min-h-0 min-w-0 flex-1 flex-col rounded-l-[1.875rem] py-1.5 pl-1.5 shadow-md shadow-black/5">
             <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-l-3xl bg-card text-card-foreground ring-1 ring-black/5 shadow-[0_8px_24px_-12px_rgba(86,47,0,0.22)] dark:shadow-[0_8px_24px_-12px_rgba(0,0,0,0.5)] dark:ring-white/10">
-              {/* Fixed breadcrumb row. */}
-              <div className="flex shrink-0 items-center gap-2 border-b px-6 py-3">
+              {/* Fixed breadcrumb row — min-height matches a sm button + py so
+                  it never jumps when the API button (CodePanel) is absent. */}
+              <div className="flex min-h-14 shrink-0 items-center gap-2 border-b px-6 py-3">
                 <AppBreadcrumbs />
                 <div className="ml-auto">
                   <CodePanel />
                 </div>
               </div>
-              {/* Scrollable content body — flush with the window edge on the
-                  right, with the scrollbar always reserved so the layout
-                  never shifts when content grows/shrinks. */}
+              {/* Content body. Plain pages scroll here (p-6); pages that use
+                  the <Page> scaffold fill this box (h-full) and manage their
+                  own sticky header + internal scroll, so only their body
+                  scrolls. overflow-y-auto keeps a scrollbar reserved for the
+                  scrolling case without forcing one on filled pages. */}
               <div
-                className="app-scrollbar min-h-0 min-w-0 flex-1 overflow-y-scroll p-6"
+                className="app-scrollbar min-h-0 min-w-0 flex-1 overflow-y-auto p-6"
                 key={org ?? "-"}
               >
                 {children}

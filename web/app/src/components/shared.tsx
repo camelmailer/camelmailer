@@ -3,7 +3,9 @@
 // Small shared building blocks used across the CRUD pages.
 
 import { useState, type ReactNode } from "react"
+import Link from "next/link"
 import { CheckIcon, CopyIcon } from "lucide-react"
+import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -19,18 +21,43 @@ export function PageHeader({
   title,
   description,
   action,
+  backHref,
+  backLabel,
+  className,
 }: {
-  title: string
-  description?: string
+  title: ReactNode
+  description?: ReactNode
   action?: ReactNode
+  // A muted, breadcrumb-style link rendered before the title ("Messages / …"),
+  // used on detail pages instead of a separate back link.
+  backHref?: string
+  backLabel?: ReactNode
+  className?: string
 }) {
   return (
-    <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-      <div>
-        <h1 className="text-lg font-semibold">{title}</h1>
-        {description && <p className="text-sm text-muted-foreground">{description}</p>}
+    <div
+      className={cn("mb-4 flex flex-wrap items-center justify-between gap-3", className)}
+    >
+      <div className="min-w-0">
+        <h1 className="text-lg font-semibold">
+          {backHref && (
+            <>
+              <Link
+                href={backHref}
+                className="font-normal text-muted-foreground/70 transition-colors hover:text-foreground"
+              >
+                {backLabel}
+              </Link>
+              <span className="mx-1.5 font-normal text-muted-foreground/40">/</span>
+            </>
+          )}
+          {title}
+        </h1>
+        {description && (
+          <div className="mt-0.5 text-sm text-muted-foreground">{description}</div>
+        )}
       </div>
-      {action}
+      {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
     </div>
   )
 }

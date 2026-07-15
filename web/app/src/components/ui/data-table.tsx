@@ -4,8 +4,9 @@
 // following the datatable-ux rules: prominent search, optional Filter
 // dropdowns for a primary dimension, sortable headers with a visible
 // affordance, a distinct tinted header, roomy hairline-divided rows, a
-// one-scale text-sm chrome, right-aligned tabular numbers (via column
-// meta.align), real loading/empty states and a client-side pagination
+// one-scale text-sm chrome, normal-case headers, left-aligned data
+// columns (numbers included) with only the trailing actions column
+// right-aligned, real loading/empty states and a client-side pagination
 // footer (rows-per-page + prev/next). Every dashboard table reuses this.
 
 import * as React from "react"
@@ -50,7 +51,8 @@ import {
   TableRow,
 } from "@/components/ui/table"
 
-// Columns opt into right alignment (numbers) via meta.align = "right".
+// meta.align is retained for column defs but no longer drives layout:
+// alignment is derived from the column id (only "actions" is right-aligned).
 declare module "@tanstack/react-table" {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   interface ColumnMeta<TData extends unknown, TValue> {
@@ -78,6 +80,7 @@ export function DataTable<TData, TValue>({
   emptyText = "Nothing here yet.",
   initialPageSize = 10,
   actions,
+  fillHeight = false,
 }: {
   columns: ColumnDef<TData, TValue>[]
   data: TData[]
@@ -91,6 +94,10 @@ export function DataTable<TData, TValue>({
   emptyText?: string
   initialPageSize?: number
   actions?: React.ReactNode
+  /** Fill the parent's height: the rows scroll inside the bordered box with a
+   *  sticky header, while the toolbar and pagination stay pinned. Use inside a
+   *  <Page variant="fill">. */
+  fillHeight?: boolean
 }) {
   const [sorting, setSorting] = React.useState<SortingState>([])
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>([])
@@ -128,10 +135,10 @@ export function DataTable<TData, TValue>({
   const showToolbar = searchable || filters.length > 0 || !!actions
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className={cn("flex flex-col gap-3", fillHeight && "min-h-0 flex-1")}>
       {/* Toolbar: search + filters (left), actions (right). */}
       {showToolbar && (
-      <div className="flex flex-wrap items-center gap-2">
+      <div className={cn("flex flex-wrap items-center gap-2", fillHeight && "shrink-0")}>
         {searchable && (
           <div className="relative w-full md:w-1/3">
             <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -190,22 +197,36 @@ export function DataTable<TData, TValue>({
       </div>
       )}
 
-      {/* Table. */}
-      <div className="overflow-hidden rounded-lg border">
+      {/* Table. The Table component wraps itself in an overflow-x-auto div;
+          in fill mode we flatten that (so it is not a nested scroll container)
+          and make THIS div the single scroller, so the sticky header holds. */}
+      <div
+        className={cn(
+          "rounded-lg border",
+          fillHeight
+            ? "min-h-0 flex-1 overflow-auto [&>div]:overflow-visible"
+            : "overflow-hidden",
+        )}
+      >
         <Table>
-          <TableHeader className="bg-muted/60">
+          <TableHeader className={cn("bg-muted/60", fillHeight && "bg-muted")}>
             {table.getHeaderGroups().map((hg) => (
               <TableRow key={hg.id} className="hover:bg-transparent">
                 {hg.headers.map((header) => {
                   const canSort = header.column.getCanSort()
                   const sorted = header.column.getIsSorted()
-                  const right = header.column.columnDef.meta?.align === "right"
+                  // Only the trailing actions column is right-aligned; all
+                  // data (numbers included) stays left, like every other column.
+                  const right = header.column.id === "actions"
                   return (
                     <TableHead
                       key={header.id}
                       className={cn(
-                        "h-10 text-xs font-medium tracking-wide text-muted-foreground uppercase",
+                        "h-10 text-xs font-medium text-muted-foreground",
                         right && "text-right",
+                        // sticky must live on the cells (th), not the thead,
+                        // to hold reliably while the rows scroll under it.
+                        fillHeight && "sticky top-0 z-10 bg-muted",
                       )}
                     >
                       {header.isPlaceholder ? null : canSort ? (
@@ -264,8 +285,7 @@ export function DataTable<TData, TValue>({
                       key={cell.id}
                       className={cn(
                         "py-3",
-                        cell.column.columnDef.meta?.align === "right" &&
-                          "text-right tabular-nums",
+                        cell.column.id === "actions" && "text-right",
                       )}
                     >
                       {flexRender(cell.column.columnDef.cell, cell.getContext())}
@@ -279,7 +299,12 @@ export function DataTable<TData, TValue>({
       </div>
 
       {/* Footer: range + rows-per-page (left), prev / page / next (right). */}
-      <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+      <div
+        className={cn(
+          "flex flex-wrap items-center gap-3 text-sm text-muted-foreground",
+          fillHeight && "shrink-0 border-t pt-3",
+        )}
+      >
         <span>
           Showing {first}–{last} of {total}
         </span>
