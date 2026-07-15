@@ -8,6 +8,7 @@ import { type ColumnDef } from "@tanstack/react-table"
 import { PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, PageHeader, SecretReveal } from "@/components/shared"
+import { Page } from "@/components/page"
 import { Button } from "@/components/ui/button"
 import { DataTable } from "@/components/ui/data-table"
 import {
@@ -74,25 +75,33 @@ export default function AdminApiKeys() {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Admin API keys"
-        description="Machine credentials with full access to the admin API (X-Admin-API-Key)."
-        action={
-          <Button size="sm" onClick={() => { setIssued(null); setOpen(true) }}>
-            <PlusIcon className="size-4" /> New key
-          </Button>
-        }
-      />
-      <DataTable
-        columns={columns}
-        data={keys.data?.admin_api_keys ?? []}
-        loading={keys.isPending}
-        searchKeys={["name", "key_prefix"]}
-        searchPlaceholder="Search keys…"
-        emptyText="No admin API keys yet."
-        initialPageSize={20}
-      />
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Admin API keys"
+          description="Machine credentials with full access to the admin API (X-Admin-API-Key)."
+          className="mb-0"
+          action={
+            <Button size="sm" onClick={() => { setIssued(null); setOpen(true) }}>
+              <PlusIcon className="size-4" /> New key
+            </Button>
+          }
+        />
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        <DataTable
+          columns={columns}
+          data={keys.data?.admin_api_keys ?? []}
+          loading={keys.isPending}
+          searchKeys={["name", "key_prefix"]}
+          searchPlaceholder="Search keys…"
+          emptyText="No admin API keys yet."
+          fillHeight
+          initialPageSize={20}
+        />
+      </div>
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
@@ -135,6 +144,6 @@ export default function AdminApiKeys() {
           }
         }}
       />
-    </div>
+    </Page>
   )
 }

@@ -178,7 +178,7 @@ export function ServersTable({ orgs }: { orgs: OrgItem[] }) {
 
 // Org-scoped servers table (no Organization column) — used on the
 // org-level Servers page.
-export function OrgServersTable({ org }: { org: string }) {
+export function OrgServersTable({ org, fillHeight }: { org: string; fillHeight?: boolean }) {
   const serversQ = useQuery({
     queryKey: ["servers", org],
     queryFn: () => adminApi.servers(org).list(),
@@ -212,6 +212,7 @@ export function OrgServersTable({ org }: { org: string }) {
       searchPlaceholder="Search servers…"
       emptyText="No servers yet."
       filters={[DELIVERABILITY_FILTER]}
+      fillHeight={fillHeight}
     />
   )
 }

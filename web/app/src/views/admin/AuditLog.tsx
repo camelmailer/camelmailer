@@ -5,6 +5,7 @@
 import { useQuery } from "@tanstack/react-query"
 import { type ColumnDef } from "@tanstack/react-table"
 import { formatDate, PageHeader } from "@/components/shared"
+import { Page } from "@/components/page"
 import { Badge } from "@/components/ui/badge"
 import { DataTable } from "@/components/ui/data-table"
 import { adminApi, type AuthEvent } from "@/lib/api"
@@ -77,31 +78,39 @@ export default function AuditLog() {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Audit log"
-        description="Logins, failures, lockouts, password / role / SSO events."
-      />
-      <DataTable
-        columns={columns}
-        data={events.data?.auth_events ?? []}
-        loading={events.isPending}
-        searchKeys={["event", "email_address", "ip_address", "user_agent"]}
-        searchPlaceholder="Search events…"
-        emptyText="No authentication events recorded yet."
-        filters={[
-          {
-            columnId: "event",
-            label: "Type",
-            options: [
-              { label: "Failures & lockouts", value: "failure" },
-              { label: "Logins & SSO", value: "auth" },
-              { label: "Other", value: "other" },
-            ],
-          },
-        ]}
-        initialPageSize={20}
-      />
-    </div>
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Audit log"
+          description="Logins, failures, lockouts, password / role / SSO events."
+          className="mb-0"
+        />
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        <DataTable
+          columns={columns}
+          data={events.data?.auth_events ?? []}
+          loading={events.isPending}
+          searchKeys={["event", "email_address", "ip_address", "user_agent"]}
+          searchPlaceholder="Search events…"
+          emptyText="No authentication events recorded yet."
+          filters={[
+            {
+              columnId: "event",
+              label: "Type",
+              options: [
+                { label: "Failures & lockouts", value: "failure" },
+                { label: "Logins & SSO", value: "auth" },
+                { label: "Other", value: "other" },
+              ],
+            },
+          ]}
+          fillHeight
+          initialPageSize={20}
+        />
+      </div>
+    </Page>
   )
 }

@@ -8,6 +8,7 @@ import { type ColumnDef } from "@tanstack/react-table"
 import { PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, EmptyState, PageHeader } from "@/components/shared"
+import { Page } from "@/components/page"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -236,16 +237,21 @@ export default function IpPools() {
   })
 
   return (
-    <div className="space-y-4">
-      <PageHeader
-        title="IP pools"
-        description="Source addresses for outbound mail; assign pools per server."
-        action={
-          <Button size="sm" onClick={() => setOpen(true)}>
-            <PlusIcon className="size-4" /> New pool
-          </Button>
-        }
-      />
+    <Page
+      header={
+        <PageHeader
+          title="IP pools"
+          description="Source addresses for outbound mail; assign pools per server."
+          className="mb-0"
+          action={
+            <Button size="sm" onClick={() => setOpen(true)}>
+              <PlusIcon className="size-4" /> New pool
+            </Button>
+          }
+        />
+      }
+    >
+      <div className="space-y-4">
       {pools.data?.ip_pools.length === 0 ? (
         <EmptyState>No IP pools. Without pools, outbound mail uses the host address.</EmptyState>
       ) : (
@@ -277,6 +283,7 @@ export default function IpPools() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+      </div>
+    </Page>
   )
 }

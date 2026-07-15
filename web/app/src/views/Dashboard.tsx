@@ -10,6 +10,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { PageHeader } from "@/components/shared"
+import { Page } from "@/components/page"
 import { EmptyState } from "@/components/empty-state"
 import { OnboardingChecklist } from "@/components/onboarding-checklist"
 import { requestNewOrganization } from "@/components/org-switcher"
@@ -54,7 +55,20 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
   const defaultOrg = all ? undefined : items[0]?.organization.permalink
 
   return (
-    <div>
+    <Page
+      variant="scroll"
+      header={
+        <PageHeader
+          title={all ? "All organizations" : "Organizations"}
+          description={
+            all
+              ? "Every organization on this instance (global admin view)."
+              : "Organizations you are a member of."
+          }
+          className="mb-0"
+        />
+      }
+    >
       {!all && defaultOrg && <OnboardingChecklist org={defaultOrg} />}
       {!all && (
         <div className="mb-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4 *:data-[slot=card]:from-primary/5 *:data-[slot=card]:to-card *:data-[slot=card]:bg-gradient-to-t *:data-[slot=card]:shadow-xs">
@@ -104,14 +118,6 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
           </Card>
         </div>
       )}
-      <PageHeader
-        title={all ? "All organizations" : "Organizations"}
-        description={
-          all
-            ? "Every organization on this instance (global admin view)."
-            : "Organizations you are a member of."
-        }
-      />
       {items.length === 0 ? (
         <EmptyState
           icon={BuildingIcon}
@@ -132,6 +138,6 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
           <ServersTable orgs={items} />
         </div>
       )}
-    </div>
+    </Page>
   )
 }

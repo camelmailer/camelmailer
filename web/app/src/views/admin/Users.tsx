@@ -8,6 +8,7 @@ import { type ColumnDef } from "@tanstack/react-table"
 import { PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, PageHeader } from "@/components/shared"
+import { Page } from "@/components/page"
 import { Button } from "@/components/ui/button"
 import { DataTable } from "@/components/ui/data-table"
 import {
@@ -123,35 +124,43 @@ export default function Users() {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Users"
-        description="Every account on this instance."
-        action={
-          <Button size="sm" onClick={() => setOpen(true)}>
-            <PlusIcon className="size-4" /> New user
-          </Button>
-        }
-      />
-      <DataTable
-        columns={columns}
-        data={rows}
-        loading={users.isPending}
-        searchKeys={["name", "email_address"]}
-        searchPlaceholder="Search users…"
-        emptyText="No users on this instance yet."
-        filters={[
-          {
-            columnId: "admin",
-            label: "Role",
-            options: [
-              { label: "Admin", value: "admin" },
-              { label: "Member", value: "member" },
-            ],
-          },
-        ]}
-        initialPageSize={20}
-      />
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Users"
+          description="Every account on this instance."
+          className="mb-0"
+          action={
+            <Button size="sm" onClick={() => setOpen(true)}>
+              <PlusIcon className="size-4" /> New user
+            </Button>
+          }
+        />
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        <DataTable
+          columns={columns}
+          data={rows}
+          loading={users.isPending}
+          searchKeys={["name", "email_address"]}
+          searchPlaceholder="Search users…"
+          emptyText="No users on this instance yet."
+          filters={[
+            {
+              columnId: "admin",
+              label: "Role",
+              options: [
+                { label: "Admin", value: "admin" },
+                { label: "Member", value: "member" },
+              ],
+            },
+          ]}
+          fillHeight
+          initialPageSize={20}
+        />
+      </div>
 
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
@@ -216,6 +225,6 @@ export default function Users() {
           }
         }}
       />
-    </div>
+    </Page>
   )
 }

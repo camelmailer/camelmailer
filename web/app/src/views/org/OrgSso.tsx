@@ -23,6 +23,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { DataTable } from "@/components/ui/data-table"
+import { Page } from "@/components/page"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -581,13 +582,20 @@ function Connections({ org }: { org: string }) {
 
 export default function OrgSso({ org }: { org: string }) {
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title="Single sign-on"
-        description="Let your team sign in through your identity provider. Verify a login domain, then connect OIDC, SAML or a social provider."
-      />
-      <EmailDomains org={org} />
-      <Connections org={org} />
-    </div>
+    <Page
+      variant="scroll"
+      header={
+        <PageHeader
+          title="Single sign-on"
+          description="Let your team sign in through your identity provider. Verify a login domain, then connect OIDC, SAML or a social provider."
+          className="mb-0"
+        />
+      }
+    >
+      <div className="space-y-6">
+        <EmailDomains org={org} />
+        <Connections org={org} />
+      </div>
+    </Page>
   )
 }

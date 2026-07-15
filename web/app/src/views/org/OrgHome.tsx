@@ -45,6 +45,8 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Field, FormActions, FormSection, FormSections } from "@/components/form-section"
+import { Page } from "@/components/page"
 import {
   Select,
   SelectContent,
@@ -113,11 +115,16 @@ export function OrgOverview({ org }: { org: string }) {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Dashboard"
-        description="Mail activity across this organization's servers over the last 30 days."
-      />
+    <Page
+      variant="scroll"
+      header={
+        <PageHeader
+          title="Dashboard"
+          description="Mail activity across this organization's servers over the last 30 days."
+          className="mb-0"
+        />
+      }
+    >
       <OnboardingChecklist org={org} />
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 *:data-[slot=card]:from-primary/5 *:data-[slot=card]:to-card *:data-[slot=card]:bg-gradient-to-t *:data-[slot=card]:shadow-xs">
         {tiles.map((t) => (
@@ -132,7 +139,7 @@ export function OrgOverview({ org }: { org: string }) {
           </Card>
         ))}
       </div>
-    </div>
+    </Page>
   )
 }
 
@@ -160,19 +167,26 @@ export function Servers({ org }: { org: string }) {
   const canManage = role === "root" || role === "admin" || role === "owner"
 
   return (
-    <div>
-      <PageHeader
-        title="Servers"
-        description="Mail servers in this organization, with 30-day activity."
-        action={
-          canManage && (
-            <Button size="sm" onClick={() => setOpen(true)}>
-              <PlusIcon className="size-4" /> New server
-            </Button>
-          )
-        }
-      />
-      <OrgServersTable org={org} />
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Servers"
+          description="Mail servers in this organization, with 30-day activity."
+          action={
+            canManage && (
+              <Button size="sm" onClick={() => setOpen(true)}>
+                <PlusIcon className="size-4" /> New server
+              </Button>
+            )
+          }
+          className="mb-0"
+        />
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        <OrgServersTable org={org} fillHeight />
+      </div>
       <FormDialog
         open={open}
         onOpenChange={setOpen}
@@ -200,7 +214,7 @@ export function Servers({ org }: { org: string }) {
           </div>
         </div>
       </FormDialog>
-    </div>
+    </Page>
   )
 }
 
@@ -440,39 +454,47 @@ export function Members({ org }: { org: string }) {
   ]
 
   return (
-    <div>
-      <PageHeader
-        title="Members"
-        description="People with access to this organization, including pending invitations."
-        action={
-          canManage && (
-            <div className="flex gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  setIssued(null)
-                  setEmail("")
-                  setInviteOpen(true)
-                }}
-              >
-                <MailPlusIcon className="size-4" /> Invite
-              </Button>
-              <Button size="sm" onClick={() => setAddOpen(true)}>
-                <PlusIcon className="size-4" /> Add member
-              </Button>
-            </div>
-          )
-        }
-      />
-      <DataTable
-        columns={columns}
-        data={rows}
-        loading={members.isPending}
-        searchKeys={["name", "email"]}
-        searchPlaceholder="Search members…"
-        emptyText="No members yet."
-      />
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Members"
+          description="People with access to this organization, including pending invitations."
+          action={
+            canManage && (
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setIssued(null)
+                    setEmail("")
+                    setInviteOpen(true)
+                  }}
+                >
+                  <MailPlusIcon className="size-4" /> Invite
+                </Button>
+                <Button size="sm" onClick={() => setAddOpen(true)}>
+                  <PlusIcon className="size-4" /> Add member
+                </Button>
+              </div>
+            )
+          }
+          className="mb-0"
+        />
+      }
+    >
+      <div className="flex min-h-0 flex-1 flex-col">
+        <DataTable
+          columns={columns}
+          data={rows}
+          loading={members.isPending}
+          searchKeys={["name", "email"]}
+          searchPlaceholder="Search members…"
+          emptyText="No members yet."
+          fillHeight
+        />
+      </div>
 
       {/* Add an existing account. */}
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
@@ -577,7 +599,7 @@ export function Members({ org }: { org: string }) {
           }
         }}
       />
-    </div>
+    </Page>
   )
 }
 
@@ -815,66 +837,67 @@ export function OrgSettings({ org }: { org: string }) {
     return <SimpleEmptyState>Only owners can manage organization settings.</SimpleEmptyState>
   }
   return (
-    <div className="max-w-lg space-y-4">
-      <PageHeader
-        title="Settings"
-        description="Security and configuration for this organization."
-      />
-      {isOwner && (
-        <>
-          <PageHeader title="Security" />
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">
-                Require two-factor authentication
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="flex items-center justify-between gap-4">
-              <p className="text-sm text-muted-foreground">
-                Every member must have two-factor authentication (an
-                authenticator app or a passkey) to access this organization.
-                Members without it are blocked until they enable it, and that
-                includes you.
-              </p>
+    <Page
+      header={
+        <PageHeader
+          title="Settings"
+          description="Security and configuration for this organization."
+          className="mb-0"
+        />
+      }
+    >
+      <FormSections>
+        <FormSection
+          title="Security"
+          description="Access requirements for everyone in this organization."
+        >
+          <Field
+            label="Require two-factor authentication"
+            span={6}
+            hint="Every member must have two-factor authentication (an authenticator app or a passkey) to access this organization. Members without it are blocked until they enable it, and that includes you."
+          >
+            <div className="flex items-center gap-2">
               <Switch
+                id="require-2fa"
                 checked={orgQuery.data?.organization.require_two_factor ?? false}
                 onCheckedChange={(value) => setRequireTwoFactor.mutate(value)}
                 disabled={!orgQuery.data || setRequireTwoFactor.isPending}
               />
-            </CardContent>
-          </Card>
-          <PageHeader title="Danger zone" />
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Delete this organization</CardTitle>
-            </CardHeader>
-            <CardContent className="flex items-center justify-between gap-4">
-              <p className="text-sm text-muted-foreground">
-                Deletes the organization with all servers and their data.
-              </p>
-              <Button variant="destructive" onClick={() => setConfirmOpen(true)}>
-                Delete
-              </Button>
-            </CardContent>
-          </Card>
-          <ConfirmDialog
-            open={confirmOpen}
-            onOpenChange={setConfirmOpen}
-            title={`Delete ${org}?`}
-            description="This cannot be undone. All servers, domains, credentials and messages are removed."
-            onConfirm={async () => {
-              try {
-                await adminApi.organizations.delete(org)
-                await refresh()
-                router.push("/")
-              } catch (err) {
-                errorToast(err, "Could not delete the organization")
-              }
-            }}
-          />
-        </>
-      )}
-    </div>
+              <Label htmlFor="require-2fa">
+                {orgQuery.data?.organization.require_two_factor ? "Required" : "Optional"}
+              </Label>
+            </div>
+          </Field>
+        </FormSection>
+
+        <FormSection
+          title="Danger zone"
+          description="Deletes the organization with all servers and their data. This cannot be undone."
+        >
+          <FormActions>
+            <Button variant="destructive" onClick={() => setConfirmOpen(true)}>
+              Delete organization
+            </Button>
+          </FormActions>
+        </FormSection>
+      </FormSections>
+
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={`Delete ${org}?`}
+        description="This cannot be undone. All servers, domains, credentials and messages are removed."
+        onConfirm={async () => {
+          try {
+            await adminApi.organizations.delete(org)
+            await refresh()
+            router.push("/")
+          } catch (err) {
+            errorToast(err, "Could not delete the organization")
+          }
+        }}
+      />
+    </Page>
   )
 }
 
