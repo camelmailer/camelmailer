@@ -174,6 +174,16 @@ export type Server = {
   default_stream_id: number | null
 }
 
+/// Per-server 30-day message counters (GET .../servers/stats). `server`
+/// is the server permalink; counts are over the last 30 days.
+export type ServerStat = {
+  server: string
+  total: number
+  outgoing: number
+  incoming: number
+  bounced: number
+}
+
 export type DnsRecord = { name: string; type: string; value: string }
 
 export type Domain = {
@@ -285,6 +295,8 @@ export type Features = {
   oidc: { enabled: boolean; name: string }
   saml: { enabled: boolean; name: string }
   sso: SsoProviderInfo[]
+  // Hosted-cloud legal links, shown on the auth cards when configured.
+  legal: { terms_url: string | null; privacy_url: string | null }
 }
 
 export type PasskeyCredential = {
@@ -717,6 +729,11 @@ export const adminApi = {
     list: () =>
       api.get<{ servers: Server[]; pagination: Pagination }>(
         `/api/v2/admin/organizations/${org}/servers?per_page=100`,
+      ),
+    // Per-server 30-day message counters for the dashboard servers table.
+    stats: () =>
+      api.get<{ stats: ServerStat[] }>(
+        `/api/v2/admin/organizations/${org}/servers/stats`,
       ),
     get: (server: string) =>
       api.get<{ server: Server }>(`/api/v2/admin/organizations/${org}/servers/${server}`),
