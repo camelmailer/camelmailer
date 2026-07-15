@@ -6,7 +6,10 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use camelmailer_api::{build_auth_router, build_router, ApiState};
 use camelmailer_core::auth;
-use camelmailer_core::{AdminStore, AuthStore, MemoryStore, NewOrganization, NewUser, Role};
+use camelmailer_core::{
+    AdminStore, AuthStore, MemoryStore, MessageScope, NewOrganization, NewServer, NewUser,
+    QueuedMessage, Role, ServerMode,
+};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -43,6 +46,24 @@ async fn harness_with_config(config: camelmailer_config::Config) -> Harness {
 
 async fn harness() -> Harness {
     harness_with_config(camelmailer_config::Config::default()).await
+}
+
+/// Like [`harness`], but wires the same [`MemoryStore`] as the tenant-scoped
+/// `server_store` too — required by `GET …/servers/stats`, which reads
+/// per-server aggregates via `ServerStore::message_stats`.
+async fn harness_with_server_store() -> Harness {
+    let store = Arc::new(MemoryStore::new());
+    let dns = Arc::new(camelmailer_core::StaticDnsResolver::new());
+    let state = ApiState::full_with_resolver(
+        store.clone(),
+        Some(store.clone()),
+        Some(store.clone()),
+        None,
+        camelmailer_config::Config::default(),
+        dns.clone(),
+    );
+    let app = build_router(state.clone()).merge(build_auth_router(state));
+    Harness { app, store, dns }
 }
 
 impl Harness {
@@ -1293,4 +1314,152 @@ async fn require_two_factor_is_patched_by_owners_only_and_shown_in_get() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["organization"]["require_two_factor"], false);
+}
+
+// -------------------------------------------------- per-server 30-day stats
+
+/// Seed one stored message for a server, so `message_stats` reports it;
+/// returns the message id so the caller can adjust its delivery status.
+fn seed_message(store: &MemoryStore, server_id: camelmailer_core::Id, scope: MessageScope) -> i64 {
+    store
+        .insert_message_record(QueuedMessage {
+            server_id,
+            rcpt_to: "rcpt@dest.example".into(),
+            mail_from: "sender@src.example".into(),
+            raw_message: b"Subject: hi\r\n\r\nbody".to_vec(),
+            received_with_ssl: false,
+            scope,
+            bounce: false,
+            domain_id: None,
+            credential_id: None,
+            route_id: None,
+            tag: None,
+            metadata: None,
+            stream_id: None,
+        })
+        .id
+}
+
+#[tokio::test]
+async fn servers_stats_returns_per_server_30_day_counters() {
+    let h = harness_with_server_store().await;
+    let org = h.org("Acme").await;
+    let owner = h.member(&org, "owner@acme.test", Role::Owner).await;
+
+    // Alpha has two outgoing (one bounced) and one incoming message.
+    let alpha = h
+        .store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "Alpha".into(),
+            permalink: "alpha".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    seed_message(&h.store, alpha.id, MessageScope::Outgoing);
+    let bounced = seed_message(&h.store, alpha.id, MessageScope::Outgoing);
+    h.store.set_message_status(bounced, "Bounced");
+    seed_message(&h.store, alpha.id, MessageScope::Incoming);
+
+    // Beta has no messages: it must still appear, with zeros.
+    let _beta = h
+        .store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "Beta".into(),
+            permalink: "beta".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+
+    let token = h.login(&owner.email_address).await;
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers/stats",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+
+    let stats = body["data"]["stats"].as_array().expect("stats array");
+    assert_eq!(stats.len(), 2, "one entry per server: {body}");
+
+    let alpha_stats = stats
+        .iter()
+        .find(|s| s["server"] == "alpha")
+        .expect("alpha entry");
+    assert_eq!(alpha_stats["total"], 3);
+    assert_eq!(alpha_stats["outgoing"], 2);
+    assert_eq!(alpha_stats["incoming"], 1);
+    assert_eq!(alpha_stats["bounced"], 1);
+
+    let beta_stats = stats
+        .iter()
+        .find(|s| s["server"] == "beta")
+        .expect("beta entry");
+    assert_eq!(beta_stats["total"], 0);
+    assert_eq!(beta_stats["outgoing"], 0);
+    assert_eq!(beta_stats["incoming"], 0);
+    assert_eq!(beta_stats["bounced"], 0);
+}
+
+#[tokio::test]
+async fn servers_stats_is_readable_by_a_plain_member() {
+    let h = harness_with_server_store().await;
+    let org = h.org("Acme").await;
+    let viewer = h.member(&org, "viewer@acme.test", Role::Viewer).await;
+    h.store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "Alpha".into(),
+            permalink: "alpha".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+
+    let token = h.login(&viewer.email_address).await;
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers/stats",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "unexpected body: {body}");
+    assert_eq!(body["data"]["stats"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn servers_stats_hides_the_org_from_non_members() {
+    let h = harness_with_server_store().await;
+    let org = h.org("Acme").await;
+    h.store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "Alpha".into(),
+            permalink: "alpha".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    // A user who is not a member of Acme.
+    let outsider = h.user("outsider@example.test", false).await;
+
+    let token = h.login(&outsider.email_address).await;
+    let (status, body) = h
+        .request(
+            "GET",
+            "/api/v2/admin/organizations/acme/servers/stats",
+            Some(&token),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unexpected body: {body}");
+    assert_eq!(body["error"]["code"], "NotFound");
 }

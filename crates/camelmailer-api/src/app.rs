@@ -958,6 +958,57 @@ async fn servers_index(
     )
 }
 
+/// `GET /organizations/{permalink}/servers/stats` — per-server 30-day
+/// message counters for the dashboard's servers table. RBAC is identical
+/// to the servers index (a read any org member may perform); the central
+/// [`auth_middleware`] enforces it, non-members get 404. Each server's
+/// aggregate comes from [`camelmailer_core::ServerStore::message_stats`]
+/// over a `from = now - 30 days` window; servers with no messages report
+/// zeros and are still included.
+async fn servers_stats(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path(org_permalink): Path<String>,
+) -> ApiResponse {
+    let organization = match find_organization(&state, &org_permalink).await {
+        Ok(Some(organization)) => organization,
+        Ok(None) => return render_not_found(Some(&start.0)),
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    let Some(server_store) = state.server_store.as_ref() else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "StorageUnavailable",
+            "Per-server statistics storage is not configured",
+        );
+    };
+    let servers: Vec<Server> = match state.store.servers_for_organization(organization.id).await {
+        Ok(servers) => servers,
+        Err(error) => return render_store_error(Some(&start.0), error),
+    };
+    let filter = camelmailer_core::StatsFilter {
+        from: Some(chrono::Utc::now() - chrono::Duration::days(30)),
+        to: None,
+        tag: None,
+    };
+    let mut stats = Vec::with_capacity(servers.len());
+    for server in &servers {
+        let counters = match server_store.message_stats(server.id, &filter).await {
+            Ok(counters) => counters,
+            Err(error) => return render_store_error(Some(&start.0), error),
+        };
+        stats.push(json!({
+            "server": server.permalink,
+            "total": counters.total,
+            "outgoing": counters.outgoing,
+            "incoming": counters.incoming,
+            "bounced": counters.bounced,
+        }));
+    }
+    render_success(Some(&start.0), StatusCode::OK, json!({ "stats": stats }))
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateServer {
     name: Option<String>,
@@ -1344,6 +1395,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/organizations/{permalink}/servers",
             get(servers_index).post(servers_create),
+        )
+        .route(
+            "/organizations/{permalink}/servers/stats",
+            get(servers_stats),
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}",
