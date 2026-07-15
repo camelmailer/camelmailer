@@ -1,9 +1,6 @@
 "use client"
 
-import { useEffect } from "react"
 import { useQueries, useQuery } from "@tanstack/react-query"
-import Link from "next/link"
-import { useRouter } from "next/navigation"
 import { BuildingIcon } from "lucide-react"
 import {
   Card,
@@ -12,36 +9,26 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { Badge } from "@/components/ui/badge"
 import { PageHeader } from "@/components/shared"
 import { EmptyState } from "@/components/empty-state"
 import { OnboardingChecklist } from "@/components/onboarding-checklist"
 import { requestNewOrganization } from "@/components/org-switcher"
 import { adminApi } from "@/lib/api"
-import { getLastActiveOrg } from "@/lib/api-extras"
 import { useAuth } from "@/lib/auth"
+import { OrganizationsTable, ServersTable } from "./dashboard-tables"
 
-/// The landing page: the user's organizations. With `all` (global admins
-/// via "All organizations…") every organization on the instance.
-/// When the user has a remembered "last active" organization, /dashboard
-/// forwards straight to its overview.
+/// The landing page ("/dashboard"): the signed-in user's overview — KPI
+/// tiles, the onboarding checklist, and the user's organizations. With
+/// `all` (global admins via "All organizations…") it lists every
+/// organization on the instance. It always renders here; picking an org
+/// from the switcher is what navigates into an organization.
 export default function Dashboard({ all = false }: { all?: boolean }) {
   const { me } = useAuth()
-  const router = useRouter()
   const allOrgs = useQuery({
     queryKey: ["organizations", "all"],
     queryFn: adminApi.organizations.list,
     enabled: all,
   })
-
-  // Forward to the last active organization, if it still exists.
-  useEffect(() => {
-    if (all || !me) return
-    const last = getLastActiveOrg()
-    if (last && me.memberships.some((m) => m.organization.permalink === last)) {
-      router.replace(`/orgs/${last}`)
-    }
-  }, [all, me, router])
 
   const items = all
     ? (allOrgs.data?.organizations ?? []).map((organization) => ({
@@ -118,7 +105,7 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
         </div>
       )}
       <PageHeader
-        title={all ? "All organizations" : "Your organizations"}
+        title={all ? "All organizations" : "Organizations"}
         description={
           all
             ? "Every organization on this instance (global admin view)."
@@ -133,27 +120,16 @@ export default function Dashboard({ all = false }: { all?: boolean }) {
           action={{ label: "Create organization", onClick: requestNewOrganization }}
         />
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {items.map(({ organization, role }) => (
-            <Link key={organization.id} href={`/orgs/${organization.permalink}`}>
-              <Card className="transition-colors hover:bg-accent/50">
-                <CardHeader className="pb-2">
-                  <CardTitle className="flex items-center gap-2 text-base">
-                    <BuildingIcon className="size-4 text-muted-foreground" />
-                    {organization.name}
-                    {role && (
-                      <Badge variant="secondary" className="ml-auto">
-                        {role}
-                      </Badge>
-                    )}
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="text-xs text-muted-foreground">
-                  /{organization.permalink}
-                </CardContent>
-              </Card>
-            </Link>
-          ))}
+        <OrganizationsTable orgs={items} />
+      )}
+
+      {!all && items.length > 0 && (
+        <div className="mt-8">
+          <PageHeader
+            title="Servers"
+            description="Mail servers across your organizations, with 30-day activity."
+          />
+          <ServersTable orgs={items} />
         </div>
       )}
     </div>
