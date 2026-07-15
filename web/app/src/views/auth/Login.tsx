@@ -3,8 +3,10 @@
 import { useEffect, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
+import { Fingerprint, KeyRound } from "lucide-react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { AuthShell } from "@/components/auth-shell"
+import { AuthLegal, AuthShell } from "@/components/auth-shell"
+import { AuthDivider, ProviderButton, providerIcon } from "@/components/auth-social"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -144,7 +146,25 @@ export default function Login() {
   }
 
   return (
-    <AuthShell title="Sign in" description="Welcome back to CamelMailer">
+    <AuthShell
+      title="Welcome back"
+      description={
+        features?.registration ? (
+          <>
+            Sign in or{" "}
+            <Link
+              href="/register"
+              className="font-medium text-foreground underline-offset-4 hover:underline"
+            >
+              create account
+            </Link>
+          </>
+        ) : (
+          "Sign in to your account"
+        )
+      }
+      footer={<AuthLegal legal={features?.legal} />}
+    >
           <form onSubmit={submit} className="grid gap-4">
             <div className="grid gap-2">
               <Label htmlFor="email">Email</Label>
@@ -203,61 +223,48 @@ export default function Login() {
             <Button type="submit" disabled={busy}>
               {busy ? "Signing in…" : "Sign in"}
             </Button>
-            {orgConnections.map((connection) => (
-              <Button
-                key={connection.id}
-                type="button"
-                variant="outline"
-                onClick={() => (window.location.href = connection.start_url)}
-              >
-                Continue with {connection.name}
-              </Button>
-            ))}
+            {(features?.webauthn ||
+              ssoUrl ||
+              saml ||
+              ssoProviders.length > 0 ||
+              orgConnections.length > 0) && <AuthDivider />}
             {features?.webauthn && (
-              <Button
-                type="button"
-                variant="outline"
+              <ProviderButton
+                icon={<Fingerprint />}
+                label="Sign in with a passkey"
                 onClick={passkeyLogin}
                 disabled={busy}
-              >
-                Sign in with passkey
-              </Button>
-            )}
-            {ssoUrl && (
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => (window.location.href = ssoUrl)}
-              >
-                Continue with SSO
-              </Button>
+              />
             )}
             {ssoProviders.map((provider) => (
-              <Button
+              <ProviderButton
                 key={provider.id}
-                type="button"
-                variant="outline"
+                icon={providerIcon(provider)}
+                label={`Continue with ${provider.name}`}
                 onClick={() => (window.location.href = ssoStartUrl(provider.id))}
-              >
-                Continue with {provider.name}
-              </Button>
+              />
             ))}
-            {features?.registration && (
-              <p className="text-center text-sm text-muted-foreground">
-                Don&apos;t have an account?{" "}
-                <Link href="/register" className="hover:underline">
-                  Create account
-                </Link>
-              </p>
+            {orgConnections.map((connection) => (
+              <ProviderButton
+                key={connection.id}
+                icon={<KeyRound />}
+                label={`Continue with ${connection.name}`}
+                onClick={() => (window.location.href = connection.start_url)}
+              />
+            ))}
+            {ssoUrl && (
+              <ProviderButton
+                icon={<KeyRound />}
+                label="Continue with SSO"
+                onClick={() => (window.location.href = ssoUrl)}
+              />
             )}
             {saml && (
-              <Button
-                type="button"
-                variant="outline"
+              <ProviderButton
+                icon={<KeyRound />}
+                label={`Sign in with ${saml.name}`}
                 onClick={() => (window.location.href = saml.url)}
-              >
-                Sign in with {saml.name}
-              </Button>
+              />
             )}
           </form>
     </AuthShell>

@@ -4,14 +4,8 @@ import { useState } from "react"
 import Link from "next/link"
 import { useSearchParams } from "next/navigation"
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import { AuthShell } from "@/components/auth-shell"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { ApiError, authApi } from "@/lib/api"
@@ -52,19 +46,14 @@ export default function ResetPassword() {
   }
 
   return (
-    <div className="flex min-h-svh items-center justify-center bg-muted/40 p-4">
-      <Card className="w-full max-w-sm">
-        <CardHeader>
-          <CardTitle className="text-xl">
-            {token ? "Choose a new password" : "Reset your password"}
-          </CardTitle>
-          <CardDescription>
-            {token
-              ? "Enter the new password for your account."
-              : "We'll issue a single-use reset link for your account."}
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
+    <AuthShell
+      title={token ? "Choose a new password" : "Reset your password"}
+      description={
+        token
+          ? "Enter the new password for your account."
+          : "We'll issue a single-use reset link for your account."
+      }
+    >
           <form onSubmit={submit} className="grid gap-4">
             {token ? (
               <div className="grid gap-2">
@@ -108,8 +97,6 @@ export default function ResetPassword() {
               Back to login
             </Link>
           </form>
-        </CardContent>
-      </Card>
-    </div>
+    </AuthShell>
   )
 }
