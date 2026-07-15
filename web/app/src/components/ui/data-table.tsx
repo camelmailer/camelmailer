@@ -72,6 +72,7 @@ export function DataTable<TData, TValue>({
   data,
   searchPlaceholder = "Search…",
   searchKeys,
+  searchable = true,
   filters = [],
   loading = false,
   emptyText = "Nothing here yet.",
@@ -83,6 +84,8 @@ export function DataTable<TData, TValue>({
   searchPlaceholder?: string
   /** Row fields the global search matches against (defaults to all string cells). */
   searchKeys?: (keyof TData)[]
+  /** Hide the built-in search box (e.g. when the page already searches server-side). */
+  searchable?: boolean
   filters?: DataTableFilter[]
   loading?: boolean
   emptyText?: string
@@ -122,19 +125,24 @@ export function DataTable<TData, TValue>({
   const first = total === 0 ? 0 : pageIndex * pageSize + 1
   const last = Math.min((pageIndex + 1) * pageSize, total)
 
+  const showToolbar = searchable || filters.length > 0 || !!actions
+
   return (
     <div className="flex flex-col gap-3">
       {/* Toolbar: search + filters (left), actions (right). */}
+      {showToolbar && (
       <div className="flex flex-wrap items-center gap-2">
-        <div className="relative w-full max-w-xs">
-          <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={globalFilter}
-            onChange={(e) => setGlobalFilter(e.target.value)}
-            placeholder={searchPlaceholder}
-            className="pl-9"
-          />
-        </div>
+        {searchable && (
+          <div className="relative w-full md:w-1/3">
+            <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={globalFilter}
+              onChange={(e) => setGlobalFilter(e.target.value)}
+              placeholder={searchPlaceholder}
+              className="h-8 pl-9"
+            />
+          </div>
+        )}
         {filters.map((f) => {
           const col = table.getColumn(f.columnId)
           const active = (col?.getFilterValue() as string | undefined) ?? ""
@@ -180,6 +188,7 @@ export function DataTable<TData, TValue>({
         })}
         {actions && <div className="ml-auto flex items-center gap-2">{actions}</div>}
       </div>
+      )}
 
       {/* Table. */}
       <div className="overflow-hidden rounded-lg border">
