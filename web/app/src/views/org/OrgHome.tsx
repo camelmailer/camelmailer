@@ -114,6 +114,10 @@ export function OrgOverview({ org }: { org: string }) {
 
   return (
     <div>
+      <PageHeader
+        title="Dashboard"
+        description="Mail activity across this organization's servers over the last 30 days."
+      />
       <OnboardingChecklist org={org} />
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 *:data-[slot=card]:from-primary/5 *:data-[slot=card]:to-card *:data-[slot=card]:bg-gradient-to-t *:data-[slot=card]:shadow-xs">
         {tiles.map((t) => (
@@ -812,6 +816,10 @@ export function OrgSettings({ org }: { org: string }) {
   }
   return (
     <div className="max-w-lg space-y-4">
+      <PageHeader
+        title="Settings"
+        description="Security and configuration for this organization."
+      />
       {isOwner && (
         <>
           <PageHeader title="Security" />
@@ -919,13 +927,8 @@ export function OrgTwoFactorGate({
 // ---------------------------------------------------------------- shell
 
 /// Header + tab bar of /orgs/[org]; pages render below as children.
-export function OrgShell({ org, children }: { org: string; children: React.ReactNode }) {
-  // Org-level navigation now lives in the sidebar; this shell just frames
-  // the org name above each sub-page (no tab bar).
-  return (
-    <div>
-      <PageHeader title={org} description="Organization" />
-      {children}
-    </div>
-  )
+export function OrgShell({ children }: { org: string; children: React.ReactNode }) {
+  // Org-level navigation lives in the sidebar and each sub-page renders its
+  // own header, so this shell is now just a passthrough.
+  return <div>{children}</div>
 }
