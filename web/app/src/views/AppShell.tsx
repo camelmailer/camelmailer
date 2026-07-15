@@ -18,12 +18,15 @@ import {
   CheckIcon,
   ChevronDownIcon,
   ChevronsUpDownIcon,
+  ClockIcon,
   CreditCardIcon,
+  FileTextIcon,
   FingerprintIcon,
   GaugeIcon,
   GlobeIcon,
   InboxIcon,
   KeyRoundIcon,
+  LayersIcon,
   LayoutDashboardIcon,
   LogOutIcon,
   NetworkIcon,
@@ -129,6 +132,8 @@ function serverAreas(base: string) {
   return [
     { href: base, label: "Dashboard", icon: GaugeIcon, match: "exact" as const },
     { href: `${base}/messaging`, label: "Messaging", icon: SendIcon, match: "prefix" as const },
+    { href: `${base}/streams`, label: "Streams", icon: LayersIcon, match: "prefix" as const },
+    { href: `${base}/templates`, label: "Templates", icon: FileTextIcon, match: "prefix" as const },
     { href: `${base}/domains`, label: "Domains", icon: GlobeIcon, match: "prefix" as const },
     { href: `${base}/credentials`, label: "Credentials", icon: KeyRoundIcon, match: "prefix" as const },
     { href: `${base}/routes`, label: "Routes", icon: InboxIcon, match: "prefix" as const },
@@ -136,6 +141,8 @@ function serverAreas(base: string) {
     { href: `${base}/sender-addresses`, label: "Senders", icon: AtSignIcon, match: "prefix" as const },
     { href: `${base}/suppressions`, label: "Suppressions", icon: BanIcon, match: "prefix" as const },
     { href: `${base}/dmarc`, label: "DMARC", icon: ShieldCheckIcon, match: "prefix" as const },
+    { href: `${base}/queue`, label: "Queue", icon: ClockIcon, match: "prefix" as const },
+    { href: `${base}/logs`, label: "API logs", icon: ScrollTextIcon, match: "prefix" as const },
     { href: `${base}/settings`, label: "Settings", icon: SettingsIcon, match: "prefix" as const },
   ]
 }
@@ -349,7 +356,7 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
   const orgAreas: OrgArea[] = orgBase
     ? [
         { href: orgBase, label: "Dashboard", icon: LayoutDashboardIcon, match: "exact" },
-        { href: `${orgBase}/servers`, label: "Servers", icon: ServerIcon, match: "prefix" },
+        { href: `${orgBase}/servers`, label: "Servers", icon: ServerIcon, match: "exact" },
         { href: `${orgBase}/members`, label: "Members", icon: UsersIcon, match: "prefix" },
         // tenant SSO configuration carries provider secrets — admin+ only
         ...(canBilling
@@ -405,14 +412,20 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
                       tooltip="Switch server"
                     className="rounded-lg border border-border bg-card shadow-sm data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
                   >
-                    <div className="flex aspect-square size-8 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
-                      <ServerIcon className="size-4" />
-                    </div>
-                    <div className="grid flex-1 text-left text-sm leading-tight">
-                      <span className="truncate font-medium">
-                        {activeServer?.name ?? "Select server"}
-                      </span>
+                    <div className="grid flex-1 text-left leading-tight">
                       <span className="truncate text-xs text-muted-foreground">Server</span>
+                      <span className="flex items-center gap-2 truncate text-sm font-medium">
+                        {activeServer && (
+                          <span
+                            aria-hidden
+                            className="size-2 shrink-0 rounded-full"
+                            style={{ backgroundColor: serverDotColor(activeServer) }}
+                          />
+                        )}
+                        <span className="truncate">
+                          {activeServer?.name ?? "Select server"}
+                        </span>
+                      </span>
                     </div>
                     <ChevronsUpDownIcon className="ml-auto size-4" />
                   </SidebarMenuButton>
@@ -454,10 +467,7 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
       </SidebarHeader>
       <SidebarContent className="overflow-x-hidden">
         {!isAdminMode && activeOrg && (
-          <SidebarGroup>
-            <SidebarGroupLabel className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-              {activeServer?.name ?? "Server"}
-            </SidebarGroupLabel>
+          <SidebarGroup className="pt-0">
             <SidebarGroupContent>
               <SidebarMenu>
                 {servers.isPending &&

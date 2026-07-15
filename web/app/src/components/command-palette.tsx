@@ -18,7 +18,6 @@ import {
   LayoutDashboardIcon,
   MailIcon,
   PlusIcon,
-  SendIcon,
   ServerIcon,
   SettingsIcon,
   ShieldCheckIcon,
@@ -46,9 +45,8 @@ const SERVER_AREAS = [
   ["sender-addresses", "Sender addresses", AtSignIcon],
   ["suppressions", "Suppressions", BanIcon],
   ["dmarc", "DMARC", ShieldCheckIcon],
-  ["messaging", "Send a message", SendIcon],
-  ["messaging/messages", "Messages", MailIcon],
-  ["messaging/templates", "Templates", MailIcon],
+  ["messaging", "Messages", MailIcon],
+  ["templates", "Templates", MailIcon],
   ["settings", "Settings", SettingsIcon],
 ] as const
 

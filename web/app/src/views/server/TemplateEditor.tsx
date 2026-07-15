@@ -46,7 +46,7 @@ export function TemplateEditor({
   permalink: string | null
 }) {
   const router = useRouter()
-  const gallery = `/orgs/${org}/servers/${server}/messaging/templates`
+  const gallery = `/orgs/${org}/servers/${server}/templates`
 
   // Existing template (list + find — the server API has no single-get).
   const templates = useQuery({ queryKey: ["sapi-templates"], queryFn: api.templates.list })
