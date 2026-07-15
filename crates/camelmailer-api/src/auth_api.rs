@@ -1274,6 +1274,10 @@ async fn features(
                     "type": provider.provider_type,
                 }))
                 .collect::<Vec<_>>(),
+            "legal": {
+                "terms_url": state.config.legal.terms_url,
+                "privacy_url": state.config.legal.privacy_url,
+            },
         }),
     )
 }

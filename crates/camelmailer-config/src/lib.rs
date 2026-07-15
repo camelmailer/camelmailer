@@ -311,6 +311,17 @@ impl std::fmt::Debug for Billing {
     }
 }
 
+/// Links to the hosted service's legal pages, shown on the sign-in and
+/// registration cards. Empty by default: self-hosted installations show no
+/// legal links, while the managed cloud points these at its Terms and
+/// Privacy pages.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Legal {
+    pub terms_url: Option<String>,
+    pub privacy_url: Option<String>,
+}
+
 /// OpenID Connect single sign-on. Field names match the upstream Postal
 /// `oidc` group so a legacy `postal.yml` loads unchanged.
 #[derive(Debug, Clone, Deserialize)]
@@ -756,6 +767,7 @@ pub struct Config {
     pub auth: Auth,
     pub app_mail: AppMail,
     pub billing: Billing,
+    pub legal: Legal,
     pub oidc: Oidc,
     pub saml: Saml,
     pub scim: Scim,

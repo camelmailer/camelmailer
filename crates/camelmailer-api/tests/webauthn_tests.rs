@@ -146,6 +146,12 @@ async fn features_reflect_the_configuration() {
     assert_eq!(body["data"]["registration"], false);
     assert_eq!(body["data"]["oidc"]["enabled"], false);
     assert_eq!(body["data"]["saml"]["enabled"], false);
+    // no legal links by default (self-hosted)
+    assert_eq!(body["data"]["legal"]["terms_url"], serde_json::Value::Null);
+    assert_eq!(
+        body["data"]["legal"]["privacy_url"],
+        serde_json::Value::Null
+    );
 
     let mut config = webauthn_config();
     config.auth.allow_registration = true;
@@ -153,6 +159,7 @@ async fn features_reflect_the_configuration() {
     config.oidc.name = "Okta".into();
     config.oidc.issuer = "https://idp.example.com".into();
     config.oidc.identifier = Some("client-1".into());
+    config.legal.terms_url = Some("https://example.com/terms".into());
     let (app, _, _) = build_app_with(config).await;
     let (status, body) = request(&app, "GET", "/api/v2/auth/features", None, None).await;
     assert_eq!(status, StatusCode::OK);
@@ -161,6 +168,10 @@ async fn features_reflect_the_configuration() {
     assert_eq!(
         body["data"]["oidc"],
         json!({ "enabled": true, "name": "Okta" })
+    );
+    assert_eq!(
+        body["data"]["legal"]["terms_url"],
+        "https://example.com/terms"
     );
 }
 

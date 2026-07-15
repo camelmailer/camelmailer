@@ -926,6 +926,12 @@ paths:
                             properties:
                               enabled: { type: boolean }
                               name: { type: string }
+                          legal:
+                            type: object
+                            description: Hosted-cloud legal links (null when unset)
+                            properties:
+                              terms_url: { type: string, nullable: true }
+                              privacy_url: { type: string, nullable: true }
                           saml:
                             type: object
                             properties:
