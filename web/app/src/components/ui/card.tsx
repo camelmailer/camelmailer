@@ -17,6 +17,33 @@ function Card({ className, ...props }: React.ComponentProps<"div">) {
   )
 }
 
+/// The glassy "halo" card — the pricing-box look: an outer glass-rimmed
+/// ring, a padded middle forming a concentric halo gap, and the inner
+/// card surface (keeps data-slot=card, so the Card* subcomponents work
+/// inside it). Reserved for spotlight surfaces (auth screens, the
+/// lightbox/dialog) rather than the dense dashboard. `className` targets
+/// the outer frame, so layout classes like `w-full` propagate.
+function HaloCard({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn(
+        // Outer radius = inner radius + gap, so the frame stays concentric
+        // with the inner card (inner 1.5rem, gap 6px -> outer 1.875rem).
+        "-m-1.5 grid grid-cols-1 rounded-[1.875rem] shadow-[inset_0_0_2px_1px_#ffffff4d] ring-1 ring-black/5 dark:shadow-[inset_0_0_2px_1px_rgba(255,255,255,0.12)] dark:ring-white/10",
+        className
+      )}
+    >
+      <div className="grid grid-cols-1 rounded-[1.875rem] p-1.5 shadow-md shadow-black/5">
+        <div
+          data-slot="card"
+          className="flex flex-col gap-6 rounded-3xl bg-card py-6 text-card-foreground shadow-2xl ring-1 ring-black/5 dark:ring-white/10"
+          {...props}
+        />
+      </div>
+    </div>
+  )
+}
+
 function CardHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
@@ -85,6 +112,7 @@ function CardFooter({ className, ...props }: React.ComponentProps<"div">) {
 
 export {
   Card,
+  HaloCard,
   CardHeader,
   CardFooter,
   CardTitle,

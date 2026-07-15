@@ -1,7 +1,9 @@
 "use client"
 
 // The unified create/edit modal: title, fields as children, submit on
-// ⌘↵, cancel on Esc — with kbd badges on the buttons and a busy state.
+// ⌘↵, cancel on Esc, and a busy state. The shortcut hints live in the
+// command palette / search, not on these buttons. `Kbd` stays exported
+// for those surfaces.
 
 import type { ReactNode } from "react"
 import { Button } from "@/components/ui/button"
@@ -75,14 +77,11 @@ export function FormDialog({
         {children}
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
-            {cancelLabel} <Kbd>Esc</Kbd>
+            {cancelLabel}
           </Button>
           {showSubmit && (
             <Button onClick={onSubmit} disabled={busy || submitDisabled}>
-              {busy ? "Working…" : submitLabel}{" "}
-              <Kbd className="border-primary-foreground/30 bg-transparent text-primary-foreground/70">
-                ⌘↵
-              </Kbd>
+              {busy ? "Working…" : submitLabel}
             </Button>
           )}
         </DialogFooter>
