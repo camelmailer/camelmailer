@@ -77,7 +77,7 @@ import {
 import { CodePanel } from "@/components/code-panel"
 import { CommandPalette } from "@/components/command-palette"
 import { FormDialog, Kbd } from "@/components/form-dialog"
-import { NEW_ORG_EVENT, OrgSwitcher } from "@/components/org-switcher"
+import { NEW_ORG_EVENT, OrgSwitcherMenuContent } from "@/components/org-switcher"
 import { adminApi, ApiError } from "@/lib/api"
 import {
   getLastActiveOrg,
@@ -370,9 +370,11 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
   const serverBase =
     activeOrg && activeServer ? `/orgs/${activeOrg}/servers/${activeServer.permalink}` : null
   const serverNav = serverBase ? serverAreas(serverBase) : []
-  const role = me?.memberships.find(
+  const activeMembership = me?.memberships.find(
     (m) => m.organization.permalink === activeOrg,
-  )?.role
+  )
+  const role = activeMembership?.role
+  const activeOrgName = activeMembership?.organization.name
   const canBilling = isAdmin || role === "owner" || role === "admin"
 
   // `enabled: false` (the self-hosted default) hides the Billing entry.
@@ -546,9 +548,33 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
         )}
         {!isAdminMode && activeOrg && (
           <SidebarGroup>
-            <SidebarGroupLabel className="text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-              Organization
-            </SidebarGroupLabel>
+            {/* Organization switcher — mirrors the header's server switcher:
+                a "lg" menu button showing the current org, opening the full
+                membership list (see components/org-switcher.tsx). */}
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <SidebarMenuButton
+                      size="lg"
+                      tooltip="Switch organization"
+                      className="rounded-lg border border-border bg-card shadow-sm data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
+                    >
+                      <div className="grid flex-1 text-left leading-tight">
+                        <span className="truncate text-xs text-muted-foreground">
+                          Organization
+                        </span>
+                        <span className="truncate text-sm font-medium">
+                          {activeOrgName ?? activeOrg ?? "Select organization"}
+                        </span>
+                      </div>
+                      <ChevronsUpDownIcon className="ml-auto size-4" />
+                    </SidebarMenuButton>
+                  </DropdownMenuTrigger>
+                  <OrgSwitcherMenuContent activeOrg={activeOrg} />
+                </DropdownMenu>
+              </SidebarMenuItem>
+            </SidebarMenu>
             <SidebarGroupContent>
               <SidebarMenu>
                 {orgAreas.map(({ href, label, icon: Icon, match }) => (
@@ -675,7 +701,6 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <Kbd className="ml-auto">⌘K</Kbd>
           </Button>
           <div className="ml-auto flex items-center gap-2">
-            <OrgSwitcher activeOrg={activeOrg} />
             <NavUser />
           </div>
         </div>
