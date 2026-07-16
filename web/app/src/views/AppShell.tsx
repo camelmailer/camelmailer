@@ -63,7 +63,6 @@ import { Label } from "@/components/ui/label"
 import {
   Sidebar,
   SidebarContent,
-  SidebarFooter,
   SidebarGroup,
   SidebarGroupContent,
   SidebarGroupLabel,
@@ -227,7 +226,7 @@ function AppBreadcrumbs() {
       crumbs.push({ label: segmentLabel(segments[2]) })
     }
   } else if (segments[0] === "account") {
-    crumbs.push({ label: "Account & security" })
+    crumbs.push({ label: "My Account" })
   } else if (segments[0] === "admin") {
     crumbs.push({ label: "Administration" })
     if (segments[1]) crumbs.push({ label: segmentLabel(segments[1]) })
@@ -288,7 +287,28 @@ function NavUser() {
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuItem onClick={() => router.push("/account")}>
-          <BadgeCheckIcon /> Account & security
+          <BadgeCheckIcon /> My Account
+        </DropdownMenuItem>
+        {isAdmin && (
+          <DropdownMenuItem asChild>
+            <Link href="/admin/users">
+              <ShieldCheckIcon /> Admin
+            </Link>
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem asChild>
+          <a href="https://camelmailer.com/docs" target="_blank" rel="noreferrer">
+            <BookOpenIcon /> Docs
+          </a>
+        </DropdownMenuItem>
+        <DropdownMenuItem asChild>
+          <a
+            href="https://github.com/camelmailer/camelmailer/releases"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <NewspaperIcon /> Changelog
+          </a>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
@@ -560,40 +580,6 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
           </SidebarGroup>
         )}
       </SidebarContent>
-      <SidebarFooter>
-        <SidebarMenu>
-          {isAdmin && (
-            <SidebarMenuItem>
-              <SidebarMenuButton asChild isActive={isAdminMode} tooltip="Admin">
-                <Link href="/admin/users">
-                  <ShieldCheckIcon />
-                  <span>Admin</span>
-                </Link>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          )}
-          <SidebarMenuItem>
-            <SidebarMenuButton asChild tooltip="Docs">
-              <a href="https://camelmailer.com/docs" target="_blank" rel="noreferrer">
-                <BookOpenIcon />
-                <span>Docs</span>
-              </a>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-          <SidebarMenuItem>
-            <SidebarMenuButton asChild tooltip="Changelog">
-              <a
-                href="https://github.com/camelmailer/camelmailer/releases"
-                target="_blank"
-                rel="noreferrer"
-              >
-                <NewspaperIcon />
-                <span>Changelog</span>
-              </a>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarFooter>
     </Sidebar>
   )
 }

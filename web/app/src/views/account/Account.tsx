@@ -130,7 +130,7 @@ export default function Account() {
 
   return (
     <div className="max-w-xl space-y-6">
-      <PageHeader title="Account & security" />
+      <PageHeader title="My Account" />
 
       <Card>
         <CardHeader>
