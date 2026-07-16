@@ -2222,6 +2222,24 @@ export function StreamDetail({
     onError: (err) => errorToast(err, "Could not archive the stream"),
   })
 
+  // Edit the stream's name/type/status in a dialog (permalink is immutable).
+  const [editOpen, setEditOpen] = useState(false)
+  const [edit, setEdit] = useState({ name: "", stream_type: "", archived: false })
+  const saveEdit = useMutation({
+    mutationFn: () =>
+      api.streams.update(permalink, {
+        name: edit.name,
+        stream_type: edit.stream_type,
+        archived: edit.archived,
+      }),
+    onSuccess: () => {
+      invalidate()
+      setEditOpen(false)
+      toast.success("Stream updated")
+    },
+    onError: (err) => errorToast(err, "Could not update the stream"),
+  })
+
   const backHref = `/orgs/${org}/servers/${server}/streams`
 
   // Same list query as the streams list — react-query dedupes the fetch;
@@ -2265,6 +2283,20 @@ export function StreamDetail({
                   <MailIcon className="size-4" /> View messages in this stream
                 </Link>
               </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setEdit({
+                    name: stream.name,
+                    stream_type: stream.stream_type,
+                    archived: stream.archived,
+                  })
+                  setEditOpen(true)
+                }}
+              >
+                Edit
+              </Button>
               {!stream.archived && (
                 <Button
                   variant="outline"
@@ -2281,15 +2313,6 @@ export function StreamDetail({
       }
     >
       <div className="space-y-4">
-        <div className="rounded-md border p-4">
-          <div className="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-2 text-sm">
-            <MetaRow label="Name" value={stream.name} />
-            <MetaRow label="Type" value={stream.stream_type} />
-            <MetaRow label="Permalink" value={stream.permalink} copy />
-            <MetaRow label="Status" value={stream.archived ? "Archived" : "Active"} />
-          </div>
-        </div>
-
         <div className="rounded-md border p-4">
           <h2 className="text-base font-semibold">Sending</h2>
           <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
@@ -2444,6 +2467,67 @@ export function StreamDetail({
           </>
         )}
       </div>
+
+      <Dialog open={editOpen} onOpenChange={setEditOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Edit stream</DialogTitle>
+          </DialogHeader>
+          <div className="grid gap-4">
+            <div className="grid gap-2">
+              <Label>Name</Label>
+              <Input
+                value={edit.name}
+                onChange={(e) => setEdit({ ...edit, name: e.target.value })}
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label>Type</Label>
+              <Select
+                value={edit.stream_type}
+                onValueChange={(v) => setEdit({ ...edit, stream_type: v })}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="transactional">transactional</SelectItem>
+                  <SelectItem value="broadcast">broadcast</SelectItem>
+                  <SelectItem value="inbound">inbound</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-2">
+              <Label>Status</Label>
+              <Select
+                value={edit.archived ? "archived" : "active"}
+                onValueChange={(v) => setEdit({ ...edit, archived: v === "archived" })}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="active">Active</SelectItem>
+                  <SelectItem value="archived">Archived</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-2">
+              <Label>Permalink</Label>
+              <Input value={stream.permalink} disabled className="font-mono text-xs" />
+              <p className="text-xs text-muted-foreground">The permalink cannot be changed.</p>
+            </div>
+            <DialogFooter>
+              <Button
+                onClick={() => saveEdit.mutate()}
+                disabled={saveEdit.isPending || !edit.name.trim()}
+              >
+                {saveEdit.isPending ? "Saving…" : "Save changes"}
+              </Button>
+            </DialogFooter>
+          </div>
+        </DialogContent>
+      </Dialog>
     </Page>
   )
 }
