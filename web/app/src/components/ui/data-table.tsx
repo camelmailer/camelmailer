@@ -13,6 +13,7 @@ import * as React from "react"
 import {
   type ColumnDef,
   type ColumnFiltersState,
+  type Header,
   type SortingState,
   flexRender,
   getCoreRowModel,
@@ -134,6 +135,119 @@ export function DataTable<TData, TValue>({
 
   const showToolbar = searchable || filters.length > 0 || !!actions
 
+  // Fill mode renders the header and body as SEPARATE tables so the scrollbar
+  // sits beside the rows only (not over the header) and the header underline
+  // stays put. We mirror the body's natural column widths onto the header and
+  // reserve the body's scrollbar width behind the header background, so the
+  // two stay pixel-aligned.
+  const bodyScrollRef = React.useRef<HTMLDivElement>(null)
+  const headerScrollRef = React.useRef<HTMLDivElement>(null)
+  const bodyTableRef = React.useRef<HTMLTableElement>(null)
+  const [colWidths, setColWidths] = React.useState<number[]>([])
+  const [scrollbarW, setScrollbarW] = React.useState(0)
+
+  React.useEffect(() => {
+    if (!fillHeight) return
+    const measure = () => {
+      const scroller = bodyScrollRef.current
+      if (scroller) {
+        const sbw = scroller.offsetWidth - scroller.clientWidth
+        setScrollbarW((p) => (Math.abs(p - sbw) < 0.5 ? p : sbw))
+      }
+      const firstRow = bodyTableRef.current?.querySelector<HTMLTableRowElement>(
+        "tbody > tr[data-row]",
+      )
+      if (firstRow && firstRow.children.length === columns.length) {
+        const widths = Array.from(firstRow.children).map(
+          (c) => (c as HTMLElement).getBoundingClientRect().width,
+        )
+        setColWidths((p) =>
+          p.length === widths.length && p.every((w, i) => Math.abs(w - widths[i]) < 0.5)
+            ? p
+            : widths,
+        )
+      }
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    const s = bodyScrollRef.current
+    const t = bodyTableRef.current
+    if (s) ro.observe(s)
+    if (t) ro.observe(t)
+    return () => ro.disconnect()
+  }, [fillHeight, rows.length, columns.length, pageIndex, pageSize])
+
+  // Shared cell renderers so header/body markup is identical in both modes.
+  const renderHeadCell = (header: Header<TData, unknown>) => {
+    const canSort = header.column.getCanSort()
+    const sorted = header.column.getIsSorted()
+    // Only the trailing actions column is right-aligned; data stays left.
+    const right = header.column.id === "actions"
+    return (
+      <TableHead
+        key={header.id}
+        className={cn("h-10 text-xs font-medium text-muted-foreground", right && "text-right")}
+      >
+        {header.isPlaceholder ? null : canSort ? (
+          <button
+            type="button"
+            onClick={header.column.getToggleSortingHandler()}
+            className={cn(
+              "flex cursor-pointer items-center gap-1 select-none hover:text-primary",
+              right && "ml-auto flex-row-reverse",
+              sorted && "text-primary",
+            )}
+          >
+            {flexRender(header.column.columnDef.header, header.getContext())}
+            {sorted === "asc" ? (
+              <ArrowUpIcon className="size-3.5" />
+            ) : sorted === "desc" ? (
+              <ArrowDownIcon className="size-3.5" />
+            ) : (
+              <ChevronsUpDownIcon className="size-3.5 opacity-50" />
+            )}
+          </button>
+        ) : (
+          flexRender(header.column.columnDef.header, header.getContext())
+        )}
+      </TableHead>
+    )
+  }
+
+  const bodyRowsNode = loading ? (
+    Array.from({ length: 5 }).map((_, i) => (
+      <TableRow key={i} className="hover:bg-transparent">
+        {columns.map((_c, j) => (
+          <TableCell key={j} className="py-3">
+            <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
+          </TableCell>
+        ))}
+      </TableRow>
+    ))
+  ) : rows.length === 0 ? (
+    <TableRow className="hover:bg-transparent">
+      <TableCell
+        colSpan={columns.length}
+        className="py-10 text-center text-sm text-muted-foreground"
+      >
+        {emptyText}
+      </TableCell>
+    </TableRow>
+  ) : (
+    rows.map((row) => (
+      <TableRow key={row.id} data-row className="group">
+        {row.getVisibleCells().map((cell) => (
+          <TableCell
+            key={cell.id}
+            className={cn("py-3", cell.column.id === "actions" && "text-right")}
+          >
+            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+          </TableCell>
+        ))}
+      </TableRow>
+    ))
+  )
+
   return (
     <div className={cn("flex flex-col gap-3", fillHeight && "min-h-0 flex-1")}>
       {/* Toolbar: search + filters (left), actions (right). */}
@@ -197,106 +311,65 @@ export function DataTable<TData, TValue>({
       </div>
       )}
 
-      {/* Table. The Table component wraps itself in an overflow-x-auto div;
-          in fill mode we flatten that (so it is not a nested scroll container)
-          and make THIS div the single scroller, so the sticky header holds. */}
-      <div
-        className={cn(
-          "rounded-lg border",
-          fillHeight
-            ? "min-h-0 flex-1 overflow-auto [&>div]:overflow-visible"
-            : "overflow-hidden",
-        )}
-      >
-        <Table>
-          <TableHeader className={cn("bg-muted/60", fillHeight && "bg-muted")}>
-            {table.getHeaderGroups().map((hg) => (
-              <TableRow key={hg.id} className="hover:bg-transparent">
-                {hg.headers.map((header) => {
-                  const canSort = header.column.getCanSort()
-                  const sorted = header.column.getIsSorted()
-                  // Only the trailing actions column is right-aligned; all
-                  // data (numbers included) stays left, like every other column.
-                  const right = header.column.id === "actions"
-                  return (
-                    <TableHead
-                      key={header.id}
-                      className={cn(
-                        "h-10 text-xs font-medium text-muted-foreground",
-                        right && "text-right",
-                        // sticky must live on the cells (th), not the thead,
-                        // to hold reliably while the rows scroll under it.
-                        fillHeight && "sticky top-0 z-10 bg-muted",
-                      )}
-                    >
-                      {header.isPlaceholder ? null : canSort ? (
-                        <button
-                          type="button"
-                          onClick={header.column.getToggleSortingHandler()}
-                          className={cn(
-                            "flex cursor-pointer items-center gap-1 select-none hover:text-primary",
-                            right && "ml-auto flex-row-reverse",
-                            sorted && "text-primary",
-                          )}
-                        >
-                          {flexRender(header.column.columnDef.header, header.getContext())}
-                          {sorted === "asc" ? (
-                            <ArrowUpIcon className="size-3.5" />
-                          ) : sorted === "desc" ? (
-                            <ArrowDownIcon className="size-3.5" />
-                          ) : (
-                            <ChevronsUpDownIcon className="size-3.5 opacity-50" />
-                          )}
-                        </button>
-                      ) : (
-                        flexRender(header.column.columnDef.header, header.getContext())
-                      )}
-                    </TableHead>
-                  )
-                })}
-              </TableRow>
-            ))}
-          </TableHeader>
-          <TableBody>
-            {loading ? (
-              Array.from({ length: 5 }).map((_, i) => (
-                <TableRow key={i} className="hover:bg-transparent">
-                  {columns.map((_c, j) => (
-                    <TableCell key={j} className="py-3">
-                      <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
-                    </TableCell>
+      {/* Table. */}
+      {fillHeight ? (
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border">
+          {/* Header: full width, its bottom border stays put. The body's
+              scrollbar width is reserved behind the header background so the
+              two tables line up; horizontal scroll is mirrored from the body. */}
+          <div
+            ref={headerScrollRef}
+            className="shrink-0 overflow-x-auto overflow-y-hidden border-b bg-muted [&::-webkit-scrollbar]:hidden"
+            style={{ paddingRight: scrollbarW, scrollbarWidth: "none" }}
+          >
+            <table
+              className="w-full caption-bottom text-sm"
+              style={colWidths.length ? { tableLayout: "fixed" } : undefined}
+            >
+              {colWidths.length > 0 && (
+                <colgroup>
+                  {colWidths.map((w, i) => (
+                    <col key={i} style={{ width: `${w}px` }} />
                   ))}
+                </colgroup>
+              )}
+              <TableHeader>
+                {table.getHeaderGroups().map((hg) => (
+                  <TableRow key={hg.id} className="border-0 hover:bg-transparent">
+                    {hg.headers.map(renderHeadCell)}
+                  </TableRow>
+                ))}
+              </TableHeader>
+            </table>
+          </div>
+          {/* Body: the only scroller, so the scrollbar sits beside the rows. */}
+          <div
+            ref={bodyScrollRef}
+            className="min-h-0 flex-1 overflow-auto"
+            onScroll={(e) => {
+              if (headerScrollRef.current)
+                headerScrollRef.current.scrollLeft = e.currentTarget.scrollLeft
+            }}
+          >
+            <table ref={bodyTableRef} className="w-full caption-bottom text-sm">
+              <TableBody>{bodyRowsNode}</TableBody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-lg border">
+          <Table>
+            <TableHeader className="bg-muted/60">
+              {table.getHeaderGroups().map((hg) => (
+                <TableRow key={hg.id} className="hover:bg-transparent">
+                  {hg.headers.map(renderHeadCell)}
                 </TableRow>
-              ))
-            ) : rows.length === 0 ? (
-              <TableRow className="hover:bg-transparent">
-                <TableCell
-                  colSpan={columns.length}
-                  className="py-10 text-center text-sm text-muted-foreground"
-                >
-                  {emptyText}
-                </TableCell>
-              </TableRow>
-            ) : (
-              rows.map((row) => (
-                <TableRow key={row.id} className="group">
-                  {row.getVisibleCells().map((cell) => (
-                    <TableCell
-                      key={cell.id}
-                      className={cn(
-                        "py-3",
-                        cell.column.id === "actions" && "text-right",
-                      )}
-                    >
-                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                    </TableCell>
-                  ))}
-                </TableRow>
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </div>
+              ))}
+            </TableHeader>
+            <TableBody>{bodyRowsNode}</TableBody>
+          </Table>
+        </div>
+      )}
 
       {/* Footer: range + rows-per-page (left), prev / page / next (right). */}
       <div

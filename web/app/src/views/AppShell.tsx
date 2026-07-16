@@ -656,9 +656,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <AppSidebar activeOrg={activeOrg} />
       <SidebarInset className="flex min-h-0 min-w-0 flex-col gap-3 p-3 md:peer-data-[variant=inset]:m-0 md:peer-data-[variant=inset]:rounded-none md:peer-data-[variant=inset]:shadow-none">
         {/* Top bar over the halo: search far left, signed-in user far right.
-            No horizontal padding so the search edge lines up exactly with
-            the halo frame's left edge below it. */}
-        <div className="flex shrink-0 items-center gap-2">
+            No left padding so the search edge lines up with the halo frame's
+            left edge below it; pr-3 puts the account block at the same right
+            gutter as the API button (24px from the window edge). */}
+        <div className="flex shrink-0 items-center gap-2 pr-3">
           <Button
             variant="ghost"
             size="sm"
@@ -694,7 +695,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                   scrolls. overflow-y-auto keeps a scrollbar reserved for the
                   scrolling case without forcing one on filled pages. */}
               <div
-                className="app-scrollbar min-h-0 min-w-0 flex-1 overflow-y-auto p-6"
+                className="min-h-0 min-w-0 flex-1 overflow-y-auto p-6"
                 key={org ?? "-"}
               >
                 {children}
