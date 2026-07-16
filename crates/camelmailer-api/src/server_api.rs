@@ -20,8 +20,9 @@ use axum::{Json, Router};
 use base64::Engine;
 use camelmailer_core::mime::{self, Address, Attachment, BuildParams};
 use camelmailer_core::{
-    ActivityEvent, DeliveryRecord, MessageFilter, MessageRecord, MessageScope, MessageStream,
-    NewStream, NewTemplate, QueuedMessage, Server, ServerContext, Template,
+    ActivityEvent, Campaign, CampaignStats, DeliveryRecord, MessageFilter, MessageRecord,
+    MessageScope, MessageStream, NewCampaign, NewStream, NewTemplate, QueuedMessage, Server,
+    ServerContext, Template,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1969,6 +1970,287 @@ async fn subscriber_complaint(
     }
 }
 
+// ------------------------------------------------------------ campaigns
+
+/// How many recipients the async expansion processes between progress writes.
+const CAMPAIGN_BATCH_SIZE: usize = 200;
+
+fn campaign_json(campaign: &Campaign) -> Value {
+    json!({
+        "id": campaign.id,
+        "stream_id": campaign.stream_id,
+        "name": campaign.name,
+        "subject": campaign.subject,
+        "from": campaign.from_address,
+        "html_body": campaign.html_body,
+        "text_body": campaign.text_body,
+        "status": campaign.status,
+        "total": campaign.total,
+        "sent": campaign.sent,
+        "created_at": campaign.created_at,
+        "completed_at": campaign.completed_at,
+    })
+}
+
+fn campaign_stats_json(stats: &CampaignStats) -> Value {
+    json!({
+        "total": stats.total,
+        "sent": stats.sent,
+        "delivered": stats.delivered,
+        "failed": stats.failed,
+        "opened": stats.opened,
+        "clicked": stats.clicked,
+        "unsubscribed": stats.unsubscribed,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateCampaign {
+    name: Option<String>,
+    /// Bare From address (the broadcast path authorizes its domain/sender).
+    from: Option<String>,
+    subject: Option<String>,
+    html_body: Option<String>,
+    text_body: Option<String>,
+}
+
+/// Expand a broadcast campaign into one message per subscriber. Factored out
+/// of [`campaigns_create`] so the handler can `tokio::spawn` it (production)
+/// while a test can await it directly: it iterates the stream's currently
+/// `subscribed` addresses in batches, sends each through the shared broadcast
+/// path ([`enqueue_send`]) with the campaign's content, attributes the stored
+/// message to the campaign, advances `sent` per batch, and finally marks the
+/// campaign `sent` + `completed_at`.
+///
+/// Resilient by design: a single recipient whose send fails is logged and
+/// skipped; only a fatal error (subscriber lookup) marks the campaign
+/// `failed`. Owns its arguments so it is `'static` for the spawn.
+pub(crate) async fn expand_campaign(
+    state: Arc<ApiState>,
+    server: Server,
+    campaign: Campaign,
+    permalink: String,
+) {
+    let Some(store) = state.server_store.clone() else {
+        return;
+    };
+    let subscribed: Vec<String> = match store
+        .list_subscriptions(server.id, campaign.stream_id)
+        .await
+    {
+        Ok(subscriptions) => subscriptions
+            .into_iter()
+            .filter(|s| s.status == "subscribed")
+            .map(|s| s.address)
+            .collect(),
+        Err(error) => {
+            tracing::error!(%error, campaign_id = campaign.id, "campaign expansion could not list subscribers");
+            let _ = store
+                .set_campaign_progress(
+                    server.id,
+                    campaign.id,
+                    0,
+                    "failed",
+                    Some(chrono::Utc::now()),
+                )
+                .await;
+            return;
+        }
+    };
+
+    let mut sent = 0i64;
+    for batch in subscribed.chunks(CAMPAIGN_BATCH_SIZE) {
+        for address in batch {
+            let message = SendMessage {
+                from: campaign.from_address.clone().map(AddressOrString::String),
+                to: vec![AddressOrString::String(address.clone())],
+                subject: campaign.subject.clone(),
+                html_body: campaign.html_body.clone(),
+                text_body: campaign.text_body.clone(),
+                stream: Some(permalink.clone()),
+                ..Default::default()
+            };
+            match enqueue_send(&state, &server, message).await {
+                Ok(data) => {
+                    if let Some(id) = data.get("message_id").and_then(Value::as_i64) {
+                        if let Err(error) =
+                            store.set_message_campaign(server.id, id, campaign.id).await
+                        {
+                            tracing::warn!(%error, campaign_id = campaign.id, message_id = id, "could not attribute message to campaign");
+                        }
+                    }
+                    sent += 1;
+                }
+                Err((_, code, message)) => {
+                    tracing::warn!(%code, %message, %address, campaign_id = campaign.id, "campaign recipient send failed; skipping");
+                }
+            }
+        }
+        // Advance progress after each batch so a poller sees the campaign move.
+        let _ = store
+            .set_campaign_progress(server.id, campaign.id, sent, "sending", None)
+            .await;
+    }
+
+    if let Err(error) = store
+        .set_campaign_progress(
+            server.id,
+            campaign.id,
+            sent,
+            "sent",
+            Some(chrono::Utc::now()),
+        )
+        .await
+    {
+        tracing::error!(%error, campaign_id = campaign.id, "could not finalize campaign");
+    }
+}
+
+/// `POST /api/v2/server/streams/{permalink}/campaigns` — create a campaign on
+/// a broadcast stream and expand it asynchronously. The request records the
+/// campaign (status `sending`, `total` = current subscriber count), spawns the
+/// batch expansion, and returns the campaign immediately (201) without
+/// blocking on the recipient list.
+async fn campaigns_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+    Json(body): Json<CreateCampaign>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let stream = match resolve_stream(store, server.0.id, &permalink, &start.0).await {
+        Ok(stream) => stream,
+        Err(response) => return response,
+    };
+    if stream.stream_type != "broadcast" {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "campaigns can only be created on a broadcast stream",
+        )
+        .into_response();
+    }
+    let Some(from) = body.from.filter(|f| !f.is_empty()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::BAD_REQUEST,
+            "ParameterMissing",
+            "param is missing or the value is empty: from",
+        )
+        .into_response();
+    };
+
+    // Snapshot the subscriber count for the campaign total. The expansion
+    // re-reads the list itself (it must not block this request).
+    let total = match store.list_subscriptions(server.0.id, stream.id).await {
+        Ok(subscriptions) => subscriptions
+            .iter()
+            .filter(|s| s.status == "subscribed")
+            .count() as i64,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+
+    let campaign = match store
+        .create_campaign(NewCampaign {
+            server_id: server.0.id,
+            stream_id: stream.id,
+            name: body.name.filter(|n| !n.is_empty()),
+            subject: body.subject.clone(),
+            from_address: Some(from),
+            html_body: body.html_body.clone(),
+            text_body: body.text_body.clone(),
+            total,
+        })
+        .await
+    {
+        Ok(campaign) => campaign,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+
+    // Fire-and-forget expansion; the request returns right away.
+    tokio::spawn(expand_campaign(
+        state.clone(),
+        server.0.clone(),
+        campaign.clone(),
+        permalink,
+    ));
+
+    render_success(
+        Some(&start.0),
+        StatusCode::CREATED,
+        json!({ "campaign": campaign_json(&campaign) }),
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/streams/{permalink}/campaigns` — the stream's
+/// campaigns, newest first.
+async fn campaigns_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let stream = match resolve_stream(store, server.0.id, &permalink, &start.0).await {
+        Ok(stream) => stream,
+        Err(response) => return response,
+    };
+    match store.list_campaigns(server.0.id, stream.id).await {
+        Ok(campaigns) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "campaigns": campaigns.iter().map(campaign_json).collect::<Vec<_>>() }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `GET /api/v2/server/streams/{permalink}/campaigns/{id}` — one campaign plus
+/// its aggregated analytics.
+async fn campaign_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path((permalink, id)): Path<(String, camelmailer_core::Id)>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    // Resolve the stream so an unknown permalink is a 404 like its siblings.
+    if let Err(response) = resolve_stream(store, server.0.id, &permalink, &start.0).await {
+        return response;
+    }
+    let campaign = match store.get_campaign(server.0.id, id).await {
+        Ok(Some(campaign)) => campaign,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let stats = match store.campaign_stats(server.0.id, id).await {
+        Ok(stats) => stats,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "campaign": campaign_json(&campaign),
+            "stats": campaign_stats_json(&stats),
+        }),
+    )
+    .into_response()
+}
+
 // ------------------------------------------------------------ templates
 
 fn template_json(template: &Template) -> Value {
@@ -2825,6 +3107,11 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         )
         .route("/streams/{permalink}/archive", post(stream_archive))
         .route("/streams/{permalink}/send", post(campaign_send))
+        .route(
+            "/streams/{permalink}/campaigns",
+            get(campaigns_index).post(campaigns_create),
+        )
+        .route("/streams/{permalink}/campaigns/{id}", get(campaign_show))
         .route(
             "/streams/{permalink}/subscribers",
             get(subscribers_index).post(subscribers_create),

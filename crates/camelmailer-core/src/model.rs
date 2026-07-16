@@ -338,3 +338,42 @@ pub struct NewSubscription {
     pub address: String,
     pub status: String,
 }
+
+/// A broadcast campaign — a tracked send of one piece of content to a
+/// broadcast stream's subscribers. Creating a campaign records this row and
+/// spawns a background expansion that produces one message per recipient
+/// (each carrying `campaign_id`), updating `sent` as it progresses. Status
+/// moves `sending` → `sent` (or `failed`). Tenant-scoped like [`Suppression`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Campaign {
+    pub id: Id,
+    pub server_id: Id,
+    pub stream_id: Id,
+    pub name: Option<String>,
+    pub subject: Option<String>,
+    pub from_address: Option<String>,
+    pub html_body: Option<String>,
+    pub text_body: Option<String>,
+    /// `sending`, `sent` or `failed`.
+    pub status: String,
+    /// Recipient count captured at creation (the subscriber count then).
+    pub total: i64,
+    /// Recipients expanded into messages so far.
+    pub sent: i64,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Fields for creating a campaign (status starts `sending`, `sent` at 0).
+#[derive(Debug, Clone)]
+pub struct NewCampaign {
+    pub server_id: Id,
+    pub stream_id: Id,
+    pub name: Option<String>,
+    pub subject: Option<String>,
+    pub from_address: Option<String>,
+    pub html_body: Option<String>,
+    pub text_body: Option<String>,
+    /// Recipient count captured at creation time.
+    pub total: i64,
+}

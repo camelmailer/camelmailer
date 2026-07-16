@@ -7,12 +7,12 @@
 
 use async_trait::async_trait;
 use camelmailer_core::{
-    store, token, ActivityEvent, AdminApiKey, AdminStore, Credential, CredentialType,
-    DeliveryRecord, Domain, DomainOwner, Id, IpAddress, IpPool, MessageFilter, MessageRecord,
-    MessageScope, MessageSink, NewCredential, NewIpAddress, NewOrganization, NewRoute,
-    NewSenderAddress, NewServer, NewSuppression, NewUser, NewWebhook, Organization, QueuedMessage,
-    ResolvedRoute, Route, RouteMode, SenderAddress, Server, ServerMode, Store, StoreError,
-    Subscription, Suppression, User, Webhook,
+    store, token, ActivityEvent, AdminApiKey, AdminStore, Campaign, CampaignStats, Credential,
+    CredentialType, DeliveryRecord, Domain, DomainOwner, Id, IpAddress, IpPool, MessageFilter,
+    MessageRecord, MessageScope, MessageSink, NewCampaign, NewCredential, NewIpAddress,
+    NewOrganization, NewRoute, NewSenderAddress, NewServer, NewSuppression, NewUser, NewWebhook,
+    Organization, QueuedMessage, ResolvedRoute, Route, RouteMode, SenderAddress, Server,
+    ServerMode, Store, StoreError, Subscription, Suppression, User, Webhook,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, QueryBuilder, Row};
@@ -233,6 +233,24 @@ fn subscription_from_row(row: &PgRow) -> Subscription {
         address: row.get("address"),
         status: row.get("status"),
         created_at: row.get("created_at"),
+    }
+}
+
+fn campaign_from_row(row: &PgRow) -> Campaign {
+    Campaign {
+        id: row.get::<i64, _>("id") as Id,
+        server_id: row.get::<i64, _>("server_id") as Id,
+        stream_id: row.get::<i64, _>("stream_id") as Id,
+        name: row.get("name"),
+        subject: row.get("subject"),
+        from_address: row.get("from_address"),
+        html_body: row.get("html_body"),
+        text_body: row.get("text_body"),
+        status: row.get("status"),
+        total: row.get::<i32, _>("total") as i64,
+        sent: row.get::<i32, _>("sent") as i64,
+        created_at: row.get("created_at"),
+        completed_at: row.get("completed_at"),
     }
 }
 
@@ -2383,6 +2401,184 @@ impl camelmailer_core::ServerStore for PgStore {
         .map_err(Self::sqlx_error)?;
         tx.commit().await.map_err(Self::sqlx_error)?;
         Ok(subscription_from_row(&row))
+    }
+
+    async fn create_campaign(&self, new: NewCampaign) -> Result<Campaign, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, new.server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let row = sqlx::query(
+            "INSERT INTO campaigns
+                 (server_id, stream_id, name, subject, from_address, html_body,
+                  text_body, total)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             RETURNING *",
+        )
+        .bind(new.server_id as i64)
+        .bind(new.stream_id as i64)
+        .bind(&new.name)
+        .bind(&new.subject)
+        .bind(&new.from_address)
+        .bind(&new.html_body)
+        .bind(&new.text_body)
+        .bind(new.total as i32)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(campaign_from_row(&row))
+    }
+
+    async fn get_campaign(&self, server_id: Id, id: Id) -> Result<Option<Campaign>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let row = sqlx::query("SELECT * FROM campaigns WHERE id = $1")
+            .bind(id as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(row.as_ref().map(campaign_from_row))
+    }
+
+    async fn list_campaigns(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+    ) -> Result<Vec<Campaign>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let rows = sqlx::query("SELECT * FROM campaigns WHERE stream_id = $1 ORDER BY id DESC")
+            .bind(stream_id as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(campaign_from_row).collect())
+    }
+
+    async fn set_campaign_progress(
+        &self,
+        server_id: Id,
+        id: Id,
+        sent: i64,
+        status: &str,
+        completed: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        sqlx::query("UPDATE campaigns SET sent = $1, status = $2, completed_at = $3 WHERE id = $4")
+            .bind(sent as i32)
+            .bind(status)
+            .bind(completed)
+            .bind(id as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(())
+    }
+
+    async fn set_message_campaign(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        campaign_id: Id,
+    ) -> Result<(), StoreError> {
+        // RLS scopes the UPDATE to the tenant; a foreign message id matches no
+        // row and is a silent no-op.
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        sqlx::query("UPDATE messages SET campaign_id = $1 WHERE id = $2")
+            .bind(campaign_id as i64)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(())
+    }
+
+    async fn campaign_stats(
+        &self,
+        server_id: Id,
+        campaign_id: Id,
+    ) -> Result<CampaignStats, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        // total/sent come from the campaign row; the rest aggregate over the
+        // attributed messages plus their loads/link_clicks. When the campaign
+        // is not the tenant's, RLS returns no row and we report zeros.
+        let campaign = sqlx::query("SELECT * FROM campaigns WHERE id = $1")
+            .bind(campaign_id as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let Some(campaign) = campaign.as_ref().map(campaign_from_row) else {
+            tx.commit().await.map_err(Self::sqlx_error)?;
+            return Ok(CampaignStats::default());
+        };
+        let counts = sqlx::query(
+            "SELECT
+                 count(*) FILTER (WHERE status = 'Sent' AND NOT held) AS delivered,
+                 count(*) FILTER (WHERE status IN ('Bounced', 'HardFail') OR bounce) AS failed
+             FROM messages WHERE campaign_id = $1",
+        )
+        .bind(campaign_id as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        let opened = sqlx::query(
+            "SELECT count(DISTINCT l.message_id) AS opened
+             FROM loads l JOIN messages m ON m.id = l.message_id
+             WHERE m.campaign_id = $1",
+        )
+        .bind(campaign_id as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        let clicked = sqlx::query(
+            "SELECT count(DISTINCT li.message_id) AS clicked
+             FROM link_clicks lc
+             JOIN links li ON li.id = lc.link_id
+             JOIN messages m ON m.id = li.message_id
+             WHERE m.campaign_id = $1",
+        )
+        .bind(campaign_id as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        let unsubscribed = sqlx::query(
+            "SELECT count(*) AS unsubscribed FROM suppressions
+             WHERE stream_id = $1 AND type IN ('unsubscribe', 'complaint')
+               AND created_at >= $2",
+        )
+        .bind(campaign.stream_id as i64)
+        .bind(campaign.created_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(CampaignStats {
+            total: campaign.total,
+            sent: campaign.sent,
+            delivered: counts.get("delivered"),
+            failed: counts.get("failed"),
+            opened: opened.get("opened"),
+            clicked: clicked.get("clicked"),
+            unsubscribed: unsubscribed.get("unsubscribed"),
+        })
     }
 
     async fn tags(

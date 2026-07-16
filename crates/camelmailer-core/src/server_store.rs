@@ -10,7 +10,7 @@
 use crate::admin_store::{AdminStore, NewSuppression, StoreError};
 use crate::dmarc::{DmarcFilter, DmarcRecordRow, DmarcReport, NewDmarcReport};
 use crate::message::{MessageRecord, QueuedMessage, SentMessage};
-use crate::model::{Id, MessageStream, Subscription, Template};
+use crate::model::{Campaign, Id, MessageStream, NewCampaign, Subscription, Template};
 use async_trait::async_trait;
 
 /// The server a per-server API request is scoped to, injected as a request
@@ -125,6 +125,28 @@ pub struct MessageStats {
     /// Bounce breakdown: unclassified bounces (category `undetermined`,
     /// plus bounce-flagged / `Bounced` messages without a category).
     pub bounces_undetermined: i64,
+}
+
+/// Per-campaign analytics, aggregated over the messages a campaign produced
+/// (attributed via `messages.campaign_id`) plus their loads/link_clicks and
+/// the stream's suppressions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CampaignStats {
+    /// Recipient count captured at creation (from the campaign row).
+    pub total: i64,
+    /// Recipients expanded into messages so far (from the campaign row).
+    pub sent: i64,
+    /// Attributed messages with status `Sent` and not held.
+    pub delivered: i64,
+    /// Attributed messages that failed (`Bounced`/`HardFail`, or bounce flag).
+    pub failed: i64,
+    /// Distinct attributed messages with at least one open (load).
+    pub opened: i64,
+    /// Distinct attributed messages with at least one click.
+    pub clicked: i64,
+    /// Stream-scoped suppressions (`unsubscribe`/`complaint`) of the campaign's
+    /// stream created at or after the campaign's `created_at`.
+    pub unsubscribed: i64,
 }
 
 /// One tag used by a server's messages, with its message count.
@@ -532,6 +554,52 @@ pub trait ServerStore: Send + Sync {
         stream_id: Id,
         address: &str,
     ) -> Result<Subscription, StoreError>;
+
+    // broadcast campaigns (tenant-scoped: RLS in Postgres)
+    /// Record a campaign in status `sending` (with `sent = 0`) and return it.
+    /// The background expansion attributes messages and advances progress.
+    async fn create_campaign(&self, new: NewCampaign) -> Result<Campaign, StoreError>;
+
+    /// One campaign by id, or `None` if it isn't the server's.
+    async fn get_campaign(&self, server_id: Id, id: Id) -> Result<Option<Campaign>, StoreError>;
+
+    /// The stream's campaigns, newest first.
+    async fn list_campaigns(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+    ) -> Result<Vec<Campaign>, StoreError>;
+
+    /// Update a campaign's progress: set `sent`, `status`, and (when finished)
+    /// `completed_at`. Called by the background expansion per batch and at the
+    /// end. No-op when the campaign isn't the server's.
+    async fn set_campaign_progress(
+        &self,
+        server_id: Id,
+        id: Id,
+        sent: i64,
+        status: &str,
+        completed: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), StoreError>;
+
+    /// Attribute a stored message to a campaign (`messages.campaign_id`). Used
+    /// by the expansion after each per-recipient send. No-op when the message
+    /// isn't the server's.
+    async fn set_message_campaign(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        campaign_id: Id,
+    ) -> Result<(), StoreError>;
+
+    /// Aggregate analytics for one campaign over its attributed messages plus
+    /// their loads/link_clicks and the stream's suppressions. Returns a zeroed
+    /// [`CampaignStats`] when the campaign isn't the server's.
+    async fn campaign_stats(
+        &self,
+        server_id: Id,
+        campaign_id: Id,
+    ) -> Result<CampaignStats, StoreError>;
 }
 
 #[async_trait]
@@ -1062,6 +1130,152 @@ impl ServerStore for crate::store::MemoryStore {
         // Flip the opt-in closed so the send gate rejects future broadcasts.
         self.upsert_subscription(server_id, stream_id, address, "unsubscribed")
             .await
+    }
+
+    async fn create_campaign(&self, new: NewCampaign) -> Result<Campaign, StoreError> {
+        Ok(self.insert_campaign(new))
+    }
+
+    async fn get_campaign(&self, server_id: Id, id: Id) -> Result<Option<Campaign>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .campaigns
+            .get(&id)
+            .filter(|c| c.server_id == server_id)
+            .cloned())
+    }
+
+    async fn list_campaigns(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+    ) -> Result<Vec<Campaign>, StoreError> {
+        let mut campaigns: Vec<Campaign> = self
+            .inner
+            .read()
+            .unwrap()
+            .campaigns
+            .values()
+            .filter(|c| c.server_id == server_id && c.stream_id == stream_id)
+            .cloned()
+            .collect();
+        campaigns.sort_by_key(|c| std::cmp::Reverse(c.id));
+        Ok(campaigns)
+    }
+
+    async fn set_campaign_progress(
+        &self,
+        server_id: Id,
+        id: Id,
+        sent: i64,
+        status: &str,
+        completed: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(campaign) = inner.campaigns.get_mut(&id) {
+            if campaign.server_id == server_id {
+                campaign.sent = sent;
+                campaign.status = status.to_string();
+                campaign.completed_at = completed;
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_message_campaign(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        campaign_id: Id,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if inner
+            .messages
+            .iter()
+            .any(|m| m.id == message_id && m.server_id == server_id)
+        {
+            inner.message_campaigns.insert(message_id, campaign_id);
+        }
+        Ok(())
+    }
+
+    async fn campaign_stats(
+        &self,
+        server_id: Id,
+        campaign_id: Id,
+    ) -> Result<CampaignStats, StoreError> {
+        use std::collections::HashSet;
+        let inner = self.inner.read().unwrap();
+        let Some(campaign) = inner
+            .campaigns
+            .get(&campaign_id)
+            .filter(|c| c.server_id == server_id)
+        else {
+            return Ok(CampaignStats::default());
+        };
+
+        // Messages attributed to this campaign (tenant-scoped).
+        let ids: HashSet<i64> = inner
+            .message_campaigns
+            .iter()
+            .filter(|(_, cid)| **cid == campaign_id)
+            .map(|(mid, _)| *mid)
+            .collect();
+
+        let mut delivered = 0i64;
+        let mut failed = 0i64;
+        for message in inner
+            .messages
+            .iter()
+            .filter(|m| m.server_id == server_id && ids.contains(&m.id))
+        {
+            if message.status == "Sent" && !message.held {
+                delivered += 1;
+            }
+            if message.status == "Bounced" || message.status == "HardFail" || message.bounce {
+                failed += 1;
+            }
+        }
+
+        let opened = inner
+            .message_opens
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .map(|(id, _)| *id)
+            .collect::<HashSet<i64>>()
+            .len() as i64;
+        let clicked = inner
+            .message_clicks
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .map(|(id, _)| *id)
+            .collect::<HashSet<i64>>()
+            .len() as i64;
+
+        // Stream-scoped unsubscribe/complaint suppressions of the campaign's
+        // stream. (In-memory suppressions carry no timestamp, so the
+        // created-at cut-off the Postgres store applies is not modelled here.)
+        let unsubscribed = inner
+            .suppressions
+            .values()
+            .filter(|s| {
+                s.server_id == server_id
+                    && s.stream_id == Some(campaign.stream_id)
+                    && matches!(s.suppression_type.as_str(), "unsubscribe" | "complaint")
+            })
+            .count() as i64;
+
+        Ok(CampaignStats {
+            total: campaign.total,
+            sent: campaign.sent,
+            delivered,
+            failed,
+            opened,
+            clicked,
+            unsubscribed,
+        })
     }
 }
 

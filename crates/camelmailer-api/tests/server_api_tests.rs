@@ -2177,6 +2177,126 @@ async fn campaign_send_on_a_non_broadcast_stream_is_rejected() {
 }
 
 #[tokio::test]
+async fn campaign_create_expands_asynchronously_and_reports_stats() {
+    use camelmailer_core::message::header_value;
+
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    create_broadcast_stream(&store, server_id, "broadcast").await;
+
+    // Four opted-in subscribers (plus one unsubscribed that must not count).
+    for address in ["a@dest.example", "b@dest.example", "c@dest.example"] {
+        post_json(
+            &app,
+            "/api/v2/server/streams/broadcast/subscribers",
+            &token,
+            json!({ "address": address }),
+        )
+        .await;
+    }
+    post_json(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        &token,
+        json!({ "address": "gone@dest.example", "status": "unsubscribed" }),
+    )
+    .await;
+
+    // Creating the campaign returns immediately (201) with the campaign; the
+    // total is the current subscribed count (3), status starts `sending`.
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/streams/broadcast/campaigns",
+        &token,
+        json!({
+            "name": "Weekly digest",
+            "from": "news@org.example",
+            "subject": "Hello",
+            "html_body": "<p>Hi</p>",
+            "text_body": "Hi"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let campaign_id = body["data"]["campaign"]["id"].as_u64().unwrap();
+    assert_eq!(body["data"]["campaign"]["total"], 3);
+    assert!(matches!(
+        body["data"]["campaign"]["status"].as_str(),
+        Some("sending") | Some("sent")
+    ));
+
+    // The expansion runs on a spawned task; poll the campaign until it settles.
+    let path = format!("/api/v2/server/streams/broadcast/campaigns/{campaign_id}");
+    let mut settled = json!(null);
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+        let (_, body) = request(&app, &path, Some(&token)).await;
+        if body["data"]["campaign"]["status"] == "sent" {
+            settled = body;
+            break;
+        }
+    }
+    assert_eq!(settled["data"]["campaign"]["status"], "sent");
+    assert_eq!(settled["data"]["campaign"]["sent"], 3);
+    assert_eq!(settled["data"]["stats"]["total"], 3);
+    assert_eq!(settled["data"]["stats"]["sent"], 3);
+
+    // Exactly three messages were produced, each carrying the broadcast
+    // List-Unsubscribe header and the CAN-SPAM footer.
+    let stored = store.messages_for(server_id);
+    assert_eq!(stored.len(), 3);
+    for message in &stored {
+        let raw = &message.raw_message;
+        assert!(header_value(raw, "List-Unsubscribe").is_some());
+        assert!(String::from_utf8_lossy(raw).contains("Unsubscribe"));
+    }
+
+    // Each message is attributed to the campaign: marking them Sent makes the
+    // per-campaign `delivered` counter reach 3 (it only counts attributed
+    // messages).
+    for message in &stored {
+        store.set_message_status(message.id, "Sent");
+    }
+    let (_, body) = request(&app, &path, Some(&token)).await;
+    assert_eq!(body["data"]["stats"]["delivered"], 3);
+    assert_eq!(body["data"]["stats"]["failed"], 0);
+
+    // The list endpoint surfaces the campaign.
+    let (status, body) = request(
+        &app,
+        "/api/v2/server/streams/broadcast/campaigns",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["campaigns"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn campaign_create_on_a_non_broadcast_stream_is_rejected() {
+    let (app, token, _store, _server_id) = build_with_verified_domain().await;
+    post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token,
+        json!({ "name": "Transact", "stream_type": "transactional" }),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/streams/transact/campaigns",
+        &token,
+        json!({ "from": "news@org.example", "subject": "Hi", "html_body": "<p>x</p>" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        body["error"]["message"],
+        "campaigns can only be created on a broadcast stream"
+    );
+}
+
+#[tokio::test]
 async fn subscriber_import_adds_and_dedupes() {
     let (app, token, _store, _server_id) = build_with_verified_domain().await;
     create_broadcast_stream(&_store, _server_id, "broadcast").await;

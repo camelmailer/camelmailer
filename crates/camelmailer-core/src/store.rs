@@ -134,6 +134,11 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) unsubscribe_tokens: Vec<(String, Id, Option<Id>, String)>,
     /// Opt-in consent rows keyed by id (tenant-scoped, like suppressions).
     pub(crate) subscriptions: HashMap<Id, Subscription>,
+    /// Broadcast campaigns keyed by id (tenant-scoped, like suppressions).
+    pub(crate) campaigns: HashMap<Id, Campaign>,
+    /// Message id -> campaign id attribution (the in-memory analogue of the
+    /// `messages.campaign_id` column).
+    pub(crate) message_campaigns: HashMap<i64, Id>,
     /// HTTP-sent / stored messages, for the per-server read API tests.
     pub(crate) messages: Vec<crate::message::MessageRecord>,
     /// Delivery attempts keyed by message id (per-server read API tests).
@@ -368,6 +373,32 @@ impl MemoryStore {
             token,
             rcpt_to: message.rcpt_to,
         }
+    }
+
+    /// Insert a campaign record (status `sending`, `sent = 0`) and return it.
+    pub fn insert_campaign(&self, new: crate::model::NewCampaign) -> crate::model::Campaign {
+        let id = self.next_id();
+        let campaign = crate::model::Campaign {
+            id,
+            server_id: new.server_id,
+            stream_id: new.stream_id,
+            name: new.name,
+            subject: new.subject,
+            from_address: new.from_address,
+            html_body: new.html_body,
+            text_body: new.text_body,
+            status: "sending".into(),
+            total: new.total,
+            sent: 0,
+            created_at: Some(chrono::Utc::now()),
+            completed_at: None,
+        };
+        self.inner
+            .write()
+            .unwrap()
+            .campaigns
+            .insert(id, campaign.clone());
+        campaign
     }
 
     /// Override a stored message's delivery status (test seeding).

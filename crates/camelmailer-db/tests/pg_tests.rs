@@ -1068,6 +1068,149 @@ async fn clicks_and_opens_are_recorded_per_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn campaign_stats_aggregate_over_attributed_messages() {
+    use camelmailer_core::{NewCampaign, NewStream, NewSuppression, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    let stream = ServerStore::create_stream(
+        &f.store,
+        NewStream {
+            server_id: f.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // A suppression created BEFORE the campaign must not count towards its
+    // unsubscribes (it predates the campaign's created_at).
+    f.store
+        .create_suppression(NewSuppression {
+            server_id: f.server.id,
+            suppression_type: "unsubscribe".into(),
+            address: "old@dest.example".into(),
+            reason: None,
+            stream_id: Some(stream.id),
+        })
+        .await
+        .unwrap();
+
+    // Three messages attributed to the campaign, plus one unattributed message
+    // that must never appear in the stats.
+    let mut ids = Vec::new();
+    for rcpt in ["a@dest.example", "b@dest.example", "c@dest.example"] {
+        let mut message = message_for(f.server.id, rcpt);
+        message.scope = MessageScope::Outgoing;
+        message.stream_id = Some(stream.id);
+        let sent = f.store.store_outgoing(message).await.unwrap();
+        ids.push(sent.id);
+    }
+    let unattributed = message_for(f.server.id, "z@dest.example");
+    sink.insert_message(&unattributed).await.unwrap();
+
+    let campaign = f
+        .store
+        .create_campaign(NewCampaign {
+            server_id: f.server.id,
+            stream_id: stream.id,
+            name: Some("Digest".into()),
+            subject: Some("Hi".into()),
+            from_address: Some("news@org.example".into()),
+            html_body: Some("<p>x</p>".into()),
+            text_body: None,
+            total: 3,
+        })
+        .await
+        .unwrap();
+    f.store
+        .set_campaign_progress(
+            f.server.id,
+            campaign.id,
+            3,
+            "sent",
+            Some(chrono::Utc::now()),
+        )
+        .await
+        .unwrap();
+    for id in &ids {
+        f.store
+            .set_message_campaign(f.server.id, *id, campaign.id)
+            .await
+            .unwrap();
+    }
+
+    // message a: delivered + opened; message b: delivered + clicked;
+    // message c: bounced (failed).
+    sink.record_delivery(f.server.id, ids[0], "Sent", "ok", "250 OK", true, None)
+        .await
+        .unwrap();
+    sink.record_delivery(f.server.id, ids[1], "Sent", "ok", "250 OK", true, None)
+        .await
+        .unwrap();
+    sink.record_delivery(f.server.id, ids[2], "Bounced", "550", "", false, None)
+        .await
+        .unwrap();
+    sink.record_load(f.server.id, ids[0], "1.2.3.4", "UA")
+        .await
+        .unwrap();
+    let (link_id, _) = sink
+        .create_link(f.server.id, ids[1], "https://example.com/o")
+        .await
+        .unwrap();
+    sink.record_link_click(f.server.id, link_id, "1.2.3.4", "UA")
+        .await
+        .unwrap();
+
+    // A stream-scoped unsubscribe created after the campaign counts; one on a
+    // different stream does not.
+    f.store
+        .create_suppression(NewSuppression {
+            server_id: f.server.id,
+            suppression_type: "unsubscribe".into(),
+            address: "new@dest.example".into(),
+            reason: None,
+            stream_id: Some(stream.id),
+        })
+        .await
+        .unwrap();
+
+    let stats = f
+        .store
+        .campaign_stats(f.server.id, campaign.id)
+        .await
+        .unwrap();
+    assert_eq!(stats.total, 3);
+    assert_eq!(stats.sent, 3);
+    assert_eq!(stats.delivered, 2);
+    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.opened, 1);
+    assert_eq!(stats.clicked, 1);
+    assert_eq!(stats.unsubscribed, 1);
+
+    // Listing and lookup are tenant-scoped and newest-first.
+    let list = f
+        .store
+        .list_campaigns(f.server.id, stream.id)
+        .await
+        .unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, campaign.id);
+    assert!(f
+        .store
+        .get_campaign(f.server.id, campaign.id)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activity_tables_are_rls_protected() {
     let base = require_db!();
     let pool = test_pool(&base).await;
