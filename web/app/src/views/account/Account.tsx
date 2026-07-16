@@ -7,15 +7,10 @@ import { useEffect, useState } from "react"
 import { QRCodeSVG } from "qrcode.react"
 import { toast } from "sonner"
 import { PageHeader, SecretReveal } from "@/components/shared"
+import { Field, FormActions, FormSection, FormSections } from "@/components/form-section"
+import { Page } from "@/components/page"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
 import {
   Dialog,
   DialogContent,
@@ -129,196 +124,197 @@ export default function Account() {
   }
 
   return (
-    <div className="max-w-xl space-y-6">
-      <PageHeader title="My Account" />
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Profile</CardTitle>
-          <CardDescription>{me?.user.email_address}</CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-4">
-          <div className="grid grid-cols-2 gap-2">
-            <div className="grid gap-2">
-              <Label>First name</Label>
-              <Input value={firstName} onChange={(e) => setFirstName(e.target.value)} />
-            </div>
-            <div className="grid gap-2">
-              <Label>Last name</Label>
-              <Input value={lastName} onChange={(e) => setLastName(e.target.value)} />
-            </div>
-          </div>
-          <Button className="justify-self-start" onClick={saveProfile}>
-            Save
-          </Button>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Change password</CardTitle>
-          <CardDescription>Changing the password signs out every other session.</CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-4">
-          <div className="grid gap-2">
-            <Label>Current password</Label>
+    <Page
+      header={
+        <PageHeader
+          title="My Account"
+          description="Your profile, password and sign-in security."
+          className="mb-0"
+        />
+      }
+    >
+      <FormSections>
+        <FormSection title="Profile" description={me?.user.email_address}>
+          <Field label="First name" span={3} htmlFor="first-name">
             <Input
+              id="first-name"
+              value={firstName}
+              onChange={(e) => setFirstName(e.target.value)}
+            />
+          </Field>
+          <Field label="Last name" span={3} htmlFor="last-name">
+            <Input
+              id="last-name"
+              value={lastName}
+              onChange={(e) => setLastName(e.target.value)}
+            />
+          </Field>
+          <FormActions>
+            <Button onClick={saveProfile}>Save</Button>
+          </FormActions>
+        </FormSection>
+
+        <FormSection
+          title="Password"
+          description="Changing the password signs out every other session."
+        >
+          <Field label="Current password" span={3} htmlFor="current-password">
+            <Input
+              id="current-password"
               type="password"
               autoComplete="current-password"
               value={currentPassword}
               onChange={(e) => setCurrentPassword(e.target.value)}
             />
-          </div>
-          <div className="grid gap-2">
-            <Label>New password</Label>
+          </Field>
+          <Field label="New password" span={3} htmlFor="new-password">
             <Input
+              id="new-password"
               type="password"
               autoComplete="new-password"
               minLength={8}
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
             />
-          </div>
-          <Button
-            className="justify-self-start"
-            onClick={changePassword}
-            disabled={!currentPassword || newPassword.length < 8}
-          >
-            Change password
-          </Button>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            Two-factor authentication
-            {totpEnabled ? <Badge>enabled</Badge> : <Badge variant="secondary">off</Badge>}
-          </CardTitle>
-          <CardDescription>
-            Time-based codes (TOTP) from Google Authenticator, 1Password &amp; co.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-4">
-          {!totpEnabled && !enroll && (
+          </Field>
+          <FormActions>
             <Button
-              className="justify-self-start"
-              onClick={async () => {
-                try {
-                  setEnroll(await authApi.totpEnroll())
-                } catch (err) {
-                  errorToast(err, "Could not start enrollment")
-                }
-              }}
+              onClick={changePassword}
+              disabled={!currentPassword || newPassword.length < 8}
             >
-              Set up 2FA
+              Change password
             </Button>
+          </FormActions>
+        </FormSection>
+
+        <FormSection
+          title={
+            <span className="flex items-center gap-2">
+              Two-factor authentication
+              {totpEnabled ? <Badge>enabled</Badge> : <Badge variant="secondary">off</Badge>}
+            </span>
+          }
+          description="Time-based codes (TOTP) from Google Authenticator, 1Password & co."
+        >
+          {!totpEnabled && !enroll && (
+            <Field span={6}>
+              <Button
+                onClick={async () => {
+                  try {
+                    setEnroll(await authApi.totpEnroll())
+                  } catch (err) {
+                    errorToast(err, "Could not start enrollment")
+                  }
+                }}
+              >
+                Set up 2FA
+              </Button>
+            </Field>
           )}
           {enroll && (
-            <div className="grid gap-4">
-              <div className="flex items-start gap-4">
-                <div className="rounded-lg border bg-white p-2">
-                  <QRCodeSVG value={enroll.otpauth_url} size={144} />
+            <Field span={6}>
+              <div className="grid gap-4">
+                <div className="flex items-start gap-4">
+                  <div className="rounded-lg border bg-white p-2">
+                    <QRCodeSVG value={enroll.otpauth_url} size={144} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <SecretReveal label="Secret (manual entry)" value={enroll.secret} />
+                  </div>
                 </div>
-                <div className="min-w-0 flex-1">
-                  <SecretReveal label="Secret (manual entry)" value={enroll.secret} />
+                <div className="grid gap-2">
+                  <Label>Confirm with a code from your app</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      className="w-32"
+                      inputMode="numeric"
+                      placeholder="123456"
+                      value={totpCode}
+                      onChange={(e) => setTotpCode(e.target.value)}
+                    />
+                    <Button
+                      onClick={async () => {
+                        try {
+                          await authApi.totpActivate(totpCode)
+                          setEnroll(null)
+                          setTotpCode("")
+                          await refresh()
+                          toast.success("Two-factor authentication is on")
+                        } catch (err) {
+                          errorToast(err, "The code is incorrect")
+                        }
+                      }}
+                      disabled={totpCode.length !== 6}
+                    >
+                      Activate
+                    </Button>
+                  </div>
                 </div>
               </div>
-              <div className="grid gap-2">
-                <Label>Confirm with a code from your app</Label>
-                <div className="flex gap-2">
-                  <Input
-                    className="w-32"
-                    inputMode="numeric"
-                    placeholder="123456"
-                    value={totpCode}
-                    onChange={(e) => setTotpCode(e.target.value)}
-                  />
-                  <Button
-                    onClick={async () => {
-                      try {
-                        await authApi.totpActivate(totpCode)
-                        setEnroll(null)
-                        setTotpCode("")
-                        await refresh()
-                        toast.success("Two-factor authentication is on")
-                      } catch (err) {
-                        errorToast(err, "The code is incorrect")
-                      }
-                    }}
-                    disabled={totpCode.length !== 6}
-                  >
-                    Activate
-                  </Button>
-                </div>
-              </div>
-            </div>
+            </Field>
           )}
           {totpEnabled && (
-            <Button
-              variant="outline"
-              className="justify-self-start"
-              onClick={() => setDisableOpen(true)}
-            >
-              Disable 2FA
-            </Button>
-          )}
-        </CardContent>
-      </Card>
-
-      {webauthnEnabled && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Passkeys</CardTitle>
-            <CardDescription>
-              Sign in with Touch ID, Windows Hello or a security key instead of
-              your password.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4">
-            {passkeys.length > 0 && (
-              <ul className="grid gap-2">
-                {passkeys.map((passkey) => (
-                  <li
-                    key={passkey.id}
-                    className="flex items-center justify-between rounded-md border px-3 py-2"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium">{passkey.name}</div>
-                      <div className="text-xs text-muted-foreground">
-                        Added {new Date(passkey.created_at).toLocaleDateString()}
-                        {passkey.last_used_at
-                          ? ` · Last used ${new Date(passkey.last_used_at).toLocaleString()}`
-                          : " · Never used"}
-                      </div>
-                    </div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => deletePasskey(passkey.id)}
-                    >
-                      Remove
-                    </Button>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <div className="flex gap-2">
-              <Input
-                placeholder="Name, e.g. MacBook Touch ID"
-                value={passkeyName}
-                onChange={(e) => setPasskeyName(e.target.value)}
-              />
-              <Button
-                onClick={addPasskey}
-                disabled={passkeyBusy || !passkeyName.trim()}
-              >
-                {passkeyBusy ? "Waiting…" : "Add passkey"}
+            <Field span={6}>
+              <Button variant="outline" onClick={() => setDisableOpen(true)}>
+                Disable 2FA
               </Button>
-            </div>
-          </CardContent>
-        </Card>
-      )}
+            </Field>
+          )}
+        </FormSection>
+
+        {webauthnEnabled && (
+          <FormSection
+            title="Passkeys"
+            description="Sign in with Touch ID, Windows Hello or a security key instead of your password."
+          >
+            {passkeys.length > 0 && (
+              <Field span={6}>
+                <ul className="grid gap-2">
+                  {passkeys.map((passkey) => (
+                    <li
+                      key={passkey.id}
+                      className="flex items-center justify-between rounded-md border px-3 py-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium">{passkey.name}</div>
+                        <div className="text-xs text-muted-foreground">
+                          Added {new Date(passkey.created_at).toLocaleDateString()}
+                          {passkey.last_used_at
+                            ? ` · Last used ${new Date(passkey.last_used_at).toLocaleString()}`
+                            : " · Never used"}
+                        </div>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => deletePasskey(passkey.id)}
+                      >
+                        Remove
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </Field>
+            )}
+            <Field label="Add a passkey" span={6} htmlFor="passkey-name">
+              <div className="flex gap-2">
+                <Input
+                  id="passkey-name"
+                  placeholder="Name, e.g. MacBook Touch ID"
+                  value={passkeyName}
+                  onChange={(e) => setPasskeyName(e.target.value)}
+                />
+                <Button
+                  onClick={addPasskey}
+                  disabled={passkeyBusy || !passkeyName.trim()}
+                >
+                  {passkeyBusy ? "Waiting…" : "Add passkey"}
+                </Button>
+              </div>
+            </Field>
+          </FormSection>
+        )}
+      </FormSections>
 
       <Dialog open={disableOpen} onOpenChange={setDisableOpen}>
         <DialogContent>
@@ -357,6 +353,6 @@ export default function Account() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </Page>
   )
 }
