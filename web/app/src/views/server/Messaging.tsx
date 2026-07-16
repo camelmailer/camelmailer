@@ -2202,24 +2202,35 @@ export function StreamDetail({
     onError: (err) => errorToast(err, "Could not import subscribers"),
   })
 
-  // Campaign: send the same content to every subscriber of this stream.
+  // Campaigns: tracked sends to all subscribers, expanded asynchronously.
+  const campaignsQuery = useQuery({
+    queryKey: ["sapi-campaigns", permalink],
+    queryFn: () => api.streams.campaigns(permalink).list(),
+    enabled: isBroadcast,
+    // Poll while any campaign is still expanding.
+    refetchInterval: (query) =>
+      query.state.data?.campaigns.some((c) => c.status === "sending") ? 3000 : false,
+  })
+  const campaigns = campaignsQuery.data?.campaigns ?? []
   const [campaignOpen, setCampaignOpen] = useState(false)
   const [campaign, setCampaign] = useState({ from: "", subject: "", html_body: "" })
   const sendCampaign = useMutation({
     mutationFn: () =>
-      api.streams.campaign(permalink, {
+      api.streams.campaigns(permalink).create({
         from: campaign.from,
         subject: campaign.subject,
         ...(campaign.html_body ? { html_body: campaign.html_body } : {}),
       }),
     onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["sapi-campaigns", permalink] })
       toast.success(
-        `Campaign queued to ${data.queued} subscriber${data.queued === 1 ? "" : "s"}` +
-          (data.skipped ? ` (${data.skipped} over the cap skipped)` : ""),
+        `Campaign started to ${data.campaign.total} subscriber${
+          data.campaign.total === 1 ? "" : "s"
+        }`,
       )
       setCampaignOpen(false)
     },
-    onError: (err) => errorToast(err, "Could not send the campaign"),
+    onError: (err) => errorToast(err, "Could not start the campaign"),
   })
 
   // Reputation isolation: which IP pool this stream sends from.
@@ -2376,6 +2387,46 @@ export function StreamDetail({
           </div>
 
           <div className="rounded-md border p-4">
+            <h2 className="text-base font-semibold">Campaigns</h2>
+            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+              Tracked sends to this stream's subscribers. Open one for its delivery, open,
+              click and unsubscribe stats.
+            </p>
+            <div className="mt-3">
+              {campaignsQuery.isLoading ? (
+                <p className="text-sm text-muted-foreground">Loading…</p>
+              ) : campaigns.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No campaigns yet. Use “Send campaign” above.
+                </p>
+              ) : (
+                <ul className="divide-y">
+                  {campaigns.map((c) => (
+                    <li key={c.id} className="flex items-center justify-between gap-2 py-2 text-sm">
+                      <Link
+                        href={`/orgs/${org}/servers/${server}/streams/${encodeURIComponent(
+                          permalink,
+                        )}/campaigns/${c.id}`}
+                        className="min-w-0 truncate font-medium hover:underline"
+                      >
+                        {c.subject || `Campaign #${c.id}`}
+                      </Link>
+                      <span className="flex shrink-0 items-center gap-3 text-muted-foreground">
+                        <span className="tabular-nums">
+                          {c.sent}/{c.total}
+                        </span>
+                        <Badge variant={c.status === "sent" ? "secondary" : "outline"}>
+                          {c.status}
+                        </Badge>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-md border p-4">
             <h2 className="text-base font-semibold">Subscribers</h2>
             <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
               Broadcast messages may only be sent to opted-in subscribers. Add addresses here;
@@ -2511,6 +2562,78 @@ export function StreamDetail({
           </div>
         </DialogContent>
       </Dialog>
+    </Page>
+  )
+}
+
+// ------------------------------------------------------- campaign detail
+
+/// One broadcast campaign with its analytics (delivery, opens, clicks,
+/// unsubscribes). Polls while the campaign is still expanding.
+export function CampaignDetail({
+  api,
+  org,
+  server,
+  permalink,
+  id,
+}: {
+  api: Api
+  org: string
+  server: string
+  permalink: string
+  id: number
+}) {
+  const query = useQuery({
+    queryKey: ["sapi-campaign", permalink, id],
+    queryFn: () => api.streams.campaigns(permalink).get(id),
+    refetchInterval: (q) => (q.state.data?.campaign.status === "sending" ? 3000 : false),
+  })
+  const c = query.data?.campaign
+  const s = query.data?.stats
+  const backHref = `/orgs/${org}/servers/${server}/streams/${encodeURIComponent(permalink)}`
+
+  const tiles: [string, number | undefined][] = [
+    ["Recipients", s?.total],
+    ["Sent", s?.sent],
+    ["Delivered", s?.delivered],
+    ["Failed", s?.failed],
+    ["Opened", s?.opened],
+    ["Clicked", s?.clicked],
+    ["Unsubscribed", s?.unsubscribed],
+  ]
+
+  return (
+    <Page
+      header={
+        <PageHeader
+          className="mb-0 items-start"
+          backHref={backHref}
+          backLabel={permalink}
+          title={c?.subject || `Campaign #${id}`}
+          description={
+            <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              {c && (
+                <Badge variant={c.status === "sent" ? "secondary" : "outline"}>{c.status}</Badge>
+              )}
+              {c && <span>From {c.from}</span>}
+              {c?.created_at && <span>{formatDate(c.created_at)}</span>}
+            </span>
+          }
+        />
+      }
+    >
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        {tiles.map(([label, value]) => (
+          <Card key={label}>
+            <CardContent className="p-4">
+              <p className="text-xs text-muted-foreground">{label}</p>
+              <p className="text-2xl font-semibold tabular-nums">
+                {value ?? (query.isLoading ? "—" : 0)}
+              </p>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
     </Page>
   )
 }

@@ -481,6 +481,33 @@ export type Subscription = {
   created_at: string | null
 }
 
+/// A broadcast campaign: one send to a stream's subscribers, expanded
+/// asynchronously and attributed for analytics.
+export type Campaign = {
+  id: number
+  stream_id: number
+  name: string | null
+  subject: string
+  from: string
+  html_body: string | null
+  text_body: string | null
+  status: "sending" | "sent" | "failed"
+  total: number
+  sent: number
+  created_at: string | null
+  completed_at: string | null
+}
+
+export type CampaignStats = {
+  total: number
+  sent: number
+  delivered: number
+  failed: number
+  opened: number
+  clicked: number
+  unsubscribed: number
+}
+
 export type Template = {
   id: number
   uuid: string
@@ -1092,6 +1119,32 @@ export function serverApi(key: string) {
         remove: (address: string) =>
           api.delete<{ deleted: boolean }>(
             `/api/v2/server/streams/${permalink}/subscribers/${encodeURIComponent(address)}`,
+            h,
+          ),
+      }),
+      // Campaigns: a tracked send to all subscribers, expanded async, with
+      // per-campaign analytics.
+      campaigns: (permalink: string) => ({
+        list: () =>
+          api.get<{ campaigns: Campaign[] }>(
+            `/api/v2/server/streams/${permalink}/campaigns`,
+            h,
+          ),
+        create: (fields: {
+          name?: string
+          from: string
+          subject: string
+          html_body?: string
+          text_body?: string
+        }) =>
+          api.post<{ campaign: Campaign }>(
+            `/api/v2/server/streams/${permalink}/campaigns`,
+            fields,
+            h,
+          ),
+        get: (id: number) =>
+          api.get<{ campaign: Campaign; stats: CampaignStats }>(
+            `/api/v2/server/streams/${permalink}/campaigns/${id}`,
             h,
           ),
       }),
