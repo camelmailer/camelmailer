@@ -41,7 +41,6 @@ import {
   UsersIcon,
   WebhookIcon,
 } from "lucide-react"
-import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import {
   Breadcrumb,
   BreadcrumbItem,
@@ -269,10 +268,6 @@ function NavUser() {
 
   const isAdmin = me?.user.admin ?? false
   const name = [me?.user.first_name, me?.user.last_name].filter(Boolean).join(" ")
-  const initials =
-    [me?.user.first_name?.[0], me?.user.last_name?.[0]].filter(Boolean).join("").toUpperCase() ||
-    me?.user.email_address?.[0]?.toUpperCase() ||
-    "?"
 
   return (
     <DropdownMenu>
@@ -282,10 +277,7 @@ function NavUser() {
           size="sm"
           className={`gap-2 ${interactiveCard}`}
         >
-          <Avatar className="size-5 rounded-md">
-            <AvatarFallback className="rounded-md text-[10px]">{initials}</AvatarFallback>
-          </Avatar>
-          <span className="hidden max-w-40 truncate font-medium sm:inline">{name}</span>
+          <span className="max-w-40 truncate font-medium">{name}</span>
           <ChevronDownIcon className="size-4 text-muted-foreground" />
         </Button>
       </DropdownMenuTrigger>
