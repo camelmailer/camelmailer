@@ -9,7 +9,7 @@
 import { Fragment, useEffect, useState, useSyncExternalStore } from "react"
 import Link from "next/link"
 import { useParams, usePathname, useRouter } from "next/navigation"
-import { useQuery } from "@tanstack/react-query"
+import { useMutation, useQuery } from "@tanstack/react-query"
 import {
   AtSignIcon,
   BadgeCheckIcon,
@@ -268,6 +268,25 @@ function NavUser() {
   const isAdmin = me?.user.admin ?? false
   const name = [me?.user.first_name, me?.user.last_name].filter(Boolean).join(" ")
 
+  // External (cloud) billing portal — only shown when billing is enabled for
+  // the active organization; self-hosted reports enabled=false and hides it.
+  const activeOrg = useActiveOrg()
+  const role = me?.memberships.find((m) => m.organization.permalink === activeOrg)?.role
+  const canBilling = isAdmin || role === "owner" || role === "admin"
+  const billing = useQuery({
+    queryKey: ["billing", activeOrg],
+    queryFn: () => adminApi.billing(activeOrg!).get(),
+    enabled: !!activeOrg && canBilling,
+  })
+  const portal = useMutation({
+    mutationFn: () => adminApi.billing(activeOrg!).portal(),
+    onSuccess: ({ url }) => {
+      window.location.href = url
+    },
+    onError: (err) =>
+      toast.error(err instanceof ApiError ? err.message : "Could not open the billing portal"),
+  })
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -289,6 +308,11 @@ function NavUser() {
         <DropdownMenuItem onClick={() => router.push("/account")}>
           <BadgeCheckIcon /> My Account
         </DropdownMenuItem>
+        {billing.data?.enabled && (
+          <DropdownMenuItem onClick={() => portal.mutate()} disabled={portal.isPending}>
+            <CreditCardIcon /> Billing
+          </DropdownMenuItem>
+        )}
         {isAdmin && (
           <DropdownMenuItem asChild>
             <Link href="/admin/users">
