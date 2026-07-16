@@ -459,17 +459,23 @@ export function Credentials({ org, server }: Scope) {
       cell: ({ row }) => {
         const credential = row.original
         return (
-          <Switch
-            checked={credential.hold}
-            onCheckedChange={async (checked) => {
-              try {
-                await adminApi.credentials(org, server).update(credential.id, { hold: checked })
-                invalidate()
-              } catch (err) {
-                errorToast(err, "Could not update the credential")
-              }
-            }}
-          />
+          <div className="flex items-center gap-2">
+            <StatusPill
+              status={credential.hold ? "On hold" : "Active"}
+              tone={credential.hold ? "amber" : undefined}
+            />
+            <Switch
+              checked={credential.hold}
+              onCheckedChange={async (checked) => {
+                try {
+                  await adminApi.credentials(org, server).update(credential.id, { hold: checked })
+                  invalidate()
+                } catch (err) {
+                  errorToast(err, "Could not update the credential")
+                }
+              }}
+            />
+          </div>
         )
       },
     },
@@ -652,7 +658,11 @@ export function CredentialDetail({ org, server, id }: Scope & { id: number }) {
           title={credential?.name ?? "Credential"}
           description={
             credential && (
-              <span className="flex items-center gap-2">
+              <span className="flex flex-wrap items-center gap-2">
+                <StatusPill
+                  status={credential.hold ? "On hold" : "Active"}
+                  tone={credential.hold ? "amber" : undefined}
+                />
                 <Badge variant="outline">{credential.type}</Badge>
                 {credential.type === "API" ? "HTTP + messaging API key" : "SMTP credential"}
               </span>
@@ -1226,18 +1236,21 @@ export function Webhooks({ org, server }: Scope) {
       cell: ({ row }) => {
         const webhook = row.original
         return (
-          <Switch
-            checked={webhook.enabled}
-            onCheckedChange={async (checked) => {
-              try {
-                if (checked) await adminApi.webhooks(org, server).enable(webhook.id)
-                else await adminApi.webhooks(org, server).disable(webhook.id)
-                invalidate()
-              } catch (err) {
-                errorToast(err, "Could not toggle the webhook")
-              }
-            }}
-          />
+          <div className="flex items-center gap-2">
+            <StatusPill status={webhook.enabled ? "Active" : "Disabled"} />
+            <Switch
+              checked={webhook.enabled}
+              onCheckedChange={async (checked) => {
+                try {
+                  if (checked) await adminApi.webhooks(org, server).enable(webhook.id)
+                  else await adminApi.webhooks(org, server).disable(webhook.id)
+                  invalidate()
+                } catch (err) {
+                  errorToast(err, "Could not toggle the webhook")
+                }
+              }}
+            />
+          </div>
         )
       },
     },
@@ -1507,7 +1520,12 @@ export function WebhookDetail({ org, server, id }: Scope & { id: number }) {
           backHref={`/orgs/${org}/servers/${server}/webhooks`}
           backLabel="Webhooks"
           title={webhook?.name ?? "Webhook"}
-          description={<code className="text-xs">{webhook?.url ?? "…"}</code>}
+          description={
+            <span className="flex flex-wrap items-center gap-2">
+              {webhook && <StatusPill status={webhook.enabled ? "Active" : "Disabled"} />}
+              <code className="text-xs">{webhook?.url ?? "…"}</code>
+            </span>
+          }
           action={
             <>
               <Button
@@ -1942,9 +1960,9 @@ export function SenderAddresses({ org, server }: Scope) {
         (row.original.verified ? "confirmed" : "pending") === value,
       cell: ({ row }) =>
         row.original.verified ? (
-          <StatusPill status="confirmed" />
+          <StatusPill status="Confirmed" />
         ) : (
-          <StatusPill status="pending" />
+          <StatusPill status="Pending" tone="amber" />
         ),
     },
     {

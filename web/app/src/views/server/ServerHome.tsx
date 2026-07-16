@@ -22,6 +22,7 @@ import { ConfirmDialog, PageHeader } from "@/components/shared"
 import { Field, FormActions, FormSection, FormSections } from "@/components/form-section"
 import { Page } from "@/components/page"
 import { Badge } from "@/components/ui/badge"
+import { StatusPill } from "@/components/status-pill"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -420,7 +421,7 @@ export function ServerDashboard({ org, server }: { org: string; server: string }
               <Badge variant={record.mode === "Live" ? "default" : "secondary"}>
                 {record.mode}
               </Badge>
-              {record.suspended && <Badge variant="destructive">suspended</Badge>}
+              <StatusPill status={record.suspended ? "Suspended" : "Active"} />
             </div>
           }
           className="mb-0"

@@ -8,10 +8,10 @@ import Link from "next/link"
 import { useQueries, useQuery } from "@tanstack/react-query"
 import { type ColumnDef } from "@tanstack/react-table"
 import { Badge } from "@/components/ui/badge"
+import { StatusPill, type PillTone } from "@/components/status-pill"
 import { DataTable } from "@/components/ui/data-table"
 import { adminApi, type Server } from "@/lib/api"
 import { serverDotColor } from "@/lib/api-extras"
-import { cn } from "@/lib/utils"
 import { orgInitials } from "@/components/org-switcher"
 
 type OrgItem = {
@@ -34,16 +34,12 @@ type ServerRow = {
   total: number
 }
 
-function deliverability(row: ServerRow): { label: string; cls: string } {
-  if (row.server.mode === "Development")
-    return { label: "Sandbox", cls: "border-amber-300 bg-amber-50 text-amber-700" }
-  if (row.server.suspended)
-    return { label: "Suspended", cls: "border-red-300 bg-red-50 text-red-700" }
-  if (row.total === 0)
-    return { label: "Never used", cls: "border-border bg-muted text-muted-foreground" }
-  if (row.bounced / row.total > 0.1)
-    return { label: "Check bounces", cls: "border-red-300 bg-red-50 text-red-700" }
-  return { label: "Good", cls: "border-emerald-300 bg-emerald-50 text-emerald-700" }
+function deliverability(row: ServerRow): { label: string; tone: PillTone } {
+  if (row.server.mode === "Development") return { label: "Sandbox", tone: "amber" }
+  if (row.server.suspended) return { label: "Suspended", tone: "red" }
+  if (row.total === 0) return { label: "Never used", tone: "gray" }
+  if (row.bounced / row.total > 0.1) return { label: "Check bounces", tone: "red" }
+  return { label: "Good", tone: "green" }
 }
 
 const DELIVERABILITY_FILTER = {
@@ -120,11 +116,7 @@ function serverColumns(showOrg: boolean): ColumnDef<ServerRow>[] {
     filterFn: (row, _id, value) => deliverability(row.original).label === value,
     cell: ({ row }) => {
       const d = deliverability(row.original)
-      return (
-        <Badge variant="outline" className={cn("font-medium", d.cls)}>
-          {d.label}
-        </Badge>
-      )
+      return <StatusPill status={d.label} tone={d.tone} />
     },
   },
   ]

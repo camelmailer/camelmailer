@@ -1992,12 +1992,9 @@ export function Streams({ api }: { api: Api }) {
       enableSorting: false,
       accessorFn: (s) => (s.archived ? "archived" : "active"),
       filterFn: (row, _id, value) => (row.original.archived ? "archived" : "active") === value,
-      cell: ({ row }) =>
-        row.original.archived ? (
-          <Badge variant="secondary">archived</Badge>
-        ) : (
-          <Badge>active</Badge>
-        ),
+      cell: ({ row }) => (
+        <StatusPill status={row.original.archived ? "Archived" : "Active"} />
+      ),
     },
     {
       id: "actions",
@@ -2271,7 +2268,12 @@ export function StreamDetail({
           backHref={backHref}
           backLabel="Streams"
           title={stream.name}
-          description={`${stream.stream_type} · ${stream.permalink}`}
+          description={
+            <span className="flex flex-wrap items-center gap-2">
+              <StatusPill status={stream.archived ? "Archived" : "Active"} />
+              <span>{stream.stream_type} · {stream.permalink}</span>
+            </span>
+          }
           action={
             <div className="flex flex-wrap items-center gap-2">
               <Button variant="outline" size="sm" asChild>
