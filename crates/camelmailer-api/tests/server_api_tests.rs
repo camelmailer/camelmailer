@@ -2083,3 +2083,200 @@ async fn subscriber_list_add_remove_round_trip() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// -------------------------------------------- broadcast: campaign / import / complaint
+
+/// Create a broadcast stream on the send-ready fixture server.
+async fn create_broadcast_stream(store: &Arc<MS>, server_id: u64, permalink: &str) {
+    use camelmailer_core::{NewStream, ServerStore};
+    ServerStore::create_stream(
+        store.as_ref(),
+        NewStream {
+            server_id,
+            name: permalink.into(),
+            permalink: permalink.into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn campaign_send_reaches_every_subscriber_with_footer_and_unsubscribe() {
+    use camelmailer_core::message::header_value;
+
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    create_broadcast_stream(&store, server_id, "broadcast").await;
+
+    // Three opted-in subscribers.
+    for address in ["a@dest.example", "b@dest.example", "c@dest.example"] {
+        post_json(
+            &app,
+            "/api/v2/server/streams/broadcast/subscribers",
+            &token,
+            json!({ "address": address }),
+        )
+        .await;
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/streams/broadcast/send",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "subject": "Weekly digest",
+            "html_body": "<p>Hi</p>",
+            "text_body": "Hi"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["queued"], 3);
+    assert_eq!(body["data"]["skipped"], 0);
+
+    // Every stored message carries a one-click List-Unsubscribe header and the
+    // CAN-SPAM footer (baked into the raw by the shared broadcast path).
+    let stored = store.messages_for(server_id);
+    assert_eq!(stored.len(), 3);
+    for message in &stored {
+        let raw = &message.raw_message;
+        let lu = header_value(raw, "List-Unsubscribe").expect("List-Unsubscribe present");
+        assert!(lu.contains("/track/u/"), "unexpected header: {lu}");
+        let text = String::from_utf8_lossy(raw);
+        assert!(text.contains("Unsubscribe"), "footer missing from {text}");
+    }
+}
+
+#[tokio::test]
+async fn campaign_send_on_a_non_broadcast_stream_is_rejected() {
+    let (app, token, _store, _server_id) = build_with_verified_domain().await;
+    // The server's default stream is transactional.
+    post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token,
+        json!({ "name": "Transact", "stream_type": "transactional" }),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/streams/transact/send",
+        &token,
+        json!({ "from": "news@org.example", "subject": "Hi", "html_body": "<p>x</p>" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        body["error"]["message"],
+        "campaigns can only be sent on a broadcast stream"
+    );
+}
+
+#[tokio::test]
+async fn subscriber_import_adds_and_dedupes() {
+    let (app, token, _store, _server_id) = build_with_verified_domain().await;
+    create_broadcast_stream(&_store, _server_id, "broadcast").await;
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers/import",
+        &token,
+        json!({
+            "addresses": [
+                "a@dest.example",
+                "b@dest.example",
+                "a@dest.example",
+                "  ",
+                " c@dest.example "
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // a, b, c distinct non-blank -> 3 added; blanks and the dup skipped.
+    assert_eq!(body["data"]["added"], 3);
+    assert_eq!(body["data"]["total"], 3);
+
+    // The list reflects them, trimmed.
+    let (_, body) = request(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        Some(&token),
+    )
+    .await;
+    let subs = body["data"]["subscribers"].as_array().unwrap();
+    assert_eq!(subs.len(), 3);
+    assert!(subs.iter().all(|s| s["status"] == "subscribed"));
+    assert!(subs.iter().any(|s| s["address"] == "c@dest.example"));
+}
+
+#[tokio::test]
+async fn complaint_suppresses_the_address_and_closes_the_opt_in_gate() {
+    use camelmailer_core::ServerStore;
+
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    create_broadcast_stream(&store, server_id, "broadcast").await;
+
+    post_json(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        &token,
+        json!({ "address": "reader@dest.example" }),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers/reader@dest.example/complaint",
+        &token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["subscriber"]["status"], "unsubscribed");
+
+    let stream = ServerStore::stream_by_permalink(store.as_ref(), server_id, "broadcast")
+        .await
+        .unwrap()
+        .unwrap();
+    // Stream-scoped complaint suppression exists; the opt-in gate is closed.
+    assert!(!ServerStore::is_subscribed(
+        store.as_ref(),
+        server_id,
+        stream.id,
+        "reader@dest.example"
+    )
+    .await
+    .unwrap());
+    assert!(ServerStore::address_suppressed(
+        store.as_ref(),
+        server_id,
+        "reader@dest.example",
+        Some(stream.id)
+    )
+    .await
+    .unwrap());
+    let suppressions = store.list_suppressions(server_id).await.unwrap();
+    assert_eq!(suppressions.len(), 1);
+    assert_eq!(suppressions[0].suppression_type, "complaint");
+
+    // A subsequent normal broadcast send to that address is rejected by the gate.
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["reader@dest.example"],
+            "subject": "Hi",
+            "html_body": "<p>x</p>",
+            "stream": "broadcast"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}

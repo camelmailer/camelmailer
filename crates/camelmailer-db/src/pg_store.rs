@@ -2341,6 +2341,50 @@ impl camelmailer_core::ServerStore for PgStore {
         Ok(row.is_some())
     }
 
+    async fn record_complaint(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+    ) -> Result<Subscription, StoreError> {
+        // Same tenant transaction writes both sides, mirroring
+        // record_unsubscribe but with a `complaint` suppression keyed on the
+        // address (no token) and a concrete stream.
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        // Idempotent stream-scoped suppression: ON CONFLICT DO NOTHING against
+        // the (server_id, address, COALESCE(stream_id, 0)) unique index.
+        sqlx::query(
+            "INSERT INTO suppressions (server_id, type, address, reason, stream_id)
+             VALUES ($1, 'complaint', $2, 'Marked as spam', $3)
+             ON CONFLICT (server_id, address, COALESCE(stream_id, 0)) DO NOTHING",
+        )
+        .bind(server_id as i64)
+        .bind(address)
+        .bind(stream_id as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        // Flip the opt-in closed for the targeted stream.
+        let row = sqlx::query(
+            "INSERT INTO subscriptions (server_id, stream_id, address, status)
+             VALUES ($1, $2, $3, 'unsubscribed')
+             ON CONFLICT (server_id, stream_id, address)
+             DO UPDATE SET status = 'unsubscribed'
+             RETURNING *",
+        )
+        .bind(server_id as i64)
+        .bind(stream_id as i64)
+        .bind(address)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(subscription_from_row(&row))
+    }
+
     async fn tags(
         &self,
         server_id: Id,

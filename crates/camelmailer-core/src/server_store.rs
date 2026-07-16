@@ -519,6 +519,19 @@ pub trait ServerStore: Send + Sync {
         stream_id: Id,
         address: &str,
     ) -> Result<bool, StoreError>;
+
+    /// Record a spam complaint for `(server, stream, address)`: create a
+    /// stream-scoped `complaint` suppression AND flip the matching
+    /// subscription to `unsubscribed` (idempotent — an existing suppression is
+    /// not an error). The manual FBL/spam-complaint mechanism; mirrors
+    /// [`Self::record_unsubscribe`] but keyed directly on the address rather
+    /// than a one-click token. Returns the resulting subscription row.
+    async fn record_complaint(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+    ) -> Result<Subscription, StoreError>;
 }
 
 #[async_trait]
@@ -1023,6 +1036,32 @@ impl ServerStore for crate::store::MemoryStore {
                 && s.address == address
                 && s.status == "subscribed"
         }))
+    }
+
+    async fn record_complaint(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+    ) -> Result<Subscription, StoreError> {
+        // Idempotent: a duplicate stream-scoped suppression is not an error
+        // (mirrors record_unsubscribe).
+        match self
+            .create_suppression(NewSuppression {
+                server_id,
+                suppression_type: "complaint".into(),
+                address: address.to_string(),
+                reason: Some("Marked as spam".into()),
+                stream_id: Some(stream_id),
+            })
+            .await
+        {
+            Ok(_) | Err(StoreError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
+        // Flip the opt-in closed so the send gate rejects future broadcasts.
+        self.upsert_subscription(server_id, stream_id, address, "unsubscribed")
+            .await
     }
 }
 

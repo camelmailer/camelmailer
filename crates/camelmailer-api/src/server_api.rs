@@ -1770,6 +1770,205 @@ async fn subscribers_delete(
     }
 }
 
+/// Cap on recipients processed by one campaign-send request; subscribers
+/// beyond this are reported as `skipped` (not queued).
+const CAMPAIGN_RECIPIENT_CAP: usize = 1000;
+
+#[derive(Debug, Deserialize)]
+struct CampaignSend {
+    /// Same shape as a normal send minus `to`; `from` is a bare address.
+    from: Option<String>,
+    subject: Option<String>,
+    html_body: Option<String>,
+    text_body: Option<String>,
+    /// Optional template to render for every recipient (like a templated send).
+    template: Option<String>,
+    template_model: Option<Value>,
+}
+
+/// `POST /api/v2/server/streams/{permalink}/send` — send the same content to
+/// every currently-subscribed address of a broadcast stream. Each recipient
+/// goes through the identical broadcast send path as a one-off send (opt-in
+/// gate, per-recipient unsubscribe token + `List-Unsubscribe`, CAN-SPAM
+/// footer) by reusing [`enqueue_send`] once per address. Synchronous; capped
+/// at [`CAMPAIGN_RECIPIENT_CAP`] recipients per request.
+async fn campaign_send(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+    Json(body): Json<CampaignSend>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let stream = match resolve_stream(store, server.0.id, &permalink, &start.0).await {
+        Ok(stream) => stream,
+        Err(response) => return response,
+    };
+    if stream.stream_type != "broadcast" {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "campaigns can only be sent on a broadcast stream",
+        )
+        .into_response();
+    }
+
+    // Resolve the content once: an inline body, or a rendered template folded
+    // over any inline fallbacks (same precedence as a templated send).
+    let (subject, html_body, text_body) = match body.template.filter(|t| !t.is_empty()) {
+        Some(permalink) => {
+            let template = match store.template_by_permalink(server.0.id, &permalink).await {
+                Ok(Some(template)) => template,
+                Ok(None) => {
+                    return render_error(
+                        Some(&start.0),
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "ValidationError",
+                        &format!("Message template {permalink:?} does not exist"),
+                    )
+                    .into_response()
+                }
+                Err(error) => return internal_error(&start.0, &error.to_string()),
+            };
+            let model = body.template_model.unwrap_or_else(|| json!({}));
+            match render_templated(store, server.0.id, &template, &model).await {
+                Ok((subject, html_body, text_body)) => (
+                    subject.or(body.subject),
+                    html_body.or(body.html_body),
+                    text_body.or(body.text_body),
+                ),
+                Err((status, code, message)) => {
+                    return render_error(Some(&start.0), status, &code, &message).into_response()
+                }
+            }
+        }
+        None => (body.subject, body.html_body, body.text_body),
+    };
+
+    let subscribed: Vec<String> = match store.list_subscriptions(server.0.id, stream.id).await {
+        Ok(subscriptions) => subscriptions
+            .into_iter()
+            .filter(|s| s.status == "subscribed")
+            .map(|s| s.address)
+            .collect(),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let skipped = subscribed.len().saturating_sub(CAMPAIGN_RECIPIENT_CAP);
+
+    let mut queued = 0u64;
+    for address in subscribed.into_iter().take(CAMPAIGN_RECIPIENT_CAP) {
+        // Build a fresh per-recipient send that reuses the broadcast path.
+        let message = SendMessage {
+            from: body.from.clone().map(AddressOrString::String),
+            to: vec![AddressOrString::String(address)],
+            subject: subject.clone(),
+            html_body: html_body.clone(),
+            text_body: text_body.clone(),
+            stream: Some(permalink.clone()),
+            ..Default::default()
+        };
+        match enqueue_send(&state, &server.0, message).await {
+            Ok(_) => queued += 1,
+            Err((status, code, message)) => {
+                return render_error(Some(&start.0), status, &code, &message).into_response()
+            }
+        }
+    }
+
+    render_success(
+        Some(&start.0),
+        StatusCode::CREATED,
+        json!({ "queued": queued, "skipped": skipped }),
+    )
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportSubscribers {
+    #[serde(default)]
+    addresses: Vec<String>,
+}
+
+/// `POST /api/v2/server/streams/{permalink}/subscribers/import` — bulk-upsert
+/// addresses as `subscribed`, skipping blanks and duplicates within the
+/// request. Returns how many were upserted and the subscriber count after.
+async fn subscribers_import(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+    Json(body): Json<ImportSubscribers>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let stream = match resolve_stream(store, server.0.id, &permalink, &start.0).await {
+        Ok(stream) => stream,
+        Err(response) => return response,
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut added = 0u64;
+    for address in &body.addresses {
+        let address = address.trim();
+        if address.is_empty() || !seen.insert(address.to_string()) {
+            continue;
+        }
+        match store
+            .upsert_subscription(server.0.id, stream.id, address, "subscribed")
+            .await
+        {
+            Ok(_) => added += 1,
+            Err(error) => return internal_error(&start.0, &error.to_string()),
+        }
+    }
+    let total = match store.list_subscriptions(server.0.id, stream.id).await {
+        Ok(subscriptions) => subscriptions.len(),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({ "added": added, "total": total }),
+    )
+    .into_response()
+}
+
+/// `POST /api/v2/server/streams/{permalink}/subscribers/{address}/complaint` —
+/// record a manual spam complaint: stream-scoped `complaint` suppression plus
+/// flipping the subscription to `unsubscribed`. Idempotent.
+async fn subscriber_complaint(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path((permalink, address)): Path<(String, String)>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let stream = match resolve_stream(store, server.0.id, &permalink, &start.0).await {
+        Ok(stream) => stream,
+        Err(response) => return response,
+    };
+    match store
+        .record_complaint(server.0.id, stream.id, &address)
+        .await
+    {
+        Ok(subscription) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "subscriber": subscription_json(&subscription) }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
 // ------------------------------------------------------------ templates
 
 fn template_json(template: &Template) -> Value {
@@ -2625,13 +2824,22 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
             get(stream_show).patch(stream_update),
         )
         .route("/streams/{permalink}/archive", post(stream_archive))
+        .route("/streams/{permalink}/send", post(campaign_send))
         .route(
             "/streams/{permalink}/subscribers",
             get(subscribers_index).post(subscribers_create),
         )
         .route(
+            "/streams/{permalink}/subscribers/import",
+            post(subscribers_import),
+        )
+        .route(
             "/streams/{permalink}/subscribers/{address}",
             axum::routing::delete(subscribers_delete),
+        )
+        .route(
+            "/streams/{permalink}/subscribers/{address}/complaint",
+            post(subscriber_complaint),
         )
         .route("/inbound", get(inbound_index))
         .route("/inbound/{id}", get(inbound_show))
