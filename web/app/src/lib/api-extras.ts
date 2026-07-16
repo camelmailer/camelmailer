@@ -46,6 +46,17 @@ export function serverDotColor(server: Pick<Server, "name" | "color">): string {
   return `hsl(${hash % 360} 65% 50%)`
 }
 
+/// Up-to-two-letter initials for an organization avatar badge.
+export function orgInitials(name: string): string {
+  const words = name.trim().split(/\s+/).filter(Boolean)
+  return (
+    words
+      .slice(0, 2)
+      .map((word) => word[0]!.toUpperCase())
+      .join("") || "?"
+  )
+}
+
 // ------------------------------------------------- onboarding data
 
 /// The first usable API credential key of a server, or null (no

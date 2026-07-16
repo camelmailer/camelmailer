@@ -17,6 +17,7 @@ import {
   BookOpenIcon,
   CheckIcon,
   ChevronDownIcon,
+  ArrowRightLeftIcon,
   ChevronsUpDownIcon,
   ClockIcon,
   CreditCardIcon,
@@ -78,7 +79,7 @@ import {
 import { CodePanel } from "@/components/code-panel"
 import { CommandPalette } from "@/components/command-palette"
 import { FormDialog, Kbd } from "@/components/form-dialog"
-import { NEW_ORG_EVENT, OrgSwitcherMenuContent } from "@/components/org-switcher"
+import { NEW_ORG_EVENT, OrgSwitcherDialog } from "@/components/org-switcher"
 import { adminApi, ApiError } from "@/lib/api"
 import {
   getLastActiveOrg,
@@ -356,6 +357,7 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
   const router = useRouter()
   const pathname = usePathname() ?? ""
   const servers = useOrgServers(activeOrg)
+  const [orgPickerOpen, setOrgPickerOpen] = useState(false)
 
   const isAdmin = me?.user.admin ?? false
   // Admin mode: the /admin/* area swaps the whole sidebar for the
@@ -456,7 +458,9 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
                     className="rounded-lg border border-border bg-card shadow-sm data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
                   >
                     <div className="grid flex-1 text-left leading-tight">
-                      <span className="truncate text-xs text-muted-foreground">Server</span>
+                      <span className="truncate text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                        Server
+                      </span>
                       <span className="flex items-center gap-2 truncate text-sm font-medium">
                         {activeServer && (
                           <span
@@ -551,33 +555,31 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
         )}
         {!isAdminMode && activeOrg && (
           <SidebarGroup>
-            {/* Organization switcher — mirrors the header's server switcher:
-                a "lg" menu button showing the current org, opening the full
-                membership list (see components/org-switcher.tsx). */}
-            <SidebarMenu>
-              <SidebarMenuItem>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <SidebarMenuButton
-                      size="lg"
-                      tooltip="Switch organization"
-                      className="rounded-lg border border-border bg-card shadow-sm data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
-                    >
-                      <div className="grid flex-1 text-left leading-tight">
-                        <span className="truncate text-xs text-muted-foreground">
-                          Organization
-                        </span>
-                        <span className="truncate text-sm font-medium">
-                          {activeOrgName ?? activeOrg ?? "Select organization"}
-                        </span>
-                      </div>
-                      <ChevronsUpDownIcon className="ml-auto size-4" />
-                    </SidebarMenuButton>
-                  </DropdownMenuTrigger>
-                  <OrgSwitcherMenuContent activeOrg={activeOrg} />
-                </DropdownMenu>
-              </SidebarMenuItem>
-            </SidebarMenu>
+            {/* Organization: the current org shown as plain caption + name,
+                with the switch affordance as a ghost icon button on the side.
+                Only that button carries the hover/click effect; the row
+                itself is not a button (see components/org-switcher.tsx). */}
+            <div className="flex items-center gap-2 px-2 py-1">
+              <div className="grid min-w-0 flex-1 leading-tight group-data-[collapsible=icon]:hidden">
+                <span className="truncate text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Organization
+                </span>
+                <span className="truncate text-sm font-medium">
+                  {activeOrgName ?? activeOrg ?? "Select organization"}
+                </span>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setOrgPickerOpen(true)}
+                aria-label="Switch organization"
+                title="Switch organization"
+                className="size-8 shrink-0 text-muted-foreground"
+              >
+                <ArrowRightLeftIcon className="size-4" />
+              </Button>
+            </div>
+            <OrgSwitcherDialog open={orgPickerOpen} onOpenChange={setOrgPickerOpen} />
             <SidebarGroupContent>
               <SidebarMenu>
                 {orgAreas.map(({ href, label, icon: Icon, match }) => (

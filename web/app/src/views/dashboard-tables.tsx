@@ -11,8 +11,7 @@ import { Badge } from "@/components/ui/badge"
 import { StatusPill, type PillTone } from "@/components/status-pill"
 import { DataTable } from "@/components/ui/data-table"
 import { adminApi, type Server } from "@/lib/api"
-import { serverDotColor } from "@/lib/api-extras"
-import { orgInitials } from "@/components/org-switcher"
+import { orgInitials, serverDotColor } from "@/lib/api-extras"
 
 type OrgItem = {
   organization: { id: number; name: string; permalink: string }
@@ -218,47 +217,57 @@ type OrgRow = {
   serverCount: number | null
 }
 
-const ORG_COLUMNS: ColumnDef<OrgRow>[] = [
-  {
-    id: "organization",
-    header: "Organization",
-    accessorFn: (r) => r.name,
-    cell: ({ row }) => (
-      <Link
-        href={`/orgs/${row.original.permalink}`}
-        className="flex items-center gap-2.5 font-medium transition-colors group-hover:text-primary"
-      >
-        <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-primary text-[10px] font-semibold text-primary-foreground">
-          {orgInitials(row.original.name)}
-        </span>
-        <span className="truncate">{row.original.name}</span>
-      </Link>
-    ),
-  },
-  {
-    id: "role",
-    header: "Role",
-    accessorFn: (r) => r.role ?? "",
-    cell: ({ row }) =>
-      row.original.role ? (
-        <Badge variant="secondary" className="capitalize">
-          {row.original.role}
-        </Badge>
-      ) : (
-        <span className="text-muted-foreground">–</span>
+function orgColumns(onNavigate?: () => void): ColumnDef<OrgRow>[] {
+  return [
+    {
+      id: "organization",
+      header: "Organization",
+      accessorFn: (r) => r.name,
+      cell: ({ row }) => (
+        <Link
+          href={`/orgs/${row.original.permalink}`}
+          onClick={onNavigate}
+          className="flex items-center gap-2.5 font-medium transition-colors group-hover:text-primary"
+        >
+          <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-primary text-[10px] font-semibold text-primary-foreground">
+            {orgInitials(row.original.name)}
+          </span>
+          <span className="truncate">{row.original.name}</span>
+        </Link>
       ),
-  },
-  {
-    id: "servers",
-    header: "Servers",
-    accessorFn: (r) => r.serverCount ?? -1,
-    cell: ({ row }) =>
-      row.original.serverCount === null ? "…" : num(row.original.serverCount),
-    meta: { align: "right" },
-  },
-]
+    },
+    {
+      id: "role",
+      header: "Role",
+      accessorFn: (r) => r.role ?? "",
+      cell: ({ row }) =>
+        row.original.role ? (
+          <Badge variant="secondary" className="capitalize">
+            {row.original.role}
+          </Badge>
+        ) : (
+          <span className="text-muted-foreground">–</span>
+        ),
+    },
+    {
+      id: "servers",
+      header: "Servers",
+      accessorFn: (r) => r.serverCount ?? -1,
+      cell: ({ row }) =>
+        row.original.serverCount === null ? "…" : num(row.original.serverCount),
+      meta: { align: "right" },
+    },
+  ]
+}
 
-export function OrganizationsTable({ orgs }: { orgs: OrgItem[] }) {
+export function OrganizationsTable({
+  orgs,
+  onNavigate,
+}: {
+  orgs: OrgItem[]
+  /** Called when a row link is clicked, e.g. to close a containing dialog. */
+  onNavigate?: () => void
+}) {
   const serverQ = useQueries({
     queries: orgs.map((o) => ({
       queryKey: ["servers", o.organization.permalink],
@@ -275,7 +284,7 @@ export function OrganizationsTable({ orgs }: { orgs: OrgItem[] }) {
 
   return (
     <DataTable
-      columns={ORG_COLUMNS}
+      columns={orgColumns(onNavigate)}
       data={rows}
       searchKeys={["name"]}
       searchPlaceholder="Search organizations…"
