@@ -491,11 +491,18 @@ export type Campaign = {
   from: string
   html_body: string | null
   text_body: string | null
-  status: "sending" | "sent" | "failed"
+  status: "draft" | "scheduled" | "sending" | "sent" | "failed" | "canceled"
   total: number
   sent: number
+  scheduled_at: string | null
   created_at: string | null
   completed_at: string | null
+}
+
+/// A campaign with the audience stream it targets (server-level campaigns
+/// list/detail carry the stream so the UI can name it without a second call).
+export type CampaignWithStream = Campaign & {
+  stream: { permalink: string; name: string } | null
 }
 
 export type CampaignStats = {
@@ -1148,6 +1155,43 @@ export function serverApi(key: string) {
             h,
           ),
       }),
+    },
+    // Server-level broadcast campaigns: a first-class planned send to a
+    // broadcast stream's subscribers, with draft/schedule/send-now lifecycle
+    // and per-campaign analytics.
+    campaigns: {
+      list: () =>
+        api.get<{ campaigns: CampaignWithStream[] }>("/api/v2/server/campaigns", h),
+      create: (fields: {
+        stream: string
+        name?: string
+        from: string
+        subject: string
+        html_body?: string
+        text_body?: string
+        scheduled_at?: string
+        send_now?: boolean
+      }) => api.post<{ campaign: Campaign }>("/api/v2/server/campaigns", fields, h),
+      get: (id: number) =>
+        api.get<{ campaign: CampaignWithStream; stats: CampaignStats }>(
+          `/api/v2/server/campaigns/${id}`,
+          h,
+        ),
+      update: (
+        id: number,
+        fields: Partial<{
+          name: string
+          from: string
+          subject: string
+          html_body: string
+          text_body: string
+          scheduled_at: string
+        }>,
+      ) => api.patch<{ campaign: Campaign }>(`/api/v2/server/campaigns/${id}`, fields, h),
+      send: (id: number) =>
+        api.post<{ campaign: Campaign }>(`/api/v2/server/campaigns/${id}/send`, {}, h),
+      cancel: (id: number) =>
+        api.post<{ campaign: Campaign }>(`/api/v2/server/campaigns/${id}/cancel`, {}, h),
     },
     dmarc: {
       summary: (params = "") =>
