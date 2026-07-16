@@ -92,6 +92,8 @@ pub struct NewSuppression {
     pub suppression_type: String,
     pub address: String,
     pub reason: Option<String>,
+    /// Stream to scope the suppression to (`None` = server-wide).
+    pub stream_id: Option<Id>,
 }
 
 #[derive(Debug, Clone)]
@@ -423,6 +425,7 @@ impl AdminStore for crate::store::MemoryStore {
             bounce_hook_url: None,
             delivery_hook_url: None,
             inbound_domain: None,
+            broadcast_physical_address: None,
             color: None,
             default_stream_id: None,
         });
@@ -436,6 +439,7 @@ impl AdminStore for crate::store::MemoryStore {
             permalink: "outbound".into(),
             stream_type: "transactional".into(),
             archived: false,
+            ip_pool_id: None,
         });
         Ok(self.insert_server(Server {
             default_stream_id: Some(stream.id),
@@ -884,11 +888,11 @@ impl AdminStore for crate::store::MemoryStore {
     async fn create_suppression(&self, new: NewSuppression) -> Result<Suppression, StoreError> {
         {
             let inner = self.inner.read().unwrap();
-            if inner
-                .suppressions
-                .values()
-                .any(|s| s.server_id == new.server_id && s.address == new.address)
-            {
+            if inner.suppressions.values().any(|s| {
+                s.server_id == new.server_id
+                    && s.address == new.address
+                    && s.stream_id == new.stream_id
+            }) {
                 return Err(StoreError::Conflict("Address is already suppressed".into()));
             }
         }
@@ -898,6 +902,7 @@ impl AdminStore for crate::store::MemoryStore {
             suppression_type: new.suppression_type,
             address: new.address,
             reason: new.reason,
+            stream_id: new.stream_id,
         };
         self.inner
             .write()

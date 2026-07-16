@@ -52,6 +52,7 @@ impl Fixtures {
             bounce_hook_url: None,
             delivery_hook_url: None,
             inbound_domain: None,
+            broadcast_physical_address: None,
             color: None,
             default_stream_id: None,
         });

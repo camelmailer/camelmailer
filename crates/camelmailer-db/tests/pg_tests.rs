@@ -494,10 +494,11 @@ async fn admin_store_crud_and_conflicts() {
         .unwrap();
     assert_eq!(found.id, f.organization.id);
 
-    // suspend via update_server
+    // suspend via update_server (also round-trips broadcast_physical_address)
     let mut server = f.server.clone();
     server.suspended = true;
     server.suspension_reason = Some("abuse".into());
+    server.broadcast_physical_address = Some("Acme Inc, 1 Main St".into());
     f.store.update_server(server).await.unwrap();
     let reloaded = f
         .store
@@ -507,6 +508,10 @@ async fn admin_store_crud_and_conflicts() {
         .unwrap();
     assert!(reloaded.suspended);
     assert_eq!(reloaded.suspension_reason.as_deref(), Some("abuse"));
+    assert_eq!(
+        reloaded.broadcast_physical_address.as_deref(),
+        Some("Acme Inc, 1 Main St")
+    );
 
     // deleting the organization cascades to servers
     assert!(f
@@ -632,6 +637,7 @@ async fn suppressions_are_tenant_isolated_by_rls() {
             suppression_type: "recipient".into(),
             address: "a@tenant-a.example".into(),
             reason: None,
+            stream_id: None,
         })
         .await
         .unwrap();
@@ -641,6 +647,7 @@ async fn suppressions_are_tenant_isolated_by_rls() {
             suppression_type: "recipient".into(),
             address: "b@tenant-b.example".into(),
             reason: None,
+            stream_id: None,
         })
         .await
         .unwrap();
@@ -653,6 +660,7 @@ async fn suppressions_are_tenant_isolated_by_rls() {
             suppression_type: "recipient".into(),
             address: "a@tenant-a.example".into(),
             reason: None,
+            stream_id: None,
         })
         .await
         .expect_err("duplicate suppression must conflict");
@@ -684,6 +692,259 @@ async fn suppressions_are_tenant_isolated_by_rls() {
         .delete_suppression(f.server.id, "a@tenant-a.example")
         .await
         .unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_scoped_suppressions_and_unsubscribe_tokens() {
+    use camelmailer_core::{NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    let stream = ServerStore::create_stream(
+        &f.store,
+        NewStream {
+            server_id: f.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // A stream-scoped unsubscribe token round-trips.
+    let token = ServerStore::create_unsubscribe_token(
+        &f.store,
+        f.server.id,
+        Some(stream.id),
+        "r@dest.example",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ServerStore::resolve_unsubscribe_token(&f.store, &token)
+            .await
+            .unwrap(),
+        Some((f.server.id, Some(stream.id), "r@dest.example".to_string()))
+    );
+    assert_eq!(
+        ServerStore::resolve_unsubscribe_token(&f.store, "nope")
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Recording is idempotent and creates the stream-scoped suppression.
+    assert!(ServerStore::record_unsubscribe(&f.store, &token)
+        .await
+        .unwrap());
+    assert!(ServerStore::record_unsubscribe(&f.store, &token)
+        .await
+        .unwrap());
+    assert!(!ServerStore::record_unsubscribe(&f.store, "nope")
+        .await
+        .unwrap());
+
+    // Blocks only the matching stream — not another stream, not server-wide.
+    assert!(ServerStore::address_suppressed(
+        &f.store,
+        f.server.id,
+        "r@dest.example",
+        Some(stream.id)
+    )
+    .await
+    .unwrap());
+    assert!(
+        !ServerStore::address_suppressed(&f.store, f.server.id, "r@dest.example", None)
+            .await
+            .unwrap()
+    );
+    let other_stream = f.server.default_stream_id;
+    assert!(!ServerStore::address_suppressed(
+        &f.store,
+        f.server.id,
+        "r@dest.example",
+        other_stream
+    )
+    .await
+    .unwrap());
+
+    // A server-wide suppression blocks every stream (today's bounce behaviour).
+    f.store
+        .create_suppression(camelmailer_core::NewSuppression {
+            server_id: f.server.id,
+            suppression_type: "recipient".into(),
+            address: "bounce@dest.example".into(),
+            reason: None,
+            stream_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(ServerStore::address_suppressed(
+        &f.store,
+        f.server.id,
+        "bounce@dest.example",
+        Some(stream.id)
+    )
+    .await
+    .unwrap());
+    assert!(
+        ServerStore::address_suppressed(&f.store, f.server.id, "bounce@dest.example", None)
+            .await
+            .unwrap()
+    );
+
+    // The idempotent record left exactly one suppression row.
+    let list = f.store.list_suppressions(f.server.id).await.unwrap();
+    let unsub: Vec<_> = list
+        .iter()
+        .filter(|s| s.suppression_type == "unsubscribe")
+        .collect();
+    assert_eq!(unsub.len(), 1);
+    assert_eq!(unsub[0].stream_id, Some(stream.id));
+}
+
+// ------------------------------------------- subscriptions (phase 4, RLS)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscriptions_gate_broadcast_and_are_tenant_isolated() {
+    use camelmailer_core::{NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    let stream = ServerStore::create_stream(
+        &f.store,
+        NewStream {
+            server_id: f.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // upsert opt-in, then flip status in place (no duplicate).
+    let created = ServerStore::upsert_subscription(
+        &f.store,
+        f.server.id,
+        stream.id,
+        "r@dest.example",
+        "subscribed",
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.status, "subscribed");
+    assert!(created.created_at.is_some());
+    assert!(
+        ServerStore::is_subscribed(&f.store, f.server.id, stream.id, "r@dest.example")
+            .await
+            .unwrap()
+    );
+
+    let flipped = ServerStore::upsert_subscription(
+        &f.store,
+        f.server.id,
+        stream.id,
+        "r@dest.example",
+        "unsubscribed",
+    )
+    .await
+    .unwrap();
+    assert_eq!(flipped.id, created.id);
+    assert_eq!(flipped.status, "unsubscribed");
+    assert!(
+        !ServerStore::is_subscribed(&f.store, f.server.id, stream.id, "r@dest.example")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        ServerStore::list_subscriptions(&f.store, f.server.id, stream.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // record_unsubscribe flips the subscription to unsubscribed and the gate
+    // then reads closed.
+    ServerStore::upsert_subscription(
+        &f.store,
+        f.server.id,
+        stream.id,
+        "r@dest.example",
+        "subscribed",
+    )
+    .await
+    .unwrap();
+    assert!(
+        ServerStore::is_subscribed(&f.store, f.server.id, stream.id, "r@dest.example")
+            .await
+            .unwrap()
+    );
+    let token = ServerStore::create_unsubscribe_token(
+        &f.store,
+        f.server.id,
+        Some(stream.id),
+        "r@dest.example",
+    )
+    .await
+    .unwrap();
+    assert!(ServerStore::record_unsubscribe(&f.store, &token)
+        .await
+        .unwrap());
+    assert!(
+        !ServerStore::is_subscribed(&f.store, f.server.id, stream.id, "r@dest.example")
+            .await
+            .unwrap()
+    );
+
+    // remove is a boolean; a second remove is a no-op.
+    assert!(
+        ServerStore::remove_subscription(&f.store, f.server.id, stream.id, "r@dest.example")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !ServerStore::remove_subscription(&f.store, f.server.id, stream.id, "r@dest.example")
+            .await
+            .unwrap()
+    );
+
+    // Tenant isolation: a second server sees none of the first's rows, even
+    // with a raw (bypass-free) count.
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: camelmailer_core::ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    ServerStore::upsert_subscription(
+        &f.store,
+        f.server.id,
+        stream.id,
+        "keep@dest.example",
+        "subscribed",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ServerStore::list_subscriptions(&f.store, other.id, stream.id)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 // ------------------------------------------- message metadata (phase 3)
@@ -1207,6 +1468,7 @@ async fn message_streams_default_crud_and_scoping() {
             name: "Broadcasts".into(),
             permalink: "broadcasts".into(),
             stream_type: "broadcast".into(),
+            ip_pool_id: None,
         })
         .await
         .unwrap();
@@ -1217,6 +1479,7 @@ async fn message_streams_default_crud_and_scoping() {
             name: "Dup".into(),
             permalink: "broadcasts".into(),
             stream_type: "broadcast".into(),
+            ip_pool_id: None,
         })
         .await
         .is_err());
@@ -1276,6 +1539,133 @@ async fn message_streams_default_crud_and_scoping() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_ip_pool_round_trips_and_resolves_source_ip() {
+    use camelmailer_core::{NewIpAddress, NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    // Server's own pool (today's behaviour): lowest priority number wins.
+    let server_pool = f.store.create_ip_pool("server", false).await.unwrap();
+    f.store
+        .create_ip_address(NewIpAddress {
+            ip_pool_id: server_pool.id,
+            ipv4: "10.0.0.9".into(),
+            ipv6: None,
+            hostname: "b.example".into(),
+            priority: 5,
+        })
+        .await
+        .unwrap();
+    f.store
+        .create_ip_address(NewIpAddress {
+            ip_pool_id: server_pool.id,
+            ipv4: "10.0.0.1".into(),
+            ipv6: None,
+            hostname: "a.example".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    f.store
+        .set_server_ip_pool(f.server.id, Some(server_pool.id))
+        .await
+        .unwrap();
+
+    // A separate broadcast pool for the stream to source from.
+    let stream_pool = f.store.create_ip_pool("stream", false).await.unwrap();
+    f.store
+        .create_ip_address(NewIpAddress {
+            ip_pool_id: stream_pool.id,
+            ipv4: "10.0.0.2".into(),
+            ipv6: None,
+            hostname: "c.example".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+
+    // create_stream with an ip_pool_id round-trips and persists.
+    let with_pool = f
+        .store
+        .create_stream(NewStream {
+            server_id: f.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: Some(stream_pool.id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(with_pool.ip_pool_id, Some(stream_pool.id));
+    assert_eq!(
+        f.store
+            .stream_by_permalink(f.server.id, "broadcast")
+            .await
+            .unwrap()
+            .unwrap()
+            .ip_pool_id,
+        Some(stream_pool.id)
+    );
+
+    let without_pool = f
+        .store
+        .create_stream(NewStream {
+            server_id: f.server.id,
+            name: "Transactional".into(),
+            permalink: "txn".into(),
+            stream_type: "transactional".into(),
+            ip_pool_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(without_pool.ip_pool_id, None);
+
+    // The stream's own pool wins when set.
+    assert_eq!(
+        ServerStore::source_ip_for(&f.store, f.server.id, Some(with_pool.id))
+            .await
+            .unwrap(),
+        Some("10.0.0.2".to_string())
+    );
+    // A stream without a pool falls back to the server pool exactly like the
+    // legacy source_ip_for_server (which is IP-typed).
+    assert_eq!(
+        ServerStore::source_ip_for(&f.store, f.server.id, Some(without_pool.id))
+            .await
+            .unwrap(),
+        Some("10.0.0.1".to_string())
+    );
+    assert_eq!(
+        ServerStore::source_ip_for(&f.store, f.server.id, None)
+            .await
+            .unwrap(),
+        Some("10.0.0.1".to_string())
+    );
+    assert_eq!(
+        f.store.source_ip_for_server(f.server.id).await,
+        Some("10.0.0.1".parse().unwrap())
+    );
+
+    // Clearing the server pool leaves no source when the stream has none.
+    f.store.set_server_ip_pool(f.server.id, None).await.unwrap();
+    assert_eq!(
+        ServerStore::source_ip_for(&f.store, f.server.id, None)
+            .await
+            .unwrap(),
+        None
+    );
+    // But the broadcast stream still resolves via its own pool.
+    assert_eq!(
+        ServerStore::source_ip_for(&f.store, f.server.id, Some(with_pool.id))
+            .await
+            .unwrap(),
+        Some("10.0.0.2".to_string())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

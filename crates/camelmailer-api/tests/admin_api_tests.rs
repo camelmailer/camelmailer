@@ -968,6 +968,7 @@ async fn server_update_persists_config_fields() {
             "spam_threshold": 5.5,
             "color": "#ff0000",
             "inbound_domain": "in.acme.example",
+            "broadcast_physical_address": "Acme Inc, 1 Main St",
             "mode": "Development"
         })),
     )
@@ -979,6 +980,7 @@ async fn server_update_persists_config_fields() {
     assert_eq!(server["spam_threshold"], 5.5);
     assert_eq!(server["color"], "#ff0000");
     assert_eq!(server["inbound_domain"], "in.acme.example");
+    assert_eq!(server["broadcast_physical_address"], "Acme Inc, 1 Main St");
     assert_eq!(server["mode"], "Development");
 
     // invalid mode → 422

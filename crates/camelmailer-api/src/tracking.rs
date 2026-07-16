@@ -5,9 +5,10 @@
 //! Both resolve the token to its tenant via the cross-tenant lookup table
 //! and record into the RLS-protected tables under that tenant context.
 
+use crate::app::ApiState;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use camelmailer_core::TrackingStore;
@@ -93,5 +94,43 @@ pub fn tracking_router(state: Arc<TrackingState>) -> Router {
     Router::new()
         .route("/track/c/{token}", get(track_click))
         .route("/track/o/{token}", get(track_open))
+        .with_state(state)
+}
+
+/// Confirmation page shown after a browser (GET) unsubscribe. Deliberately
+/// content-free about token validity — the same page is returned whether or
+/// not the token matched.
+const UNSUBSCRIBE_PAGE: &str =
+    "<!doctype html><html><head><meta charset=\"utf-8\"><title>Unsubscribed</title></head>\
+     <body><p>You have been unsubscribed.</p></body></html>";
+
+/// One-click / browser unsubscribe. Both verbs resolve the token and, if it
+/// matches, create a stream-scoped `unsubscribe` suppression (idempotent).
+/// The result never leaks token validity: GET always returns the neutral
+/// confirmation page, POST (RFC 8058 `List-Unsubscribe-Post`) an empty 200.
+async fn unsubscribe(State(state): State<Arc<ApiState>>, Path(token): Path<String>) -> Response {
+    if let Some(store) = state.server_store.as_ref() {
+        let _ = store.record_unsubscribe(&token).await;
+    }
+    (StatusCode::OK, Html(UNSUBSCRIBE_PAGE)).into_response()
+}
+
+async fn unsubscribe_post(
+    State(state): State<Arc<ApiState>>,
+    Path(token): Path<String>,
+) -> Response {
+    if let Some(store) = state.server_store.as_ref() {
+        let _ = store.record_unsubscribe(&token).await;
+    }
+    StatusCode::OK.into_response()
+}
+
+/// Public one-click unsubscribe endpoint (`GET`/`POST /track/u/{token}`).
+/// Separate from [`tracking_router`] because it resolves through
+/// [`camelmailer_core::ServerStore`] (which both the Postgres and in-memory
+/// stores implement), so it is available regardless of the tracking backend.
+pub fn unsubscribe_router(state: Arc<ApiState>) -> Router {
+    Router::new()
+        .route("/track/u/{token}", get(unsubscribe).post(unsubscribe_post))
         .with_state(state)
 }

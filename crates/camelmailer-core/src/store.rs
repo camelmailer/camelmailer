@@ -129,6 +129,11 @@ pub(crate) struct MemoryStoreInner {
     /// Verified single sender addresses (per-address From authorization).
     pub(crate) sender_addresses: HashMap<Id, SenderAddress>,
     pub(crate) suppressions: HashMap<Id, Suppression>,
+    /// One-click unsubscribe tokens: (token, server_id, stream_id, address).
+    /// Cross-tenant lookup table resolved by token alone.
+    pub(crate) unsubscribe_tokens: Vec<(String, Id, Option<Id>, String)>,
+    /// Opt-in consent rows keyed by id (tenant-scoped, like suppressions).
+    pub(crate) subscriptions: HashMap<Id, Subscription>,
     /// HTTP-sent / stored messages, for the per-server read API tests.
     pub(crate) messages: Vec<crate::message::MessageRecord>,
     /// Delivery attempts keyed by message id (per-server read API tests).

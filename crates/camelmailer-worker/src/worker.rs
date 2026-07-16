@@ -148,11 +148,17 @@ impl Worker {
         queued: &camelmailer_db::QueuedMessageRow,
         message: &StoredMessage,
     ) -> Result<ProcessOutcome, sqlx::Error> {
-        // Suppression list check (tenant-scoped, RLS-protected)
-        if self
-            .sink
-            .address_suppressed(message.server_id, &message.rcpt_to)
-            .await?
+        // Suppression list check (tenant-scoped, RLS-protected). Stream-aware:
+        // a server-wide (stream_id NULL) or this-stream suppression blocks it,
+        // so a broadcast opt-out never holds transactional mail.
+        if camelmailer_core::ServerStore::address_suppressed(
+            &self.store,
+            message.server_id,
+            &message.rcpt_to,
+            message.stream_id,
+        )
+        .await
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
         {
             self.queue.complete(queued.id).await?;
             self.sink
@@ -203,9 +209,18 @@ impl Worker {
             None => tracked,
         };
 
-        // Source-address selection: send from the server's IP pool if one
-        // is assigned (highest-priority IPv4).
-        let source_ip = self.store.source_ip_for_server(message.server_id).await;
+        // Source-address selection: send from the message stream's IP pool if
+        // it sets one, else the server's pool (highest-priority IPv4). A
+        // stream without a pool resolves to the server pool exactly as before.
+        let source_ip = camelmailer_core::ServerStore::source_ip_for(
+            &self.store,
+            message.server_id,
+            message.stream_id,
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|ip| ip.parse().ok());
 
         let outcome = self
             .sender

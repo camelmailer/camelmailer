@@ -905,6 +905,15 @@ async fn send_targets_a_stream_and_list_filters_by_it() {
     )
     .await;
 
+    // opt the recipient in to the broadcast stream (Phase 4 gate)
+    post_json(
+        &app,
+        "/api/v2/server/streams/broadcasts/subscribers",
+        &token,
+        json!({ "address": "a@dest.example" }),
+    )
+    .await;
+
     // send explicitly to the broadcasts stream
     let (status, body) = post_json(
         &app,
@@ -1646,4 +1655,431 @@ async fn layouts_wrap_rendered_templates_and_unhook_on_delete() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["rendered"]["html_body"], "<p>Hi Ada</p>");
+}
+
+// ------------------------------------------ broadcast: List-Unsubscribe
+
+#[tokio::test]
+async fn broadcast_send_carries_list_unsubscribe_and_post_unsubscribes() {
+    use camelmailer_core::{message::header_value, NewStream, ServerStore};
+
+    let (server_app, token, store, server_id) = build_with_verified_domain().await;
+    // The unsubscribe endpoint resolves through the same MemoryStore.
+    let state = ApiState::with_server_store(store.clone(), store.clone(), None);
+    let unsub_app = camelmailer_api::unsubscribe_router(state);
+
+    // A broadcast stream to send on.
+    ServerStore::create_stream(
+        store.as_ref(),
+        NewStream {
+            server_id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // opt the recipient in (Phase 4 broadcast gate)
+    post_json(
+        &server_app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        &token,
+        json!({ "address": "reader@dest.example" }),
+    )
+    .await;
+
+    let (status, _) = post_json(
+        &server_app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["reader@dest.example"],
+            "subject": "Weekly digest",
+            "html_body": "<p>Hi</p>",
+            "stream": "broadcast"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The stored raw carries a one-click List-Unsubscribe header.
+    let stored = store.messages_for(server_id);
+    assert_eq!(stored.len(), 1);
+    let raw = &stored[0].raw_message;
+    let lu = header_value(raw, "List-Unsubscribe").expect("List-Unsubscribe header present");
+    assert!(lu.contains("/track/u/"), "unexpected header: {lu}");
+    assert_eq!(
+        header_value(raw, "List-Unsubscribe-Post").as_deref(),
+        Some("List-Unsubscribe=One-Click")
+    );
+
+    // Extract the token from `<...://.../track/u/TOKEN>, <mailto:...>`.
+    let token_value = lu
+        .split("/track/u/")
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .expect("token in header")
+        .to_string();
+
+    // Not yet suppressed on the broadcast stream.
+    let stream = ServerStore::stream_by_permalink(store.as_ref(), server_id, "broadcast")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!ServerStore::address_suppressed(
+        store.as_ref(),
+        server_id,
+        "reader@dest.example",
+        Some(stream.id)
+    )
+    .await
+    .unwrap());
+
+    // One-click POST unsubscribes.
+    let response = unsub_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/track/u/{token_value}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Now suppressed on the broadcast stream, but NOT server-wide / other streams.
+    assert!(ServerStore::address_suppressed(
+        store.as_ref(),
+        server_id,
+        "reader@dest.example",
+        Some(stream.id)
+    )
+    .await
+    .unwrap());
+    assert!(!ServerStore::address_suppressed(
+        store.as_ref(),
+        server_id,
+        "reader@dest.example",
+        None
+    )
+    .await
+    .unwrap());
+
+    // An unknown token still returns a neutral 200 (no validity leak).
+    let response = unsub_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/track/u/nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn broadcast_send_appends_compliance_footer() {
+    use camelmailer_core::{mime::extract_bodies, AdminStore, NewStream, ServerStore};
+
+    let (server_app, token, store, server_id) = build_with_verified_domain().await;
+
+    // Configure the physical postal address for the CAN-SPAM footer.
+    let mut server = AdminStore::server_for_api_token(store.as_ref(), &token)
+        .await
+        .unwrap()
+        .unwrap();
+    server.broadcast_physical_address = Some("Acme Inc, 1 Main St, Springfield".into());
+    AdminStore::update_server(store.as_ref(), server)
+        .await
+        .unwrap();
+
+    ServerStore::create_stream(
+        store.as_ref(),
+        NewStream {
+            server_id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // opt the recipient in (Phase 4 broadcast gate)
+    post_json(
+        &server_app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        &token,
+        json!({ "address": "reader@dest.example" }),
+    )
+    .await;
+
+    let (status, _) = post_json(
+        &server_app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["reader@dest.example"],
+            "subject": "Weekly digest",
+            "html_body": "<p>Hi</p>",
+            "text_body": "Hi",
+            "stream": "broadcast"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let stored = store.messages_for(server_id);
+    assert_eq!(stored.len(), 1);
+    let bodies = extract_bodies(&stored[0].raw_message);
+
+    let html = bodies.html.expect("html part present");
+    assert!(
+        html.contains("<p>Hi</p>"),
+        "original html preserved: {html}"
+    );
+    assert!(
+        html.contains("/track/u/"),
+        "unsubscribe link in html: {html}"
+    );
+    assert!(
+        html.contains("Unsubscribe"),
+        "unsubscribe text in html: {html}"
+    );
+    assert!(
+        html.contains("Acme Inc, 1 Main St, Springfield"),
+        "physical address in html: {html}"
+    );
+
+    let text = bodies.text.expect("text part present");
+    assert!(
+        text.contains("Unsubscribe: "),
+        "unsubscribe line in text: {text}"
+    );
+    assert!(
+        text.contains("/track/u/"),
+        "unsubscribe url in text: {text}"
+    );
+    assert!(
+        text.contains("Acme Inc, 1 Main St, Springfield"),
+        "physical address in text: {text}"
+    );
+}
+
+#[tokio::test]
+async fn transactional_send_has_no_list_unsubscribe() {
+    use camelmailer_core::message::header_value;
+
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["reader@dest.example"],
+            "subject": "Receipt",
+            "text_body": "thanks"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let stored = store.messages_for(server_id);
+    assert_eq!(stored.len(), 1);
+    assert!(header_value(&stored[0].raw_message, "List-Unsubscribe").is_none());
+}
+
+// -------------------------------------------- broadcast: opt-in / consent
+
+#[tokio::test]
+async fn broadcast_opt_in_gate_rejects_then_allows_then_rejects_after_unsubscribe() {
+    use camelmailer_core::message::header_value;
+
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    // The unsubscribe endpoint resolves through the same MemoryStore.
+    let state = ApiState::with_server_store(store.clone(), store.clone(), None);
+    let unsub_app = camelmailer_api::unsubscribe_router(state);
+
+    // a broadcast stream
+    post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token,
+        json!({ "name": "Broadcast", "stream_type": "broadcast" }),
+    )
+    .await;
+
+    let send_body = json!({
+        "from": "news@org.example",
+        "to": ["reader@dest.example"],
+        "subject": "Digest",
+        "html_body": "<p>Hi</p>",
+        "stream": "broadcast"
+    });
+
+    // 1) with no opt-in the whole send is rejected 422, naming the address
+    //    and the stream, and nothing is stored.
+    let (status, body) =
+        post_json(&app, "/api/v2/server/messages", &token, send_body.clone()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("reader@dest.example"),
+        "message: {message}"
+    );
+    assert!(message.contains("broadcast"), "message: {message}");
+    assert!(store.messages_for(server_id).is_empty());
+
+    // 2) opting in through the subscribers API lets the send through.
+    let (status, sub) = post_json(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        &token,
+        json!({ "address": "reader@dest.example" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(sub["data"]["subscriber"]["status"], "subscribed");
+    assert_eq!(sub["data"]["subscriber"]["address"], "reader@dest.example");
+
+    let (status, _) = post_json(&app, "/api/v2/server/messages", &token, send_body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 3) one-click unsubscribe flips the subscription; the next send is
+    //    rejected again.
+    let stored = store.messages_for(server_id);
+    let raw = &stored.last().unwrap().raw_message;
+    let lu = header_value(raw, "List-Unsubscribe").expect("List-Unsubscribe header");
+    let token_value = lu
+        .split("/track/u/")
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .expect("token in header")
+        .to_string();
+    let response = unsub_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/track/u/{token_value}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // the subscription now reads `unsubscribed` in the list
+    let (_, list) = request(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        Some(&token),
+    )
+    .await;
+    let subscribers = list["data"]["subscribers"].as_array().unwrap();
+    assert_eq!(subscribers.len(), 1);
+    assert_eq!(subscribers[0]["status"], "unsubscribed");
+
+    let (status, _) = post_json(&app, "/api/v2/server/messages", &token, send_body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn subscriber_list_add_remove_round_trip() {
+    let (app, token, _store, _server_id) = build_with_verified_domain().await;
+
+    post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token,
+        json!({ "name": "Broadcast", "stream_type": "broadcast" }),
+    )
+    .await;
+
+    // empty to start
+    let (status, list) = request(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["data"]["subscribers"].as_array().unwrap().len(), 0);
+
+    // add two
+    for addr in ["a@dest.example", "b@dest.example"] {
+        let (status, _) = post_json(
+            &app,
+            "/api/v2/server/streams/broadcast/subscribers",
+            &token,
+            json!({ "address": addr }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let (_, list) = request(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(list["data"]["subscribers"].as_array().unwrap().len(), 2);
+
+    // upsert is idempotent (no duplicate row, status update in place)
+    let (status, sub) = post_json(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        &token,
+        json!({ "address": "a@dest.example", "status": "unsubscribed" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(sub["data"]["subscriber"]["status"], "unsubscribed");
+    let (_, list) = request(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(list["data"]["subscribers"].as_array().unwrap().len(), 2);
+
+    // remove one
+    let (status, body) = json_request(
+        &app,
+        "DELETE",
+        "/api/v2/server/streams/broadcast/subscribers/a@dest.example",
+        &token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["deleted"], true);
+    let (_, list) = request(
+        &app,
+        "/api/v2/server/streams/broadcast/subscribers",
+        Some(&token),
+    )
+    .await;
+    let subscribers = list["data"]["subscribers"].as_array().unwrap();
+    assert_eq!(subscribers.len(), 1);
+    assert_eq!(subscribers[0]["address"], "b@dest.example");
+
+    // subscribers on an unknown stream -> 404
+    let (status, _) = request(
+        &app,
+        "/api/v2/server/streams/nope/subscribers",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

@@ -270,10 +270,16 @@ pub(crate) async fn enqueue_send(
     };
 
     // Resolve the target stream: an explicit permalink (must exist and not be
-    // archived) or the server's default stream.
-    let stream_id = match &body.stream {
+    // archived) or the server's default stream. Broadcast streams also carry
+    // per-recipient one-click unsubscribe (see below); transactional and
+    // inbound streams are unaffected.
+    let (stream_id, is_broadcast, stream_label) = match &body.stream {
         Some(permalink) => match server_store.stream_by_permalink(server.id, permalink).await {
-            Ok(Some(stream)) if !stream.archived => Some(stream.id),
+            Ok(Some(stream)) if !stream.archived => (
+                Some(stream.id),
+                stream.stream_type == "broadcast",
+                stream.permalink,
+            ),
             Ok(Some(_)) => {
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -296,7 +302,21 @@ pub(crate) async fn enqueue_send(
                 ))
             }
         },
-        None => server.default_stream_id,
+        None => {
+            let stream_id = server.default_stream_id;
+            let (is_broadcast, stream_label) = match stream_id {
+                Some(id) => server_store
+                    .list_streams(server.id)
+                    .await
+                    .map_err(|_| internal_error())?
+                    .into_iter()
+                    .find(|s| s.id == id)
+                    .map(|s| (s.stream_type == "broadcast", s.permalink))
+                    .unwrap_or((false, String::new())),
+                None => (false, String::new()),
+            };
+            (stream_id, is_broadcast, stream_label)
+        }
     };
 
     let attachments: Vec<Attachment> = body
@@ -333,18 +353,108 @@ pub(crate) async fn enqueue_send(
         attachments,
         message_id: None,
     };
-    let raw = mime::build_message(&params);
+    // Non-broadcast sends share one raw message (unchanged behaviour). Broadcast
+    // sends get a per-recipient raw carrying that recipient's List-Unsubscribe
+    // header, so each opt-out link is unique — built inside the loop below.
+    let raw = if is_broadcast {
+        None
+    } else {
+        Some(mime::build_message(&params))
+    };
+    let track_base = format!(
+        "{}://{}",
+        state.config.camelmailer.web_protocol, state.config.dns.track_domain
+    );
 
     // one stored message per recipient (matches SMTP intake semantics)
     let recipients: Vec<Address> = to.into_iter().chain(cc).chain(bcc).collect();
+
+    // Opt-in gate: a broadcast stream may only send to addresses that have
+    // consented. Reject the whole request naming the first offender.
+    // Transactional/inbound sends are unaffected.
+    if is_broadcast {
+        if let Some(stream_id) = stream_id {
+            for recipient in &recipients {
+                let subscribed = server_store
+                    .is_subscribed(server.id, stream_id, &recipient.email)
+                    .await
+                    .map_err(|_| internal_error())?;
+                if !subscribed {
+                    return Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "ValidationError".into(),
+                        format!(
+                            "{} has not opted in to the {stream_label} stream",
+                            recipient.email
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
     let mut results = Vec::with_capacity(recipients.len());
     let mut shared_id: Option<i64> = None;
     for recipient in &recipients {
+        let raw_message = if is_broadcast {
+            // Register a one-click unsubscribe token for this recipient/stream
+            // and bake the RFC 8058 headers into the stored raw.
+            let token = server_store
+                .create_unsubscribe_token(server.id, stream_id, &recipient.email)
+                .await
+                .map_err(|_| internal_error())?;
+            let mut params = params.clone();
+            params.headers.push((
+                "List-Unsubscribe".into(),
+                format!(
+                    "<{track_base}/track/u/{token}>, <mailto:unsubscribe@{}>",
+                    state.config.dns.track_domain
+                ),
+            ));
+            params.headers.push((
+                "List-Unsubscribe-Post".into(),
+                "List-Unsubscribe=One-Click".into(),
+            ));
+            // CAN-SPAM compliance footer: a visible unsubscribe link (reusing
+            // this recipient's one-click token) and, when configured, the
+            // sender's physical postal address. Baked into the stored raw so it
+            // travels with the message like the List-Unsubscribe header above.
+            let unsubscribe_url = format!("{track_base}/track/u/{token}");
+            let address = server.broadcast_physical_address.as_deref();
+            let mut html_footer = format!(
+                "<div style=\"margin-top:24px;padding-top:16px;\
+                 border-top:1px solid #e5e5e5;font-family:Arial,sans-serif;\
+                 font-size:12px;color:#8a8a8a;\">You are receiving this because \
+                 you subscribed. <a href=\"{unsubscribe_url}\" \
+                 style=\"color:#8a8a8a;\">Unsubscribe</a>."
+            );
+            if let Some(addr) = address {
+                html_footer.push_str("<br>");
+                html_footer.push_str(&html_escape(addr));
+            }
+            html_footer.push_str("</div>");
+            params.html_body = Some(match params.html_body.take() {
+                Some(body) => format!("{body}{html_footer}"),
+                None => html_footer,
+            });
+            let mut text_footer = format!("\n\n--\nUnsubscribe: {unsubscribe_url}");
+            if let Some(addr) = address {
+                text_footer.push('\n');
+                text_footer.push_str(addr);
+            }
+            params.text_body = Some(match params.text_body.take() {
+                Some(body) => format!("{body}{text_footer}"),
+                None => text_footer.trim_start().to_string(),
+            });
+            mime::build_message(&params)
+        } else {
+            raw.clone().expect("non-broadcast raw is built once")
+        };
         let queued = QueuedMessage {
             server_id: server.id,
             rcpt_to: recipient.email.clone(),
             mail_from: from.email.clone(),
-            raw_message: raw.clone(),
+            raw_message,
             received_with_ssl: false,
             scope: MessageScope::Outgoing,
             bounce: false,
@@ -498,6 +608,15 @@ async fn resolve_stream_filter(
 /// The configured tenant-scoped store, if the API was built with one.
 fn server_store(state: &ApiState) -> Option<&Arc<dyn camelmailer_core::ServerStore>> {
     state.server_store.as_ref()
+}
+
+/// Minimal HTML escaping for values interpolated into the compliance footer.
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn storage_unconfigured(start: &RequestStart) -> Response {
@@ -1289,6 +1408,7 @@ fn stream_json(stream: &MessageStream) -> Value {
         "permalink": stream.permalink,
         "stream_type": stream.stream_type,
         "archived": stream.archived,
+        "ip_pool_id": stream.ip_pool_id,
     })
 }
 
@@ -1322,6 +1442,9 @@ struct CreateStream {
     name: Option<String>,
     permalink: Option<String>,
     stream_type: Option<String>,
+    /// IP pool the stream sources outbound mail from (`None` = the server's
+    /// pool). Accepted as-is; the FK enforces it references a real pool.
+    ip_pool_id: Option<camelmailer_core::Id>,
 }
 
 /// `POST /api/v2/server/streams`.
@@ -1365,6 +1488,7 @@ async fn streams_create(
             name,
             permalink,
             stream_type,
+            ip_pool_id: body.ip_pool_id,
         })
         .await
     {
@@ -1408,11 +1532,27 @@ async fn stream_show(
     }
 }
 
+/// Distinguish an omitted key from an explicit `null` for a nullable update
+/// field: absent → `None` (leave unchanged), `null` → `Some(None)` (clear),
+/// value → `Some(Some(v))` (set). Serde otherwise collapses `null` to the
+/// outer `None`, making "clear" impossible.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct UpdateStream {
     name: Option<String>,
     stream_type: Option<String>,
     archived: Option<bool>,
+    /// Present (value or `null`) sets/clears the stream's IP pool; omitted
+    /// leaves it unchanged.
+    #[serde(default, deserialize_with = "double_option")]
+    ip_pool_id: Option<Option<camelmailer_core::Id>>,
 }
 
 /// `PATCH /api/v2/server/streams/{permalink}`.
@@ -1450,6 +1590,9 @@ async fn stream_update(
     if let Some(archived) = body.archived {
         stream.archived = archived;
     }
+    if let Some(ip_pool_id) = body.ip_pool_id {
+        stream.ip_pool_id = ip_pool_id;
+    }
     match store.update_stream(stream).await {
         Ok(stream) => render_success(
             Some(&start.0),
@@ -1483,6 +1626,144 @@ async fn stream_archive(
             Some(&start.0),
             StatusCode::OK,
             json!({ "stream": stream_json(&stream) }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+// ----------------------------------------------------------- subscribers
+
+fn subscription_json(subscription: &camelmailer_core::Subscription) -> Value {
+    json!({
+        "id": subscription.id,
+        "address": subscription.address,
+        "status": subscription.status,
+        "created_at": subscription.created_at,
+    })
+}
+
+/// Resolve a stream by permalink or render a 404. Shared by the subscriber
+/// endpoints, which are all scoped to one stream.
+async fn resolve_stream(
+    store: &Arc<dyn camelmailer_core::ServerStore>,
+    server_id: camelmailer_core::Id,
+    permalink: &str,
+    start: &RequestStart,
+) -> Result<MessageStream, Response> {
+    match store.stream_by_permalink(server_id, permalink).await {
+        Ok(Some(stream)) => Ok(stream),
+        Ok(None) => Err(not_found(start)),
+        Err(error) => Err(internal_error(start, &error.to_string())),
+    }
+}
+
+/// `GET /api/v2/server/streams/{permalink}/subscribers`.
+async fn subscribers_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let stream = match resolve_stream(store, server.0.id, &permalink, &start.0).await {
+        Ok(stream) => stream,
+        Err(response) => return response,
+    };
+    match store.list_subscriptions(server.0.id, stream.id).await {
+        Ok(subscriptions) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({
+                "subscribers": subscriptions.iter().map(subscription_json).collect::<Vec<_>>()
+            }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSubscriber {
+    address: Option<String>,
+    status: Option<String>,
+}
+
+/// `POST /api/v2/server/streams/{permalink}/subscribers`.
+async fn subscribers_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+    Json(body): Json<CreateSubscriber>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let Some(address) = body.address.filter(|a| !a.is_empty()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::BAD_REQUEST,
+            "ParameterMissing",
+            "param is missing or the value is empty: address",
+        )
+        .into_response();
+    };
+    let status = body.status.unwrap_or_else(|| "subscribed".into());
+    if !matches!(status.as_str(), "subscribed" | "unsubscribed") {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            &format!("Subscription status {status:?} is not valid"),
+        )
+        .into_response();
+    }
+    let stream = match resolve_stream(store, server.0.id, &permalink, &start.0).await {
+        Ok(stream) => stream,
+        Err(response) => return response,
+    };
+    match store
+        .upsert_subscription(server.0.id, stream.id, &address, &status)
+        .await
+    {
+        Ok(subscription) => render_success(
+            Some(&start.0),
+            StatusCode::CREATED,
+            json!({ "subscriber": subscription_json(&subscription) }),
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `DELETE /api/v2/server/streams/{permalink}/subscribers/{address}`.
+async fn subscribers_delete(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path((permalink, address)): Path<(String, String)>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let stream = match resolve_stream(store, server.0.id, &permalink, &start.0).await {
+        Ok(stream) => stream,
+        Err(response) => return response,
+    };
+    match store
+        .remove_subscription(server.0.id, stream.id, &address)
+        .await
+    {
+        Ok(removed) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "deleted": removed }),
         )
         .into_response(),
         Err(error) => internal_error(&start.0, &error.to_string()),
@@ -2344,6 +2625,14 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
             get(stream_show).patch(stream_update),
         )
         .route("/streams/{permalink}/archive", post(stream_archive))
+        .route(
+            "/streams/{permalink}/subscribers",
+            get(subscribers_index).post(subscribers_create),
+        )
+        .route(
+            "/streams/{permalink}/subscribers/{address}",
+            axum::routing::delete(subscribers_delete),
+        )
         .route("/inbound", get(inbound_index))
         .route("/inbound/{id}", get(inbound_show))
         .route("/inbound/{id}/bypass", post(inbound_bypass))

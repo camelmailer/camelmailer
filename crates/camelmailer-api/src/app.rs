@@ -758,6 +758,7 @@ pub(crate) fn server_json(server: &Server) -> Value {
         "bounce_hook_url": server.bounce_hook_url,
         "delivery_hook_url": server.delivery_hook_url,
         "inbound_domain": server.inbound_domain,
+        "broadcast_physical_address": server.broadcast_physical_address,
         "color": server.color,
         "ip_pool_id": server.ip_pool_id,
         "default_stream_id": server.default_stream_id,
@@ -1221,6 +1222,7 @@ struct UpdateServer {
     bounce_hook_url: Option<String>,
     delivery_hook_url: Option<String>,
     inbound_domain: Option<String>,
+    broadcast_physical_address: Option<String>,
     color: Option<String>,
 }
 
@@ -1270,6 +1272,9 @@ async fn servers_update(
     }
     if body.inbound_domain.is_some() {
         server.inbound_domain = body.inbound_domain;
+    }
+    if body.broadcast_physical_address.is_some() {
+        server.broadcast_physical_address = body.broadcast_physical_address;
     }
     if body.color.is_some() {
         server.color = body.color;

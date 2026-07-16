@@ -1640,6 +1640,8 @@ fn suppression_json(suppression: &Suppression) -> Value {
         "type": suppression.suppression_type,
         "address": suppression.address,
         "reason": suppression.reason,
+        // null = server-wide; a set id scopes the opt-out to one stream.
+        "stream_id": suppression.stream_id,
     })
 }
 
@@ -1653,6 +1655,27 @@ pub(crate) async fn suppressions_index(
         Ok(server) => server,
         Err(response) => return response,
     };
+    // Resolve the server's streams so the response can name each
+    // suppression's scope (the frontend is on the management surface and
+    // cannot reach the messaging-API stream list itself).
+    let streams = match &state.server_store {
+        Some(server_store) => server_store
+            .list_streams(server.id)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let streams_json: Vec<Value> = streams
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "name": s.name,
+                "permalink": s.permalink,
+                "stream_type": s.stream_type,
+            })
+        })
+        .collect();
     from_result(
         &start,
         state.store.list_suppressions(server.id).await,
@@ -1662,6 +1685,7 @@ pub(crate) async fn suppressions_index(
                 &start,
                 json!({
                     "suppressions": result.items.iter().map(suppression_json).collect::<Vec<_>>(),
+                    "streams": streams_json,
                     "pagination": result.pagination,
                 }),
             )
@@ -1702,6 +1726,9 @@ pub(crate) async fn suppressions_create(
                 suppression_type: body.suppression_type.unwrap_or_else(|| "recipient".into()),
                 address,
                 reason: body.reason,
+                // The admin API manages server-wide suppressions; stream-scoped
+                // ones are created by the unsubscribe endpoint.
+                stream_id: None,
             })
             .await,
         |suppression| {

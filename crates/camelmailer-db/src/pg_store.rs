@@ -12,7 +12,7 @@ use camelmailer_core::{
     MessageScope, MessageSink, NewCredential, NewIpAddress, NewOrganization, NewRoute,
     NewSenderAddress, NewServer, NewSuppression, NewUser, NewWebhook, Organization, QueuedMessage,
     ResolvedRoute, Route, RouteMode, SenderAddress, Server, ServerMode, Store, StoreError,
-    Suppression, User, Webhook,
+    Subscription, Suppression, User, Webhook,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, QueryBuilder, Row};
@@ -104,6 +104,7 @@ fn server_from_row(row: &PgRow) -> Server {
         bounce_hook_url: row.get("bounce_hook_url"),
         delivery_hook_url: row.get("delivery_hook_url"),
         inbound_domain: row.get("inbound_domain"),
+        broadcast_physical_address: row.get("broadcast_physical_address"),
         color: row.get("color"),
         default_stream_id: row
             .get::<Option<i64>, _>("default_stream_id")
@@ -220,6 +221,18 @@ fn suppression_from_row(row: &PgRow) -> Suppression {
         suppression_type: row.get("type"),
         address: row.get("address"),
         reason: row.get("reason"),
+        stream_id: row.get::<Option<i64>, _>("stream_id").map(|id| id as Id),
+    }
+}
+
+fn subscription_from_row(row: &PgRow) -> Subscription {
+    Subscription {
+        id: row.get::<i64, _>("id") as Id,
+        server_id: row.get::<i64, _>("server_id") as Id,
+        stream_id: row.get::<i64, _>("stream_id") as Id,
+        address: row.get("address"),
+        status: row.get("status"),
+        created_at: row.get("created_at"),
     }
 }
 
@@ -276,7 +289,8 @@ const ROUTE_WITH_SERVER: &str = r#"
            s.suspension_reason, s.privacy_mode, s.log_smtp_data, s.allow_sender,
            s.ip_pool_id AS s_ip_pool_id, s.track_opens, s.track_clicks,
            s.spam_threshold, s.outbound_spam_threshold, s.bounce_hook_url,
-           s.delivery_hook_url, s.inbound_domain, s.color, s.default_stream_id
+           s.delivery_hook_url, s.inbound_domain, s.broadcast_physical_address,
+           s.color, s.default_stream_id
     FROM routes r
     JOIN servers s ON s.id = r.server_id
     LEFT JOIN domains d ON d.id = r.domain_id
@@ -309,6 +323,7 @@ fn resolved_route_from_row(row: &PgRow) -> ResolvedRoute {
             bounce_hook_url: row.get("bounce_hook_url"),
             delivery_hook_url: row.get("delivery_hook_url"),
             inbound_domain: row.get("inbound_domain"),
+            broadcast_physical_address: row.get("broadcast_physical_address"),
             color: row.get("color"),
             default_stream_id: row
                 .get::<Option<i64>, _>("default_stream_id")
@@ -681,6 +696,7 @@ impl AdminStore for PgStore {
             bounce_hook_url: None,
             delivery_hook_url: None,
             inbound_domain: None,
+            broadcast_physical_address: None,
             color: None,
             default_stream_id: Some(default_stream_id),
         })
@@ -693,7 +709,8 @@ impl AdminStore for PgStore {
                     mode = $8, track_opens = $9, track_clicks = $10,
                     spam_threshold = $11, outbound_spam_threshold = $12,
                     bounce_hook_url = $13, delivery_hook_url = $14,
-                    inbound_domain = $15, color = $16, default_stream_id = $17
+                    inbound_domain = $15, broadcast_physical_address = $16,
+                    color = $17, default_stream_id = $18
              WHERE id = $1",
         )
         .bind(server.id as i64)
@@ -714,6 +731,7 @@ impl AdminStore for PgStore {
         .bind(&server.bounce_hook_url)
         .bind(&server.delivery_hook_url)
         .bind(&server.inbound_domain)
+        .bind(&server.broadcast_physical_address)
         .bind(&server.color)
         .bind(server.default_stream_id.map(|id| id as i64))
         .execute(&self.pool)
@@ -1227,13 +1245,14 @@ impl AdminStore for PgStore {
             .await
             .map_err(Self::sqlx_error)?;
         let row = sqlx::query(
-            "INSERT INTO suppressions (server_id, type, address, reason)
-             VALUES ($1, $2, $3, $4) RETURNING id",
+            "INSERT INTO suppressions (server_id, type, address, reason, stream_id)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
         )
         .bind(new.server_id as i64)
         .bind(&new.suppression_type)
         .bind(&new.address)
         .bind(&new.reason)
+        .bind(new.stream_id.map(|id| id as i64))
         .fetch_one(&mut *tx)
         .await
         .map_err(Self::sqlx_error)?;
@@ -1244,6 +1263,7 @@ impl AdminStore for PgStore {
             suppression_type: new.suppression_type,
             address: new.address,
             reason: new.reason,
+            stream_id: new.stream_id,
         })
     }
 
@@ -1607,14 +1627,15 @@ impl camelmailer_core::ServerStore for PgStore {
     ) -> Result<camelmailer_core::MessageStream, StoreError> {
         let uuid = token::generate_uuid();
         let row = sqlx::query(
-            "INSERT INTO message_streams (uuid, server_id, name, permalink, stream_type)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            "INSERT INTO message_streams (uuid, server_id, name, permalink, stream_type, ip_pool_id)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
         .bind(&uuid)
         .bind(new.server_id as i64)
         .bind(&new.name)
         .bind(&new.permalink)
         .bind(&new.stream_type)
+        .bind(new.ip_pool_id.map(|id| id as i64))
         .fetch_one(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -1626,6 +1647,7 @@ impl camelmailer_core::ServerStore for PgStore {
             permalink: new.permalink,
             stream_type: new.stream_type,
             archived: false,
+            ip_pool_id: new.ip_pool_id,
         })
     }
 
@@ -1634,16 +1656,44 @@ impl camelmailer_core::ServerStore for PgStore {
         stream: camelmailer_core::MessageStream,
     ) -> Result<camelmailer_core::MessageStream, StoreError> {
         sqlx::query(
-            "UPDATE message_streams SET name = $2, stream_type = $3, archived = $4 WHERE id = $1",
+            "UPDATE message_streams
+             SET name = $2, stream_type = $3, archived = $4, ip_pool_id = $5 WHERE id = $1",
         )
         .bind(stream.id as i64)
         .bind(&stream.name)
         .bind(&stream.stream_type)
         .bind(stream.archived)
+        .bind(stream.ip_pool_id.map(|id| id as i64))
         .execute(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
         Ok(stream)
+    }
+
+    async fn source_ip_for(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+    ) -> Result<Option<String>, StoreError> {
+        // COALESCE resolves the stream's pool first, then the server's — so a
+        // NULL stream_id, an unknown stream, or a stream without a pool all
+        // fall through to the server pool, matching source_ip_for_server
+        // exactly (no regression for transactional streams).
+        let row = sqlx::query(
+            "SELECT a.ipv4 FROM ip_addresses a
+             WHERE a.ip_pool_id = COALESCE(
+                 (SELECT ms.ip_pool_id FROM message_streams ms
+                  WHERE ms.id = $2 AND ms.server_id = $1),
+                 (SELECT s.ip_pool_id FROM servers s WHERE s.id = $1))
+             ORDER BY a.priority, a.id
+             LIMIT 1",
+        )
+        .bind(server_id as i64)
+        .bind(stream_id.map(|id| id as i64))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(row.map(|row| row.get::<String, _>("ipv4")))
     }
 
     async fn inbound_messages(
@@ -2088,6 +2138,209 @@ impl camelmailer_core::ServerStore for PgStore {
         }))
     }
 
+    async fn address_suppressed(
+        &self,
+        server_id: Id,
+        address: &str,
+        stream_id: Option<Id>,
+    ) -> Result<bool, StoreError> {
+        // Tenant-scoped table: enter the RLS context (no WHERE server_id).
+        // Suppressed when a server-wide (stream_id IS NULL) or matching
+        // stream-scoped row exists for the address.
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let row = sqlx::query(
+            "SELECT count(*) AS c FROM suppressions
+             WHERE address = $1 AND (stream_id IS NULL OR stream_id = $2)",
+        )
+        .bind(address)
+        .bind(stream_id.map(|id| id as i64))
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(row.get::<i64, _>("c") > 0)
+    }
+
+    async fn create_unsubscribe_token(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+        address: &str,
+    ) -> Result<String, StoreError> {
+        // Cross-tenant lookup table (resolved by token alone); no RLS.
+        let token = token::generate_token(32);
+        sqlx::query(
+            "INSERT INTO unsubscribe_tokens (server_id, stream_id, address, token)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(server_id as i64)
+        .bind(stream_id.map(|id| id as i64))
+        .bind(address)
+        .bind(&token)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(token)
+    }
+
+    async fn resolve_unsubscribe_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<(Id, Option<Id>, String)>, StoreError> {
+        let row = sqlx::query(
+            "SELECT server_id, stream_id, address FROM unsubscribe_tokens WHERE token = $1",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(row.map(|row| {
+            (
+                row.get::<i64, _>("server_id") as Id,
+                row.get::<Option<i64>, _>("stream_id").map(|id| id as Id),
+                row.get::<String, _>("address"),
+            )
+        }))
+    }
+
+    async fn record_unsubscribe(&self, token: &str) -> Result<bool, StoreError> {
+        let Some((server_id, stream_id, address)) = self.resolve_unsubscribe_token(token).await?
+        else {
+            return Ok(false);
+        };
+        // Idempotent stream-scoped suppression: ON CONFLICT DO NOTHING against
+        // the (server_id, address, COALESCE(stream_id, 0)) unique index.
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        sqlx::query(
+            "INSERT INTO suppressions (server_id, type, address, reason, stream_id)
+             VALUES ($1, 'unsubscribe', $2, 'Unsubscribed via List-Unsubscribe', $3)
+             ON CONFLICT (server_id, address, COALESCE(stream_id, 0)) DO NOTHING",
+        )
+        .bind(server_id as i64)
+        .bind(&address)
+        .bind(stream_id.map(|id| id as i64))
+        .execute(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        // Flip the opt-in to `unsubscribed` for the targeted stream (a
+        // subscription always belongs to a concrete stream). Same tenant tx.
+        if let Some(stream_id) = stream_id {
+            sqlx::query(
+                "INSERT INTO subscriptions (server_id, stream_id, address, status)
+                 VALUES ($1, $2, $3, 'unsubscribed')
+                 ON CONFLICT (server_id, stream_id, address)
+                 DO UPDATE SET status = 'unsubscribed'",
+            )
+            .bind(server_id as i64)
+            .bind(stream_id as i64)
+            .bind(&address)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        }
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(true)
+    }
+
+    async fn list_subscriptions(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+    ) -> Result<Vec<Subscription>, StoreError> {
+        // Tenant-scoped table: enter the RLS context; the query filters the
+        // stream (server scope comes from RLS).
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let rows = sqlx::query("SELECT * FROM subscriptions WHERE stream_id = $1 ORDER BY id")
+            .bind(stream_id as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(subscription_from_row).collect())
+    }
+
+    async fn upsert_subscription(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+        status: &str,
+    ) -> Result<Subscription, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let row = sqlx::query(
+            "INSERT INTO subscriptions (server_id, stream_id, address, status)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (server_id, stream_id, address)
+             DO UPDATE SET status = EXCLUDED.status
+             RETURNING *",
+        )
+        .bind(server_id as i64)
+        .bind(stream_id as i64)
+        .bind(address)
+        .bind(status)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(subscription_from_row(&row))
+    }
+
+    async fn remove_subscription(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let result = sqlx::query("DELETE FROM subscriptions WHERE stream_id = $1 AND address = $2")
+            .bind(stream_id as i64)
+            .bind(address)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn is_subscribed(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let row = sqlx::query(
+            "SELECT 1 AS one FROM subscriptions
+             WHERE stream_id = $1 AND address = $2 AND status = 'subscribed'
+             LIMIT 1",
+        )
+        .bind(stream_id as i64)
+        .bind(address)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(row.is_some())
+    }
+
     async fn tags(
         &self,
         server_id: Id,
@@ -2426,6 +2679,7 @@ pub struct StoredMessage {
     pub inspected: bool,
     pub tag: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    pub stream_id: Option<Id>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -2457,6 +2711,7 @@ fn stored_message_from_row(row: &PgRow) -> StoredMessage {
         inspected: row.get("inspected"),
         tag: row.get("tag"),
         metadata: row.get("metadata"),
+        stream_id: row.get::<Option<i64>, _>("stream_id").map(|id| id as Id),
         created_at: row.get("created_at"),
     }
 }
@@ -2810,22 +3065,6 @@ impl PgMessageSink {
             .get("c");
         tx.commit().await?;
         Ok((clicks, opens))
-    }
-
-    /// Is this address on the tenant's suppression list?
-    pub async fn address_suppressed(
-        &self,
-        server_id: Id,
-        address: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let mut tx = self.store.pool.begin().await?;
-        set_tenant_context(&mut tx, server_id).await?;
-        let row = sqlx::query("SELECT count(*) AS c FROM suppressions WHERE address = $1")
-            .bind(address)
-            .fetch_one(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(row.get::<i64, _>("c") > 0)
     }
 
     /// List a tenant's messages. The query carries no `WHERE server_id`
@@ -3195,6 +3434,7 @@ fn message_stream_from_row(row: &PgRow) -> camelmailer_core::MessageStream {
         permalink: row.get("permalink"),
         stream_type: row.get("stream_type"),
         archived: row.get("archived"),
+        ip_pool_id: row.get::<Option<i64>, _>("ip_pool_id").map(|id| id as Id),
     }
 }
 

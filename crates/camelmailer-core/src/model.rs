@@ -49,6 +49,9 @@ pub struct Server {
     pub delivery_hook_url: Option<String>,
     /// Domain that accepts inbound mail for this server.
     pub inbound_domain: Option<String>,
+    /// Physical postal address rendered in the CAN-SPAM compliance footer of
+    /// broadcast mail (None = not configured).
+    pub broadcast_physical_address: Option<String>,
     /// UI accent color.
     pub color: Option<String>,
     /// Default message stream for HTTP sends (populated by migration 0012).
@@ -253,6 +256,10 @@ pub struct MessageStream {
     pub permalink: String,
     pub stream_type: String,
     pub archived: bool,
+    /// IP pool this stream sources outbound mail from (`None` = fall back to
+    /// the server's pool). Lets broadcast streams send from separate IPs so
+    /// marketing sends never share reputation with transactional mail.
+    pub ip_pool_id: Option<Id>,
 }
 
 /// A message template — named subject/html/text bodies rendered with a
@@ -300,4 +307,34 @@ pub struct Suppression {
     pub suppression_type: String,
     pub address: String,
     pub reason: Option<String>,
+    /// Stream this suppression is scoped to. `None` = server-wide (blocks
+    /// every stream); `Some(id)` = only the given message stream.
+    pub stream_id: Option<Id>,
+}
+
+/// A recorded opt-in (consent) for one (server, stream, address). Broadcast
+/// streams may only send to an address with a `subscribed` row. Tenant-scoped:
+/// lives under RLS in Postgres like [`Suppression`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Subscription {
+    pub id: Id,
+    pub server_id: Id,
+    /// The broadcast stream this consent applies to (always set — a
+    /// subscription is never server-wide).
+    pub stream_id: Id,
+    pub address: String,
+    /// `subscribed` or `unsubscribed`.
+    pub status: String,
+    /// When the row was first created (Postgres default `now()`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Fields for creating (or upserting) a subscription.
+#[derive(Debug, Clone)]
+pub struct NewSubscription {
+    pub server_id: Id,
+    pub stream_id: Id,
+    pub address: String,
+    pub status: String,
 }

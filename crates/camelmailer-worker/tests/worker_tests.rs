@@ -571,6 +571,7 @@ async fn suppressed_recipients_hold_the_message() {
             suppression_type: "recipient".into(),
             address: "blocked@dest.example".into(),
             reason: Some("hard bounce".into()),
+            stream_id: None,
         })
         .await
         .unwrap();
@@ -585,6 +586,65 @@ async fn suppressed_recipients_hold_the_message() {
     assert_eq!(s.queue.queue_size().await.unwrap(), 0);
     // nothing was sent over SMTP
     assert!(smtp.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_scoped_suppression_holds_broadcast_but_not_transactional() {
+    use camelmailer_core::{NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    // A broadcast stream, and the recipient unsubscribed on it.
+    let stream = ServerStore::create_stream(
+        &s.store,
+        NewStream {
+            server_id: s.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    s.store
+        .create_suppression(NewSuppression {
+            server_id: s.server.id,
+            suppression_type: "unsubscribe".into(),
+            address: "reader@dest.example".into(),
+            reason: Some("Unsubscribed via List-Unsubscribe".into()),
+            stream_id: Some(stream.id),
+        })
+        .await
+        .unwrap();
+
+    // A broadcast message to that address is held.
+    let mut broadcast = outgoing_message(s.server.id, "reader@dest.example");
+    broadcast.stream_id = Some(stream.id);
+    s.sink.insert_message(&broadcast).await.unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Held
+    );
+    assert!(smtp.received.lock().unwrap().is_empty());
+
+    // The same address on a transactional (default) stream is NOT blocked.
+    let mut transactional = outgoing_message(s.server.id, "reader@dest.example");
+    transactional.stream_id = s.server.default_stream_id;
+    s.sink.insert_message(&transactional).await.unwrap();
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
+    assert!(smtp
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l == "RCPT TO:<reader@dest.example>"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

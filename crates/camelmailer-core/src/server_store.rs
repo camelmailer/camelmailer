@@ -7,10 +7,10 @@
 //! The trait grows one bundle at a time as the Server API phases land; this
 //! module starts with the request-scope newtype and the trait shell.
 
-use crate::admin_store::StoreError;
+use crate::admin_store::{AdminStore, NewSuppression, StoreError};
 use crate::dmarc::{DmarcFilter, DmarcRecordRow, DmarcReport, NewDmarcReport};
 use crate::message::{MessageRecord, QueuedMessage, SentMessage};
-use crate::model::{Id, MessageStream, Template};
+use crate::model::{Id, MessageStream, Subscription, Template};
 use async_trait::async_trait;
 
 /// The server a per-server API request is scoped to, injected as a request
@@ -39,6 +39,9 @@ pub struct NewStream {
     pub name: String,
     pub permalink: String,
     pub stream_type: String,
+    /// IP pool the stream sources outbound mail from (`None` = the server's
+    /// pool).
+    pub ip_pool_id: Option<Id>,
 }
 
 /// Fields for creating a message template.
@@ -330,6 +333,18 @@ pub trait ServerStore: Send + Sync {
     async fn create_stream(&self, new: NewStream) -> Result<MessageStream, StoreError>;
     async fn update_stream(&self, stream: MessageStream) -> Result<MessageStream, StoreError>;
 
+    /// The source address for a message on `stream_id`: the highest-priority
+    /// IPv4 (as a string) of the stream's IP pool when the stream sets one,
+    /// else of the server's pool, else `None`. With `stream_id = None` (or a
+    /// stream without a pool) this resolves EXACTLY to the server-pool address
+    /// the worker used before per-stream pools existed — no regression for
+    /// transactional streams. Server-scoped (RLS-free config lookup).
+    async fn source_ip_for(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+    ) -> Result<Option<String>, StoreError>;
+
     // inbound message management (scope = incoming)
     /// Incoming messages matching `filter` (scope is always forced to
     /// incoming), newest first.
@@ -433,6 +448,77 @@ pub trait ServerStore: Send + Sync {
         &self,
         token_hash: &str,
     ) -> Result<Option<MessageShare>, StoreError>;
+
+    // suppression gate + one-click unsubscribe (broadcast streams)
+    /// Is `address` suppressed for a message on `stream_id`? True when a
+    /// suppression row exists for the address that is either server-wide
+    /// (`stream_id IS NULL`) or scoped to this exact stream. Tenant-scoped
+    /// (RLS in Postgres; explicit `server_id` filter in memory).
+    async fn address_suppressed(
+        &self,
+        server_id: Id,
+        address: &str,
+        stream_id: Option<Id>,
+    ) -> Result<bool, StoreError>;
+
+    /// Register a one-click unsubscribe token for `address` on `stream_id`
+    /// and return the opaque token. Cross-tenant lookup table (resolved by
+    /// token alone by the unauthenticated unsubscribe endpoint).
+    async fn create_unsubscribe_token(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+        address: &str,
+    ) -> Result<String, StoreError>;
+
+    /// Resolve an unsubscribe token to `(server_id, stream_id, address)`, or
+    /// `None` when the token is unknown.
+    async fn resolve_unsubscribe_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<(Id, Option<Id>, String)>, StoreError>;
+
+    /// Act on a presented unsubscribe token: resolve it, then create a
+    /// stream-scoped `unsubscribe` suppression AND flip the matching
+    /// subscription to `unsubscribed` (idempotent — an existing suppression is
+    /// not an error). Returns whether a token matched.
+    async fn record_unsubscribe(&self, token: &str) -> Result<bool, StoreError>;
+
+    // opt-in / consent (broadcast streams; tenant-scoped)
+    /// The stream's subscription rows (opt-ins and opt-outs), ordered by id.
+    async fn list_subscriptions(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+    ) -> Result<Vec<Subscription>, StoreError>;
+
+    /// Insert a subscription for `(server, stream, address)`, or update its
+    /// status when one already exists. Returns the resulting row.
+    async fn upsert_subscription(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+        status: &str,
+    ) -> Result<Subscription, StoreError>;
+
+    /// Remove the subscription for `(server, stream, address)`. Returns whether
+    /// a row was deleted.
+    async fn remove_subscription(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Has `address` opted in to `stream_id`? True iff a row exists with status
+    /// `subscribed`. The broadcast opt-in send gate.
+    async fn is_subscribed(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+    ) -> Result<bool, StoreError>;
 }
 
 #[async_trait]
@@ -569,11 +655,39 @@ impl ServerStore for crate::store::MemoryStore {
             permalink: new.permalink,
             stream_type: new.stream_type,
             archived: false,
+            ip_pool_id: new.ip_pool_id,
         }))
     }
 
     async fn update_stream(&self, stream: MessageStream) -> Result<MessageStream, StoreError> {
         Ok(self.insert_stream(stream))
+    }
+
+    async fn source_ip_for(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+    ) -> Result<Option<String>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        // Resolve the stream's pool first (if the stream is set and carries
+        // one), else the server's pool — the exact fallback the worker relied
+        // on before per-stream pools existed.
+        let pool_id = stream_id
+            .and_then(|id| inner.message_streams.get(&id))
+            .filter(|s| s.server_id == server_id)
+            .and_then(|s| s.ip_pool_id)
+            .or_else(|| inner.servers.get(&server_id).and_then(|s| s.ip_pool_id));
+        let Some(pool_id) = pool_id else {
+            return Ok(None);
+        };
+        // Highest-priority (lowest priority number, tie by id) address in the
+        // pool — the same ordering the Postgres store applies.
+        Ok(inner
+            .ip_addresses
+            .values()
+            .filter(|a| a.ip_pool_id == pool_id)
+            .min_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)))
+            .map(|a| a.ipv4.clone()))
     }
 
     async fn inbound_messages(
@@ -757,6 +871,158 @@ impl ServerStore for crate::store::MemoryStore {
         token_hash: &str,
     ) -> Result<Option<MessageShare>, StoreError> {
         Ok(self.find_message_share(token_hash))
+    }
+
+    async fn address_suppressed(
+        &self,
+        server_id: Id,
+        address: &str,
+        stream_id: Option<Id>,
+    ) -> Result<bool, StoreError> {
+        Ok(self.inner.read().unwrap().suppressions.values().any(|s| {
+            s.server_id == server_id
+                && s.address == address
+                && (s.stream_id.is_none() || s.stream_id == stream_id)
+        }))
+    }
+
+    async fn create_unsubscribe_token(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+        address: &str,
+    ) -> Result<String, StoreError> {
+        let token = crate::token::generate_token(32);
+        self.inner.write().unwrap().unsubscribe_tokens.push((
+            token.clone(),
+            server_id,
+            stream_id,
+            address.to_string(),
+        ));
+        Ok(token)
+    }
+
+    async fn resolve_unsubscribe_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<(Id, Option<Id>, String)>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .unsubscribe_tokens
+            .iter()
+            .find(|(t, ..)| t == token)
+            .map(|(_, server_id, stream_id, address)| (*server_id, *stream_id, address.clone())))
+    }
+
+    async fn record_unsubscribe(&self, token: &str) -> Result<bool, StoreError> {
+        let Some((server_id, stream_id, address)) = self.resolve_unsubscribe_token(token).await?
+        else {
+            return Ok(false);
+        };
+        // Idempotent: a duplicate stream-scoped suppression is not an error.
+        match self
+            .create_suppression(NewSuppression {
+                server_id,
+                suppression_type: "unsubscribe".into(),
+                address: address.clone(),
+                reason: Some("Unsubscribed via List-Unsubscribe".into()),
+                stream_id,
+            })
+            .await
+        {
+            Ok(_) | Err(StoreError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
+        // Flip the opt-in to `unsubscribed` for the stream this token targets
+        // (subscriptions always belong to a concrete stream).
+        if let Some(stream_id) = stream_id {
+            self.upsert_subscription(server_id, stream_id, &address, "unsubscribed")
+                .await?;
+        }
+        Ok(true)
+    }
+
+    async fn list_subscriptions(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+    ) -> Result<Vec<Subscription>, StoreError> {
+        let mut subscriptions: Vec<Subscription> = self
+            .inner
+            .read()
+            .unwrap()
+            .subscriptions
+            .values()
+            .filter(|s| s.server_id == server_id && s.stream_id == stream_id)
+            .cloned()
+            .collect();
+        subscriptions.sort_by_key(|s| s.id);
+        Ok(subscriptions)
+    }
+
+    async fn upsert_subscription(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+        status: &str,
+    ) -> Result<Subscription, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(existing) = inner
+            .subscriptions
+            .values_mut()
+            .find(|s| s.server_id == server_id && s.stream_id == stream_id && s.address == address)
+        {
+            existing.status = status.to_string();
+            return Ok(existing.clone());
+        }
+        drop(inner);
+        let id = self.next_id();
+        let subscription = Subscription {
+            id,
+            server_id,
+            stream_id,
+            address: address.to_string(),
+            status: status.to_string(),
+            created_at: Some(chrono::Utc::now()),
+        };
+        self.inner
+            .write()
+            .unwrap()
+            .subscriptions
+            .insert(id, subscription.clone());
+        Ok(subscription)
+    }
+
+    async fn remove_subscription(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+    ) -> Result<bool, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let id = inner
+            .subscriptions
+            .values()
+            .find(|s| s.server_id == server_id && s.stream_id == stream_id && s.address == address)
+            .map(|s| s.id);
+        Ok(id.map(|id| inner.subscriptions.remove(&id)).is_some())
+    }
+
+    async fn is_subscribed(
+        &self,
+        server_id: Id,
+        stream_id: Id,
+        address: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.inner.read().unwrap().subscriptions.values().any(|s| {
+            s.server_id == server_id
+                && s.stream_id == stream_id
+                && s.address == address
+                && s.status == "subscribed"
+        }))
     }
 }
 
@@ -954,5 +1220,331 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, all[0].id);
+    }
+
+    #[tokio::test]
+    async fn stream_scoped_suppression_blocks_only_its_stream() {
+        let store = MemoryStore::new();
+        // Suppress addr on stream 10 only.
+        store
+            .create_suppression(NewSuppression {
+                server_id: 1,
+                suppression_type: "unsubscribe".into(),
+                address: "a@dest.example".into(),
+                reason: None,
+                stream_id: Some(10),
+            })
+            .await
+            .unwrap();
+
+        // Blocked on the matching stream, not on another stream, not server-wide.
+        assert!(
+            ServerStore::address_suppressed(&store, 1, "a@dest.example", Some(10))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !ServerStore::address_suppressed(&store, 1, "a@dest.example", Some(20))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !ServerStore::address_suppressed(&store, 1, "a@dest.example", None)
+                .await
+                .unwrap()
+        );
+        // Not another tenant's problem.
+        assert!(
+            !ServerStore::address_suppressed(&store, 2, "a@dest.example", Some(10))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_wide_suppression_blocks_every_stream() {
+        let store = MemoryStore::new();
+        store
+            .create_suppression(NewSuppression {
+                server_id: 1,
+                suppression_type: "recipient".into(),
+                address: "b@dest.example".into(),
+                reason: Some("hard bounce".into()),
+                stream_id: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            ServerStore::address_suppressed(&store, 1, "b@dest.example", None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            ServerStore::address_suppressed(&store, 1, "b@dest.example", Some(10))
+                .await
+                .unwrap()
+        );
+        assert!(
+            ServerStore::address_suppressed(&store, 1, "b@dest.example", Some(99))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_token_roundtrips_and_record_is_idempotent() {
+        let store = MemoryStore::new();
+        let token = ServerStore::create_unsubscribe_token(&store, 1, Some(7), "c@dest.example")
+            .await
+            .unwrap();
+
+        let resolved = ServerStore::resolve_unsubscribe_token(&store, &token)
+            .await
+            .unwrap();
+        assert_eq!(resolved, Some((1, Some(7), "c@dest.example".to_string())));
+        assert_eq!(
+            ServerStore::resolve_unsubscribe_token(&store, "nope")
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Recording creates the stream-scoped suppression; unknown token → false.
+        assert!(ServerStore::record_unsubscribe(&store, &token)
+            .await
+            .unwrap());
+        assert!(!ServerStore::record_unsubscribe(&store, "nope")
+            .await
+            .unwrap());
+        // Idempotent: recording the same token again is still Ok(true), no dup.
+        assert!(ServerStore::record_unsubscribe(&store, &token)
+            .await
+            .unwrap());
+
+        assert!(
+            ServerStore::address_suppressed(&store, 1, "c@dest.example", Some(7))
+                .await
+                .unwrap()
+        );
+        // Only scoped to stream 7 — a transactional stream is unaffected.
+        assert!(
+            !ServerStore::address_suppressed(&store, 1, "c@dest.example", Some(1))
+                .await
+                .unwrap()
+        );
+        let suppressions = store.list_suppressions(1).await.unwrap();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0].suppression_type, "unsubscribe");
+        assert_eq!(suppressions[0].stream_id, Some(7));
+    }
+
+    #[tokio::test]
+    async fn subscriptions_upsert_list_remove_and_gate_sends() {
+        let store = MemoryStore::new();
+
+        // Opt in, and idempotently upsert to the same status.
+        let created =
+            ServerStore::upsert_subscription(&store, 1, 7, "a@dest.example", "subscribed")
+                .await
+                .unwrap();
+        assert_eq!(created.status, "subscribed");
+        assert_eq!(created.stream_id, 7);
+        assert!(ServerStore::is_subscribed(&store, 1, 7, "a@dest.example")
+            .await
+            .unwrap());
+        // Not opted in to another stream, not another tenant.
+        assert!(!ServerStore::is_subscribed(&store, 1, 8, "a@dest.example")
+            .await
+            .unwrap());
+        assert!(!ServerStore::is_subscribed(&store, 2, 7, "a@dest.example")
+            .await
+            .unwrap());
+
+        // Upsert flips status in place (no duplicate row).
+        let flipped =
+            ServerStore::upsert_subscription(&store, 1, 7, "a@dest.example", "unsubscribed")
+                .await
+                .unwrap();
+        assert_eq!(flipped.id, created.id);
+        assert_eq!(flipped.status, "unsubscribed");
+        assert!(!ServerStore::is_subscribed(&store, 1, 7, "a@dest.example")
+            .await
+            .unwrap());
+
+        // A second address, then list is stream-scoped and ordered by id.
+        ServerStore::upsert_subscription(&store, 1, 7, "b@dest.example", "subscribed")
+            .await
+            .unwrap();
+        let list = ServerStore::list_subscriptions(&store, 1, 7).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].address, "a@dest.example");
+        assert_eq!(list[1].address, "b@dest.example");
+
+        // Remove is a boolean; a second remove is a no-op.
+        assert!(
+            ServerStore::remove_subscription(&store, 1, 7, "a@dest.example")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !ServerStore::remove_subscription(&store, 1, 7, "a@dest.example")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            ServerStore::list_subscriptions(&store, 1, 7)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn record_unsubscribe_flips_the_subscription_to_unsubscribed() {
+        let store = MemoryStore::new();
+        // Opt in on stream 7, then unsubscribe via a one-click token.
+        ServerStore::upsert_subscription(&store, 1, 7, "c@dest.example", "subscribed")
+            .await
+            .unwrap();
+        assert!(ServerStore::is_subscribed(&store, 1, 7, "c@dest.example")
+            .await
+            .unwrap());
+
+        let token = ServerStore::create_unsubscribe_token(&store, 1, Some(7), "c@dest.example")
+            .await
+            .unwrap();
+        assert!(ServerStore::record_unsubscribe(&store, &token)
+            .await
+            .unwrap());
+
+        // The subscription is now unsubscribed (the send gate closes) AND a
+        // stream-scoped suppression exists.
+        assert!(!ServerStore::is_subscribed(&store, 1, 7, "c@dest.example")
+            .await
+            .unwrap());
+        let subscriptions = ServerStore::list_subscriptions(&store, 1, 7).await.unwrap();
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].status, "unsubscribed");
+        assert!(
+            ServerStore::address_suppressed(&store, 1, "c@dest.example", Some(7))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_ip_pool_round_trips_and_resolves_source_ip() {
+        use crate::admin_store::{AdminStore, NewIpAddress};
+
+        let fixtures = crate::testing::Fixtures::new();
+        let store = fixtures.store();
+        let server_id = fixtures.server_id();
+
+        // The server's own pool (today's behaviour): two addresses, so the
+        // lowest priority number must win.
+        let server_pool = store.create_ip_pool("server", false).await.unwrap();
+        store
+            .create_ip_address(NewIpAddress {
+                ip_pool_id: server_pool.id,
+                ipv4: "10.0.0.9".into(),
+                ipv6: None,
+                hostname: "b.example".into(),
+                priority: 5,
+            })
+            .await
+            .unwrap();
+        store
+            .create_ip_address(NewIpAddress {
+                ip_pool_id: server_pool.id,
+                ipv4: "10.0.0.1".into(),
+                ipv6: None,
+                hostname: "a.example".into(),
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        store
+            .set_server_ip_pool(server_id, Some(server_pool.id))
+            .await
+            .unwrap();
+
+        // A separate broadcast pool for the stream to source from.
+        let stream_pool = store.create_ip_pool("stream", false).await.unwrap();
+        store
+            .create_ip_address(NewIpAddress {
+                ip_pool_id: stream_pool.id,
+                ipv4: "10.0.0.2".into(),
+                ipv6: None,
+                hostname: "c.example".into(),
+                priority: 0,
+            })
+            .await
+            .unwrap();
+
+        // create_stream with an ip_pool_id round-trips (and persists).
+        let with_pool = store
+            .create_stream(NewStream {
+                server_id,
+                name: "Broadcast".into(),
+                permalink: "broadcast".into(),
+                stream_type: "broadcast".into(),
+                ip_pool_id: Some(stream_pool.id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(with_pool.ip_pool_id, Some(stream_pool.id));
+        assert_eq!(
+            store
+                .stream_by_permalink(server_id, "broadcast")
+                .await
+                .unwrap()
+                .unwrap()
+                .ip_pool_id,
+            Some(stream_pool.id)
+        );
+
+        let without_pool = store
+            .create_stream(NewStream {
+                server_id,
+                name: "Transactional".into(),
+                permalink: "outbound".into(),
+                stream_type: "transactional".into(),
+                ip_pool_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(without_pool.ip_pool_id, None);
+
+        // The stream's own pool wins when set.
+        assert_eq!(
+            ServerStore::source_ip_for(&*store, server_id, Some(with_pool.id))
+                .await
+                .unwrap(),
+            Some("10.0.0.2".to_string())
+        );
+        // A stream without a pool falls back to the server pool (highest
+        // priority = lowest priority number).
+        assert_eq!(
+            ServerStore::source_ip_for(&*store, server_id, Some(without_pool.id))
+                .await
+                .unwrap(),
+            Some("10.0.0.1".to_string())
+        );
+        // No stream at all resolves to the server pool exactly as before.
+        assert_eq!(
+            ServerStore::source_ip_for(&*store, server_id, None)
+                .await
+                .unwrap(),
+            Some("10.0.0.1".to_string())
+        );
+        // A server with no pool resolves to None.
+        assert_eq!(
+            ServerStore::source_ip_for(&*store, 999_999, None)
+                .await
+                .unwrap(),
+            None
+        );
     }
 }
