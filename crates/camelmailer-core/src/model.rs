@@ -339,11 +339,15 @@ pub struct NewSubscription {
     pub status: String,
 }
 
-/// A broadcast campaign — a tracked send of one piece of content to a
-/// broadcast stream's subscribers. Creating a campaign records this row and
-/// spawns a background expansion that produces one message per recipient
-/// (each carrying `campaign_id`), updating `sent` as it progresses. Status
-/// moves `sending` → `sent` (or `failed`). Tenant-scoped like [`Suppression`].
+/// A broadcast campaign — a first-class, planned send of one piece of content
+/// to a broadcast stream's subscribers (its audience, via `stream_id`).
+/// Creating a campaign records this row; it can start as a `draft` (editable,
+/// not sent), a `scheduled` send (a `scheduled_at` the in-process scheduler
+/// acts on), or go straight to `sending`. A background expansion produces one
+/// message per recipient (each carrying `campaign_id`), updating `sent` as it
+/// progresses. Status moves through `draft`/`scheduled` → `sending` → `sent`
+/// (or `failed`), or `draft`/`scheduled` → `canceled`. Tenant-scoped like
+/// [`Suppression`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Campaign {
     pub id: Id,
@@ -354,17 +358,21 @@ pub struct Campaign {
     pub from_address: Option<String>,
     pub html_body: Option<String>,
     pub text_body: Option<String>,
-    /// `sending`, `sent` or `failed`.
+    /// `draft`, `scheduled`, `sending`, `sent`, `failed` or `canceled`.
     pub status: String,
     /// Recipient count captured at creation (the subscriber count then).
     pub total: i64,
     /// Recipients expanded into messages so far.
     pub sent: i64,
+    /// When set on a `scheduled` campaign, the time the scheduler auto-sends it.
+    pub scheduled_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Fields for creating a campaign (status starts `sending`, `sent` at 0).
+/// Fields for creating a campaign. `status` selects the initial lifecycle
+/// state (`draft`, `scheduled` or `sending`); `scheduled_at` carries the send
+/// time for a `scheduled` campaign. `sent` always starts at 0.
 #[derive(Debug, Clone)]
 pub struct NewCampaign {
     pub server_id: Id,
@@ -376,4 +384,8 @@ pub struct NewCampaign {
     pub text_body: Option<String>,
     /// Recipient count captured at creation time.
     pub total: i64,
+    /// Initial status: `draft`, `scheduled` or `sending`.
+    pub status: String,
+    /// The send time for a `scheduled` campaign (`None` otherwise).
+    pub scheduled_at: Option<chrono::DateTime<chrono::Utc>>,
 }

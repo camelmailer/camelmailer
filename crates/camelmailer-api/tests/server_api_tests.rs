@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::Engine;
-use camelmailer_api::{build_server_router, ApiState};
+use camelmailer_api::{build_server_router, run_scheduler_tick, ApiState};
 use camelmailer_core::{
     AdminStore, CredentialType, MemoryStore, NewCredential, NewOrganization, NewServer, ServerMode,
 };
@@ -2293,6 +2293,324 @@ async fn campaign_create_on_a_non_broadcast_stream_is_rejected() {
     assert_eq!(
         body["error"]["message"],
         "campaigns can only be created on a broadcast stream"
+    );
+}
+
+// ------------------------------------ server-level campaigns (planning + scheduler)
+
+/// Like [`build_with_verified_domain`] but also returns the `ApiState`, so a
+/// test can drive the scheduler (`run_scheduler_tick`) directly.
+async fn build_with_state() -> (Router, Arc<ApiState>, String, Arc<MS>, u64) {
+    let store = Arc::new(MS::new());
+    let org = store
+        .create_organization(NewOrganization {
+            name: "Org".into(),
+            permalink: "org".into(),
+        })
+        .await
+        .unwrap();
+    let server = store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "S".into(),
+            permalink: "s".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    store.insert_domain(camelmailer_core::Domain {
+        id: store.next_id(),
+        uuid: "d".into(),
+        owner: DomainOwner::Server(server.id),
+        name: "org.example".into(),
+        verified: true,
+        verification_token: "vtoken".into(),
+        dkim_private_key: None,
+    });
+    let token = "sched-token-000000000".to_string();
+    store
+        .create_credential_record(NewCredential {
+            server_id: server.id,
+            credential_type: CredentialType::Api,
+            name: "api".into(),
+            key: Some(token.clone()),
+        })
+        .await
+        .unwrap();
+    let state = ApiState::with_server_store(store.clone(), store.clone(), None);
+    let app = build_server_router(state.clone());
+    (app, state, token, store, server.id)
+}
+
+/// Add `count` opted-in subscribers to a broadcast stream via the API.
+async fn add_subscribers(app: &Router, token: &str, permalink: &str, addresses: &[&str]) {
+    for address in addresses {
+        post_json(
+            app,
+            &format!("/api/v2/server/streams/{permalink}/subscribers"),
+            token,
+            json!({ "address": address }),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn draft_campaign_is_not_expanded_then_send_expands() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    create_broadcast_stream(&store, server_id, "broadcast").await;
+    add_subscribers(
+        &app,
+        &token,
+        "broadcast",
+        &["a@dest.example", "b@dest.example", "c@dest.example"],
+    )
+    .await;
+
+    // A plain create (no send_now, no scheduled_at) is a draft; it must NOT
+    // expand into any message.
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/campaigns",
+        &token,
+        json!({
+            "stream": "broadcast",
+            "name": "Draft digest",
+            "from": "news@org.example",
+            "subject": "Hello",
+            "html_body": "<p>Hi</p>"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["campaign"]["status"], "draft");
+    assert_eq!(body["data"]["campaign"]["stream"]["permalink"], "broadcast");
+    let campaign_id = body["data"]["campaign"]["id"].as_u64().unwrap();
+    // Give any (erroneously) spawned task a chance to run: still zero messages.
+    tokio::task::yield_now().await;
+    assert_eq!(store.messages_for(server_id).len(), 0);
+
+    // Sending it now expands to all three subscribers.
+    let path = format!("/api/v2/server/campaigns/{campaign_id}");
+    let (status, body) = post_json(&app, &format!("{path}/send"), &token, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(matches!(
+        body["data"]["campaign"]["status"].as_str(),
+        Some("sending") | Some("sent")
+    ));
+
+    let mut settled = json!(null);
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+        let (_, body) = request(&app, &path, Some(&token)).await;
+        if body["data"]["campaign"]["status"] == "sent" {
+            settled = body;
+            break;
+        }
+    }
+    assert_eq!(settled["data"]["campaign"]["status"], "sent");
+    assert_eq!(settled["data"]["campaign"]["sent"], 3);
+    assert_eq!(store.messages_for(server_id).len(), 3);
+}
+
+#[tokio::test]
+async fn scheduled_campaign_is_claimed_once_and_sent_by_the_scheduler() {
+    use camelmailer_core::ServerStore;
+
+    let (app, state, token, store, server_id) = build_with_state().await;
+    create_broadcast_stream(&store, server_id, "broadcast").await;
+    add_subscribers(
+        &app,
+        &token,
+        "broadcast",
+        &["a@dest.example", "b@dest.example"],
+    )
+    .await;
+
+    // Schedule a campaign in the past — it is due immediately but must not have
+    // expanded on create.
+    let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/campaigns",
+        &token,
+        json!({
+            "stream": "broadcast",
+            "from": "news@org.example",
+            "subject": "Scheduled",
+            "html_body": "<p>Hi</p>",
+            "scheduled_at": past
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["campaign"]["status"], "scheduled");
+    assert!(body["data"]["campaign"]["scheduled_at"].is_string());
+    tokio::task::yield_now().await;
+    assert_eq!(store.messages_for(server_id).len(), 0);
+
+    // One scheduler pass claims and sends it to both subscribers.
+    run_scheduler_tick(&state).await;
+    assert_eq!(store.messages_for(server_id).len(), 2);
+    let campaign_id = body["data"]["campaign"]["id"].as_u64().unwrap();
+    let (_, shown) = request(
+        &app,
+        &format!("/api/v2/server/campaigns/{campaign_id}"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(shown["data"]["campaign"]["status"], "sent");
+    assert_eq!(shown["data"]["campaign"]["sent"], 2);
+
+    // A claim is exactly-once: a second pass finds nothing due and sends no
+    // more messages.
+    let none = ServerStore::claim_due_campaigns(store.as_ref(), server_id, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+    run_scheduler_tick(&state).await;
+    assert_eq!(store.messages_for(server_id).len(), 2);
+}
+
+#[tokio::test]
+async fn canceling_a_scheduled_campaign_stops_the_scheduler() {
+    use camelmailer_core::ServerStore;
+
+    let (app, state, token, store, server_id) = build_with_state().await;
+    create_broadcast_stream(&store, server_id, "broadcast").await;
+    add_subscribers(&app, &token, "broadcast", &["a@dest.example"]).await;
+
+    let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    let (_, body) = post_json(
+        &app,
+        "/api/v2/server/campaigns",
+        &token,
+        json!({
+            "stream": "broadcast",
+            "from": "news@org.example",
+            "subject": "Scheduled",
+            "html_body": "<p>Hi</p>",
+            "scheduled_at": past
+        }),
+    )
+    .await;
+    let campaign_id = body["data"]["campaign"]["id"].as_u64().unwrap();
+
+    // Cancel it: status becomes canceled.
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v2/server/campaigns/{campaign_id}/cancel"),
+        &token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["campaign"]["status"], "canceled");
+
+    // The scheduler skips a canceled campaign — nothing is claimed or sent.
+    let none = ServerStore::claim_due_campaigns(store.as_ref(), server_id, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+    run_scheduler_tick(&state).await;
+    assert_eq!(store.messages_for(server_id).len(), 0);
+}
+
+#[tokio::test]
+async fn editing_a_sent_campaign_is_rejected() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    create_broadcast_stream(&store, server_id, "broadcast").await;
+    add_subscribers(&app, &token, "broadcast", &["a@dest.example"]).await;
+
+    // Send now, then poll until it settles as sent.
+    let (_, body) = post_json(
+        &app,
+        "/api/v2/server/campaigns",
+        &token,
+        json!({
+            "stream": "broadcast",
+            "from": "news@org.example",
+            "subject": "Now",
+            "html_body": "<p>Hi</p>",
+            "send_now": true
+        }),
+    )
+    .await;
+    let campaign_id = body["data"]["campaign"]["id"].as_u64().unwrap();
+    let path = format!("/api/v2/server/campaigns/{campaign_id}");
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+        let (_, body) = request(&app, &path, Some(&token)).await;
+        if body["data"]["campaign"]["status"] == "sent" {
+            break;
+        }
+    }
+
+    // A PATCH is rejected 422 once the campaign is no longer draft/scheduled.
+    let (status, body) = patch_json(&app, &path, &token, json!({ "subject": "Edited" })).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        body["error"]["message"],
+        "a sent campaign can no longer be edited"
+    );
+}
+
+#[tokio::test]
+async fn server_level_list_returns_campaigns_across_streams() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    create_broadcast_stream(&store, server_id, "one").await;
+    create_broadcast_stream(&store, server_id, "two").await;
+
+    for stream in ["one", "two"] {
+        post_json(
+            &app,
+            "/api/v2/server/campaigns",
+            &token,
+            json!({
+                "stream": stream,
+                "from": "news@org.example",
+                "subject": "Draft",
+                "html_body": "<p>Hi</p>"
+            }),
+        )
+        .await;
+    }
+
+    let (status, body) = request(&app, "/api/v2/server/campaigns", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let campaigns = body["data"]["campaigns"].as_array().unwrap();
+    assert_eq!(campaigns.len(), 2);
+    // Newest first, and each carries its audience stream's permalink.
+    let permalinks: Vec<&str> = campaigns
+        .iter()
+        .map(|c| c["stream"]["permalink"].as_str().unwrap())
+        .collect();
+    assert!(permalinks.contains(&"one"));
+    assert!(permalinks.contains(&"two"));
+}
+
+#[tokio::test]
+async fn creating_a_campaign_on_a_non_broadcast_stream_is_rejected() {
+    let (app, token, _store, _server_id) = build_with_verified_domain().await;
+    post_json(
+        &app,
+        "/api/v2/server/streams",
+        &token,
+        json!({ "name": "Transact", "stream_type": "transactional" }),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/campaigns",
+        &token,
+        json!({ "stream": "transact", "from": "news@org.example", "subject": "Hi" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        body["error"]["message"],
+        "campaigns can only target a broadcast stream"
     );
 }
 

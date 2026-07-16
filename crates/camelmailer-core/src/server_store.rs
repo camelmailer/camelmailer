@@ -10,7 +10,7 @@
 use crate::admin_store::{AdminStore, NewSuppression, StoreError};
 use crate::dmarc::{DmarcFilter, DmarcRecordRow, DmarcReport, NewDmarcReport};
 use crate::message::{MessageRecord, QueuedMessage, SentMessage};
-use crate::model::{Campaign, Id, MessageStream, NewCampaign, Subscription, Template};
+use crate::model::{Campaign, Id, MessageStream, NewCampaign, Server, Subscription, Template};
 use async_trait::async_trait;
 
 /// The server a per-server API request is scoped to, injected as a request
@@ -147,6 +147,26 @@ pub struct CampaignStats {
     /// Stream-scoped suppressions (`unsubscribe`/`complaint`) of the campaign's
     /// stream created at or after the campaign's `created_at`.
     pub unsubscribed: i64,
+}
+
+/// Editable fields of a planned (`draft`/`scheduled`) campaign. Every field is
+/// optional: `None` leaves the column unchanged. `scheduled_at` is a nested
+/// option so an explicit `Some(None)` clears the schedule (dropping the
+/// campaign back to a draft) while `None` leaves it untouched.
+#[derive(Debug, Clone, Default)]
+pub struct CampaignUpdate {
+    pub name: Option<Option<String>>,
+    pub subject: Option<Option<String>>,
+    pub from_address: Option<Option<String>>,
+    pub html_body: Option<Option<String>>,
+    pub text_body: Option<Option<String>>,
+    pub scheduled_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
+    /// New lifecycle status (`draft`/`scheduled`/`sending`/`canceled`); `None`
+    /// leaves it unchanged.
+    pub status: Option<String>,
+    /// New recipient snapshot (re-captured when a send begins); `None` leaves
+    /// it unchanged.
+    pub total: Option<i64>,
 }
 
 /// One tag used by a server's messages, with its message count.
@@ -566,8 +586,9 @@ pub trait ServerStore: Send + Sync {
     ) -> Result<Subscription, StoreError>;
 
     // broadcast campaigns (tenant-scoped: RLS in Postgres)
-    /// Record a campaign in status `sending` (with `sent = 0`) and return it.
-    /// The background expansion attributes messages and advances progress.
+    /// Record a campaign in the status `new.status` selects (`draft`,
+    /// `scheduled` or `sending`), with `sent = 0`, and return it. The
+    /// background expansion attributes messages and advances progress.
     async fn create_campaign(&self, new: NewCampaign) -> Result<Campaign, StoreError>;
 
     /// One campaign by id, or `None` if it isn't the server's.
@@ -578,6 +599,31 @@ pub trait ServerStore: Send + Sync {
         &self,
         server_id: Id,
         stream_id: Id,
+    ) -> Result<Vec<Campaign>, StoreError>;
+
+    /// All of the server's campaigns (across every stream), newest first. The
+    /// server-level campaign index.
+    async fn list_server_campaigns(&self, server_id: Id) -> Result<Vec<Campaign>, StoreError>;
+
+    /// Apply `update` to a planned campaign's editable fields (subject, from,
+    /// bodies, name, scheduled_at, status). Returns the updated campaign, or
+    /// `None` if it isn't the server's. Callers gate this to `draft`/`scheduled`
+    /// campaigns; the store does not re-check the current status.
+    async fn update_campaign(
+        &self,
+        server_id: Id,
+        id: Id,
+        update: CampaignUpdate,
+    ) -> Result<Option<Campaign>, StoreError>;
+
+    /// Atomically claim the server's `scheduled` campaigns whose `scheduled_at`
+    /// is at or before `now`: flip each to `sending` and return the claimed
+    /// rows. A concurrent scheduler tick sees them already `sending`, so a
+    /// campaign is never double-claimed. Tenant-scoped (RLS in Postgres).
+    async fn claim_due_campaigns(
+        &self,
+        server_id: Id,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<Campaign>, StoreError>;
 
     /// Update a campaign's progress: set `sent`, `status`, and (when finished)
@@ -610,6 +656,12 @@ pub trait ServerStore: Send + Sync {
         server_id: Id,
         campaign_id: Id,
     ) -> Result<CampaignStats, StoreError>;
+
+    /// Every mail server across all tenants, ordered by id. The `servers` table
+    /// is plain config (not RLS), so this is a cross-tenant read — used by the
+    /// in-process scheduler to fan out over servers before entering each one's
+    /// tenant context.
+    async fn list_all_servers(&self) -> Result<Vec<Server>, StoreError>;
 }
 
 #[async_trait]
@@ -1203,6 +1255,81 @@ impl ServerStore for crate::store::MemoryStore {
         Ok(campaigns)
     }
 
+    async fn list_server_campaigns(&self, server_id: Id) -> Result<Vec<Campaign>, StoreError> {
+        let mut campaigns: Vec<Campaign> = self
+            .inner
+            .read()
+            .unwrap()
+            .campaigns
+            .values()
+            .filter(|c| c.server_id == server_id)
+            .cloned()
+            .collect();
+        campaigns.sort_by_key(|c| std::cmp::Reverse(c.id));
+        Ok(campaigns)
+    }
+
+    async fn update_campaign(
+        &self,
+        server_id: Id,
+        id: Id,
+        update: CampaignUpdate,
+    ) -> Result<Option<Campaign>, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let Some(campaign) = inner
+            .campaigns
+            .get_mut(&id)
+            .filter(|c| c.server_id == server_id)
+        else {
+            return Ok(None);
+        };
+        if let Some(name) = update.name {
+            campaign.name = name;
+        }
+        if let Some(subject) = update.subject {
+            campaign.subject = subject;
+        }
+        if let Some(from_address) = update.from_address {
+            campaign.from_address = from_address;
+        }
+        if let Some(html_body) = update.html_body {
+            campaign.html_body = html_body;
+        }
+        if let Some(text_body) = update.text_body {
+            campaign.text_body = text_body;
+        }
+        if let Some(scheduled_at) = update.scheduled_at {
+            campaign.scheduled_at = scheduled_at;
+        }
+        if let Some(status) = update.status {
+            campaign.status = status;
+        }
+        if let Some(total) = update.total {
+            campaign.total = total;
+        }
+        Ok(Some(campaign.clone()))
+    }
+
+    async fn claim_due_campaigns(
+        &self,
+        server_id: Id,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Campaign>, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let mut claimed = Vec::new();
+        for campaign in inner.campaigns.values_mut() {
+            if campaign.server_id == server_id
+                && campaign.status == "scheduled"
+                && campaign.scheduled_at.is_some_and(|at| at <= now)
+            {
+                campaign.status = "sending".into();
+                claimed.push(campaign.clone());
+            }
+        }
+        claimed.sort_by_key(|c| c.id);
+        Ok(claimed)
+    }
+
     async fn set_campaign_progress(
         &self,
         server_id: Id,
@@ -1314,6 +1441,10 @@ impl ServerStore for crate::store::MemoryStore {
             clicked,
             unsubscribed,
         })
+    }
+
+    async fn list_all_servers(&self) -> Result<Vec<Server>, StoreError> {
+        Ok(self.servers())
     }
 }
 

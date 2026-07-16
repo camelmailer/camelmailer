@@ -45,10 +45,10 @@ pub use org_sso::{
     OrgSsoConnectionUpdate, OrgSsoStore, SsoKind,
 };
 pub use server_store::{
-    ActivityEvent, ApiRequestFilter, ApiRequestRecord, CampaignStats, DeliveryRecord,
-    DeliveryStats, MessageFilter, MessageShare, MessageStats, NewApiRequest, NewLayout,
-    NewMessageShare, NewStream, NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter,
-    TagCount,
+    ActivityEvent, ApiRequestFilter, ApiRequestRecord, CampaignStats, CampaignUpdate,
+    DeliveryRecord, DeliveryStats, MessageFilter, MessageShare, MessageStats, NewApiRequest,
+    NewLayout, NewMessageShare, NewStream, NewTemplate, QueuedDomain, ServerContext, ServerStore,
+    StatsFilter, TagCount,
 };
 pub use store::{MemoryStore, Store};
 pub use template::{

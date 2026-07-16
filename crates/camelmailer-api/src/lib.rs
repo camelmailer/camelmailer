@@ -32,7 +32,7 @@ pub use oidc::build_oidc_router;
 pub use org_sso_login::build_org_sso_login_router;
 pub use saml::build_saml_router;
 pub use scim::build_scim_router;
-pub use server_api::build_server_router;
+pub use server_api::{build_server_router, run_campaign_scheduler, run_scheduler_tick};
 pub use share::build_share_router;
 pub use sso::{build_sso_router, GithubEmail, GithubOauth, GithubUser, HttpGithub};
 pub use tracking::{tracking_router, unsubscribe_router, TrackingState};

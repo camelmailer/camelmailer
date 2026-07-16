@@ -1213,6 +1213,8 @@ async fn campaign_stats_aggregate_over_attributed_messages() {
             html_body: Some("<p>x</p>".into()),
             text_body: None,
             total: 3,
+            status: "sending".into(),
+            scheduled_at: None,
         })
         .await
         .unwrap();
@@ -1295,6 +1297,135 @@ async fn campaign_stats_aggregate_over_attributed_messages() {
         .await
         .unwrap()
         .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn campaign_planning_lifecycle_and_scheduler_claim() {
+    use camelmailer_core::{CampaignUpdate, NewCampaign, NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    let stream = ServerStore::create_stream(
+        &f.store,
+        NewStream {
+            server_id: f.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // A draft (honors the provided status + no schedule).
+    let draft = f
+        .store
+        .create_campaign(NewCampaign {
+            server_id: f.server.id,
+            stream_id: stream.id,
+            name: Some("Draft".into()),
+            subject: Some("Hi".into()),
+            from_address: Some("news@org.example".into()),
+            html_body: Some("<p>x</p>".into()),
+            text_body: None,
+            total: 0,
+            status: "draft".into(),
+            scheduled_at: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(draft.status, "draft");
+    assert!(draft.scheduled_at.is_none());
+
+    // A scheduled campaign, due in the past.
+    let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let scheduled = f
+        .store
+        .create_campaign(NewCampaign {
+            server_id: f.server.id,
+            stream_id: stream.id,
+            name: Some("Scheduled".into()),
+            subject: Some("Hi".into()),
+            from_address: Some("news@org.example".into()),
+            html_body: Some("<p>x</p>".into()),
+            text_body: None,
+            total: 0,
+            status: "scheduled".into(),
+            scheduled_at: Some(past),
+        })
+        .await
+        .unwrap();
+    assert_eq!(scheduled.status, "scheduled");
+
+    // Editing the draft: change the subject and give it a schedule.
+    let later = chrono::Utc::now() + chrono::Duration::hours(1);
+    let edited = f
+        .store
+        .update_campaign(
+            f.server.id,
+            draft.id,
+            CampaignUpdate {
+                subject: Some(Some("Edited".into())),
+                scheduled_at: Some(Some(later)),
+                status: Some("scheduled".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited.subject.as_deref(), Some("Edited"));
+    assert_eq!(edited.status, "scheduled");
+    assert!(edited.scheduled_at.is_some());
+
+    // The server-level index returns both, newest first.
+    let all = f.store.list_server_campaigns(f.server.id).await.unwrap();
+    assert_eq!(all.len(), 2);
+
+    // Claiming due campaigns: only the past-due `scheduled` one, exactly once.
+    let claimed = f
+        .store
+        .claim_due_campaigns(f.server.id, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, scheduled.id);
+    assert_eq!(claimed[0].status, "sending");
+    // A second claim finds nothing (it is already `sending`).
+    let again = f
+        .store
+        .claim_due_campaigns(f.server.id, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert!(again.is_empty());
+
+    // Canceling the (future-scheduled) draft-turned-scheduled campaign: it is
+    // then never claimed even once its time arrives.
+    f.store
+        .update_campaign(
+            f.server.id,
+            edited.id,
+            CampaignUpdate {
+                status: Some("canceled".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let far_future = chrono::Utc::now() + chrono::Duration::days(1);
+    let due = f
+        .store
+        .claim_due_campaigns(f.server.id, far_future)
+        .await
+        .unwrap();
+    assert!(due.is_empty());
+
+    // list_all_servers is a cross-tenant read that includes this server.
+    let servers = f.store.list_all_servers().await.unwrap();
+    assert!(servers.iter().any(|s| s.id == f.server.id));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1987,9 +1987,27 @@ fn campaign_json(campaign: &Campaign) -> Value {
         "status": campaign.status,
         "total": campaign.total,
         "sent": campaign.sent,
+        "scheduled_at": campaign.scheduled_at,
         "created_at": campaign.created_at,
         "completed_at": campaign.completed_at,
     })
+}
+
+/// [`campaign_json`] enriched with the audience stream's `permalink`/`name` so
+/// the server-level campaign endpoints can show the target without a second
+/// lookup. `stream` is the campaign's resolved stream (may be absent if it was
+/// archived away).
+fn campaign_json_with_stream(campaign: &Campaign, stream: Option<&MessageStream>) -> Value {
+    let mut value = campaign_json(campaign);
+    let object = value.as_object_mut().expect("campaign_json is an object");
+    object.insert(
+        "stream".into(),
+        json!({
+            "permalink": stream.map(|s| s.permalink.clone()),
+            "name": stream.map(|s| s.name.clone()),
+        }),
+    );
+    value
 }
 
 fn campaign_stats_json(stats: &CampaignStats) -> Value {
@@ -2165,6 +2183,10 @@ async fn campaigns_create(
             html_body: body.html_body.clone(),
             text_body: body.text_body.clone(),
             total,
+            // The legacy stream-scoped route keeps its send-immediately
+            // behaviour; the server-level route is the planning surface.
+            status: "sending".into(),
+            scheduled_at: None,
         })
         .await
     {
@@ -2249,6 +2271,485 @@ async fn campaign_show(
         }),
     )
     .into_response()
+}
+
+// -------------------------------------------- server-level campaigns (planning)
+
+/// Statuses in which a campaign may still be edited, sent-now or canceled.
+fn campaign_is_planned(status: &str) -> bool {
+    matches!(status, "draft" | "scheduled")
+}
+
+/// Resolve the audience stream of a campaign by id (across the server's
+/// streams), for enriching the JSON with the target's permalink/name.
+async fn campaign_stream(
+    store: &Arc<dyn camelmailer_core::ServerStore>,
+    server_id: camelmailer_core::Id,
+    stream_id: camelmailer_core::Id,
+) -> Option<MessageStream> {
+    store
+        .list_streams(server_id)
+        .await
+        .ok()
+        .and_then(|streams| streams.into_iter().find(|s| s.id == stream_id))
+}
+
+/// Current opted-in subscriber count of a stream (the campaign audience size).
+async fn subscribed_count(
+    store: &Arc<dyn camelmailer_core::ServerStore>,
+    server_id: camelmailer_core::Id,
+    stream_id: camelmailer_core::Id,
+) -> Result<i64, StoreErrorResponse> {
+    store
+        .list_subscriptions(server_id, stream_id)
+        .await
+        .map(|subs| subs.iter().filter(|s| s.status == "subscribed").count() as i64)
+        .map_err(StoreErrorResponse)
+}
+
+/// Wrapper so `?` can bubble a store error out of the small helpers above into
+/// the handler's rendered 500.
+struct StoreErrorResponse(camelmailer_core::StoreError);
+
+#[derive(Debug, Deserialize)]
+struct CreateServerCampaign {
+    /// The audience: a broadcast stream permalink.
+    stream: Option<String>,
+    name: Option<String>,
+    /// Bare From address (the broadcast path authorizes its domain/sender).
+    from: Option<String>,
+    subject: Option<String>,
+    html_body: Option<String>,
+    text_body: Option<String>,
+    /// RFC 3339 send time; when present (and not `send_now`) the campaign is
+    /// scheduled and the in-process scheduler sends it when due.
+    scheduled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Send immediately on create (overrides `scheduled_at`).
+    #[serde(default)]
+    send_now: bool,
+}
+
+/// `GET /api/v2/server/campaigns` — every campaign of the server (across
+/// streams), newest first, each carrying its audience stream's permalink/name.
+async fn server_campaigns_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let campaigns = match store.list_server_campaigns(server.0.id).await {
+        Ok(campaigns) => campaigns,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    // Resolve stream metadata once and index it by id.
+    let streams = store.list_streams(server.0.id).await.unwrap_or_default();
+    let by_id: std::collections::HashMap<_, _> = streams.iter().map(|s| (s.id, s)).collect();
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "campaigns": campaigns
+                .iter()
+                .map(|c| campaign_json_with_stream(c, by_id.get(&c.stream_id).copied()))
+                .collect::<Vec<_>>(),
+        }),
+    )
+    .into_response()
+}
+
+/// `POST /api/v2/server/campaigns` — create a server-level campaign targeting a
+/// broadcast stream. `send_now` sends immediately (status `sending`), a
+/// `scheduled_at` schedules it (status `scheduled`), otherwise it is a `draft`.
+async fn server_campaigns_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Json(body): Json<CreateServerCampaign>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let Some(permalink) = body.stream.filter(|s| !s.is_empty()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::BAD_REQUEST,
+            "ParameterMissing",
+            "param is missing or the value is empty: stream",
+        )
+        .into_response();
+    };
+    // The stream must exist and be broadcast (422 otherwise).
+    let stream = match store.stream_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(stream)) => stream,
+        Ok(None) => {
+            return render_error(
+                Some(&start.0),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ValidationError",
+                &format!("Message stream {permalink:?} does not exist"),
+            )
+            .into_response()
+        }
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    if stream.stream_type != "broadcast" {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "campaigns can only target a broadcast stream",
+        )
+        .into_response();
+    }
+    let Some(from) = body.from.filter(|f| !f.is_empty()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::BAD_REQUEST,
+            "ParameterMissing",
+            "param is missing or the value is empty: from",
+        )
+        .into_response();
+    };
+
+    // Audience snapshot; also the `total` for a send-now campaign.
+    let total = match subscribed_count(store, server.0.id, stream.id).await {
+        Ok(total) => total,
+        Err(StoreErrorResponse(error)) => return internal_error(&start.0, &error.to_string()),
+    };
+
+    // Pick the initial lifecycle state: send-now wins, then a schedule, else a
+    // draft. Only send-now expands right away.
+    let (status, scheduled_at) = if body.send_now {
+        ("sending", None)
+    } else if let Some(at) = body.scheduled_at {
+        ("scheduled", Some(at))
+    } else {
+        ("draft", None)
+    };
+
+    let campaign = match store
+        .create_campaign(NewCampaign {
+            server_id: server.0.id,
+            stream_id: stream.id,
+            name: body.name.filter(|n| !n.is_empty()),
+            subject: body.subject.clone(),
+            from_address: Some(from),
+            html_body: body.html_body.clone(),
+            text_body: body.text_body.clone(),
+            total,
+            status: status.into(),
+            scheduled_at,
+        })
+        .await
+    {
+        Ok(campaign) => campaign,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+
+    // Only a send-now campaign expands on create; drafts/scheduled wait.
+    if body.send_now {
+        tokio::spawn(expand_campaign(
+            state.clone(),
+            server.0.clone(),
+            campaign.clone(),
+            permalink,
+        ));
+    }
+
+    render_success(
+        Some(&start.0),
+        StatusCode::CREATED,
+        json!({ "campaign": campaign_json_with_stream(&campaign, Some(&stream)) }),
+    )
+    .into_response()
+}
+
+/// `GET /api/v2/server/campaigns/{id}` — one campaign (+ audience stream) plus
+/// its aggregated analytics.
+async fn server_campaign_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<camelmailer_core::Id>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let campaign = match store.get_campaign(server.0.id, id).await {
+        Ok(Some(campaign)) => campaign,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    let stream = campaign_stream(store, server.0.id, campaign.stream_id).await;
+    let stats = match store.campaign_stats(server.0.id, id).await {
+        Ok(stats) => stats,
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({
+            "campaign": campaign_json_with_stream(&campaign, stream.as_ref()),
+            "stats": campaign_stats_json(&stats),
+        }),
+    )
+    .into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct UpdateCampaign {
+    #[serde(default, deserialize_with = "double_option")]
+    name: Option<Option<String>>,
+    from: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    subject: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    html_body: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    text_body: Option<Option<String>>,
+    /// Present (value or `null`) sets/clears the schedule; omitted leaves it.
+    /// Setting a time moves a draft to `scheduled`; clearing it drops back to
+    /// `draft`.
+    #[serde(default, deserialize_with = "double_option")]
+    scheduled_at: Option<Option<chrono::DateTime<chrono::Utc>>>,
+}
+
+/// `PATCH /api/v2/server/campaigns/{id}` — edit a `draft`/`scheduled` campaign.
+/// 422 once it is sending/sent/failed/canceled.
+async fn server_campaign_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<camelmailer_core::Id>,
+    Json(body): Json<UpdateCampaign>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let campaign = match store.get_campaign(server.0.id, id).await {
+        Ok(Some(campaign)) => campaign,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    if !campaign_is_planned(&campaign.status) {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            &format!("a {} campaign can no longer be edited", campaign.status),
+        )
+        .into_response();
+    }
+
+    // A schedule change also moves the status between draft and scheduled.
+    let status = match &body.scheduled_at {
+        Some(Some(_)) => Some("scheduled".to_string()),
+        Some(None) => Some("draft".to_string()),
+        None => None,
+    };
+    let update = camelmailer_core::CampaignUpdate {
+        name: body.name,
+        subject: body.subject,
+        from_address: body.from.filter(|f| !f.is_empty()).map(Some),
+        html_body: body.html_body,
+        text_body: body.text_body,
+        scheduled_at: body.scheduled_at,
+        status,
+        total: None,
+    };
+    match store.update_campaign(server.0.id, id, update).await {
+        Ok(Some(campaign)) => {
+            let stream = campaign_stream(store, server.0.id, campaign.stream_id).await;
+            render_success(
+                Some(&start.0),
+                StatusCode::OK,
+                json!({ "campaign": campaign_json_with_stream(&campaign, stream.as_ref()) }),
+            )
+            .into_response()
+        }
+        Ok(None) => not_found(&start.0),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// `POST /api/v2/server/campaigns/{id}/send` — send a `draft`/`scheduled`
+/// campaign now: re-snapshot `total`, flip to `sending`, spawn the expansion.
+/// 422 otherwise.
+async fn server_campaign_send(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<camelmailer_core::Id>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let campaign = match store.get_campaign(server.0.id, id).await {
+        Ok(Some(campaign)) => campaign,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    if !campaign_is_planned(&campaign.status) {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            &format!("a {} campaign cannot be sent", campaign.status),
+        )
+        .into_response();
+    }
+    let stream = match campaign_stream(store, server.0.id, campaign.stream_id).await {
+        Some(stream) => stream,
+        None => return internal_error(&start.0, "the campaign's audience stream is missing"),
+    };
+    // Re-snapshot the audience and flip to `sending` before expanding.
+    let total = match subscribed_count(store, server.0.id, stream.id).await {
+        Ok(total) => total,
+        Err(StoreErrorResponse(error)) => return internal_error(&start.0, &error.to_string()),
+    };
+    let update = camelmailer_core::CampaignUpdate {
+        status: Some("sending".into()),
+        total: Some(total),
+        ..Default::default()
+    };
+    let campaign = match store.update_campaign(server.0.id, id, update).await {
+        Ok(Some(campaign)) => campaign,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    tokio::spawn(expand_campaign(
+        state.clone(),
+        server.0.clone(),
+        campaign.clone(),
+        stream.permalink.clone(),
+    ));
+    render_success(
+        Some(&start.0),
+        StatusCode::OK,
+        json!({ "campaign": campaign_json_with_stream(&campaign, Some(&stream)) }),
+    )
+    .into_response()
+}
+
+/// `POST /api/v2/server/campaigns/{id}/cancel` — cancel a `draft`/`scheduled`
+/// campaign (status `canceled`). 422 otherwise.
+async fn server_campaign_cancel(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<camelmailer_core::Id>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let campaign = match store.get_campaign(server.0.id, id).await {
+        Ok(Some(campaign)) => campaign,
+        Ok(None) => return not_found(&start.0),
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    if !campaign_is_planned(&campaign.status) {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            &format!("a {} campaign cannot be canceled", campaign.status),
+        )
+        .into_response();
+    }
+    let update = camelmailer_core::CampaignUpdate {
+        status: Some("canceled".into()),
+        ..Default::default()
+    };
+    match store.update_campaign(server.0.id, id, update).await {
+        Ok(Some(campaign)) => {
+            let stream = campaign_stream(store, server.0.id, campaign.stream_id).await;
+            render_success(
+                Some(&start.0),
+                StatusCode::OK,
+                json!({ "campaign": campaign_json_with_stream(&campaign, stream.as_ref()) }),
+            )
+            .into_response()
+        }
+        Ok(None) => not_found(&start.0),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
+}
+
+/// How often the scheduler wakes to look for due campaigns.
+const SCHEDULER_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One scheduler pass: list every server (the `servers` table is plain config,
+/// so this is a cross-tenant read), and for each atomically claim its due
+/// `scheduled` campaigns (`claim_due_campaigns` flips them to `sending` inside
+/// the server's tenant context, so two passes never double-send) and await the
+/// shared [`expand_campaign`] for each. Resilient by design: a per-server or
+/// per-campaign error is logged and the pass moves on; it never panics. Public
+/// so the loop and the tests can drive a single deterministic pass.
+pub async fn run_scheduler_tick(state: &Arc<ApiState>) {
+    let Some(store) = state.server_store.clone() else {
+        return;
+    };
+    let servers = match store.list_all_servers().await {
+        Ok(servers) => servers,
+        Err(error) => {
+            tracing::warn!(%error, "campaign scheduler could not list servers");
+            return;
+        }
+    };
+    let now = chrono::Utc::now();
+    for server in servers {
+        let due = match store.claim_due_campaigns(server.id, now).await {
+            Ok(due) => due,
+            Err(error) => {
+                tracing::warn!(%error, server_id = server.id, "could not claim due campaigns");
+                continue;
+            }
+        };
+        for campaign in due {
+            // Resolve the audience stream permalink; skip (and mark failed) if
+            // it has gone missing.
+            let Some(stream) = campaign_stream(&store, server.id, campaign.stream_id).await else {
+                tracing::warn!(
+                    campaign_id = campaign.id,
+                    "scheduled campaign has no stream; marking failed"
+                );
+                let _ = store
+                    .set_campaign_progress(
+                        server.id,
+                        campaign.id,
+                        0,
+                        "failed",
+                        Some(chrono::Utc::now()),
+                    )
+                    .await;
+                continue;
+            };
+            expand_campaign(state.clone(), server.clone(), campaign, stream.permalink).await;
+        }
+    }
+}
+
+/// The in-process campaign scheduler. Runs inside the `web-server` process so a
+/// local install auto-sends scheduled campaigns without a separate worker: it
+/// drives [`run_scheduler_tick`] every [`SCHEDULER_TICK`].
+pub async fn run_campaign_scheduler(state: Arc<ApiState>) {
+    if state.server_store.is_none() {
+        tracing::info!("campaign scheduler disabled: no tenant-scoped store");
+        return;
+    }
+    tracing::info!("campaign scheduler started");
+    loop {
+        tokio::time::sleep(SCHEDULER_TICK).await;
+        run_scheduler_tick(&state).await;
+    }
 }
 
 // ------------------------------------------------------------ templates
@@ -3112,6 +3613,18 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
             get(campaigns_index).post(campaigns_create),
         )
         .route("/streams/{permalink}/campaigns/{id}", get(campaign_show))
+        // Server-level campaigns (the first-class planning surface). The
+        // stream-scoped routes above are kept for back-compat.
+        .route(
+            "/campaigns",
+            get(server_campaigns_index).post(server_campaigns_create),
+        )
+        .route(
+            "/campaigns/{id}",
+            get(server_campaign_show).patch(server_campaign_update),
+        )
+        .route("/campaigns/{id}/send", post(server_campaign_send))
+        .route("/campaigns/{id}/cancel", post(server_campaign_cancel))
         .route(
             "/streams/{permalink}/subscribers",
             get(subscribers_index).post(subscribers_create),

@@ -7,12 +7,12 @@
 
 use async_trait::async_trait;
 use camelmailer_core::{
-    store, token, ActivityEvent, AdminApiKey, AdminStore, Campaign, CampaignStats, Credential,
-    CredentialType, DeliveryRecord, Domain, DomainOwner, Id, IpAddress, IpPool, MessageFilter,
-    MessageRecord, MessageScope, MessageSink, NewCampaign, NewCredential, NewIpAddress,
-    NewOrganization, NewRoute, NewSenderAddress, NewServer, NewSuppression, NewUser, NewWebhook,
-    Organization, QueuedMessage, ResolvedRoute, Route, RouteMode, SenderAddress, Server,
-    ServerMode, Store, StoreError, Subscription, Suppression, User, Webhook,
+    store, token, ActivityEvent, AdminApiKey, AdminStore, Campaign, CampaignStats, CampaignUpdate,
+    Credential, CredentialType, DeliveryRecord, Domain, DomainOwner, Id, IpAddress, IpPool,
+    MessageFilter, MessageRecord, MessageScope, MessageSink, NewCampaign, NewCredential,
+    NewIpAddress, NewOrganization, NewRoute, NewSenderAddress, NewServer, NewSuppression, NewUser,
+    NewWebhook, Organization, QueuedMessage, ResolvedRoute, Route, RouteMode, SenderAddress,
+    Server, ServerMode, Store, StoreError, Subscription, Suppression, User, Webhook,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, QueryBuilder, Row};
@@ -249,6 +249,7 @@ fn campaign_from_row(row: &PgRow) -> Campaign {
         status: row.get("status"),
         total: row.get::<i32, _>("total") as i64,
         sent: row.get::<i32, _>("sent") as i64,
+        scheduled_at: row.get("scheduled_at"),
         created_at: row.get("created_at"),
         completed_at: row.get("completed_at"),
     }
@@ -2454,8 +2455,8 @@ impl camelmailer_core::ServerStore for PgStore {
         let row = sqlx::query(
             "INSERT INTO campaigns
                  (server_id, stream_id, name, subject, from_address, html_body,
-                  text_body, total)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                  text_body, total, status, scheduled_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              RETURNING *",
         )
         .bind(new.server_id as i64)
@@ -2466,6 +2467,8 @@ impl camelmailer_core::ServerStore for PgStore {
         .bind(&new.html_body)
         .bind(&new.text_body)
         .bind(new.total as i32)
+        .bind(&new.status)
+        .bind(new.scheduled_at)
         .fetch_one(&mut *tx)
         .await
         .map_err(Self::sqlx_error)?;
@@ -2501,6 +2504,115 @@ impl camelmailer_core::ServerStore for PgStore {
             .fetch_all(&mut *tx)
             .await
             .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(campaign_from_row).collect())
+    }
+
+    async fn list_server_campaigns(&self, server_id: Id) -> Result<Vec<Campaign>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        // RLS scopes the read to this server; no explicit server_id filter.
+        let rows = sqlx::query("SELECT * FROM campaigns ORDER BY created_at DESC, id DESC")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(campaign_from_row).collect())
+    }
+
+    async fn update_campaign(
+        &self,
+        server_id: Id,
+        id: Id,
+        update: CampaignUpdate,
+    ) -> Result<Option<Campaign>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        // No fields to change: return the current row (an empty SET is invalid
+        // SQL). RLS scopes the read to the tenant.
+        let has_updates = update.name.is_some()
+            || update.subject.is_some()
+            || update.from_address.is_some()
+            || update.html_body.is_some()
+            || update.text_body.is_some()
+            || update.scheduled_at.is_some()
+            || update.status.is_some()
+            || update.total.is_some();
+        if !has_updates {
+            let row = sqlx::query("SELECT * FROM campaigns WHERE id = $1")
+                .bind(id as i64)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(Self::sqlx_error)?;
+            tx.commit().await.map_err(Self::sqlx_error)?;
+            return Ok(row.as_ref().map(campaign_from_row));
+        }
+        // Build a targeted UPDATE from the provided fields only. RLS scopes the
+        // WHERE to the tenant, so a foreign id matches no row (returns None).
+        let mut builder = QueryBuilder::new("UPDATE campaigns SET ");
+        let mut sep = builder.separated(", ");
+        if let Some(name) = &update.name {
+            sep.push("name = ").push_bind_unseparated(name);
+        }
+        if let Some(subject) = &update.subject {
+            sep.push("subject = ").push_bind_unseparated(subject);
+        }
+        if let Some(from_address) = &update.from_address {
+            sep.push("from_address = ")
+                .push_bind_unseparated(from_address);
+        }
+        if let Some(html_body) = &update.html_body {
+            sep.push("html_body = ").push_bind_unseparated(html_body);
+        }
+        if let Some(text_body) = &update.text_body {
+            sep.push("text_body = ").push_bind_unseparated(text_body);
+        }
+        if let Some(scheduled_at) = &update.scheduled_at {
+            sep.push("scheduled_at = ")
+                .push_bind_unseparated(*scheduled_at);
+        }
+        if let Some(status) = &update.status {
+            sep.push("status = ").push_bind_unseparated(status);
+        }
+        if let Some(total) = &update.total {
+            sep.push("total = ").push_bind_unseparated(*total as i32);
+        }
+        builder.push(" WHERE id = ").push_bind(id as i64);
+        builder.push(" RETURNING *");
+        let row = builder
+            .build()
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(row.as_ref().map(campaign_from_row))
+    }
+
+    async fn claim_due_campaigns(
+        &self,
+        server_id: Id,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Campaign>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        // Flip every due scheduled campaign to `sending` in one statement and
+        // return the claimed rows, so a concurrent tick never double-claims.
+        let rows = sqlx::query(
+            "UPDATE campaigns SET status = 'sending'
+             WHERE status = 'scheduled' AND scheduled_at IS NOT NULL
+               AND scheduled_at <= $1
+             RETURNING *",
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
         tx.commit().await.map_err(Self::sqlx_error)?;
         Ok(rows.iter().map(campaign_from_row).collect())
     }
@@ -2622,6 +2734,16 @@ impl camelmailer_core::ServerStore for PgStore {
             clicked: clicked.get("clicked"),
             unsubscribed: unsubscribed.get("unsubscribed"),
         })
+    }
+
+    async fn list_all_servers(&self) -> Result<Vec<Server>, StoreError> {
+        // `servers` is plain config (not RLS): a cross-tenant read with no
+        // tenant context, for the scheduler to fan out over.
+        let rows = sqlx::query("SELECT * FROM servers ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(server_from_row).collect())
     }
 
     async fn tags(

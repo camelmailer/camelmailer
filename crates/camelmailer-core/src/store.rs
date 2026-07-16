@@ -375,7 +375,8 @@ impl MemoryStore {
         }
     }
 
-    /// Insert a campaign record (status `sending`, `sent = 0`) and return it.
+    /// Insert a campaign record (honoring `new.status`/`scheduled_at`, `sent =
+    /// 0`) and return it.
     pub fn insert_campaign(&self, new: crate::model::NewCampaign) -> crate::model::Campaign {
         let id = self.next_id();
         let campaign = crate::model::Campaign {
@@ -387,9 +388,10 @@ impl MemoryStore {
             from_address: new.from_address,
             html_body: new.html_body,
             text_body: new.text_body,
-            status: "sending".into(),
+            status: new.status,
             total: new.total,
             sent: 0,
+            scheduled_at: new.scheduled_at,
             created_at: Some(chrono::Utc::now()),
             completed_at: None,
         };
