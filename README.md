@@ -79,6 +79,16 @@ for the five-minute zero-to-first-mail walkthrough, and
 TLS, and the production checklist. Accounts, roles and SSO are covered in
 **[docs/authentication.md](docs/authentication.md)**.
 
+The full documentation lives in **[docs/](docs/README.md)**, with a guide
+per feature area: [sending](docs/sending.md), [message
+streams](docs/streams.md), [templates](docs/templates.md) and
+[tracking](docs/tracking.md); the marketing surface in
+[broadcast streams](docs/broadcast.md), [campaigns](docs/campaigns.md) and
+[suppressions](docs/suppressions.md); deliverability in
+[sending domains](docs/domains.md), [DMARC](docs/dmarc.md) and
+[IP pools](docs/deliverability.md); and integration through
+[inbound routing](docs/inbound.md) and [webhooks](docs/webhooks.md).
+
 ## How it's built
 
 Test-first, throughout: protocol state machines, storage traits with
