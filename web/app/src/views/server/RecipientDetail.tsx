@@ -7,8 +7,10 @@
 // and the suppression list.
 
 import { useMemo, useState } from "react"
+import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useQuery } from "@tanstack/react-query"
+import { type ColumnDef } from "@tanstack/react-table"
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -21,9 +23,11 @@ import { EmptyState } from "@/components/empty-state"
 import { MessagePill, messageStatus, statusDotClass } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
+import { DataTable } from "@/components/ui/data-table"
 import { cn } from "@/lib/utils"
 import { serverApi, type Message } from "@/lib/api"
-import { useServerMessagingApi } from "@/lib/api-p2"
+import { relativeTime } from "@/lib/api-p1"
+import { recipientHref, useServerMessagingApi } from "@/lib/api-p2"
 import { SendMessageButton } from "@/views/server/Messaging"
 
 type Api = ReturnType<typeof serverApi>
@@ -237,6 +241,136 @@ export function RecipientDetail({
         </>
       )}
       </div>
+    </Page>
+  )
+}
+
+// ---------------------------------------------------------------- list
+
+type RecipientRow = {
+  address: string
+  count: number
+  last: string
+  status: string
+  held: boolean
+}
+
+/// The standalone Recipients view (its own sidebar item, after Messaging):
+/// the distinct addresses this server has sent to recently, with a message
+/// count, latest status and last activity. Each row opens the recipient
+/// detail. Derived from the recent outgoing messages — the server API has no
+/// dedicated recipients endpoint.
+export function RecipientsList({ org, server }: { org: string; server: string }) {
+  const { api, isLoading } = useServerMessagingApi(org, server)
+  const messagesQuery = useQuery({
+    queryKey: ["recipients-list", org, server],
+    queryFn: () => api!.messages("?scope=outgoing&per_page=100"),
+    enabled: api !== null,
+  })
+
+  const rows = useMemo<RecipientRow[]>(() => {
+    const map = new Map<string, RecipientRow>()
+    for (const m of messagesQuery.data?.messages ?? []) {
+      const key = m.rcpt_to.toLowerCase()
+      const current = map.get(key)
+      if (!current) {
+        map.set(key, {
+          address: m.rcpt_to,
+          count: 1,
+          last: m.created_at,
+          status: m.status ?? "",
+          held: !!m.held,
+        })
+      } else {
+        current.count += 1
+        if (m.created_at > current.last) {
+          current.last = m.created_at
+          current.status = m.status ?? ""
+          current.held = !!m.held
+        }
+      }
+    }
+    return [...map.values()].sort((a, b) => b.last.localeCompare(a.last))
+  }, [messagesQuery.data])
+
+  const columns: ColumnDef<RecipientRow>[] = [
+    {
+      id: "address",
+      header: "Recipient",
+      accessorFn: (r) => r.address,
+      cell: ({ row }) => (
+        <Link
+          href={recipientHref(org, server, row.original.address)}
+          className="block max-w-[26rem] truncate font-medium transition-colors group-hover:text-primary hover:underline"
+        >
+          {row.original.address}
+        </Link>
+      ),
+    },
+    {
+      id: "messages",
+      header: "Messages",
+      accessorFn: (r) => r.count,
+      cell: ({ row }) => <span className="tabular-nums">{row.original.count}</span>,
+    },
+    {
+      id: "status",
+      header: "Last status",
+      accessorFn: (r) => r.status,
+      cell: ({ row }) => (
+        <MessagePill message={{ status: row.original.status, held: row.original.held }} />
+      ),
+    },
+    {
+      id: "last",
+      header: "Last activity",
+      accessorFn: (r) => r.last,
+      cell: ({ row }) => (
+        <span
+          className="whitespace-nowrap text-muted-foreground"
+          title={formatDate(row.original.last)}
+        >
+          {relativeTime(row.original.last)}
+        </span>
+      ),
+    },
+  ]
+
+  return (
+    <Page
+      variant="fill"
+      header={
+        <PageHeader
+          title="Recipients"
+          description="Everyone this server has sent to recently, with their latest delivery status."
+          className="mb-0"
+        />
+      }
+    >
+      {!api && !isLoading ? (
+        <EmptyState
+          icon={KeyRoundIcon}
+          title="Connect an API credential"
+          description="The recipient list talks to the server's own API. Create an API credential first, then come back here."
+          action={{
+            label: "Create API credential",
+            href: `/orgs/${org}/servers/${server}/credentials`,
+          }}
+        />
+      ) : (
+        <div className="flex min-h-0 flex-1 flex-col">
+          <DataTable
+            columns={columns}
+            data={rows}
+            loading={messagesQuery.isLoading || isLoading}
+            fillHeight
+            searchKeys={["address"]}
+            searchPlaceholder="Search recipients…"
+            emptyText="No recipients yet."
+            initialPageSize={20}
+          />
+        </div>
+      )}
     </Page>
   )
 }

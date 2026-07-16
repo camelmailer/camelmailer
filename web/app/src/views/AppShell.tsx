@@ -37,6 +37,7 @@ import {
   ServerIcon,
   SettingsIcon,
   ShieldCheckIcon,
+  UserIcon,
   UsersIcon,
   WebhookIcon,
 } from "lucide-react"
@@ -132,6 +133,7 @@ function serverAreas(base: string) {
   return [
     { href: base, label: "Dashboard", icon: GaugeIcon, match: "exact" as const },
     { href: `${base}/messaging`, label: "Messaging", icon: SendIcon, match: "prefix" as const },
+    { href: `${base}/recipients`, label: "Recipients", icon: UserIcon, match: "prefix" as const },
     { href: `${base}/streams`, label: "Streams", icon: LayersIcon, match: "prefix" as const },
     { href: `${base}/templates`, label: "Templates", icon: FileTextIcon, match: "prefix" as const },
     { href: `${base}/domains`, label: "Domains", icon: GlobeIcon, match: "prefix" as const },
