@@ -506,6 +506,16 @@ pub trait ServerStore: Send + Sync {
     /// not an error). Returns whether a token matched.
     async fn record_unsubscribe(&self, token: &str) -> Result<bool, StoreError>;
 
+    /// Act on an unsubscribe token presented by an automatic spam complaint
+    /// (ARF feedback loop): resolve it like [`Self::record_unsubscribe`], then
+    /// create a stream-scoped `complaint` suppression AND flip the matching
+    /// subscription to `unsubscribed` (idempotent — an existing suppression is
+    /// not an error). The token-keyed sibling of [`Self::record_complaint`],
+    /// used when the affected recipient is recovered from a report's embedded
+    /// `List-Unsubscribe` header rather than named directly. Returns whether a
+    /// token matched.
+    async fn record_complaint_by_token(&self, token: &str) -> Result<bool, StoreError>;
+
     // opt-in / consent (broadcast streams; tenant-scoped)
     /// The stream's subscription rows (opt-ins and opt-outs), ordered by id.
     async fn list_subscriptions(
@@ -1018,6 +1028,34 @@ impl ServerStore for crate::store::MemoryStore {
         }
         // Flip the opt-in to `unsubscribed` for the stream this token targets
         // (subscriptions always belong to a concrete stream).
+        if let Some(stream_id) = stream_id {
+            self.upsert_subscription(server_id, stream_id, &address, "unsubscribed")
+                .await?;
+        }
+        Ok(true)
+    }
+
+    async fn record_complaint_by_token(&self, token: &str) -> Result<bool, StoreError> {
+        let Some((server_id, stream_id, address)) = self.resolve_unsubscribe_token(token).await?
+        else {
+            return Ok(false);
+        };
+        // Idempotent: a duplicate stream-scoped suppression is not an error.
+        match self
+            .create_suppression(NewSuppression {
+                server_id,
+                suppression_type: "complaint".into(),
+                address: address.clone(),
+                reason: Some("Spam complaint (feedback loop)".into()),
+                stream_id,
+            })
+            .await
+        {
+            Ok(_) | Err(StoreError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
+        // Flip the opt-in closed for the stream this token targets (a
+        // subscription always belongs to a concrete stream).
         if let Some(stream_id) = stream_id {
             self.upsert_subscription(server_id, stream_id, &address, "unsubscribed")
                 .await?;
@@ -1684,6 +1722,50 @@ mod tests {
             ServerStore::address_suppressed(&store, 1, "c@dest.example", Some(7))
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn record_complaint_by_token_suppresses_and_opts_out() {
+        let store = MemoryStore::new();
+        // Opt in on the broadcast stream, then a feedback-loop complaint
+        // arrives carrying the recipient's unsubscribe token.
+        ServerStore::upsert_subscription(&store, 1, 7, "c@dest.example", "subscribed")
+            .await
+            .unwrap();
+        let token = ServerStore::create_unsubscribe_token(&store, 1, Some(7), "c@dest.example")
+            .await
+            .unwrap();
+
+        // A known token matches; an unknown token is a no-op returning false.
+        assert!(ServerStore::record_complaint_by_token(&store, &token)
+            .await
+            .unwrap());
+        assert!(!ServerStore::record_complaint_by_token(&store, "nope")
+            .await
+            .unwrap());
+        // Idempotent: recording the same token again is still Ok(true), no dup.
+        assert!(ServerStore::record_complaint_by_token(&store, &token)
+            .await
+            .unwrap());
+
+        // The recipient is now stream-suppressed as `complaint` and the opt-in
+        // is closed (is_subscribed reads false).
+        assert!(!ServerStore::is_subscribed(&store, 1, 7, "c@dest.example")
+            .await
+            .unwrap());
+        assert!(
+            ServerStore::address_suppressed(&store, 1, "c@dest.example", Some(7))
+                .await
+                .unwrap()
+        );
+        let suppressions = store.list_suppressions(1).await.unwrap();
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0].suppression_type, "complaint");
+        assert_eq!(suppressions[0].stream_id, Some(7));
+        assert_eq!(
+            suppressions[0].reason.as_deref(),
+            Some("Spam complaint (feedback loop)")
         );
     }
 

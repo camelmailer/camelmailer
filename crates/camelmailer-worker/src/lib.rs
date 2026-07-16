@@ -1,6 +1,7 @@
 //! CamelMailer delivery worker — the Rust port of `script/worker.rb`,
 //! `app/lib/message_dequeuer` and `app/senders`.
 
+pub mod arf;
 pub mod dkim;
 pub mod dmarc;
 pub mod inspection;

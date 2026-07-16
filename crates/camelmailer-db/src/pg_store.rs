@@ -2266,6 +2266,49 @@ impl camelmailer_core::ServerStore for PgStore {
         Ok(true)
     }
 
+    async fn record_complaint_by_token(&self, token: &str) -> Result<bool, StoreError> {
+        let Some((server_id, stream_id, address)) = self.resolve_unsubscribe_token(token).await?
+        else {
+            return Ok(false);
+        };
+        // Same tenant transaction writes both sides, mirroring record_unsubscribe
+        // but with a `complaint` suppression (the ARF feedback-loop reason).
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        // Idempotent stream-scoped suppression: ON CONFLICT DO NOTHING against
+        // the (server_id, address, COALESCE(stream_id, 0)) unique index.
+        sqlx::query(
+            "INSERT INTO suppressions (server_id, type, address, reason, stream_id)
+             VALUES ($1, 'complaint', $2, 'Spam complaint (feedback loop)', $3)
+             ON CONFLICT (server_id, address, COALESCE(stream_id, 0)) DO NOTHING",
+        )
+        .bind(server_id as i64)
+        .bind(&address)
+        .bind(stream_id.map(|id| id as i64))
+        .execute(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        // Flip the opt-in to `unsubscribed` for the targeted stream. Same tx.
+        if let Some(stream_id) = stream_id {
+            sqlx::query(
+                "INSERT INTO subscriptions (server_id, stream_id, address, status)
+                 VALUES ($1, $2, $3, 'unsubscribed')
+                 ON CONFLICT (server_id, stream_id, address)
+                 DO UPDATE SET status = 'unsubscribed'",
+            )
+            .bind(server_id as i64)
+            .bind(stream_id as i64)
+            .bind(&address)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        }
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(true)
+    }
+
     async fn list_subscriptions(
         &self,
         server_id: Id,

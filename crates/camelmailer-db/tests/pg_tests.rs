@@ -807,6 +807,93 @@ async fn stream_scoped_suppressions_and_unsubscribe_tokens() {
     assert_eq!(unsub[0].stream_id, Some(stream.id));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_complaint_by_token_suppresses_and_opts_out() {
+    use camelmailer_core::{NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    let stream = ServerStore::create_stream(
+        &f.store,
+        NewStream {
+            server_id: f.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Opt in on the broadcast stream, then a feedback-loop complaint arrives
+    // carrying the recipient's unsubscribe token.
+    ServerStore::upsert_subscription(
+        &f.store,
+        f.server.id,
+        stream.id,
+        "r@dest.example",
+        "subscribed",
+    )
+    .await
+    .unwrap();
+    let token = ServerStore::create_unsubscribe_token(
+        &f.store,
+        f.server.id,
+        Some(stream.id),
+        "r@dest.example",
+    )
+    .await
+    .unwrap();
+
+    // A known token matches and is idempotent; an unknown token is a no-op.
+    assert!(ServerStore::record_complaint_by_token(&f.store, &token)
+        .await
+        .unwrap());
+    assert!(ServerStore::record_complaint_by_token(&f.store, &token)
+        .await
+        .unwrap());
+    assert!(!ServerStore::record_complaint_by_token(&f.store, "nope")
+        .await
+        .unwrap());
+
+    // The recipient is stream-suppressed as `complaint` and opted out.
+    assert!(
+        !ServerStore::is_subscribed(&f.store, f.server.id, stream.id, "r@dest.example")
+            .await
+            .unwrap()
+    );
+    assert!(ServerStore::address_suppressed(
+        &f.store,
+        f.server.id,
+        "r@dest.example",
+        Some(stream.id)
+    )
+    .await
+    .unwrap());
+    // Scoped to the broadcast stream only — not server-wide.
+    assert!(
+        !ServerStore::address_suppressed(&f.store, f.server.id, "r@dest.example", None)
+            .await
+            .unwrap()
+    );
+
+    // The idempotent record left exactly one `complaint` suppression row.
+    let list = f.store.list_suppressions(f.server.id).await.unwrap();
+    let complaints: Vec<_> = list
+        .iter()
+        .filter(|s| s.suppression_type == "complaint")
+        .collect();
+    assert_eq!(complaints.len(), 1);
+    assert_eq!(complaints[0].stream_id, Some(stream.id));
+    assert_eq!(
+        complaints[0].reason.as_deref(),
+        Some("Spam complaint (feedback loop)")
+    );
+}
+
 // ------------------------------------------- subscriptions (phase 4, RLS)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

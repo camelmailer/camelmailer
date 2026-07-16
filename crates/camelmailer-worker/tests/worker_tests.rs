@@ -1806,3 +1806,127 @@ async fn unparseable_dmarc_route_messages_are_held_not_fatal() {
     let outcome = worker.process_next().await.unwrap().unwrap();
     assert_eq!(outcome, ProcessOutcome::DmarcReportIngested);
 }
+
+// ---------------------------------------- ARF ingestion (feedback loop)
+
+/// A raw inbound ARF report whose embedded original carries the given
+/// broadcast `List-Unsubscribe` token.
+fn arf_mail(token: &str) -> Vec<u8> {
+    format!(
+        "From: abuse@isp.example\r\n\
+         To: fbl@track.example.com\r\n\
+         Subject: FW: spam\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/report; report-type=\"feedback-report\";\r\n\
+         \tboundary=\"B\"\r\n\
+         \r\n\
+         --B\r\n\
+         Content-Type: text/plain\r\n\
+         \r\n\
+         This is an email abuse report.\r\n\
+         --B\r\n\
+         Content-Type: message/feedback-report\r\n\
+         \r\n\
+         Feedback-Type: abuse\r\n\
+         Version: 1\r\n\
+         Original-Rcpt-To: <r@dest.example>\r\n\
+         \r\n\
+         --B\r\n\
+         Content-Type: message/rfc822\r\n\
+         \r\n\
+         From: <broadcast@org.example>\r\n\
+         To: <r@dest.example>\r\n\
+         Subject: Newsletter\r\n\
+         List-Unsubscribe: <http://track.example.com/track/u/{token}>, <mailto:u@org.example>\r\n\
+         \r\n\
+         Spam spam spam\r\n\
+         --B--\r\n"
+    )
+    .into_bytes()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_arf_reports_record_a_stream_scoped_complaint() {
+    use camelmailer_core::{NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+
+    // A broadcast stream with an opted-in recipient and a one-click token.
+    let stream = ServerStore::create_stream(
+        &s.store,
+        NewStream {
+            server_id: s.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    ServerStore::upsert_subscription(
+        &s.store,
+        s.server.id,
+        stream.id,
+        "r@dest.example",
+        "subscribed",
+    )
+    .await
+    .unwrap();
+    let token = ServerStore::create_unsubscribe_token(
+        &s.store,
+        s.server.id,
+        Some(stream.id),
+        "r@dest.example",
+    )
+    .await
+    .unwrap();
+
+    // The ISP feedback loop delivers the ARF report as ordinary inbound mail.
+    let mut message = outgoing_message(s.server.id, "fbl@track.example.com");
+    message.scope = MessageScope::Incoming;
+    message.raw_message = arf_mail(&token);
+    let message_id = s.sink.insert_message(&message).await.unwrap();
+
+    let worker = Worker::new(&worker_config(1), s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::FeedbackReportIngested);
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+
+    // The recipient is now stream-suppressed as `complaint` and opted out.
+    assert!(
+        !ServerStore::is_subscribed(&s.store, s.server.id, stream.id, "r@dest.example")
+            .await
+            .unwrap()
+    );
+    assert!(ServerStore::address_suppressed(
+        &s.store,
+        s.server.id,
+        "r@dest.example",
+        Some(stream.id)
+    )
+    .await
+    .unwrap());
+
+    // The message was marked processed with the complaint noted.
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Processed");
+    let deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, message_id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert!(deliveries[0]
+        .details
+        .as_deref()
+        .unwrap_or_default()
+        .contains("spam complaint recorded"));
+}

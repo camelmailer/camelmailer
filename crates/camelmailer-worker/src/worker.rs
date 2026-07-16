@@ -42,6 +42,9 @@ pub enum ProcessOutcome {
     /// Incoming message parsed and stored as a DMARC aggregate report
     /// (route target `internal://dmarc-reports`).
     DmarcReportIngested,
+    /// Incoming message recognised as an ARF spam-complaint (feedback loop)
+    /// report and turned into a stream-scoped complaint for the recipient.
+    FeedbackReportIngested,
     /// Nothing to deliver (incoming without an endpoint, bounces).
     NothingToDo,
     /// The queued message no longer exists.
@@ -421,6 +424,14 @@ impl Worker {
                 .await?;
         }
 
+        // Feedback-loop (ARF) reports: an ISP delivers a spam complaint as a
+        // multipart/report; report-type=feedback-report. Recognise it by its
+        // envelope (content-based, independent of routing) and record a
+        // stream-scoped complaint for the recipient who complained.
+        if crate::arf::is_feedback_report(&message.raw_message) {
+            return self.ingest_feedback_report(queued, message).await;
+        }
+
         let route = match message.route_id {
             Some(route_id) => self
                 .store
@@ -566,6 +577,103 @@ impl Worker {
                     Ok(ProcessOutcome::Delayed { response })
                 }
             }
+        }
+    }
+
+    /// Parse an inbound message as an ARF feedback-loop (spam-complaint)
+    /// report and, when it is an abuse report that maps back to a broadcast
+    /// recipient, record a stream-scoped complaint (suppression + opt-out) for
+    /// that recipient. Parse failures / non-abuse reports hold the message
+    /// (like any undeliverable inbound mail); storage failures retry with
+    /// backoff. Mirrors [`Self::ingest_dmarc_report`]; never panics.
+    async fn ingest_feedback_report(
+        &self,
+        queued: &camelmailer_db::QueuedMessageRow,
+        message: &StoredMessage,
+    ) -> Result<ProcessOutcome, sqlx::Error> {
+        let report = match crate::arf::extract_feedback(&message.raw_message) {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(%error, message_id = message.id, "unparseable ARF report held");
+                self.queue.complete(queued.id).await?;
+                self.sink
+                    .record_delivery(
+                        message.server_id,
+                        message.id,
+                        "Held",
+                        "message could not be parsed as an ARF feedback report",
+                        &error.to_string(),
+                        false,
+                        None,
+                    )
+                    .await?;
+                return Ok(ProcessOutcome::Held);
+            }
+        };
+
+        // Only abuse reports that map back to a broadcast recipient (via the
+        // original message's List-Unsubscribe token) become complaints. A
+        // report without a usable token, or a non-abuse feedback type, is
+        // stored but actioned no further — like an accepted inbound with
+        // nothing to deliver.
+        let is_abuse = report.feedback_type == "abuse";
+        if let (true, Some(token)) = (is_abuse, report.unsubscribe_token.as_deref()) {
+            match camelmailer_core::ServerStore::record_complaint_by_token(&self.store, token).await
+            {
+                Ok(matched) => {
+                    self.queue.complete(queued.id).await?;
+                    let detail = if matched {
+                        "spam complaint recorded for the broadcast recipient".to_string()
+                    } else {
+                        "feedback report parsed; unsubscribe token did not match a recipient"
+                            .to_string()
+                    };
+                    self.sink
+                        .record_delivery(
+                            message.server_id,
+                            message.id,
+                            "Processed",
+                            &detail,
+                            "",
+                            false,
+                            None,
+                        )
+                        .await?;
+                    Ok(ProcessOutcome::FeedbackReportIngested)
+                }
+                Err(error) => {
+                    // storage trouble is transient — retry like a failing
+                    // endpoint instead of losing the complaint
+                    tracing::warn!(%error, message_id = message.id, "could not record feedback complaint");
+                    let response = format!("could not record the feedback complaint: {error}");
+                    if queued.attempts + 1 >= self.max_attempts {
+                        self.queue.complete(queued.id).await?;
+                        Ok(ProcessOutcome::Failed { response })
+                    } else {
+                        self.queue.retry(queued.id, queued.attempts).await?;
+                        Ok(ProcessOutcome::Delayed { response })
+                    }
+                }
+            }
+        } else {
+            // Recognised ARF, but nothing to action (non-abuse type, or no
+            // recoverable recipient token). Store and move on.
+            self.queue.complete(queued.id).await?;
+            self.sink
+                .record_delivery(
+                    message.server_id,
+                    message.id,
+                    "Processed",
+                    &format!(
+                        "feedback report ({}) recorded; no complaint actioned",
+                        report.feedback_type
+                    ),
+                    "",
+                    false,
+                    None,
+                )
+                .await?;
+            Ok(ProcessOutcome::FeedbackReportIngested)
         }
     }
 
