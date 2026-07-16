@@ -62,6 +62,7 @@ function Settings({ org, server }: { org: string; server: Server }) {
     delivery_hook_url: server.delivery_hook_url ?? "",
     inbound_domain: server.inbound_domain ?? "",
     spam_threshold: server.spam_threshold?.toString() ?? "",
+    broadcast_physical_address: server.broadcast_physical_address ?? "",
   })
   const [deleteOpen, setDeleteOpen] = useState(false)
   const pools = useQuery({ queryKey: ["admin", "ip-pools"], queryFn: adminApi.ipPools.list })
@@ -82,6 +83,9 @@ function Settings({ org, server }: { org: string; server: Server }) {
         ...(fields.inbound_domain ? { inbound_domain: fields.inbound_domain } : {}),
         ...(fields.spam_threshold
           ? { spam_threshold: Number(fields.spam_threshold) }
+          : {}),
+        ...(fields.broadcast_physical_address
+          ? { broadcast_physical_address: fields.broadcast_physical_address }
           : {}),
       }),
     onSuccess: () => {
@@ -173,6 +177,19 @@ function Settings({ org, server }: { org: string; server: Server }) {
               value={fields.spam_threshold}
               onChange={(e) => setFields({ ...fields, spam_threshold: e.target.value })}
               placeholder="5"
+            />
+          </Field>
+          <Field
+            label="Broadcast postal address"
+            span={6}
+            hint="Shown in the CAN-SPAM footer of every broadcast (marketing) message. Required by law for marketing mail."
+          >
+            <Input
+              value={fields.broadcast_physical_address}
+              onChange={(e) =>
+                setFields({ ...fields, broadcast_physical_address: e.target.value })
+              }
+              placeholder="Acme Inc, 123 Market Street, San Francisco, CA 94103"
             />
           </Field>
           <FormActions>
@@ -392,17 +409,25 @@ export function ServerDashboard({ org, server }: { org: string; server: string }
   }
 
   return (
-    <div className="space-y-6">
-      <PageHeader
-        title={record.name}
-        description={`${org} / ${server}`}
-        action={
-          <div className="flex items-center gap-2">
-            <Badge variant={record.mode === "Live" ? "default" : "secondary"}>{record.mode}</Badge>
-            {record.suspended && <Badge variant="destructive">suspended</Badge>}
-          </div>
-        }
-      />
+    <Page
+      variant="scroll"
+      header={
+        <PageHeader
+          title={record.name}
+          description={`${org} / ${server}`}
+          action={
+            <div className="flex items-center gap-2">
+              <Badge variant={record.mode === "Live" ? "default" : "secondary"}>
+                {record.mode}
+              </Badge>
+              {record.suspended && <Badge variant="destructive">suspended</Badge>}
+            </div>
+          }
+          className="mb-0"
+        />
+      }
+    >
+      <div className="space-y-6">
 
       <div className="grid grid-cols-2 gap-4 *:data-[slot=card]:bg-gradient-to-t *:data-[slot=card]:from-primary/5 *:data-[slot=card]:to-card *:data-[slot=card]:shadow-xs lg:grid-cols-4">
         <Card>
@@ -515,6 +540,7 @@ export function ServerDashboard({ org, server }: { org: string; server: string }
         <h2 className="mb-3 text-sm font-medium text-muted-foreground">Summary</h2>
         <ServerSummary org={org} server={server} />
       </div>
-    </div>
+      </div>
+    </Page>
   )
 }

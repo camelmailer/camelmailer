@@ -1715,6 +1715,9 @@ export function Suppressions({ org, server }: Scope) {
   const [reactivating, setReactivating] = useState<Suppression | null>(null)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: key })
   const rows: SuppressionWithDate[] = suppressions.data?.suppressions ?? []
+  // Maps a suppression's stream_id to its stream so the Scope column can
+  // name it (a null stream_id means the suppression is server-wide).
+  const streamMap = new Map((suppressions.data?.streams ?? []).map((s) => [s.id, s]))
 
   const create = useMutation({
     mutationFn: () =>
@@ -1752,6 +1755,18 @@ export function Suppressions({ org, server }: Scope) {
       accessorFn: (s) => s.type,
       filterFn: (row, _id, value) => row.original.type === value,
       cell: ({ row }) => <Badge variant="outline">{row.original.type}</Badge>,
+    },
+    {
+      id: "scope",
+      header: "Scope",
+      accessorFn: (s) =>
+        s.stream_id == null ? "All streams" : streamMap.get(s.stream_id)?.name ?? "Stream",
+      cell: ({ row }) => {
+        const sid = row.original.stream_id
+        if (sid == null) return <span className="text-muted-foreground">All streams</span>
+        const stream = streamMap.get(sid)
+        return <Badge variant="outline">{stream ? stream.name : `Stream #${sid}`}</Badge>
+      },
     },
     {
       id: "reason",

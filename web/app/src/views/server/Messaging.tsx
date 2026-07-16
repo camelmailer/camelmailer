@@ -1181,7 +1181,9 @@ function MessageDetailBody({ api, id }: { api: Api; id: number }) {
                 <div className="absolute right-2 top-2">
                   <CopyButton value={html} />
                 </div>
-                <pre className="overflow-auto rounded-md bg-muted p-3 text-xs">{html}</pre>
+                <pre className="overflow-x-hidden rounded-md bg-muted p-3 pr-10 text-xs whitespace-pre-wrap break-all">
+                  {html}
+                </pre>
               </div>
             ) : (
               <p className="text-sm text-muted-foreground">
@@ -2130,6 +2132,61 @@ export function StreamDetail({
   const stream = streams.data?.streams.find((s) => s.permalink === permalink)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-streams"] })
 
+  // Broadcast streams are marketing streams: surface the opt-outs suppressed
+  // on this stream (the management-API suppression list carries the scope).
+  const isBroadcast = stream?.stream_type === "broadcast"
+  const suppressions = useQuery({
+    queryKey: ["suppressions", org, server],
+    queryFn: () => adminApi.suppressions(org, server).list(),
+    enabled: isBroadcast,
+  })
+  const streamUnsubs = (suppressions.data?.suppressions ?? []).filter(
+    (s) => s.stream_id === stream?.id,
+  )
+
+  // Compliance: the server's postal address goes in the broadcast footer.
+  const serverRec = useQuery({
+    queryKey: ["server", org, server],
+    queryFn: () => adminApi.servers(org).get(server),
+    enabled: isBroadcast,
+  })
+  const hasAddress = !!serverRec.data?.server.broadcast_physical_address
+
+  // Opt-in subscribers (broadcast only): consent gate for marketing sends.
+  const subscribers = useQuery({
+    queryKey: ["sapi-subscribers", permalink],
+    queryFn: () => api.streams.subscribers(permalink).list(),
+    enabled: isBroadcast,
+  })
+  const subs = subscribers.data?.subscribers ?? []
+  const [newSub, setNewSub] = useState("")
+  const invalidateSubs = () =>
+    queryClient.invalidateQueries({ queryKey: ["sapi-subscribers", permalink] })
+  const addSub = useMutation({
+    mutationFn: () => api.streams.subscribers(permalink).add(newSub.trim()),
+    onSuccess: () => {
+      invalidateSubs()
+      setNewSub("")
+    },
+    onError: (err) => errorToast(err, "Could not add the subscriber"),
+  })
+  const removeSub = useMutation({
+    mutationFn: (address: string) => api.streams.subscribers(permalink).remove(address),
+    onSuccess: invalidateSubs,
+    onError: (err) => errorToast(err, "Could not remove the subscriber"),
+  })
+
+  // Reputation isolation: which IP pool this stream sends from.
+  const pools = useQuery({ queryKey: ["admin", "ip-pools"], queryFn: adminApi.ipPools.list })
+  const setPool = useMutation({
+    mutationFn: (ip_pool_id: number | null) => api.streams.update(permalink, { ip_pool_id }),
+    onSuccess: () => {
+      invalidate()
+      toast.success("Sending IP pool updated")
+    },
+    onError: (err) => errorToast(err, "Could not update the IP pool"),
+  })
+
   const archive = useMutation({
     mutationFn: () => api.streams.archive(permalink),
     onSuccess: () => {
@@ -2197,13 +2254,133 @@ export function StreamDetail({
         />
       }
     >
-      <div className="rounded-md border p-4">
-        <div className="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-2 text-sm">
-          <MetaRow label="Name" value={stream.name} />
-          <MetaRow label="Type" value={stream.stream_type} />
-          <MetaRow label="Permalink" value={stream.permalink} copy />
-          <MetaRow label="Status" value={stream.archived ? "Archived" : "Active"} />
+      <div className="space-y-4">
+        <div className="rounded-md border p-4">
+          <div className="grid grid-cols-[6rem_1fr] gap-x-3 gap-y-2 text-sm">
+            <MetaRow label="Name" value={stream.name} />
+            <MetaRow label="Type" value={stream.stream_type} />
+            <MetaRow label="Permalink" value={stream.permalink} copy />
+            <MetaRow label="Status" value={stream.archived ? "Archived" : "Active"} />
+          </div>
         </div>
+
+        <div className="rounded-md border p-4">
+          <h2 className="text-base font-semibold">Sending</h2>
+          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+            The IP pool this stream sends from. Broadcast streams should use a separate pool to
+            keep marketing reputation isolated from transactional mail.
+          </p>
+          <div className="mt-3 grid max-w-sm gap-2">
+            <Label>IP pool</Label>
+            <Select
+              value={stream.ip_pool_id?.toString() ?? "none"}
+              onValueChange={(v) => setPool.mutate(v === "none" ? null : Number(v))}
+              disabled={setPool.isPending}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">Server default pool</SelectItem>
+                {pools.data?.ip_pools.map((p) => (
+                  <SelectItem key={p.id} value={p.id.toString()}>
+                    {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        {isBroadcast && (
+          <>
+          <div className="rounded-md border p-4">
+            <h2 className="text-base font-semibold">Marketing stream</h2>
+            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+              Messages on this stream carry a one-click List-Unsubscribe header and a CAN-SPAM
+              footer (unsubscribe link + postal address). Recipients who unsubscribe are
+              suppressed on this stream only, so opt-outs here never block your transactional mail.
+            </p>
+            {!hasAddress && (
+              <p className="mt-3 rounded-md border border-amber-300/60 bg-amber-50 p-3 text-sm text-amber-900">
+                No broadcast postal address is set — required for CAN-SPAM.{" "}
+                <Link
+                  href={`/orgs/${org}/servers/${server}/settings`}
+                  className="font-medium underline underline-offset-2"
+                >
+                  Add one in Settings
+                </Link>
+                .
+              </p>
+            )}
+            <div className="mt-4 flex flex-wrap items-center gap-6">
+              <div>
+                <div className="text-2xl font-semibold tabular-nums">{streamUnsubs.length}</div>
+                <div className="text-xs text-muted-foreground">unsubscribed / suppressed</div>
+              </div>
+              <Button variant="outline" size="sm" asChild>
+                <Link href={`/orgs/${org}/servers/${server}/suppressions`}>
+                  View suppressions
+                </Link>
+              </Button>
+            </div>
+          </div>
+
+          <div className="rounded-md border p-4">
+            <h2 className="text-base font-semibold">Subscribers</h2>
+            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+              Broadcast messages may only be sent to opted-in subscribers. Add addresses here;
+              an unsubscribe removes consent automatically.
+            </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Input
+                value={newSub}
+                onChange={(e) => setNewSub(e.target.value)}
+                placeholder="subscriber@example.com"
+                className="h-8 max-w-xs"
+              />
+              <Button
+                size="sm"
+                onClick={() => addSub.mutate()}
+                disabled={!newSub.trim() || addSub.isPending}
+              >
+                Add subscriber
+              </Button>
+            </div>
+            <div className="mt-3">
+              {subscribers.isLoading ? (
+                <p className="text-sm text-muted-foreground">Loading…</p>
+              ) : subs.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No subscribers yet.</p>
+              ) : (
+                <ul className="divide-y">
+                  {subs.map((s) => (
+                    <li
+                      key={s.id}
+                      className="flex items-center justify-between gap-2 py-2 text-sm"
+                    >
+                      <span className="min-w-0 truncate">{s.address}</span>
+                      <span className="flex shrink-0 items-center gap-2">
+                        <Badge variant={s.status === "subscribed" ? "secondary" : "outline"}>
+                          {s.status}
+                        </Badge>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => removeSub.mutate(s.address)}
+                          disabled={removeSub.isPending}
+                        >
+                          Remove
+                        </Button>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+          </>
+        )}
       </div>
     </Page>
   )

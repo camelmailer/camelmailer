@@ -172,6 +172,8 @@ export type Server = {
   color: string | null
   ip_pool_id: number | null
   default_stream_id: number | null
+  // Physical postal address shown in the CAN-SPAM footer of broadcast mail.
+  broadcast_physical_address: string | null
 }
 
 /// Per-server 30-day message counters (GET .../servers/stats). `server`
@@ -270,6 +272,18 @@ export type Suppression = {
   type: string
   address: string
   reason: string | null
+  // null = server-wide (hard bounces, manual); a set id scopes the opt-out
+  // to one message stream (e.g. a broadcast unsubscribe).
+  stream_id: number | null
+}
+
+/// The stream lookup returned alongside a suppression list, so the UI can
+/// name each suppression's scope without a second (messaging-API) call.
+export type SuppressionStreamRef = {
+  id: number
+  name: string
+  permalink: string
+  stream_type: string
 }
 
 export type Invitation = {
@@ -454,6 +468,17 @@ export type Stream = {
   permalink: string
   stream_type: string
   archived: boolean
+  // Reputation isolation: the IP pool this stream sends from (null = the
+  // server's pool).
+  ip_pool_id: number | null
+}
+
+/// An opt-in subscriber of a (broadcast) stream.
+export type Subscription = {
+  id: number
+  address: string
+  status: "subscribed" | "unsubscribed"
+  created_at: string | null
 }
 
 export type Template = {
@@ -887,7 +912,11 @@ export const adminApi = {
     const base = `/api/v2/admin/organizations/${org}/servers/${server}/suppressions`
     return {
       list: () =>
-        api.get<{ suppressions: Suppression[]; pagination: Pagination }>(`${base}?per_page=100`),
+        api.get<{
+          suppressions: Suppression[]
+          streams: SuppressionStreamRef[]
+          pagination: Pagination
+        }>(`${base}?per_page=100`),
       create: (fields: { type: string; address: string; reason?: string }) =>
         api.post<{ suppression: Suppression }>(base, fields),
       delete: (address: string) =>
@@ -1014,6 +1043,26 @@ export function serverApi(key: string) {
         api.patch<{ stream: Stream }>(`/api/v2/server/streams/${permalink}`, fields, h),
       archive: (permalink: string) =>
         api.post<unknown>(`/api/v2/server/streams/${permalink}/archive`, {}, h),
+      // Opt-in subscribers of a (broadcast) stream: broadcast sends are only
+      // allowed to addresses with an active subscription here.
+      subscribers: (permalink: string) => ({
+        list: () =>
+          api.get<{ subscribers: Subscription[] }>(
+            `/api/v2/server/streams/${permalink}/subscribers`,
+            h,
+          ),
+        add: (address: string, status?: string) =>
+          api.post<{ subscriber: Subscription }>(
+            `/api/v2/server/streams/${permalink}/subscribers`,
+            { address, ...(status ? { status } : {}) },
+            h,
+          ),
+        remove: (address: string) =>
+          api.delete<{ deleted: boolean }>(
+            `/api/v2/server/streams/${permalink}/subscribers/${encodeURIComponent(address)}`,
+            h,
+          ),
+      }),
     },
     dmarc: {
       summary: (params = "") =>
