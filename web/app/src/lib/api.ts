@@ -1043,6 +1043,24 @@ export function serverApi(key: string) {
         api.patch<{ stream: Stream }>(`/api/v2/server/streams/${permalink}`, fields, h),
       archive: (permalink: string) =>
         api.post<unknown>(`/api/v2/server/streams/${permalink}/archive`, {}, h),
+      // Send the same content to every subscriber of a broadcast stream — each
+      // goes through the full broadcast path (opt-in gate, unsubscribe, footer).
+      campaign: (
+        permalink: string,
+        fields: {
+          from: string
+          subject?: string
+          html_body?: string
+          text_body?: string
+          template?: string
+          template_model?: unknown
+        },
+      ) =>
+        api.post<{ queued: number; skipped: number }>(
+          `/api/v2/server/streams/${permalink}/send`,
+          fields,
+          h,
+        ),
       // Opt-in subscribers of a (broadcast) stream: broadcast sends are only
       // allowed to addresses with an active subscription here.
       subscribers: (permalink: string) => ({
@@ -1055,6 +1073,20 @@ export function serverApi(key: string) {
           api.post<{ subscriber: Subscription }>(
             `/api/v2/server/streams/${permalink}/subscribers`,
             { address, ...(status ? { status } : {}) },
+            h,
+          ),
+        import: (addresses: string[]) =>
+          api.post<{ added: number; total: number }>(
+            `/api/v2/server/streams/${permalink}/subscribers/import`,
+            { addresses },
+            h,
+          ),
+        complaint: (address: string) =>
+          api.post<{ subscriber: Subscription }>(
+            `/api/v2/server/streams/${permalink}/subscribers/${encodeURIComponent(
+              address,
+            )}/complaint`,
+            {},
             h,
           ),
         remove: (address: string) =>

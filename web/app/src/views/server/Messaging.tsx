@@ -2175,6 +2175,52 @@ export function StreamDetail({
     onSuccess: invalidateSubs,
     onError: (err) => errorToast(err, "Could not remove the subscriber"),
   })
+  const complain = useMutation({
+    mutationFn: (address: string) => api.streams.subscribers(permalink).complaint(address),
+    onSuccess: () => {
+      invalidateSubs()
+      toast.success("Recorded as a spam complaint")
+    },
+    onError: (err) => errorToast(err, "Could not record the complaint"),
+  })
+  const [importText, setImportText] = useState("")
+  const importSubs = useMutation({
+    mutationFn: () =>
+      api.streams
+        .subscribers(permalink)
+        .import(
+          importText
+            .split(/[\s,;]+/)
+            .map((a) => a.trim())
+            .filter(Boolean),
+        ),
+    onSuccess: (data) => {
+      invalidateSubs()
+      setImportText("")
+      toast.success(`Added ${data.added} subscriber${data.added === 1 ? "" : "s"}`)
+    },
+    onError: (err) => errorToast(err, "Could not import subscribers"),
+  })
+
+  // Campaign: send the same content to every subscriber of this stream.
+  const [campaignOpen, setCampaignOpen] = useState(false)
+  const [campaign, setCampaign] = useState({ from: "", subject: "", html_body: "" })
+  const sendCampaign = useMutation({
+    mutationFn: () =>
+      api.streams.campaign(permalink, {
+        from: campaign.from,
+        subject: campaign.subject,
+        ...(campaign.html_body ? { html_body: campaign.html_body } : {}),
+      }),
+    onSuccess: (data) => {
+      toast.success(
+        `Campaign queued to ${data.queued} subscriber${data.queued === 1 ? "" : "s"}` +
+          (data.skipped ? ` (${data.skipped} over the cap skipped)` : ""),
+      )
+      setCampaignOpen(false)
+    },
+    onError: (err) => errorToast(err, "Could not send the campaign"),
+  })
 
   // Reputation isolation: which IP pool this stream sends from.
   const pools = useQuery({ queryKey: ["admin", "ip-pools"], queryFn: adminApi.ipPools.list })
@@ -2313,11 +2359,14 @@ export function StreamDetail({
                 .
               </p>
             )}
-            <div className="mt-4 flex flex-wrap items-center gap-6">
-              <div>
+            <div className="mt-4 flex flex-wrap items-center gap-4">
+              <div className="mr-2">
                 <div className="text-2xl font-semibold tabular-nums">{streamUnsubs.length}</div>
                 <div className="text-xs text-muted-foreground">unsubscribed / suppressed</div>
               </div>
+              <Button size="sm" onClick={() => setCampaignOpen(true)}>
+                <SendIcon className="size-4" /> Send campaign
+              </Button>
               <Button variant="outline" size="sm" asChild>
                 <Link href={`/orgs/${org}/servers/${server}/suppressions`}>
                   View suppressions
@@ -2347,6 +2396,27 @@ export function StreamDetail({
                 Add subscriber
               </Button>
             </div>
+            <div className="mt-3 grid gap-2">
+              <Label className="text-xs text-muted-foreground">
+                Import (one address per line or comma-separated)
+              </Label>
+              <Textarea
+                rows={3}
+                value={importText}
+                onChange={(e) => setImportText(e.target.value)}
+                placeholder={"a@example.com\nb@example.com"}
+                className="font-mono text-xs"
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                className="justify-self-start"
+                onClick={() => importSubs.mutate()}
+                disabled={!importText.trim() || importSubs.isPending}
+              >
+                Import subscribers
+              </Button>
+            </div>
             <div className="mt-3">
               {subscribers.isLoading ? (
                 <p className="text-sm text-muted-foreground">Loading…</p>
@@ -2364,6 +2434,16 @@ export function StreamDetail({
                         <Badge variant={s.status === "subscribed" ? "secondary" : "outline"}>
                           {s.status}
                         </Badge>
+                        {s.status === "subscribed" && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => complain.mutate(s.address)}
+                            disabled={complain.isPending}
+                          >
+                            Mark complaint
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -2382,6 +2462,55 @@ export function StreamDetail({
           </>
         )}
       </div>
+
+      <Dialog open={campaignOpen} onOpenChange={setCampaignOpen}>
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Send campaign</DialogTitle>
+          </DialogHeader>
+          <div className="grid gap-4">
+            <p className="text-sm text-muted-foreground">
+              Sends this message to all {subs.filter((s) => s.status === "subscribed").length}{" "}
+              subscriber(s) of this stream. Every copy carries the unsubscribe footer and header.
+            </p>
+            <div className="grid gap-2">
+              <Label>From</Label>
+              <Input
+                value={campaign.from}
+                onChange={(e) => setCampaign({ ...campaign, from: e.target.value })}
+                placeholder="news@yourdomain.com"
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label>Subject</Label>
+              <Input
+                value={campaign.subject}
+                onChange={(e) => setCampaign({ ...campaign, subject: e.target.value })}
+              />
+            </div>
+            <div className="grid gap-2">
+              <Label>HTML body</Label>
+              <Textarea
+                rows={8}
+                value={campaign.html_body}
+                onChange={(e) => setCampaign({ ...campaign, html_body: e.target.value })}
+                className="font-mono text-xs"
+              />
+            </div>
+            <Button
+              className="justify-self-start"
+              onClick={() => sendCampaign.mutate()}
+              disabled={
+                sendCampaign.isPending || !campaign.from.includes("@") || !campaign.subject.trim()
+              }
+            >
+              {sendCampaign.isPending
+                ? "Sending…"
+                : `Send to ${subs.filter((s) => s.status === "subscribed").length} subscribers`}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </Page>
   )
 }
