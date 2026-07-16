@@ -2199,16 +2199,14 @@ export function StreamDetail({
     onError: (err) => errorToast(err, "Could not import subscribers"),
   })
 
-  // Reputation isolation: which IP pool this stream sends from.
+  // Reputation isolation: which IP pool this stream sends from. The pool is
+  // shown in the header and edited in the stream dialog (below).
   const pools = useQuery({ queryKey: ["admin", "ip-pools"], queryFn: adminApi.ipPools.list })
-  const setPool = useMutation({
-    mutationFn: (ip_pool_id: number | null) => api.streams.update(permalink, { ip_pool_id }),
-    onSuccess: () => {
-      invalidate()
-      toast.success("Sending IP pool updated")
-    },
-    onError: (err) => errorToast(err, "Could not update the IP pool"),
-  })
+  const poolName =
+    stream?.ip_pool_id == null
+      ? "Server default pool"
+      : (pools.data?.ip_pools.find((p) => p.id === stream.ip_pool_id)?.name ??
+        `Pool #${stream.ip_pool_id}`)
 
   const archive = useMutation({
     mutationFn: () => api.streams.archive(permalink),
@@ -2219,15 +2217,21 @@ export function StreamDetail({
     onError: (err) => errorToast(err, "Could not archive the stream"),
   })
 
-  // Edit the stream's name/type/status in a dialog (permalink is immutable).
+  // Edit the stream's name/type/status/IP pool in a dialog (permalink is immutable).
   const [editOpen, setEditOpen] = useState(false)
-  const [edit, setEdit] = useState({ name: "", stream_type: "", archived: false })
+  const [edit, setEdit] = useState({
+    name: "",
+    stream_type: "",
+    archived: false,
+    ip_pool_id: null as number | null,
+  })
   const saveEdit = useMutation({
     mutationFn: () =>
       api.streams.update(permalink, {
         name: edit.name,
         stream_type: edit.stream_type,
         archived: edit.archived,
+        ip_pool_id: edit.ip_pool_id,
       }),
     onSuccess: () => {
       invalidate()
@@ -2271,7 +2275,9 @@ export function StreamDetail({
           description={
             <span className="flex flex-wrap items-center gap-2">
               <StatusPill status={stream.archived ? "Archived" : "Active"} />
-              <span>{stream.stream_type} · {stream.permalink}</span>
+              <span>
+                {stream.stream_type} · {stream.permalink} · {poolName}
+              </span>
             </span>
           }
           action={
@@ -2285,6 +2291,11 @@ export function StreamDetail({
                   <MailIcon className="size-4" /> View messages in this stream
                 </Link>
               </Button>
+              <Button variant="outline" size="sm" asChild>
+                <Link href={`/orgs/${org}/servers/${server}/suppressions`}>
+                  View suppressions
+                </Link>
+              </Button>
               <Button
                 variant="outline"
                 size="sm"
@@ -2293,6 +2304,7 @@ export function StreamDetail({
                     name: stream.name,
                     stream_type: stream.stream_type,
                     archived: stream.archived,
+                    ip_pool_id: stream.ip_pool_id ?? null,
                   })
                   setEditOpen(true)
                 }}
@@ -2315,34 +2327,6 @@ export function StreamDetail({
       }
     >
       <div className="space-y-4">
-        <div className="rounded-md border p-4">
-          <h2 className="text-base font-semibold">Sending</h2>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-            The IP pool this stream sends from. Broadcast streams should use a separate pool to
-            keep marketing reputation isolated from transactional mail.
-          </p>
-          <div className="mt-3 grid max-w-sm gap-2">
-            <Label>IP pool</Label>
-            <Select
-              value={stream.ip_pool_id?.toString() ?? "none"}
-              onValueChange={(v) => setPool.mutate(v === "none" ? null : Number(v))}
-              disabled={setPool.isPending}
-            >
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="none">Server default pool</SelectItem>
-                {pools.data?.ip_pools.map((p) => (
-                  <SelectItem key={p.id} value={p.id.toString()}>
-                    {p.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        </div>
-
         {isBroadcast && (
           <>
           <div className="rounded-md border p-4">
@@ -2364,21 +2348,9 @@ export function StreamDetail({
                 .
               </p>
             )}
-            <div className="mt-4 flex flex-wrap items-center gap-4">
-              <div className="mr-2">
-                <div className="text-2xl font-semibold tabular-nums">{streamUnsubs.length}</div>
-                <div className="text-xs text-muted-foreground">unsubscribed / suppressed</div>
-              </div>
-              <Button size="sm" asChild>
-                <Link href={`/orgs/${org}/servers/${server}/campaigns/new`}>
-                  <SendIcon className="size-4" /> New campaign
-                </Link>
-              </Button>
-              <Button variant="outline" size="sm" asChild>
-                <Link href={`/orgs/${org}/servers/${server}/suppressions`}>
-                  View suppressions
-                </Link>
-              </Button>
+            <div className="mt-4">
+              <div className="text-2xl font-semibold tabular-nums">{streamUnsubs.length}</div>
+              <div className="text-xs text-muted-foreground">unsubscribed / suppressed</div>
             </div>
           </div>
 
@@ -2513,6 +2485,31 @@ export function StreamDetail({
                   <SelectItem value="archived">Archived</SelectItem>
                 </SelectContent>
               </Select>
+            </div>
+            <div className="grid gap-2">
+              <Label>IP pool</Label>
+              <Select
+                value={edit.ip_pool_id?.toString() ?? "none"}
+                onValueChange={(v) =>
+                  setEdit({ ...edit, ip_pool_id: v === "none" ? null : Number(v) })
+                }
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">Server default pool</SelectItem>
+                  {pools.data?.ip_pools.map((p) => (
+                    <SelectItem key={p.id} value={p.id.toString()}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Broadcast streams should use a separate pool to keep marketing reputation
+                isolated from transactional mail.
+              </p>
             </div>
             <div className="grid gap-2">
               <Label>Permalink</Label>
