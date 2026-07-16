@@ -15,6 +15,58 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-16
+
+### Added
+
+- **Broadcast (marketing) message streams.** A stream typed `broadcast`
+  now enforces the four things marketing mail needs, while `transactional`
+  and `inbound` streams keep their existing behavior:
+  - **One-click unsubscribe** (RFC 8058): every broadcast message carries a
+    `List-Unsubscribe` header (a signed `https://…/track/u/{token}` URL plus
+    a `mailto:`) and `List-Unsubscribe-Post: List-Unsubscribe=One-Click`.
+    The public endpoint records the opt-out as a suppression scoped to that
+    stream only, so a marketing opt-out never blocks transactional mail.
+  - **Stream-scoped suppressions**: `suppressions.stream_id` distinguishes
+    server-wide suppressions (hard bounces, manual entries) from per-stream
+    opt-outs; the send gate blocks an address when a suppression matches
+    `stream_id IS NULL` or the message's stream.
+  - **CAN-SPAM compliance footer** built from a per-server
+    `broadcast_physical_address`, appended to the HTML and text bodies with
+    a visible unsubscribe link.
+  - **Opt-in subscribers**: a `subscriptions` table keyed by
+    `(server_id, stream_id, address)` with a `subscribed | unsubscribed`
+    status; broadcast sends to a non-subscribed address are rejected with
+    `422`. Manage subscribers (add, import, remove) from the stream view.
+  - **Per-stream IP pool** (`message_streams.ip_pool_id`) so broadcast mail
+    sends from its own pool and keeps its reputation isolated. The worker
+    resolves the stream pool first, then the server pool.
+- **Campaigns.** A first-class entity to plan, schedule and send a
+  broadcast to a stream's subscribers: draft, schedule for later (an
+  in-process scheduler claims due campaigns per tenant), async expansion
+  into one message per subscriber tagged with the `campaign_id`,
+  per-campaign analytics, and cancel.
+- **Automatic complaint ingestion (FBL/ARF)**: abuse reports are parsed
+  into `complaint` suppressions and flip the matching subscriber to
+  `unsubscribed`.
+- **Documentation**: a full set of feature guides under `docs/`
+  (sending, message streams, broadcast, campaigns, suppressions, templates,
+  sending domains, inbound routing, webhooks, tracking and deliverability),
+  plus a documentation index.
+
+### Changed
+
+- **Stream detail** now surfaces the IP pool in the header and edits it in
+  the stream dialog, keeps the suppressions link in the header, and moves
+  campaigns into their own area.
+- **Green "Active" status pills** across the resource tables and detail
+  headers, with a shared `statusTone` mapping.
+- **Sidebar organization switcher** moved into the sidebar and reworked as
+  a lightbox that holds the organizations table (name, role, server count,
+  search); the account menu was restructured (My Account, billing portal,
+  admin, docs, changelog).
+- **Recipients** are now a standalone sidebar view alongside Messaging.
+
 ## [0.4.1] - 2026-07-12
 
 ### Fixed
