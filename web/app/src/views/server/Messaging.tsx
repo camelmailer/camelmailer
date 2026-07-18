@@ -322,7 +322,7 @@ function SentFlow({
           : "Queued for delivery. This updates automatically as it goes out."
 
   return (
-    <div className="grid gap-4">
+    <div className="grid min-w-0 gap-4">
       <div className="flex items-start gap-3 rounded-lg border p-4">
         <StatusIcon className={cn("mt-0.5 size-5 shrink-0", iconClass)} />
         <div className="min-w-0">
@@ -365,7 +365,7 @@ function SentFlow({
         ) : (
           <div className="grid gap-2">
             {deliveries.map((delivery) => (
-              <div key={delivery.id} className="rounded-md border p-2 text-xs">
+              <div key={delivery.id} className="min-w-0 rounded-md border p-2 text-xs">
                 <div className="flex flex-wrap items-center gap-2">
                   <MessagePill message={{ status: delivery.status, held: false }} />
                   <span className="text-muted-foreground">{formatDate(delivery.timestamp)}</span>
@@ -373,7 +373,7 @@ function SentFlow({
                 </div>
                 {delivery.details && <p className="mt-1.5">{delivery.details}</p>}
                 {delivery.output && (
-                  <pre className="mt-1.5 overflow-x-auto rounded bg-muted p-2 font-mono">
+                  <pre className="mt-1.5 overflow-x-auto rounded bg-muted p-2 font-mono whitespace-pre-wrap break-all">
                     {delivery.output}
                   </pre>
                 )}
