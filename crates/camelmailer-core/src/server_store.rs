@@ -462,10 +462,8 @@ pub trait ServerStore: Send + Sync {
     ) -> Result<(), StoreError>;
     /// Fetch a layout's logo by the layout's public `uuid`, for the
     /// unauthenticated serve endpoint (layouts are not under RLS).
-    async fn layout_logo(
-        &self,
-        layout_uuid: &str,
-    ) -> Result<Option<(Vec<u8>, String)>, StoreError>;
+    async fn layout_logo(&self, layout_uuid: &str)
+        -> Result<Option<(Vec<u8>, String)>, StoreError>;
 
     // DMARC aggregate reports (tenant-scoped: RLS in Postgres)
     /// Persist one parsed aggregate report with all its rows.

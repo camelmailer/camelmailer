@@ -3,8 +3,7 @@
 
 use camelmailer_api::{
     build_assets_router, build_auth_router, build_oidc_router, build_org_sso_login_router,
-    build_router,
-    build_saml_router, build_scim_router, build_server_router, build_share_router,
+    build_router, build_saml_router, build_scim_router, build_server_router, build_share_router,
     build_sso_router, cors_layer, run_campaign_scheduler, tracking_router, unsubscribe_router,
     ApiState, TrackingState,
 };

@@ -3738,7 +3738,10 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/inbound/{id}/retry", post(inbound_retry))
         .route("/templates", get(templates_index).post(templates_create))
         .route("/layouts", get(layouts_index).post(layouts_create))
-        .route("/layouts/{permalink}/logo", axum::routing::post(layout_logo_upload))
+        .route(
+            "/layouts/{permalink}/logo",
+            axum::routing::post(layout_logo_upload),
+        )
         .route(
             "/layouts/{permalink}",
             get(layout_show).patch(layout_update).delete(layout_destroy),
