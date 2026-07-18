@@ -110,6 +110,38 @@ GET /api/v2/server/dmarc/reports/{id}
 
 `from`/`to` select reports whose date range **overlaps** the window.
 
-The dashboard's **DMARC** tab per server combines all of it: pick a
-domain, see the health traffic lights, the compliance summary and the
-sources table, and follow the setup hint until reports flow.
+## 4. The compliance dashboard
+
+The dashboard's **DMARC** tab per server combines all of it. Pick a domain
+and the page shows, from top to bottom: the overall traffic light with the
+`next_step` hint, the SPF/DKIM/DMARC health cards with a **Re-check**
+button that re-runs the live DNS lookup, and, once reports have arrived,
+the compliance view built from the stored aggregate records.
+
+The compliance view leads with three rates over the selected window:
+
+- **Compliance rate** is the share of covered volume that is not a threat,
+  that is `(volume − threat) / volume`.
+- **SPF rate** and **DKIM rate** are the shares of volume that align on SPF
+  and on DKIM respectively.
+
+Below the rates, every sending source (a source IP with its resolved
+identity) is grouped and classified into one of four categories by how it
+aligns:
+
+| Category | Alignment | What it means |
+|---|---|---|
+| **Compliant** | DKIM and SPF both align | Your own authorized mail. |
+| **Forwarded** | DKIM aligns, SPF does not | Legitimate mail that lost SPF in transit (mailing lists, forwarders); DKIM still carries it. |
+| **Non-compliant** | SPF aligns, DKIM does not | Authorized by IP but unsigned; usually a sender you still need to set up DKIM for. |
+| **Threat / Unknown** | neither aligns | Mail you did not authenticate, including potential spoofing. |
+
+A row of category chips (each with its volume) filters the sources table,
+and a daily series charts volume by category over the window so you can
+watch compliance climb as you bring sources into alignment.
+
+When no inbound route feeds `internal://dmarc-reports` yet, the tab offers
+a **one-click action to create that route** for the selected domain (the
+same route described in section 2, `name: "dmarc"`, `mode: "Endpoint"`,
+`endpoint_url: "internal://dmarc-reports"`). Publish the matching `rua=`
+address and reports start flowing into this view.

@@ -185,6 +185,67 @@ so the editor blocks saving until a raw placeholder is present. The wrapper
 sees the same model as the template plus the injected `content`, so it can
 use variables such as `product` and `unsubscribe_url` too.
 
+### The visual layout editor
+
+The dashboard builds the wrapper for you. Open **Layouts** from the
+Templates page, and each layout has a full-page editor with a **Design**
+switch between two modes and a live preview of a sample mail wrapped by the
+layout:
+
+- **Editor** mode assembles a branded 560px shell from a few fields:
+  - a **logo** you upload (PNG, JPG, SVG, GIF or WebP, up to 1 MB) with an
+    adjustable height, or a **brand text** header when no logo is set (the
+    brand text may contain variables such as `{{ product }}`),
+  - a **color scheme** applied to every mail that uses the layout:
+    **Primary** (the header bar, buttons and links), **Background** (the
+    page behind the card) and **Text** (the body text color),
+  - a **font family** from a set of email-safe stacks (system sans,
+    Helvetica / Arial, Georgia, Verdana, Trebuchet, Courier),
+  - a shared **footer** that also accepts variables (for example
+    `{{ unsubscribe_url }}`).
+- **HTML** mode is the expert escape hatch: edit the `html_wrapper` and an
+  optional plain-text wrapper directly. The editor still blocks saving
+  until a raw `{{{ content }}}` (or `{{& content }}`) placeholder is
+  present.
+
+A layout built in the Editor carries an invisible marker comment, so
+re-opening it rebuilds the field editor exactly. A wrapper you hand-write
+in HTML mode has no marker and opens in HTML mode.
+
+### The logo is a served asset
+
+The uploaded logo is stored in Postgres on the layout row (`logo` bytes
+plus `logo_content_type`) and served by a public endpoint, so real mail
+references an absolute URL that survives in mail clients rather than an
+inline `data:` URI:
+
+```
+GET /assets/layouts/{uuid}/logo
+```
+
+When you pick a logo, the editor previews it locally as a `data:` URI. On
+save it is uploaded to `POST /api/v2/server/layouts/{permalink}/logo`
+(which returns the served `{ "url": … }`), and the wrapper is rewritten to
+point at that URL before the layout is stored. A logo image over 1 MB is
+rejected with `422 ValidationError`.
+
+### Managing layouts with the API
+
+Layouts live under the Server API alongside templates:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v2/server/layouts` | List layouts |
+| `POST` | `/api/v2/server/layouts` | Create a layout (`name`, `html_wrapper`, optional `text_wrapper`) |
+| `GET` | `/api/v2/server/layouts/{permalink}` | Show one layout |
+| `PATCH` | `/api/v2/server/layouts/{permalink}` | Update a layout |
+| `DELETE` | `/api/v2/server/layouts/{permalink}` | Delete a layout |
+| `POST` | `/api/v2/server/layouts/{permalink}/logo` | Upload the logo image, returns the served URL |
+| `GET` | `/assets/layouts/{uuid}/logo` | Public: serve the stored logo image |
+
+A template points at a layout by permalink through the `layout` field on
+create and update; the stored template keeps the resolved `layout_id`.
+
 ## The template library
 
 CamelMailer bundles **20 production-ready transactional templates** in the
@@ -302,13 +363,42 @@ curl -X POST "$API/api/v2/admin/organizations/acme/servers/production/templates/
 Under **Server → Messaging → Templates** you get the gallery of thumbnails,
 each with its name, permalink and a Published or Archived pill. From here:
 
-- **New template** and **Edit** open a focus-mode split editor where you
-  write the subject, HTML and text bodies and preview the live render.
+- **New template** and **Edit** open the full-page editor described below.
 - **Copy to server…** pushes the template to another server of the same
   organization.
 - **Archive** retires a published template.
-- **Layouts** and **Start from library** open the wrappers manager and the
+- **Layouts** and **Start from library** open the layouts manager and the
   bundled-template wizard.
+
+#### The block editor
+
+The editor puts the content on the left and a live preview on the right.
+Above both sit the identity and envelope fields (name/slug, subject, a
+preview-only From and preview text) and the **Layout** picker that chooses
+the wrapping [layout](#layouts). The **Content** area has three modes:
+
+- **Editor** is a block builder. A palette adds blocks of nine kinds:
+  **Heading**, **Subheading**, **Text**, **Button**, **Image**, **List**,
+  **Divider**, **Spacer** and **Footer**. Drag a block by its handle, or
+  use the up/down controls, to reorder; delete it with the trash control.
+  Each block has its own fields: a button takes a label, a link URL and a
+  color; an image takes an image URL, an optional link and alt text; a list
+  takes one item per line; a spacer takes a height in pixels. Blocks
+  serialize to email-safe HTML in the same visual language as the bundled
+  library (a 560px card, muted body text, table-based buttons), and the
+  body they produce is content only. The branded shell comes from the
+  chosen layout, which wraps the body via `{{{ content }}}`.
+- **HTML** is the expert mode: write raw, email-safe HTML directly.
+- **Plain Text** holds the text alternative.
+
+A block-authored body carries an invisible marker comment, so re-opening
+the template rebuilds the block editor exactly. Hand-written HTML has no
+marker and opens in HTML mode. The right pane switches between **Preview**
+(the HTML wrapped in the chosen layout, rendered in a sandboxed iframe),
+**Plain text**, and a **Test model** you edit as JSON. The preview renders
+the Mustache subset client-side and wraps the body in the layout exactly as
+the server does at send time, so unsaved edits show instantly. Detected
+`{{ variables }}` are listed as chips to fill in the test model.
 
 ## Sending with a template
 

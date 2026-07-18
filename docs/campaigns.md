@@ -132,8 +132,22 @@ curl -s "$API/api/v2/server/campaigns/42" -H "X-Server-API-Key: $SERVER_KEY"
 The dashboard exposes the same surface under **Server → Campaigns**: a
 list with each campaign's audience, status, schedule and progress; a
 compose form that offers **Send now**, **Schedule** and **Save as
-draft**; and a detail page with the analytics tiles and status-dependent
-actions.
+draft**; and a tabbed detail page.
+
+The compose form uses the same block editor as templates: a **Content**
+area with **Editor** (the block builder), **HTML** and **Plain Text**
+modes and a live preview. See
+[the block editor](templates.md#the-block-editor) for the block kinds and
+how the body serializes.
+
+The detail page has three tabs and polls while the campaign is sending:
+
+- **Dashboard** shows the analytics tiles (the `stats` below) and the
+  status-dependent actions (edit, send now, cancel).
+- **Recipients** lists the address, delivery status and timestamp for each
+  message the campaign produced.
+- **Messages** lists those messages, fetched with the `campaign_id` filter
+  described below.
 
 ## Scheduling
 
@@ -257,10 +271,27 @@ curl -s "$API/api/v2/server/campaigns/42" -H "X-Server-API-Key: $SERVER_KEY"
 they populate only for streams and messages where tracking is enabled. See
 [Tracking](tracking.md) for how opens and clicks are recorded, and
 [Suppressions](suppressions.md) for how unsubscribes and complaints feed
-the `unsubscribed` figure. Because every expanded message carries the
-campaign's tag, you can also inspect the individual messages through the
-normal message endpoints, and campaign volume shows up in the server-wide
+the `unsubscribed` figure. Campaign volume also shows up in the server-wide
 aggregate at `GET /api/v2/server/stats`.
+
+### Filtering messages by campaign
+
+Every message a campaign expands into carries the campaign's id in its
+`campaign_id` field, and the message list endpoint accepts a matching
+filter:
+
+```bash
+# every message produced by campaign 42, newest first
+curl -s "$API/api/v2/server/messages?campaign_id=42&per_page=100" \
+  -H "X-Server-API-Key: $SERVER_KEY"
+```
+
+`GET /api/v2/server/messages?campaign_id=<id>` returns only the messages
+attributed to that campaign, and each message in the response (here and on
+`GET /api/v2/server/messages/{id}`) carries `campaign_id` so you can tell
+which campaign produced it. The filter combines with the other message
+filters (`stream`, `status`, `tag`, `query`, `page`, `per_page`). This is
+the endpoint the detail page's **Recipients** and **Messages** tabs read.
 
 ## Cancel a campaign
 

@@ -215,9 +215,22 @@ Archiving is equivalent to `PATCH {"archived": true}`; unarchive with
 The **Streams** tab lists every stream with its name, permalink, type and
 status, and a **New stream** dialog takes a name and type. Opening a
 stream shows its detail page: the header carries the status pill, the
-type, the permalink and the resolved IP pool, plus actions to view the
-stream's messages, edit it, and archive it. The **Edit** dialog changes
-the name, type, status (Active or Archived) and IP pool; the permalink is
-shown but disabled. Broadcast streams additionally surface their
-subscribers, unsubscribe count and the CAN-SPAM postal-address check on
-the same page.
+type, the permalink and the resolved IP pool, plus actions to edit and
+archive it. The **Edit** dialog changes the name, type, status (Active or
+Archived) and IP pool; the permalink is shown but disabled.
+
+The detail page is tabbed:
+
+- **Dashboard** shows the stream's counters as tiles (volume, delivered,
+  bounced, held, queued, and for broadcast streams the subscriber and
+  unsubscribe counts).
+- **Messages** lists the mail on this stream, filtered to the stream.
+- **Subscribers** (broadcast streams only) manages the opt-in list: an add
+  box, a paste-to-import textarea and a CSV upload, the subscriber list
+  with a status badge, and per-row "Mark complaint" and "Remove" actions.
+- **Settings** (broadcast streams only) carries the IP-pool selector and
+  the CAN-SPAM postal-address check, which warns and links to Settings when
+  no broadcast postal address is set.
+
+The subscriber management, the CSV import shape and the postal-address
+requirement are covered in [Broadcast streams](broadcast.md).

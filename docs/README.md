@@ -50,6 +50,13 @@ send your first message in about five minutes, then read
 | [Webhooks](webhooks.md) | Event types, the payload envelope, RSA signature verification, and retry semantics |
 | [Accounts, RBAC and SSO](authentication.md) | User accounts, two-factor authentication, organization roles, invitations, OIDC and SAML, and SCIM |
 
+## Account and cloud
+
+| Page | What it covers |
+|---|---|
+| [Cloud pricing and the public beta](pricing.md) | The beta cap, the coming Base package, over-quota options, and where billing lives |
+| [Import and export](import-export.md) | CSV and JSON export, and CSV import, across the dashboard resource lists |
+
 ## Reference
 
 The full HTTP API is described by the OpenAPI 3.0 spec at

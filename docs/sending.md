@@ -263,6 +263,16 @@ A successful `AUTH` is acknowledged with `235 Granted for <org>/<server>`.
 As with the HTTP API, each `RCPT TO` recipient becomes its own stored,
 queued message.
 
+**Managing credentials in the dashboard.** A server's **Credentials** tab
+lists every credential with its name, type and status. Opening one shows a
+details lightbox rather than a separate page: its status (Active or On
+hold), and for an API credential the key, for an `SMTP-IP` credential the
+allowed CIDR, and for an `SMTP` credential the copy-first connection facts
+(host, the submission ports, the username `org/server`, and the password,
+which is the credential's key). Export from this tab carries credential
+metadata only; the secret key is shown once at creation and is never
+exported (see [Import and export](import-export.md)).
+
 ## What happens after a message is accepted
 
 Accepting a message and delivering it are two steps:

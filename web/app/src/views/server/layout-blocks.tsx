@@ -1,8 +1,10 @@
 // Structured editor model for a layout (the shared shell around every mail).
 // A layout serializes to an `html_wrapper` document that embeds the body via
 // {{{ content }}} and carries a marker comment so the visual editor can
-// round-trip. The logo is stored as a data URI inside the wrapper — i.e.
-// "hard in Postgres" (the layouts.html_wrapper column), no asset service.
+// round-trip. The logo is picked as a data URI for the live editor preview;
+// on save LayoutEditor uploads the bytes (stored in Postgres) and rewrites the
+// wrapper to reference the served URL (GET /assets/layouts/{uuid}/logo), so the
+// image survives in real email clients.
 "use client"
 
 import { useRef } from "react"

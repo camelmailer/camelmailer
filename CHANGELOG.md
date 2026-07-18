@@ -15,6 +15,41 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Dashboard overhaul.** A wave of dashboard capabilities, all documented
+  under `docs/`:
+  - **DMARC compliance dashboard.** Aggregate-report ingestion feeds a per
+    domain view with a compliance rate plus SPF and DKIM alignment rates,
+    sending sources grouped and classified as compliant, forwarded,
+    non-compliant or threat, a daily volume series, and a one-click action
+    to create the inbound route that ingests reports at
+    `internal://dmarc-reports`.
+  - **Block-based template and layout editors.** Templates author their body
+    from stackable blocks (heading, subheading, text, button, image, list,
+    divider, spacer, footer) with Editor, HTML and Plain-Text modes and a
+    live layout-wrapped preview. Layouts are reusable shells with a color
+    scheme (primary, background, text, font) and an uploaded logo stored in
+    Postgres and served from `GET /assets/layouts/{uuid}/logo`; templates
+    wrap their body through `{{{ content }}}`.
+  - **Tabbed stream and campaign views.** Streams show Dashboard, Messages,
+    and (for broadcast) Subscribers with CSV import and Settings. Campaigns
+    show Dashboard, Recipients and Messages, and the campaign compose form
+    uses the block editor.
+  - **`campaign_id` message filter.** `GET /api/v2/server/messages` accepts
+    `?campaign_id=<id>`, and every message payload now carries `campaign_id`.
+  - **Layout logo endpoints.** `POST /api/v2/server/layouts/{permalink}/logo`
+    stores a logo image (up to 1 MB) and returns its served URL; the public
+    `GET /assets/layouts/{uuid}/logo` serves it.
+  - **Import and export across resource lists.** CSV, JSON and Excel-CSV
+    export with a column picker, and CSV import with a downloadable template,
+    on Domains, Routes, Webhooks, Suppressions and more (Credentials and
+    Recipients export only; credential secrets are never exported).
+  - **Cloud pricing preview.** A public-beta cap of 5,000 emails per month,
+    a planned Base package (€5 / 5,000 emails per month, cloud, with in-app
+    open and click tracking), and an auto-upgrade versus buy-packages choice.
+    Pricing launches after the beta.
+
 ## [0.5.0] - 2026-07-16
 
 ### Added
