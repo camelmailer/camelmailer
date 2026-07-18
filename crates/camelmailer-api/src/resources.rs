@@ -149,6 +149,11 @@ pub(crate) async fn domains_index(
 #[derive(Deserialize)]
 pub(crate) struct CreateDomain {
     name: Option<String>,
+    /// Optional RSA private key (PKCS#8 or PKCS#1 PEM) to import as the
+    /// domain's DKIM key. Migrations pass the source provider's key so the
+    /// signing key, and therefore the published DKIM record, carries over
+    /// unchanged. When absent a fresh RSA-2048 key is generated.
+    dkim_private_key: Option<String>,
 }
 
 pub(crate) async fn domains_create(
@@ -167,14 +172,29 @@ pub(crate) async fn domains_create(
             "param is missing or the value is empty: name",
         );
     };
-    // Every new domain gets its own RSA-2048 DKIM key; domains created
-    // before this existed keep signing with the installation key.
-    let dkim_private_key = match tokio::task::spawn_blocking(generate_dkim_key).await {
-        Ok(Ok(pem)) => pem,
-        Ok(Err(message)) => return render_store_error(Some(&start), StoreError::Other(message)),
-        Err(error) => {
-            return render_store_error(Some(&start), StoreError::Other(error.to_string()))
+    // A domain either imports an existing DKIM key (migrations preserve the
+    // source key so DNS and reputation carry over) or gets a fresh RSA-2048
+    // key. Domains created before per-domain keys existed sign with the
+    // installation key.
+    let dkim_private_key = match body.dkim_private_key.filter(|k| !k.trim().is_empty()) {
+        Some(pem) => {
+            if dkim_public_key_b64(&pem).is_none() {
+                return render_validation_error(
+                    Some(&start),
+                    "dkim_private_key must be a valid RSA private key in PKCS#8 or PKCS#1 PEM form",
+                );
+            }
+            pem
         }
+        None => match tokio::task::spawn_blocking(generate_dkim_key).await {
+            Ok(Ok(pem)) => pem,
+            Ok(Err(message)) => {
+                return render_store_error(Some(&start), StoreError::Other(message))
+            }
+            Err(error) => {
+                return render_store_error(Some(&start), StoreError::Other(error.to_string()))
+            }
+        },
     };
     from_result(
         &start,

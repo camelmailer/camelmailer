@@ -15,6 +15,16 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **DKIM key import on domain creation.** `POST …/servers/{server}/domains`
+  now accepts an optional `dkim_private_key` (PKCS#8 or PKCS#1 PEM). When
+  present it is validated and stored as the domain's signing key instead of
+  generating a fresh one, so a migration can carry a domain's existing DKIM
+  key over unchanged. This backs the
+  [camelmailer-migrate](https://github.com/camelmailer/camelmailer-migrate)
+  Postal migration tool.
+
 ## [0.6.0] - 2026-07-18
 
 ### Added
