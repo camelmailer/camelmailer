@@ -30,6 +30,8 @@ pub struct MessageFilter {
     pub query: Option<String>,
     /// Restrict to one message stream (resolved id).
     pub stream_id: Option<Id>,
+    /// Restrict to messages produced by one broadcast campaign.
+    pub campaign_id: Option<Id>,
 }
 
 /// Fields for creating a message stream.
@@ -449,6 +451,21 @@ pub trait ServerStore: Send + Sync {
         layout: crate::model::Layout,
     ) -> Result<crate::model::Layout, StoreError>;
     async fn delete_layout(&self, server_id: Id, layout_id: Id) -> Result<bool, StoreError>;
+    /// Store (or replace) a layout's logo image (bytes + content type),
+    /// persisted directly in Postgres.
+    async fn set_layout_logo(
+        &self,
+        server_id: Id,
+        layout_id: Id,
+        data: Vec<u8>,
+        content_type: String,
+    ) -> Result<(), StoreError>;
+    /// Fetch a layout's logo by the layout's public `uuid`, for the
+    /// unauthenticated serve endpoint (layouts are not under RLS).
+    async fn layout_logo(
+        &self,
+        layout_uuid: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, StoreError>;
 
     // DMARC aggregate reports (tenant-scoped: RLS in Postgres)
     /// Persist one parsed aggregate report with all its rows.
@@ -977,6 +994,35 @@ impl ServerStore for crate::store::MemoryStore {
         Ok(existed)
     }
 
+    async fn set_layout_logo(
+        &self,
+        server_id: Id,
+        layout_id: Id,
+        data: Vec<u8>,
+        content_type: String,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if inner
+            .layouts
+            .get(&layout_id)
+            .is_some_and(|l| l.server_id == server_id)
+        {
+            inner.layout_logos.insert(layout_id, (data, content_type));
+        }
+        Ok(())
+    }
+
+    async fn layout_logo(
+        &self,
+        layout_uuid: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let Some(layout) = inner.layouts.values().find(|l| l.uuid == layout_uuid) else {
+            return Ok(None);
+        };
+        Ok(inner.layout_logos.get(&layout.id).cloned())
+    }
+
     async fn store_dmarc_report(&self, new: NewDmarcReport) -> Result<DmarcReport, StoreError> {
         Ok(self.insert_dmarc_report(new))
     }
@@ -1362,6 +1408,11 @@ impl ServerStore for crate::store::MemoryStore {
             .any(|m| m.id == message_id && m.server_id == server_id)
         {
             inner.message_campaigns.insert(message_id, campaign_id);
+            // Keep the record's own field in lockstep with the Postgres column,
+            // so reads (message_json / campaign filter) reflect the attribution.
+            if let Some(record) = inner.messages.iter_mut().find(|m| m.id == message_id) {
+                record.campaign_id = Some(campaign_id);
+            }
         }
         Ok(())
     }

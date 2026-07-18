@@ -14,14 +14,17 @@ import { type ColumnDef } from "@tanstack/react-table"
 import {
   ChevronDownIcon,
   ChevronRightIcon,
+  DownloadIcon,
   KeyRoundIcon,
   MailIcon,
 } from "lucide-react"
 import { formatDate, PageHeader } from "@/components/shared"
 import { Page } from "@/components/page"
 import { EmptyState } from "@/components/empty-state"
+import { DataExportDialog, type ExportColumn } from "@/components/data-export-dialog"
 import { MessagePill, messageStatus, statusDotClass } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { DataTable } from "@/components/ui/data-table"
 import { cn } from "@/lib/utils"
@@ -262,6 +265,7 @@ type RecipientRow = {
 /// dedicated recipients endpoint.
 export function RecipientsList({ org, server }: { org: string; server: string }) {
   const { api, isLoading } = useServerMessagingApi(org, server)
+  const [exportOpen, setExportOpen] = useState(false)
   const messagesQuery = useQuery({
     queryKey: ["recipients-list", org, server],
     queryFn: () => api!.messages("?scope=outgoing&per_page=100"),
@@ -336,6 +340,13 @@ export function RecipientsList({ org, server }: { org: string; server: string })
     },
   ]
 
+  const exportColumns: ExportColumn<RecipientRow>[] = [
+    { key: "address", label: "Recipient", accessor: (r) => r.address },
+    { key: "count", label: "Messages", accessor: (r) => r.count },
+    { key: "status", label: "Last status", accessor: (r) => r.status },
+    { key: "last", label: "Last activity", accessor: (r) => r.last },
+  ]
+
   return (
     <Page
       variant="fill"
@@ -344,9 +355,27 @@ export function RecipientsList({ org, server }: { org: string; server: string })
           title="Recipients"
           description="Everyone this server has sent to recently, with their latest delivery status."
           className="mb-0"
+          action={
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setExportOpen(true)}
+              disabled={rows.length === 0}
+            >
+              <DownloadIcon className="size-4" /> Export
+            </Button>
+          }
         />
       }
     >
+      <DataExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        title="Export recipients"
+        filename={`recipients-${server}`}
+        columns={exportColumns}
+        rows={rows}
+      />
       {!api && !isLoading ? (
         <EmptyState
           icon={KeyRoundIcon}

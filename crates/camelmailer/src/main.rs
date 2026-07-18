@@ -2,7 +2,8 @@
 //! process roles from a single binary.
 
 use camelmailer_api::{
-    build_auth_router, build_oidc_router, build_org_sso_login_router, build_router,
+    build_assets_router, build_auth_router, build_oidc_router, build_org_sso_login_router,
+    build_router,
     build_saml_router, build_scim_router, build_server_router, build_share_router,
     build_sso_router, cors_layer, run_campaign_scheduler, tracking_router, unsubscribe_router,
     ApiState, TrackingState,
@@ -224,6 +225,7 @@ async fn web_server() -> std::io::Result<()> {
     tokio::spawn(run_campaign_scheduler(state.clone()));
 
     let mut router = build_router(state.clone())
+        .merge(build_assets_router(state.clone()))
         .merge(build_server_router(state.clone()))
         .merge(build_share_router(state.clone()))
         .merge(build_auth_router(state.clone()))

@@ -550,6 +550,7 @@ pub(crate) fn message_json(message: &MessageRecord) -> Value {
         "size": message.size,
         "metadata": message.metadata,
         "stream_id": message.stream_id,
+        "campaign_id": message.campaign_id,
         "bypassed": message.bypassed,
         "created_at": message.created_at.to_rfc3339(),
     })
@@ -586,6 +587,8 @@ struct MessageListParams {
     query: Option<String>,
     /// Restrict to one message stream (by permalink).
     stream: Option<String>,
+    /// Restrict to messages produced by one broadcast campaign (by id).
+    campaign_id: Option<i64>,
 }
 
 /// Resolve an optional `?stream=` permalink to a stream id. `Ok(None)` means
@@ -652,6 +655,7 @@ async fn messages_index(
         tag: params.tag.filter(|s| !s.is_empty()),
         query: params.query.filter(|s| !s.is_empty()),
         stream_id,
+        campaign_id: params.campaign_id.map(|id| id as camelmailer_core::Id),
     };
     let messages = match store.messages(server.0.id, &filter).await {
         Ok(messages) => messages,
@@ -1039,6 +1043,7 @@ async fn bounces_index(
         tag: params.tag.filter(|s| !s.is_empty()),
         query: params.query.filter(|s| !s.is_empty()),
         stream_id: None,
+        campaign_id: None,
     };
     let bounces = match store.bounces(server.0.id, &filter).await {
         Ok(bounces) => bounces,
@@ -1307,6 +1312,7 @@ async fn inbound_index(
         tag: params.tag.filter(|s| !s.is_empty()),
         query: params.query.filter(|s| !s.is_empty()),
         stream_id,
+        campaign_id: None,
     };
     let messages = match store.inbound_messages(server.0.id, &filter).await {
         Ok(messages) => messages,
@@ -2886,6 +2892,91 @@ async fn layouts_create(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct LogoUpload {
+    /// A base64 `data:` URL: `data:image/png;base64,…`.
+    data_url: Option<String>,
+}
+
+/// `POST /api/v2/server/layouts/{permalink}/logo` — store a logo image in
+/// Postgres and return the public URL that mails embed. Kept as a served
+/// asset (not an inline data: URI) so the image survives in real clients.
+async fn layout_logo_upload(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(permalink): Path<String>,
+    Json(body): Json<LogoUpload>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    let Some(data_url) = body.data_url.filter(|d| !d.is_empty()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::BAD_REQUEST,
+            "ParameterMissing",
+            "param is missing or the value is empty: data_url",
+        )
+        .into_response();
+    };
+    let Some((content_type, b64)) = data_url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,"))
+    else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "data_url must be a base64 data: URL (data:<type>;base64,…)",
+        )
+        .into_response();
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "data_url payload is not valid base64",
+        )
+        .into_response();
+    };
+    if bytes.len() > 1_048_576 {
+        return render_error(
+            Some(&start.0),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError",
+            "logo image exceeds the 1 MB limit",
+        )
+        .into_response();
+    }
+    let layout = match store.layout_by_permalink(server.0.id, &permalink).await {
+        Ok(Some(layout)) => layout,
+        Ok(None) => {
+            return render_error(
+                Some(&start.0),
+                StatusCode::NOT_FOUND,
+                "NotFound",
+                &format!("Layout {permalink:?} does not exist"),
+            )
+            .into_response()
+        }
+        Err(error) => return internal_error(&start.0, &error.to_string()),
+    };
+    if let Err(error) = store
+        .set_layout_logo(server.0.id, layout.id, bytes, content_type.to_string())
+        .await
+    {
+        return internal_error(&start.0, &error.to_string());
+    }
+    let url = format!(
+        "{}://{}/assets/layouts/{}/logo",
+        state.config.camelmailer.web_protocol, state.config.camelmailer.web_hostname, layout.uuid
+    );
+    render_success(Some(&start.0), StatusCode::OK, json!({ "url": url })).into_response()
+}
+
 /// `GET /api/v2/server/layouts/{permalink}`.
 async fn layout_show(
     State(state): State<Arc<ApiState>>,
@@ -3647,6 +3738,7 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         .route("/inbound/{id}/retry", post(inbound_retry))
         .route("/templates", get(templates_index).post(templates_create))
         .route("/layouts", get(layouts_index).post(layouts_create))
+        .route("/layouts/{permalink}/logo", axum::routing::post(layout_logo_upload))
         .route(
             "/layouts/{permalink}",
             get(layout_show).patch(layout_update).delete(layout_destroy),

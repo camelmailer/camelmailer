@@ -154,6 +154,9 @@ pub(crate) struct MemoryStoreInner {
     /// Reusable layouts wrapped around template bodies (config;
     /// server-scoped).
     pub(crate) layouts: HashMap<Id, crate::model::Layout>,
+    /// Layout logo images keyed by layout id: (bytes, content_type). The
+    /// in-memory analogue of the `layouts.logo`/`logo_content_type` columns.
+    pub(crate) layout_logos: HashMap<Id, (Vec<u8>, String)>,
     /// Public message share links (cross-tenant lookup by token hash).
     pub(crate) message_shares: Vec<crate::server_store::MessageShare>,
     /// DMARC aggregate reports (tenant-scoped like messages).
@@ -363,6 +366,7 @@ impl MemoryStore {
             size: message.raw_message.len() as i64,
             metadata: message.metadata,
             stream_id: message.stream_id,
+            campaign_id: None,
             bypassed: false,
             created_at: chrono::Utc::now(),
             raw_message: message.raw_message,
@@ -466,6 +470,7 @@ impl MemoryStore {
                     .is_none_or(|t| m.tag.as_deref() == Some(t))
             })
             .filter(|m| filter.stream_id.is_none_or(|s| m.stream_id == Some(s)))
+            .filter(|m| filter.campaign_id.is_none_or(|c| m.campaign_id == Some(c)))
             .filter(|m| {
                 query.as_deref().is_none_or(|q| {
                     m.subject

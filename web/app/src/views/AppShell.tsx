@@ -130,24 +130,40 @@ function segmentLabel(segment: string) {
 /// The areas of a single mail server, shown as a sub-menu beneath the
 /// active server in the sidebar (this replaces the old in-page tab bar).
 /// The server index is its Dashboard; everything else hangs off it.
-function serverAreas(base: string) {
+type ServerArea = {
+  href: string
+  label: string
+  icon: typeof GaugeIcon
+  match: "exact" | "prefix"
+  // Extra path prefix that also marks this item active (e.g. layouts live
+  // under the Templates area but at a sibling route).
+  extra?: string
+}
+
+function serverAreas(base: string): ServerArea[] {
   return [
-    { href: base, label: "Dashboard", icon: GaugeIcon, match: "exact" as const },
-    { href: `${base}/messaging`, label: "Messaging", icon: SendIcon, match: "prefix" as const },
-    { href: `${base}/recipients`, label: "Recipients", icon: UserIcon, match: "prefix" as const },
-    { href: `${base}/streams`, label: "Streams", icon: LayersIcon, match: "prefix" as const },
-    { href: `${base}/campaigns`, label: "Campaigns", icon: MegaphoneIcon, match: "prefix" as const },
-    { href: `${base}/templates`, label: "Templates", icon: FileTextIcon, match: "prefix" as const },
-    { href: `${base}/domains`, label: "Domains", icon: GlobeIcon, match: "prefix" as const },
-    { href: `${base}/credentials`, label: "Credentials", icon: KeyRoundIcon, match: "prefix" as const },
-    { href: `${base}/routes`, label: "Routes", icon: InboxIcon, match: "prefix" as const },
-    { href: `${base}/webhooks`, label: "Webhooks", icon: WebhookIcon, match: "prefix" as const },
-    { href: `${base}/sender-addresses`, label: "Senders", icon: AtSignIcon, match: "prefix" as const },
-    { href: `${base}/suppressions`, label: "Suppressions", icon: BanIcon, match: "prefix" as const },
-    { href: `${base}/dmarc`, label: "DMARC", icon: ShieldCheckIcon, match: "prefix" as const },
-    { href: `${base}/queue`, label: "Queue", icon: ClockIcon, match: "prefix" as const },
-    { href: `${base}/logs`, label: "API logs", icon: ScrollTextIcon, match: "prefix" as const },
-    { href: `${base}/settings`, label: "Settings", icon: SettingsIcon, match: "prefix" as const },
+    { href: base, label: "Dashboard", icon: GaugeIcon, match: "exact" },
+    { href: `${base}/messaging`, label: "Messaging", icon: SendIcon, match: "prefix" },
+    { href: `${base}/recipients`, label: "Recipients", icon: UserIcon, match: "prefix" },
+    { href: `${base}/streams`, label: "Streams", icon: LayersIcon, match: "prefix" },
+    { href: `${base}/campaigns`, label: "Campaigns", icon: MegaphoneIcon, match: "prefix" },
+    {
+      href: `${base}/templates`,
+      label: "Templates",
+      icon: FileTextIcon,
+      match: "prefix",
+      extra: `${base}/layouts`,
+    },
+    { href: `${base}/domains`, label: "Domains", icon: GlobeIcon, match: "prefix" },
+    { href: `${base}/credentials`, label: "Credentials", icon: KeyRoundIcon, match: "prefix" },
+    { href: `${base}/routes`, label: "Routes", icon: InboxIcon, match: "prefix" },
+    { href: `${base}/webhooks`, label: "Webhooks", icon: WebhookIcon, match: "prefix" },
+    { href: `${base}/sender-addresses`, label: "Senders", icon: AtSignIcon, match: "prefix" },
+    { href: `${base}/suppressions`, label: "Suppressions", icon: BanIcon, match: "prefix" },
+    { href: `${base}/dmarc`, label: "DMARC", icon: ShieldCheckIcon, match: "prefix" },
+    { href: `${base}/queue`, label: "Queue", icon: ClockIcon, match: "prefix" },
+    { href: `${base}/logs`, label: "API logs", icon: ScrollTextIcon, match: "prefix" },
+    { href: `${base}/settings`, label: "Settings", icon: SettingsIcon, match: "prefix" },
   ]
 }
 
@@ -217,6 +233,10 @@ function AppBreadcrumbs() {
       const serverHref = `${orgHref}/servers/${server}`
       const rest = segments.slice(4)
       crumbs.push({ label: serverName, href: rest.length > 0 ? serverHref : undefined })
+      // Layouts live under the Templates area — show Templates as their parent.
+      if (rest[0] === "layouts") {
+        crumbs.push({ label: "Templates", href: `${serverHref}/templates` })
+      }
       rest.forEach((segment, i) => {
         crumbs.push({
           label: segmentLabel(segment),
@@ -523,14 +543,16 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
                       <SidebarMenuSkeleton showIcon />
                     </SidebarMenuItem>
                   ))}
-                {serverNav.map(({ href, label, icon: Icon, match }) => (
+                {serverNav.map(({ href, label, icon: Icon, match, extra }) => (
                   <SidebarMenuItem key={label}>
                     <SidebarMenuButton
                       asChild
                       isActive={
                         match === "exact"
                           ? pathname === href
-                          : pathname === href || pathname.startsWith(`${href}/`)
+                          : pathname === href ||
+                            pathname.startsWith(`${href}/`) ||
+                            (!!extra && (pathname === extra || pathname.startsWith(`${extra}/`)))
                       }
                       tooltip={label}
                     >

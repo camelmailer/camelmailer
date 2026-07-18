@@ -1644,3 +1644,35 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route("/health", get(health))
         .nest("/api/v2/admin", admin)
 }
+
+/// Unauthenticated public asset serving. Layout logos are stored in Postgres
+/// and referenced by mails as absolute URLs, so they must be fetchable without
+/// a session or API key (like the tracking endpoints).
+pub fn build_assets_router(state: Arc<ApiState>) -> Router {
+    Router::new()
+        .route("/assets/layouts/{uuid}/logo", get(serve_layout_logo))
+        .with_state(state)
+}
+
+async fn serve_layout_logo(
+    State(state): State<Arc<ApiState>>,
+    Path(uuid): Path<String>,
+) -> Response {
+    let Some(store) = state.server_store.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match store.layout_logo(&uuid).await {
+        Ok(Some((bytes, content_type))) => (
+            [
+                (axum::http::header::CONTENT_TYPE, content_type),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "public, max-age=86400".to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}

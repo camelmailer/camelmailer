@@ -9,6 +9,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ComponentProps,
   type ReactNode,
@@ -20,11 +21,13 @@ import { useRouter } from "next/navigation"
 import {
   ChevronRightIcon,
   CircleCheckIcon,
+  DownloadIcon,
   FileTextIcon,
   InboxIcon,
   KeyRoundIcon,
   LayersIcon,
   MailIcon,
+  MegaphoneIcon,
   MoreVerticalIcon,
   PlusIcon,
   RefreshCwIcon,
@@ -34,11 +37,18 @@ import {
   Share2Icon,
   SparklesIcon,
   TriangleAlertIcon,
+  UploadIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 import { CopyButton, formatDate, PageHeader } from "@/components/shared"
 import { EmptyState } from "@/components/empty-state"
 import { FormDialog } from "@/components/form-dialog"
+import { DataExportDialog, type ExportColumn } from "@/components/data-export-dialog"
+import {
+  DataImportDialog,
+  runRowImport,
+  type ImportColumn,
+} from "@/components/data-import-dialog"
 import { MessagePill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -70,15 +80,20 @@ import { Page } from "@/components/page"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { Switch } from "@/components/ui/switch"
+import { Skeleton } from "@/components/ui/skeleton"
+import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
+import { Cell, Pie, PieChart } from "recharts"
 import { cn } from "@/lib/utils"
 import {
   adminApi,
   ApiError,
   serverApi,
+  type CampaignWithStream,
   type InsightCheck,
   type Layout,
   type Message,
   type Stream,
+  type Subscription,
   type Template,
 } from "@/lib/api"
 import {
@@ -89,7 +104,7 @@ import {
   type ApiRequestEntry,
   type ParsedEmail,
 } from "@/lib/api-p1"
-import { recipientHref } from "@/lib/api-p2"
+import { downloadFile, recipientHref } from "@/lib/api-p2"
 import {
   extractVariables,
   renderMustache,
@@ -99,6 +114,7 @@ import {
   type LibraryTemplate,
 } from "@/lib/api-p3"
 import { StatusPill } from "@/components/status-pill"
+import { SAMPLE_BODY } from "./layout-blocks"
 import { useOrgParams } from "@/lib/params"
 
 function errorToast(err: unknown, fallback: string) {
@@ -1336,6 +1352,17 @@ export function Messages({ api }: { api: Api }) {
     )
   }, [messages.data, cutoff])
   const hasFilters = query || status !== "all" || tag !== "all" || stream !== "all" || range !== "all"
+  const [exportOpen, setExportOpen] = useState(false)
+
+  const exportColumns: ExportColumn<Message>[] = [
+    { key: "id", label: "ID", accessor: (m) => m.id },
+    { key: "status", label: "Status", accessor: (m) => m.status ?? "" },
+    { key: "mail_from", label: "From", accessor: (m) => m.mail_from ?? "" },
+    { key: "rcpt_to", label: "Recipient", accessor: (m) => m.rcpt_to },
+    { key: "subject", label: "Subject", accessor: (m) => m.subject ?? "" },
+    { key: "tag", label: "Tag", accessor: (m) => m.tag ?? "" },
+    { key: "created_at", label: "Time", accessor: (m) => m.created_at },
+  ]
 
   const columns: ColumnDef<Message>[] = [
     {
@@ -1488,7 +1515,24 @@ export function Messages({ api }: { api: Api }) {
               ))}
           </SelectContent>
         </Select>
+        <Button
+          variant="outline"
+          size="sm"
+          className="ml-auto"
+          onClick={() => setExportOpen(true)}
+          disabled={rows.length === 0}
+        >
+          <DownloadIcon className="size-4" /> Export
+        </Button>
       </div>
+      <DataExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        title="Export messages"
+        filename={`messages-${server}`}
+        columns={exportColumns}
+        rows={rows}
+      />
       {rows.length === 0 ? (
         hasFilters ? (
           <EmptyState
@@ -1570,6 +1614,15 @@ export function LogsView() {
     ? rows.filter((r) => r.path.toLowerCase().includes(query.toLowerCase()))
     : rows
   const hasFilters = method !== "all" || status !== "all"
+  const [exportOpen, setExportOpen] = useState(false)
+
+  const exportColumns: ExportColumn<ApiRequestEntry>[] = [
+    { key: "method", label: "Method", accessor: (e) => e.method },
+    { key: "path", label: "Endpoint", accessor: (e) => e.path },
+    { key: "status_code", label: "Status", accessor: (e) => e.status_code },
+    { key: "duration_ms", label: "Latency (ms)", accessor: (e) => e.duration_ms },
+    { key: "created_at", label: "Time", accessor: (e) => e.created_at },
+  ]
 
   const columns: ColumnDef<ApiRequestEntry>[] = [
     {
@@ -1628,7 +1681,7 @@ export function LogsView() {
       variant="fill"
       header={
         <PageHeader
-          title="API request log"
+          title="API logs"
           description="Every authenticated call to this server's API: method, endpoint, status and latency."
           className="mb-0"
         />
@@ -1681,7 +1734,24 @@ export function LogsView() {
             ))}
           </SelectContent>
         </Select>
+        <Button
+          variant="outline"
+          size="sm"
+          className="ml-auto"
+          onClick={() => setExportOpen(true)}
+          disabled={filtered.length === 0}
+        >
+          <DownloadIcon className="size-4" /> Export
+        </Button>
         </div>
+        <DataExportDialog
+          open={exportOpen}
+          onOpenChange={setExportOpen}
+          title="Export API logs"
+          filename="api-logs"
+          columns={exportColumns}
+          rows={filtered}
+        />
         {rows.length === 0 ? (
           <EmptyState
             icon={ScrollTextIcon}
@@ -1718,6 +1788,7 @@ export function InboundQueue({ api }: { api: Api }) {
   })
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-inbound"] })
   const rows = inbound.data?.inbound ?? []
+  const [exportOpen, setExportOpen] = useState(false)
   const statusOptions = useMemo(
     () =>
       [...new Set(rows.map((m) => m.status ?? "").filter(Boolean))].map((s) => ({
@@ -1726,6 +1797,15 @@ export function InboundQueue({ api }: { api: Api }) {
       })),
     [rows],
   )
+
+  const exportColumns: ExportColumn<Message>[] = [
+    { key: "id", label: "ID", accessor: (m) => m.id },
+    { key: "rcpt_to", label: "To", accessor: (m) => m.rcpt_to },
+    { key: "subject", label: "Subject", accessor: (m) => m.subject ?? "" },
+    { key: "status", label: "Status", accessor: (m) => m.status ?? "" },
+    { key: "held", label: "Held", accessor: (m) => !!m.held },
+    { key: "created_at", label: "Time", accessor: (m) => m.created_at },
+  ]
 
   const columns: ColumnDef<Message>[] = [
     {
@@ -1809,13 +1889,31 @@ export function InboundQueue({ api }: { api: Api }) {
       variant="fill"
       header={
         <PageHeader
-          title="Inbound & held messages"
-          description="Retry failed inbound deliveries or bypass holds."
+          title="Queue"
+          description="Inbound deliveries and held messages waiting — retry failures or bypass holds."
           className="mb-0"
+          action={
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setExportOpen(true)}
+              disabled={rows.length === 0}
+            >
+              <DownloadIcon className="size-4" /> Export
+            </Button>
+          }
         />
       }
     >
       <div className="flex min-h-0 flex-1 flex-col">
+        <DataExportDialog
+          open={exportOpen}
+          onOpenChange={setExportOpen}
+          title="Export queue"
+          filename="queue"
+          columns={exportColumns}
+          rows={rows}
+        />
         {rows.length === 0 ? (
           <EmptyState
             icon={InboxIcon}
@@ -2034,8 +2132,8 @@ export function Streams({ api }: { api: Api }) {
       variant="fill"
       header={
         <PageHeader
-          title="Message streams"
-          description="Group outgoing mail (transactional / broadcast) for stats and policies."
+          title="Streams"
+          description="Group outgoing mail (transactional / broadcast / inbound) for stats and policies."
           action={
             <Button size="sm" onClick={() => setOpen(true)}>
               <PlusIcon className="size-4" /> New stream
@@ -2113,6 +2211,48 @@ export function Streams({ api }: { api: Api }) {
 /// section. The messaging API has no single-get for a stream, so we read
 /// the list and find by permalink — the same shape Templates/TemplateEditor
 /// use for a single template.
+// A minimal client-side CSV parse for the subscriber import. Accepts a
+// single column of addresses, or a multi-column CSV that carries an
+// `address` / `email` header (the shape Excel exports as CSV). Only rows
+// whose chosen cell looks like an email address are kept.
+function parseAddressesFromCsv(text: string): string[] {
+  const clean = text.replace(/^﻿/, "")
+  const lines = clean.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  if (lines.length === 0) return []
+  const splitRow = (line: string) =>
+    line.split(",").map((c) => c.trim().replace(/^"(.*)"$/, "$1").trim())
+  const header = splitRow(lines[0]).map((c) => c.toLowerCase())
+  const headerCol = header.findIndex(
+    (c) => c === "address" || c === "email" || c === "email_address",
+  )
+  const hasHeader = headerCol >= 0
+  const col = hasHeader ? headerCol : 0
+  const out: string[] = []
+  for (let i = hasHeader ? 1 : 0; i < lines.length; i++) {
+    const cells = splitRow(lines[i])
+    const value = (cells[col] ?? cells[0] ?? "").trim()
+    if (value.includes("@")) out.push(value)
+  }
+  return out
+}
+
+// The downloadable import template: one `address` column plus an example row.
+const SUBSCRIBERS_CSV_TEMPLATE = "address\nsubscriber@example.com\n"
+
+// Delivery-outcome colors for the stream dashboard donut.
+const DELIVERY_COLORS: Record<string, string> = {
+  delivered: "#10b981",
+  bounced: "#ef4444",
+  held: "#f59e0b",
+  pending: "#94a3b8",
+}
+const deliveryChartConfig = {
+  delivered: { label: "Delivered", color: DELIVERY_COLORS.delivered },
+  bounced: { label: "Bounced", color: DELIVERY_COLORS.bounced },
+  held: { label: "Held", color: DELIVERY_COLORS.held },
+  pending: { label: "Queued", color: DELIVERY_COLORS.pending },
+} satisfies ChartConfig
+
 export function StreamDetail({
   api,
   org,
@@ -2147,7 +2287,6 @@ export function StreamDetail({
     queryFn: () => adminApi.servers(org).get(server),
     enabled: isBroadcast,
   })
-  const hasAddress = !!serverRec.data?.server.broadcast_physical_address
 
   // Opt-in subscribers (broadcast only): consent gate for marketing sends.
   const subscribers = useQuery({
@@ -2181,16 +2320,10 @@ export function StreamDetail({
     onError: (err) => errorToast(err, "Could not record the complaint"),
   })
   const [importText, setImportText] = useState("")
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const importSubs = useMutation({
-    mutationFn: () =>
-      api.streams
-        .subscribers(permalink)
-        .import(
-          importText
-            .split(/[\s,;]+/)
-            .map((a) => a.trim())
-            .filter(Boolean),
-        ),
+    mutationFn: (addresses: string[]) =>
+      api.streams.subscribers(permalink).import(addresses),
     onSuccess: (data) => {
       invalidateSubs()
       setImportText("")
@@ -2198,6 +2331,26 @@ export function StreamDetail({
     },
     onError: (err) => errorToast(err, "Could not import subscribers"),
   })
+  // Paste box → split on whitespace, commas or semicolons.
+  const importFromText = () =>
+    importSubs.mutate(
+      importText.split(/[\s,;]+/).map((a) => a.trim()).filter(Boolean),
+    )
+  // CSV upload (Excel exports CSV too): parse client-side, then import.
+  const importFromFile = async (file: File) => {
+    let addresses: string[]
+    try {
+      addresses = parseAddressesFromCsv(await file.text())
+    } catch {
+      toast.error("Could not read that file")
+      return
+    }
+    if (addresses.length === 0) {
+      toast.error("No email addresses found in that file")
+      return
+    }
+    importSubs.mutate(addresses)
+  }
 
   // Reputation isolation: which IP pool this stream sends from. The pool is
   // shown in the header and edited in the stream dialog (below).
@@ -2241,6 +2394,88 @@ export function StreamDetail({
     onError: (err) => errorToast(err, "Could not update the stream"),
   })
 
+  // The server's CAN-SPAM postal address (server-level, admin API), edited
+  // from the Settings tab of a broadcast stream. Seeded once it arrives.
+  const [physicalAddress, setPhysicalAddress] = useState<string | null>(null)
+  if (isBroadcast && physicalAddress === null && serverRec.data) {
+    setPhysicalAddress(serverRec.data.server.broadcast_physical_address ?? "")
+  }
+  const saveAddress = useMutation({
+    mutationFn: () =>
+      adminApi.servers(org).update(server, {
+        broadcast_physical_address: physicalAddress ?? "",
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["server", org, server] })
+      toast.success("Physical address saved")
+    },
+    onError: (err) => errorToast(err, "Could not save the address"),
+  })
+
+  // Recent campaigns targeting this stream (broadcast only), for the dashboard.
+  const campaignsQuery = useQuery({
+    queryKey: ["sapi-campaigns", org, server],
+    queryFn: () => api.campaigns.list(),
+    enabled: isBroadcast,
+  })
+  const streamCampaigns = (campaignsQuery.data?.campaigns ?? []).filter(
+    (c) => c.stream?.permalink === permalink,
+  )
+
+  // Messages in this stream: one page for the Messages tab table.
+  const streamMessages = useQuery({
+    queryKey: ["sapi-messages", `?stream=${permalink}&per_page=100`],
+    queryFn: () =>
+      api.messages(`?stream=${encodeURIComponent(permalink)}&per_page=100`),
+    refetchInterval: 15_000,
+  })
+
+  // Dashboard counters: true per-stream totals read from the messages
+  // pagination (per_page=1 keeps each call to a single row).
+  const countParam = `?stream=${encodeURIComponent(permalink)}&per_page=1`
+  const volumeQ = useQuery({
+    queryKey: ["stream-count", permalink, "all"],
+    queryFn: () => api.messages(countParam),
+  })
+  const deliveredQ = useQuery({
+    queryKey: ["stream-count", permalink, "sent"],
+    queryFn: () => api.messages(`${countParam}&status=Sent`),
+  })
+  const bouncedQ = useQuery({
+    queryKey: ["stream-count", permalink, "bounced"],
+    queryFn: () => api.messages(`${countParam}&status=Bounced`),
+  })
+  const heldQ = useQuery({
+    queryKey: ["stream-count", permalink, "held"],
+    queryFn: () => api.messages(`${countParam}&status=Held`),
+  })
+  const pendingQ = useQuery({
+    queryKey: ["stream-count", permalink, "pending"],
+    queryFn: () => api.messages(`${countParam}&status=Pending`),
+  })
+  const countsLoading =
+    volumeQ.isLoading ||
+    deliveredQ.isLoading ||
+    bouncedQ.isLoading ||
+    heldQ.isLoading ||
+    pendingQ.isLoading
+  const counts = {
+    volume: volumeQ.data?.pagination.total ?? 0,
+    delivered: deliveredQ.data?.pagination.total ?? 0,
+    bounced: bouncedQ.data?.pagination.total ?? 0,
+    held: heldQ.data?.pagination.total ?? 0,
+    pending: pendingQ.data?.pagination.total ?? 0,
+  }
+
+  // The active tab, deep-linked via ?tab= (client-only, no Suspense needed).
+  const [tab, setTab] = useState(() => initialTab("dashboard"))
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    const url = new URL(window.location.href)
+    url.searchParams.set("tab", tab)
+    window.history.replaceState(window.history.state, "", url)
+  }, [tab])
+
   const backHref = `/orgs/${org}/servers/${server}/streams`
 
   // Same list query as the streams list — react-query dedupes the fetch;
@@ -2264,6 +2499,200 @@ export function StreamDetail({
     )
   }
 
+  // Seed the edit dialog from the current stream, then open it.
+  const openEdit = () => {
+    setEdit({
+      name: stream.name,
+      stream_type: stream.stream_type,
+      archived: stream.archived,
+      ip_pool_id: stream.ip_pool_id ?? null,
+    })
+    setEditOpen(true)
+  }
+
+  const subscribedCount = subs.filter((s) => s.status === "subscribed").length
+
+  const dashTiles: [string, number][] = [
+    ["Volume", counts.volume],
+    ["Delivered", counts.delivered],
+    ["Bounced", counts.bounced],
+    ["Held", counts.held],
+    ["Queued", counts.pending],
+    ...(isBroadcast
+      ? ([
+          ["Subscribers", subscribedCount],
+          ["Unsubscribed", streamUnsubs.length],
+        ] as [string, number][])
+      : []),
+  ]
+
+  const deliveryData = [
+    { key: "delivered", label: "Delivered", value: counts.delivered },
+    { key: "bounced", label: "Bounced", value: counts.bounced },
+    { key: "held", label: "Held", value: counts.held },
+    { key: "pending", label: "Queued", value: counts.pending },
+  ].filter((d) => d.value > 0)
+
+  const messageHref = (id: number) => `/orgs/${org}/servers/${server}/messaging/${id}`
+  const messageColumns: ColumnDef<Message>[] = [
+    {
+      id: "event",
+      header: "Event",
+      accessorFn: (m) => m.status ?? "",
+      cell: ({ row }) => <MessagePill message={row.original} />,
+    },
+    {
+      id: "recipient",
+      header: "Recipient",
+      accessorFn: (m) => m.rcpt_to,
+      cell: ({ row }) => (
+        <Link
+          href={recipientHref(org, server, row.original.rcpt_to)}
+          className="block max-w-48 truncate font-medium text-primary underline-offset-2 hover:underline"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {row.original.rcpt_to}
+        </Link>
+      ),
+    },
+    {
+      id: "subject",
+      header: "Subject",
+      accessorFn: (m) => m.subject ?? "",
+      cell: ({ row }) => (
+        <Link
+          href={messageHref(row.original.id)}
+          className="block max-w-64 truncate transition-colors group-hover:text-primary hover:underline"
+        >
+          {row.original.subject ?? "—"}
+        </Link>
+      ),
+    },
+    {
+      id: "tag",
+      header: "Tag",
+      accessorFn: (m) => m.tag ?? "",
+      cell: ({ row }) =>
+        row.original.tag ? (
+          <Badge variant="secondary" className="font-normal">
+            {row.original.tag}
+          </Badge>
+        ) : (
+          <span className="text-muted-foreground">—</span>
+        ),
+    },
+    {
+      id: "time",
+      header: "Time",
+      accessorFn: (m) => m.created_at,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <span
+          className="whitespace-nowrap text-muted-foreground"
+          title={formatDate(row.original.created_at)}
+        >
+          {relativeTime(row.original.created_at)}
+        </span>
+      ),
+    },
+  ]
+
+  const subscriberColumns: ColumnDef<Subscription>[] = [
+    {
+      id: "address",
+      header: "Address",
+      accessorFn: (s) => s.address,
+      cell: ({ row }) => (
+        <span className="block max-w-72 truncate font-medium">{row.original.address}</span>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      accessorFn: (s) => s.status,
+      cell: ({ row }) => (
+        <Badge variant={row.original.status === "subscribed" ? "secondary" : "outline"}>
+          {row.original.status}
+        </Badge>
+      ),
+    },
+    {
+      id: "added",
+      header: "Added",
+      accessorFn: (s) => s.created_at ?? "",
+      cell: ({ row }) => (
+        <span className="whitespace-nowrap text-muted-foreground">
+          {row.original.created_at ? formatDate(row.original.created_at) : "—"}
+        </span>
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <span className="flex justify-end gap-2">
+          {row.original.status === "subscribed" && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => complain.mutate(row.original.address)}
+              disabled={complain.isPending}
+            >
+              Mark complaint
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => removeSub.mutate(row.original.address)}
+            disabled={removeSub.isPending}
+          >
+            Remove
+          </Button>
+        </span>
+      ),
+    },
+  ]
+
+  const campaignColumns: ColumnDef<CampaignWithStream>[] = [
+    {
+      id: "subject",
+      header: "Subject",
+      accessorFn: (c) => c.subject,
+      cell: ({ row }) => (
+        <Link
+          href={`/orgs/${org}/servers/${server}/campaigns/${row.original.id}`}
+          className="block max-w-72 truncate font-medium transition-colors group-hover:text-primary hover:underline"
+        >
+          {row.original.subject || `Campaign #${row.original.id}`}
+        </Link>
+      ),
+    },
+    {
+      id: "status",
+      header: "Status",
+      accessorFn: (c) => c.status,
+      cell: ({ row }) => (
+        <Badge variant="outline" className="capitalize">
+          {row.original.status}
+        </Badge>
+      ),
+    },
+    {
+      id: "progress",
+      header: "Progress",
+      accessorFn: (c) => c.sent,
+      meta: { align: "right" },
+      cell: ({ row }) => (
+        <span className="tabular-nums text-muted-foreground">
+          {row.original.sent}/{row.original.total}
+        </span>
+      ),
+    },
+  ]
+
   return (
     <Page
       header={
@@ -2281,103 +2710,226 @@ export function StreamDetail({
             </span>
           }
           action={
-            <div className="flex flex-wrap items-center gap-2">
-              <Button variant="outline" size="sm" asChild>
-                <Link
-                  href={`/orgs/${org}/servers/${server}/messaging?stream=${encodeURIComponent(
-                    stream.permalink,
-                  )}`}
-                >
-                  <MailIcon className="size-4" /> View messages in this stream
-                </Link>
-              </Button>
-              <Button variant="outline" size="sm" asChild>
-                <Link href={`/orgs/${org}/servers/${server}/suppressions`}>
-                  View suppressions
-                </Link>
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => {
-                  setEdit({
-                    name: stream.name,
-                    stream_type: stream.stream_type,
-                    archived: stream.archived,
-                    ip_pool_id: stream.ip_pool_id ?? null,
-                  })
-                  setEditOpen(true)
-                }}
-              >
-                Edit
-              </Button>
-              {!stream.archived && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => archive.mutate()}
-                  disabled={archive.isPending}
-                >
-                  {archive.isPending ? "Archiving…" : "Archive"}
+            !isBroadcast ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <Button variant="outline" size="sm" onClick={openEdit}>
+                  Edit
                 </Button>
-              )}
-            </div>
+                {!stream.archived && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => archive.mutate()}
+                    disabled={archive.isPending}
+                  >
+                    {archive.isPending ? "Archiving…" : "Archive"}
+                  </Button>
+                )}
+              </div>
+            ) : undefined
           }
         />
       }
     >
-      <div className="space-y-4">
-        {isBroadcast && (
-          <>
-          <div className="rounded-md border p-4">
-            <h2 className="text-base font-semibold">Marketing stream</h2>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-              Messages on this stream carry a one-click List-Unsubscribe header and a CAN-SPAM
-              footer (unsubscribe link + postal address). Recipients who unsubscribe are
-              suppressed on this stream only, so opt-outs here never block your transactional mail.
-            </p>
-            {!hasAddress && (
-              <p className="mt-3 rounded-md border border-amber-300/60 bg-amber-50 p-3 text-sm text-amber-900">
-                No broadcast postal address is set — required for CAN-SPAM.{" "}
-                <Link
-                  href={`/orgs/${org}/servers/${server}/settings`}
-                  className="font-medium underline underline-offset-2"
-                >
-                  Add one in Settings
-                </Link>
-                .
-              </p>
-            )}
-            <div className="mt-4">
-              <div className="text-2xl font-semibold tabular-nums">{streamUnsubs.length}</div>
-              <div className="text-xs text-muted-foreground">unsubscribed / suppressed</div>
-            </div>
-          </div>
+      <Tabs value={tab} onValueChange={setTab}>
+        <TabsList className="mb-4 flex-wrap">
+          <TabsTrigger value="dashboard">Dashboard</TabsTrigger>
+          <TabsTrigger value="messages">Messages</TabsTrigger>
+          {isBroadcast && <TabsTrigger value="subscribers">Subscribers</TabsTrigger>}
+          {isBroadcast && <TabsTrigger value="settings">Settings</TabsTrigger>}
+        </TabsList>
 
-          <div className="rounded-md border p-4">
-            <h2 className="text-base font-semibold">Subscribers</h2>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-              Broadcast messages may only be sent to opted-in subscribers. Add addresses here;
-              an unsubscribe removes consent automatically.
-            </p>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <Input
-                value={newSub}
-                onChange={(e) => setNewSub(e.target.value)}
-                placeholder="subscriber@example.com"
-                className="h-8 max-w-xs"
-              />
+        {/* --------------------------------------------------- Dashboard */}
+        <TabsContent value="dashboard" className="space-y-6">
+          {countsLoading ? (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-5">
+              {dashTiles.map(([label]) => (
+                <Card key={label}>
+                  <CardContent className="p-4">
+                    <p className="text-xs text-muted-foreground">{label}</p>
+                    <Skeleton className="mt-2 h-7 w-12" />
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-5">
+              {dashTiles.map(([label, value]) => (
+                <Card key={label}>
+                  <CardContent className="p-4">
+                    <p className="text-xs text-muted-foreground">{label}</p>
+                    <p className="text-2xl font-semibold tabular-nums">
+                      {value.toLocaleString()}
+                    </p>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          )}
+
+          <Card>
+            <CardContent className="p-4">
+              <h3 className="mb-3 text-sm font-medium">Delivery outcomes</h3>
+              {countsLoading ? (
+                <Skeleton className="h-40 w-40 rounded-full" />
+              ) : counts.volume === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  No messages have been sent on this stream yet.
+                </p>
+              ) : (
+                <div className="flex flex-wrap items-center gap-6">
+                  <ChartContainer config={deliveryChartConfig} className="aspect-square h-40">
+                    <PieChart>
+                      <Pie
+                        data={deliveryData}
+                        dataKey="value"
+                        nameKey="label"
+                        innerRadius="60%"
+                        outerRadius="100%"
+                        strokeWidth={2}
+                        isAnimationActive={false}
+                      >
+                        {deliveryData.map((d) => (
+                          <Cell key={d.key} fill={DELIVERY_COLORS[d.key]} />
+                        ))}
+                      </Pie>
+                    </PieChart>
+                  </ChartContainer>
+                  <dl className="space-y-1.5 text-sm">
+                    {deliveryData.map((d) => (
+                      <div key={d.key} className="flex items-center gap-2">
+                        <span
+                          className="size-2.5 rounded-sm"
+                          style={{ backgroundColor: DELIVERY_COLORS[d.key] }}
+                        />
+                        <dt className="w-24 text-muted-foreground">{d.label}</dt>
+                        <dd className="font-medium tabular-nums">{d.value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          {isBroadcast && (
+            <div>
+              <div className="mb-2 flex items-center justify-between">
+                <h3 className="text-sm font-medium">Recent campaigns</h3>
+                <Button variant="outline" size="sm" asChild>
+                  <Link href={`/orgs/${org}/servers/${server}/campaigns/new`}>
+                    <MegaphoneIcon className="size-4" /> New campaign
+                  </Link>
+                </Button>
+              </div>
+              {campaignsQuery.isLoading ? (
+                <Skeleton className="h-24 w-full" />
+              ) : streamCampaigns.length === 0 ? (
+                <EmptyState
+                  icon={MegaphoneIcon}
+                  title="No campaigns yet"
+                  description="Broadcast to this stream's subscribers by creating a campaign."
+                />
+              ) : (
+                <DataTable
+                  columns={campaignColumns}
+                  data={streamCampaigns.slice(0, 10)}
+                  searchable={false}
+                  emptyText="No campaigns for this stream."
+                  initialPageSize={10}
+                />
+              )}
+            </div>
+          )}
+        </TabsContent>
+
+        {/* ---------------------------------------------------- Messages */}
+        <TabsContent value="messages">
+          {streamMessages.isPending ? (
+            <Skeleton className="h-64 w-full" />
+          ) : (streamMessages.data?.messages ?? []).length === 0 ? (
+            <EmptyState
+              icon={MailIcon}
+              title="No messages in this stream yet"
+              description="Messages sent on this stream will appear here."
+            />
+          ) : (
+            <DataTable
+              columns={messageColumns}
+              data={streamMessages.data?.messages ?? []}
+              searchKeys={["rcpt_to", "subject"]}
+              searchPlaceholder="Search recipient or subject…"
+              emptyText="No messages match your search."
+              initialPageSize={20}
+            />
+          )}
+        </TabsContent>
+
+        {/* ------------------------------------------------- Subscribers */}
+        {isBroadcast && (
+          <TabsContent value="subscribers" className="space-y-4">
+            <div>
+              <p className="max-w-2xl text-sm text-muted-foreground">
+                Broadcast messages may only be sent to opted-in subscribers. Add addresses
+                here; an unsubscribe removes consent automatically.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-end gap-2">
+              <div className="grid gap-1.5">
+                <Label className="text-xs text-muted-foreground">Add a subscriber</Label>
+                <Input
+                  value={newSub}
+                  onChange={(e) => setNewSub(e.target.value)}
+                  placeholder="subscriber@example.com"
+                  className="h-9 w-72 max-w-full"
+                />
+              </div>
               <Button
-                size="sm"
                 onClick={() => addSub.mutate()}
                 disabled={!newSub.trim() || addSub.isPending}
               >
                 Add subscriber
               </Button>
             </div>
-            <div className="mt-3 grid gap-2">
+
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  downloadFile("subscribers-template.csv", SUBSCRIBERS_CSV_TEMPLATE)
+                }
+              >
+                <DownloadIcon className="size-4" /> Download template
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={importSubs.isPending}
+              >
+                <UploadIcon className="size-4" /> Import CSV
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                CSV with an <code>address</code> column (Excel-exported CSV works too).
+              </span>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".csv,text/csv"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0]
+                  if (file) importFromFile(file)
+                  e.target.value = ""
+                }}
+              />
+            </div>
+
+            <div className="grid max-w-2xl gap-2">
               <Label className="text-xs text-muted-foreground">
-                Import (one address per line or comma-separated)
+                Or paste addresses (one per line or comma-separated)
               </Label>
               <Textarea
                 rows={3}
@@ -2390,57 +2942,109 @@ export function StreamDetail({
                 variant="outline"
                 size="sm"
                 className="justify-self-start"
-                onClick={() => importSubs.mutate()}
+                onClick={importFromText}
                 disabled={!importText.trim() || importSubs.isPending}
               >
-                Import subscribers
+                Import pasted addresses
               </Button>
             </div>
-            <div className="mt-3">
-              {subscribers.isLoading ? (
-                <p className="text-sm text-muted-foreground">Loading…</p>
-              ) : subs.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No subscribers yet.</p>
-              ) : (
-                <ul className="divide-y">
-                  {subs.map((s) => (
-                    <li
-                      key={s.id}
-                      className="flex items-center justify-between gap-2 py-2 text-sm"
-                    >
-                      <span className="min-w-0 truncate">{s.address}</span>
-                      <span className="flex shrink-0 items-center gap-2">
-                        <Badge variant={s.status === "subscribed" ? "secondary" : "outline"}>
-                          {s.status}
-                        </Badge>
-                        {s.status === "subscribed" && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => complain.mutate(s.address)}
-                            disabled={complain.isPending}
-                          >
-                            Mark complaint
-                          </Button>
-                        )}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => removeSub.mutate(s.address)}
-                          disabled={removeSub.isPending}
-                        >
-                          Remove
-                        </Button>
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </div>
-          </>
+
+            {subscribers.isLoading ? (
+              <Skeleton className="h-48 w-full" />
+            ) : subs.length === 0 ? (
+              <EmptyState
+                icon={MailIcon}
+                title="No subscribers yet"
+                description="Add addresses above or import a CSV to build this stream's audience."
+              />
+            ) : (
+              <DataTable
+                columns={subscriberColumns}
+                data={subs}
+                searchKeys={["address"]}
+                searchPlaceholder="Search subscribers…"
+                emptyText="No subscribers match your search."
+                initialPageSize={20}
+              />
+            )}
+          </TabsContent>
         )}
-      </div>
+
+        {/* ---------------------------------------------------- Settings */}
+        {isBroadcast && (
+          <TabsContent value="settings" className="space-y-4">
+            <Card>
+              <CardContent className="space-y-3 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-medium">Stream</h3>
+                  <div className="flex items-center gap-2">
+                    <Button variant="outline" size="sm" onClick={openEdit}>
+                      Edit stream
+                    </Button>
+                    {!stream.archived && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => archive.mutate()}
+                        disabled={archive.isPending}
+                      >
+                        {archive.isPending ? "Archiving…" : "Archive"}
+                      </Button>
+                    )}
+                  </div>
+                </div>
+                <dl className="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-1.5 text-sm">
+                  <dt className="text-muted-foreground">Name</dt>
+                  <dd className="font-medium">{stream.name}</dd>
+                  <dt className="text-muted-foreground">Permalink</dt>
+                  <dd className="font-mono text-xs">{stream.permalink}</dd>
+                  <dt className="text-muted-foreground">Status</dt>
+                  <dd>{stream.archived ? "Archived" : "Active"}</dd>
+                  <dt className="text-muted-foreground">IP pool</dt>
+                  <dd>{poolName}</dd>
+                </dl>
+                <p className="text-xs text-muted-foreground">
+                  Broadcast streams should use a separate IP pool to keep marketing
+                  reputation isolated from transactional mail.
+                </p>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardContent className="space-y-3 p-4">
+                <div>
+                  <h3 className="text-sm font-medium">Physical mailing address</h3>
+                  <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+                    Shown in the CAN-SPAM footer of every broadcast message. Required for
+                    marketing mail. This is a server-level setting shared by all broadcast
+                    streams on this server.
+                  </p>
+                </div>
+                {serverRec.isLoading ? (
+                  <Skeleton className="h-20 w-full max-w-2xl" />
+                ) : (
+                  <div className="grid max-w-2xl gap-2">
+                    <Textarea
+                      rows={3}
+                      value={physicalAddress ?? ""}
+                      onChange={(e) => setPhysicalAddress(e.target.value)}
+                      placeholder={"Acme Inc.\n123 Main Street\nSpringfield, ST 00000"}
+                    />
+                    <Button
+                      size="sm"
+                      className="justify-self-start"
+                      onClick={() => saveAddress.mutate()}
+                      disabled={saveAddress.isPending}
+                    >
+                      {saveAddress.isPending ? "Saving…" : "Save address"}
+                    </Button>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+        )}
+      </Tabs>
 
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
         <DialogContent className="sm:max-w-md">
@@ -2540,29 +3144,81 @@ function TemplateThumbnail({
   html,
   subject,
   textBody,
+  wrapper,
 }: {
   html: string | null
   subject?: string | null
   textBody?: string | null
+  // Optional layout HTML wrapper ({{{ content }}}); when set, the rendered
+  // body is wrapped in it so the thumbnail shows the branded shell.
+  wrapper?: string | null
 }) {
   if (!html) {
     return (
-      <div className="flex h-36 items-center justify-center rounded-t-md border-b bg-muted/40 text-xs text-muted-foreground">
+      <div className="flex aspect-[16/10] items-center justify-center rounded-t-md border-b bg-muted/40 text-xs text-muted-foreground">
         Plain-text template
       </div>
     )
   }
-  const rendered = renderMustache(html, sampleModel(subject, html, textBody))
+  const model = sampleModel(subject, html, textBody)
+  const body = renderMustache(html, model)
+  const rendered = wrapper
+    ? renderMustache(wrapper, { ...(typeof model === "object" && model !== null ? model : {}), content: body })
+    : body
+  return <ThumbnailFrame rendered={rendered} />
+}
+
+// A layout thumbnail: the wrapper rendered around sample body content, so the
+// layouts gallery shows each layout as a real mail (like the template cards).
+function LayoutThumbnail({ wrapper }: { wrapper: string }) {
+  const hasContent = /\{\{\{\s*content\s*\}\}\}|\{\{&\s*content\s*\}\}/.test(wrapper)
+  if (!hasContent) {
+    return (
+      <div className="flex aspect-[16/10] items-center justify-center rounded-t-md border-b bg-muted/40 text-xs text-muted-foreground">
+        No preview
+      </div>
+    )
+  }
+  const rendered = renderMustache(wrapper, {
+    product: "Acme",
+    unsubscribe_url: "#",
+    content: SAMPLE_BODY,
+  })
+  return <ThumbnailFrame rendered={rendered} />
+}
+
+// A 600×450 render of the mail scaled to exactly fill the card width, measured
+// with a ResizeObserver. 600px ≈ the email's own 560px body, so the preview
+// reads at a natural size instead of floating tiny in a too-wide viewport.
+function ThumbnailFrame({ rendered }: { rendered: string }) {
+  const DESIGN_W = 600
+  const DESIGN_H = 450
+  const ref = useRef<HTMLDivElement>(null)
+  const [scale, setScale] = useState(0.52)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth) setScale(el.clientWidth / DESIGN_W)
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
   return (
-    <div className="h-36 overflow-hidden rounded-t-md border-b bg-white">
+    <div ref={ref} className="relative aspect-[4/3] w-full overflow-hidden rounded-t-md border-b bg-white">
       <iframe
         title="Template thumbnail"
         sandbox=""
         srcDoc={rendered}
         tabIndex={-1}
         aria-hidden
-        className="pointer-events-none origin-top-left"
-        style={{ width: "600px", height: "480px", transform: "scale(0.44)", border: "0" }}
+        className="pointer-events-none absolute left-0 top-0 origin-top-left"
+        style={{
+          width: `${DESIGN_W}px`,
+          height: `${DESIGN_H}px`,
+          transform: `scale(${scale})`,
+          border: "0",
+        }}
       />
     </div>
   )
@@ -2583,6 +3239,21 @@ function LibraryWizard({
   onImported: () => void
 }) {
   const [importing, setImporting] = useState<string | null>(null)
+  const [query, setQuery] = useState("")
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return TEMPLATE_LIBRARY
+    return TEMPLATE_LIBRARY.filter((t) =>
+      [t.name, t.permalink, t.description, t.subject].some((field) =>
+        field.toLowerCase().includes(q),
+      ),
+    )
+  }, [query])
+
+  const importedCount = TEMPLATE_LIBRARY.filter((t) =>
+    existingPermalinks.has(t.permalink),
+  ).length
 
   async function importTemplate(template: LibraryTemplate) {
     setImporting(template.permalink)
@@ -2604,49 +3275,86 @@ function LibraryWizard({
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-3xl">
+      <DialogContent className="w-[96vw] gap-3 sm:max-w-5xl">
         <DialogHeader>
           <DialogTitle>Start from the library</DialogTitle>
+          <p className="text-sm text-muted-foreground">
+            {TEMPLATE_LIBRARY.length} production-ready transactional templates: account
+            lifecycle, security, collaboration and commerce. Import one to make it your own.
+          </p>
         </DialogHeader>
-        <p className="text-sm text-muted-foreground">
-          Twenty production-ready transactional templates: account lifecycle, security,
-          collaboration and commerce. Import one to make it your own.
-        </p>
-        <div className="grid max-h-[65svh] grid-cols-2 gap-3 overflow-y-auto pr-1 sm:grid-cols-3">
-          {TEMPLATE_LIBRARY.map((template) => {
-            const already = existingPermalinks.has(template.permalink)
-            return (
-              <Card key={template.permalink} className="gap-0 overflow-hidden p-0">
-                <TemplateThumbnail
-                  html={template.html_body}
-                  subject={template.subject}
-                  textBody={template.text_body}
-                />
-                <CardContent className="grid gap-2 p-3">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-medium">{template.name}</p>
-                    <p className="line-clamp-2 text-xs text-muted-foreground">
-                      {template.description}
-                    </p>
-                  </div>
-                  <Button
-                    size="sm"
-                    variant={already ? "outline" : "default"}
-                    disabled={already || importing !== null}
-                    onClick={() => importTemplate(template)}
-                  >
-                    {already
-                      ? "Already imported"
-                      : importing === template.permalink
-                        ? "Importing…"
-                        : "Import"}
-                  </Button>
-                </CardContent>
-              </Card>
-            )
-          })}
+        <div className="relative">
+          <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            autoFocus
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search templates by name, subject or keyword…"
+            className="pl-9"
+          />
         </div>
-        <DialogFooter>
+
+        {/* Fixed-height, scrollable body so the dialog never grows past the
+            viewport and its height stays stable while the search filters. */}
+        <div className="h-[56vh] overflow-y-auto rounded-md border bg-muted/20 p-4">
+          {filtered.length === 0 ? (
+            <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-sm text-muted-foreground">
+              <p className="font-medium text-foreground">No templates match “{query}”</p>
+              <p>Try a different name or keyword.</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {filtered.map((template) => {
+                const already = existingPermalinks.has(template.permalink)
+                return (
+                  <Card
+                    key={template.permalink}
+                    className="flex flex-col gap-0 overflow-hidden p-0 transition-shadow hover:shadow-md"
+                  >
+                    <TemplateThumbnail
+                      html={template.html_body}
+                      subject={template.subject}
+                      textBody={template.text_body}
+                    />
+                    <CardContent className="flex flex-1 flex-col gap-2 p-4">
+                      <div className="min-w-0 space-y-1">
+                        <p className="truncate text-sm font-semibold">{template.name}</p>
+                        <p className="truncate font-mono text-[11px] text-muted-foreground">
+                          {template.subject}
+                        </p>
+                      </div>
+                      <p className="line-clamp-2 flex-1 text-xs text-muted-foreground">
+                        {template.description}
+                      </p>
+                      <Button
+                        size="sm"
+                        className="mt-1 w-full"
+                        variant={already ? "outline" : "default"}
+                        disabled={already || importing !== null}
+                        onClick={() => importTemplate(template)}
+                      >
+                        {already ? (
+                          <>
+                            <CircleCheckIcon className="size-4" /> Imported
+                          </>
+                        ) : importing === template.permalink ? (
+                          "Importing…"
+                        ) : (
+                          "Import"
+                        )}
+                      </Button>
+                    </CardContent>
+                  </Card>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
+        <DialogFooter className="items-center sm:justify-between">
+          <span className="text-xs text-muted-foreground">
+            {filtered.length} shown · {importedCount} of {TEMPLATE_LIBRARY.length} imported
+          </span>
           <Button variant="outline" onClick={onClose}>
             Done
           </Button>
@@ -2751,290 +3459,201 @@ function CopyTemplateDialog({
 /// slug badge and Published/Archived status; "New template" and Edit open
 /// the focus-mode split editor (a route), "Start from library" the
 /// gallery-wizard, "Copy to server…" the sibling-server push.
-/// Manage reusable layouts (the shared logo/address/social chrome that
-/// wraps template bodies). A default HTML wrapper seeds a new layout so
-/// the required {{{ content }}} placeholder is never forgotten.
-const DEFAULT_WRAPPER = `<table role="presentation" width="100%" style="background:#f4f4f5;padding:24px 0;font-family:Arial,sans-serif">
-  <tr><td align="center">
-    <table role="presentation" width="560" style="background:#fff;border-radius:12px;overflow:hidden">
-      <tr><td style="padding:24px 32px;font-size:18px;font-weight:700;color:#18181b">{{ product }}</td></tr>
-      <tr><td style="padding:0 32px 24px">{{{ content }}}</td></tr>
-      <tr><td style="padding:20px 32px;font-size:12px;color:#a1a1aa;border-top:1px solid #e4e4e7">
-        Acme GmbH · Camelweg 1 · 10115 Berlin<br>
-        <a href="{{ unsubscribe_url }}" style="color:#71717a">Unsubscribe</a>
-      </td></tr>
-    </table>
-  </td></tr>
-</table>`
-
-function LayoutsDialog({ api, onClose }: { api: Api; onClose: () => void }) {
-  const queryClient = useQueryClient()
-  const layouts = useQuery({ queryKey: ["sapi-layouts"], queryFn: api.layouts.list })
-  const [editing, setEditing] = useState<Layout | "new" | null>(null)
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-layouts"] })
-  const rows = layouts.data?.layouts ?? []
-
-  const columns: ColumnDef<Layout>[] = [
-    {
-      id: "name",
-      header: "Name",
-      accessorFn: (l) => l.name,
-      cell: ({ row }) => (
-        <span className="block max-w-64 truncate font-medium transition-colors group-hover:text-primary">
-          {row.original.name}
-        </span>
-      ),
-    },
-    {
-      id: "slug",
-      header: "Slug",
-      accessorFn: (l) => l.permalink,
-      cell: ({ row }) => (
-        <span className="font-mono text-xs text-muted-foreground">{row.original.permalink}</span>
-      ),
-    },
-    {
-      id: "actions",
-      header: "",
-      enableSorting: false,
-      meta: { align: "right" },
-      cell: ({ row }) => (
-        <div className="space-x-2">
-          <Button variant="outline" size="sm" onClick={() => setEditing(row.original)}>
-            Edit
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={async () => {
-              try {
-                await api.layouts.delete(row.original.permalink)
-                invalidate()
-              } catch (err) {
-                errorToast(err, "Could not delete the layout")
-              }
-            }}
-          >
-            Delete
-          </Button>
-        </div>
-      ),
-    },
-  ]
-
-  if (editing) {
-    return (
-      <LayoutEditorDialog
-        api={api}
-        layout={editing === "new" ? null : editing}
-        onClose={() => setEditing(null)}
-        onSaved={() => {
-          invalidate()
-          setEditing(null)
-        }}
-      />
-    )
-  }
-
-  return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>Layouts</DialogTitle>
-        </DialogHeader>
-        <p className="text-sm text-muted-foreground">
-          Reusable wrappers for the logo, postal address and social links every mail shares.
-          Templates pick a layout, and it wraps their rendered body.
-        </p>
-        {rows.length === 0 ? (
-          <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-            No layouts yet. Create one to share branding across templates.
-          </div>
-        ) : (
-          <DataTable
-            columns={columns}
-            data={rows}
-            loading={layouts.isPending}
-            searchKeys={["name", "permalink"]}
-            searchPlaceholder="Search layouts…"
-            emptyText="No layouts match your search."
-            initialPageSize={10}
-          />
-        )}
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            Close
-          </Button>
-          <Button onClick={() => setEditing("new")}>
-            <PlusIcon className="size-4" /> New layout
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-/// Create/edit one layout: an HTML wrapper (required, must embed
-/// {{{ content }}}) and an optional plain-text wrapper, with a live
-/// preview of a sample body wrapped by it.
-function LayoutEditorDialog({
+export function Templates({
   api,
-  layout,
-  onClose,
-  onSaved,
+  org,
+  server,
+  view,
 }: {
   api: Api
-  layout: Layout | null
-  onClose: () => void
-  onSaved: () => void
+  org: string
+  server: string
+  view: "templates" | "layouts"
 }) {
-  const [name, setName] = useState(layout?.name ?? "")
-  const [htmlWrapper, setHtmlWrapper] = useState(layout?.html_wrapper ?? DEFAULT_WRAPPER)
-  const [textWrapper, setTextWrapper] = useState(layout?.text_wrapper ?? "")
-  const [busy, setBusy] = useState(false)
-
-  const hasContent = /\{\{\{\s*content\s*\}\}\}|\{\{&\s*content\s*\}\}/.test(htmlWrapper)
-  const preview = hasContent
-    ? renderMustache(htmlWrapper, {
-        product: "Acme",
-        unsubscribe_url: "#",
-        content: "<p style='margin:0'>Your message body appears here.</p>",
-      })
-    : ""
-
-  async function save() {
-    setBusy(true)
-    try {
-      if (layout) {
-        await api.layouts.update(layout.permalink, {
-          name,
-          html_wrapper: htmlWrapper,
-          text_wrapper: textWrapper,
-        })
-      } else {
-        await api.layouts.create({
-          name,
-          html_wrapper: htmlWrapper,
-          ...(textWrapper ? { text_wrapper: textWrapper } : {}),
-        })
-      }
-      toast.success(layout ? "Layout saved" : "Layout created")
-      onSaved()
-    } catch (err) {
-      errorToast(err, "Could not save the layout")
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-4xl">
-        <DialogHeader>
-          <DialogTitle>{layout ? `Edit ${layout.name}` : "New layout"}</DialogTitle>
-        </DialogHeader>
-        <div className="grid gap-4 lg:grid-cols-2">
-          <div className="grid content-start gap-3">
-            <div className="grid gap-1.5">
-              <Label>Name</Label>
-              <Input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Brand"
-              />
-            </div>
-            <div className="grid gap-1.5">
-              <Label>HTML wrapper</Label>
-              <Textarea
-                rows={14}
-                value={htmlWrapper}
-                onChange={(e) => setHtmlWrapper(e.target.value)}
-                className="font-mono text-xs"
-              />
-              {!hasContent && (
-                <p className="text-xs text-red-600 dark:text-red-400">
-                  The wrapper must embed the body with {"{{{ content }}}"} (raw interpolation).
-                </p>
-              )}
-            </div>
-            <div className="grid gap-1.5">
-              <Label>Plain-text wrapper (optional)</Label>
-              <Textarea
-                rows={4}
-                value={textWrapper}
-                onChange={(e) => setTextWrapper(e.target.value)}
-                className="font-mono text-xs"
-                placeholder={"{{& content }}\n--\nAcme GmbH"}
-              />
-            </div>
-          </div>
-          <div className="grid content-start gap-1.5">
-            <Label>Preview</Label>
-            {preview ? (
-              <iframe
-                title="Layout preview"
-                sandbox=""
-                srcDoc={preview}
-                className="h-[60svh] w-full rounded-md border bg-white"
-              />
-            ) : (
-              <p className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-                Add {"{{{ content }}}"} to see the preview.
-              </p>
-            )}
-          </div>
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button onClick={save} disabled={busy || !name.trim() || !hasContent}>
-            {busy ? "Saving…" : layout ? "Save" : "Create"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-export function Templates({ api, org, server }: { api: Api; org: string; server: string }) {
   const router = useRouter()
   const queryClient = useQueryClient()
   const templates = useQuery({ queryKey: ["sapi-templates"], queryFn: api.templates.list })
+  const layouts = useQuery({ queryKey: ["sapi-layouts"], queryFn: api.layouts.list })
+  const wrapperById = useMemo(() => {
+    const map = new Map<number, string>()
+    for (const l of layouts.data?.layouts ?? []) map.set(l.id, l.html_wrapper)
+    return map
+  }, [layouts.data])
+  const layoutPermalinkById = useMemo(() => {
+    const map = new Map<number, string>()
+    for (const l of layouts.data?.layouts ?? []) map.set(l.id, l.permalink)
+    return map
+  }, [layouts.data])
   const [library, setLibrary] = useState(false)
-  const [layoutsOpen, setLayoutsOpen] = useState(false)
   const [copying, setCopying] = useState<Template | null>(null)
+  const [exportOpen, setExportOpen] = useState(false)
+  const [importOpen, setImportOpen] = useState(false)
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["sapi-templates"] })
+  const invalidateLayouts = () => queryClient.invalidateQueries({ queryKey: ["sapi-layouts"] })
 
   const base = `/orgs/${org}/servers/${server}/templates`
+  const layoutsBase = `/orgs/${org}/servers/${server}/layouts`
   const editorHref = (permalink: string) => `${base}/${encodeURIComponent(permalink)}`
+  const layoutHref = (permalink: string) => `${layoutsBase}/${encodeURIComponent(permalink)}`
   const existingPermalinks = new Set(templates.data?.templates.map((t) => t.permalink) ?? [])
+  const templateRows = templates.data?.templates ?? []
+  const layoutRows = layouts.data?.layouts ?? []
+
+  // Templates and layouts carry HTML bodies, so JSON is the natural export
+  // shape; the export dialog still offers CSV too.
+  const templateExportColumns: ExportColumn<Template>[] = [
+    { key: "name", label: "Name", accessor: (t) => t.name },
+    { key: "permalink", label: "Permalink", accessor: (t) => t.permalink },
+    { key: "subject", label: "Subject", accessor: (t) => t.subject ?? "" },
+    { key: "html_body", label: "HTML body", accessor: (t) => t.html_body ?? "" },
+    { key: "text_body", label: "Text body", accessor: (t) => t.text_body ?? "" },
+    {
+      key: "layout",
+      label: "Layout",
+      accessor: (t) => (t.layout_id ? layoutPermalinkById.get(t.layout_id) ?? "" : ""),
+    },
+    { key: "archived", label: "Archived", accessor: (t) => t.archived },
+  ]
+  const templateImportColumns: ImportColumn[] = [
+    { key: "name", label: "Name", example: "Welcome email", required: true },
+    { key: "subject", label: "Subject", example: "Welcome to {{ product }}" },
+    { key: "html_body", label: "HTML body", example: "<h1>Hello {{ name }}</h1>" },
+    { key: "text_body", label: "Text body", example: "Hello {{ name }}" },
+    { key: "layout", label: "Layout permalink", example: "" },
+  ]
+  const layoutExportColumns: ExportColumn<Layout>[] = [
+    { key: "name", label: "Name", accessor: (l) => l.name },
+    { key: "permalink", label: "Permalink", accessor: (l) => l.permalink },
+    { key: "html_wrapper", label: "HTML wrapper", accessor: (l) => l.html_wrapper },
+    { key: "text_wrapper", label: "Text wrapper", accessor: (l) => l.text_wrapper ?? "" },
+  ]
+  const layoutImportColumns: ImportColumn[] = [
+    { key: "name", label: "Name", example: "Default layout", required: true },
+    {
+      key: "html_wrapper",
+      label: "HTML wrapper",
+      example: "<html><body>{{{ content }}}</body></html>",
+      required: true,
+    },
+    { key: "text_wrapper", label: "Text wrapper", example: "{{{ content }}}" },
+  ]
 
   return (
     <Page
       variant="scroll"
       header={
-        <PageHeader
-          title="Templates"
-          description="Mustache-style templates ({{ name }}) rendered per send."
-          action={
-            <div className="flex items-center gap-2">
-              <Button variant="outline" size="sm" onClick={() => setLayoutsOpen(true)}>
-                <LayersIcon className="size-4" /> Layouts
+        <div className="mb-0 flex flex-wrap items-center justify-between gap-3">
+          <Tabs
+            value={view}
+            onValueChange={(v) => router.push(v === "layouts" ? layoutsBase : base)}
+          >
+            <TabsList>
+              <TabsTrigger value="templates">Templates</TabsTrigger>
+              <TabsTrigger value="layouts">Layouts</TabsTrigger>
+            </TabsList>
+          </Tabs>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
+              <UploadIcon className="size-4" /> Import
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setExportOpen(true)}
+              disabled={(view === "templates" ? templateRows.length : layoutRows.length) === 0}
+            >
+              <DownloadIcon className="size-4" /> Export
+            </Button>
+            {view === "templates" ? (
+              <>
+                <Button variant="outline" size="sm" onClick={() => setLibrary(true)}>
+                  <SparklesIcon className="size-4" /> Start from library
+                </Button>
+                <Button size="sm" onClick={() => router.push(`${base}/new`)}>
+                  <PlusIcon className="size-4" /> New template
+                </Button>
+              </>
+            ) : (
+              <Button size="sm" onClick={() => router.push(`${layoutsBase}/new`)}>
+                <PlusIcon className="size-4" /> New layout
               </Button>
-              <Button variant="outline" size="sm" onClick={() => setLibrary(true)}>
-                <SparklesIcon className="size-4" /> Start from library
-              </Button>
-              <Button size="sm" onClick={() => router.push(`${base}/new`)}>
-                <PlusIcon className="size-4" /> New template
-              </Button>
-            </div>
-          }
-          className="mb-0"
-        />
+            )}
+          </div>
+        </div>
       }
     >
-      {templates.data?.templates.length === 0 ? (
+      {view === "layouts" ? (
+        layoutRows.length === 0 ? (
+          <EmptyState
+            icon={LayersIcon}
+            title="No layouts yet"
+            description="A layout is the shared shell (logo, header, footer) that wraps every mail. Create one and templates can use it."
+            action={{ label: "New layout", onClick: () => router.push(`${layoutsBase}/new`) }}
+          />
+        ) : (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {layoutRows.map((layout) => (
+              <Card key={layout.id} className="gap-0 overflow-hidden p-0">
+                <Link href={layoutHref(layout.permalink)} aria-label={`Edit ${layout.name}`}>
+                  <LayoutThumbnail wrapper={layout.html_wrapper} />
+                </Link>
+                <CardContent className="grid gap-2 p-3">
+                  <div className="min-w-0">
+                    <Link
+                      href={layoutHref(layout.permalink)}
+                      className="block truncate text-sm font-medium transition-colors hover:text-primary hover:underline"
+                    >
+                      {layout.name}
+                    </Link>
+                    <p className="truncate font-mono text-xs text-muted-foreground">
+                      {layout.permalink}
+                    </p>
+                  </div>
+                  <div className="mt-1 flex flex-wrap items-center gap-2">
+                    <Button variant="outline" size="sm" asChild>
+                      <Link href={layoutHref(layout.permalink)}>Edit</Link>
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={async () => {
+                        try {
+                          await api.layouts.create({
+                            name: `${layout.name} (copy)`,
+                            html_wrapper: layout.html_wrapper,
+                            ...(layout.text_wrapper ? { text_wrapper: layout.text_wrapper } : {}),
+                          })
+                          toast.success(`Duplicated “${layout.name}”`)
+                          invalidateLayouts()
+                        } catch (err) {
+                          errorToast(err, "Could not duplicate the layout")
+                        }
+                      }}
+                    >
+                      Duplicate
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-muted-foreground hover:text-destructive"
+                      onClick={async () => {
+                        try {
+                          await api.layouts.delete(layout.permalink)
+                          invalidateLayouts()
+                        } catch (err) {
+                          errorToast(err, "Could not delete the layout")
+                        }
+                      }}
+                    >
+                      Delete
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        )
+      ) : templates.data?.templates.length === 0 ? (
         <EmptyState
           icon={FileTextIcon}
           title="No templates yet"
@@ -3050,6 +3669,7 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
                 html={template.html_body}
                 subject={template.subject}
                 textBody={template.text_body}
+                wrapper={template.layout_id ? wrapperById.get(template.layout_id) : null}
               />
               <CardContent className="grid gap-2 p-3">
                 <div className="flex items-start justify-between gap-2">
@@ -3070,6 +3690,30 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
                 <div className="mt-1 flex flex-wrap items-center gap-2">
                   <Button variant="outline" size="sm" asChild>
                     <Link href={editorHref(template.permalink)}>Edit</Link>
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={async () => {
+                      try {
+                        const layoutPermalink = template.layout_id
+                          ? layoutPermalinkById.get(template.layout_id)
+                          : undefined
+                        await api.templates.create({
+                          name: `${template.name} (copy)`,
+                          ...(template.subject ? { subject: template.subject } : {}),
+                          ...(template.html_body ? { html_body: template.html_body } : {}),
+                          ...(template.text_body ? { text_body: template.text_body } : {}),
+                          ...(layoutPermalink ? { layout: layoutPermalink } : {}),
+                        })
+                        toast.success(`Duplicated “${template.name}”`)
+                        invalidate()
+                      } catch (err) {
+                        errorToast(err, "Could not duplicate the template")
+                      }
+                    }}
+                  >
+                    Duplicate
                   </Button>
                   <Button variant="outline" size="sm" onClick={() => setCopying(template)}>
                     Copy to server…
@@ -3104,7 +3748,6 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
           onImported={invalidate}
         />
       )}
-      {layoutsOpen && <LayoutsDialog api={api} onClose={() => setLayoutsOpen(false)} />}
       {copying && (
         <CopyTemplateDialog
           org={org}
@@ -3112,6 +3755,73 @@ export function Templates({ api, org, server }: { api: Api; org: string; server:
           template={copying}
           onClose={() => setCopying(null)}
         />
+      )}
+      {view === "templates" ? (
+        <>
+          <DataExportDialog
+            open={exportOpen}
+            onOpenChange={setExportOpen}
+            title="Export templates"
+            defaultFormat="json"
+            filename={`templates-${server}`}
+            columns={templateExportColumns}
+            rows={templateRows}
+          />
+          <DataImportDialog
+            open={importOpen}
+            onOpenChange={setImportOpen}
+            title="Import templates"
+            templateFilename="templates-template"
+            columns={templateImportColumns}
+            onDone={invalidate}
+            onImport={(imported, onProgress) =>
+              runRowImport(
+                imported,
+                (r) =>
+                  api.templates.create({
+                    name: r.name,
+                    ...(r.subject ? { subject: r.subject } : {}),
+                    ...(r.html_body ? { html_body: r.html_body } : {}),
+                    ...(r.text_body ? { text_body: r.text_body } : {}),
+                    ...(r.layout ? { layout: r.layout } : {}),
+                  }),
+                onProgress,
+              )
+            }
+          />
+        </>
+      ) : (
+        <>
+          <DataExportDialog
+            open={exportOpen}
+            onOpenChange={setExportOpen}
+            title="Export layouts"
+            defaultFormat="json"
+            filename={`layouts-${server}`}
+            columns={layoutExportColumns}
+            rows={layoutRows}
+          />
+          <DataImportDialog
+            open={importOpen}
+            onOpenChange={setImportOpen}
+            title="Import layouts"
+            templateFilename="layouts-template"
+            columns={layoutImportColumns}
+            onDone={invalidateLayouts}
+            onImport={(imported, onProgress) =>
+              runRowImport(
+                imported,
+                (r) =>
+                  api.layouts.create({
+                    name: r.name,
+                    html_wrapper: r.html_wrapper,
+                    ...(r.text_wrapper ? { text_wrapper: r.text_wrapper } : {}),
+                  }),
+                onProgress,
+              )
+            }
+          />
+        </>
       )}
     </Page>
   )
@@ -3237,14 +3947,30 @@ export function ServerLogs({ org, server }: { org: string; server: string }) {
   )
 }
 
-function TemplatesBound({ org, server }: { org: string; server: string }) {
+function TemplatesBound({
+  org,
+  server,
+  view,
+}: {
+  org: string
+  server: string
+  view: "templates" | "layouts"
+}) {
   const api = useMessagingApi()
-  return <Templates api={api} org={org} server={server} />
+  return <Templates api={api} org={org} server={server} view={view} />
 }
-export function ServerTemplates({ org, server }: { org: string; server: string }) {
+export function ServerTemplates({
+  org,
+  server,
+  view = "templates",
+}: {
+  org: string
+  server: string
+  view?: "templates" | "layouts"
+}) {
   return (
     <MessagingApiProvider org={org} server={server}>
-      <TemplatesBound org={org} server={server} />
+      <TemplatesBound org={org} server={server} view={view} />
     </MessagingApiProvider>
   )
 }

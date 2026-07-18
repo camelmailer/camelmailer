@@ -429,6 +429,7 @@ export type Message = {
   threat?: boolean
   size?: number | null
   stream_id?: number | null
+  campaign_id?: number | null
   held?: boolean
   bounce?: boolean
   bypassed?: boolean
@@ -877,7 +878,7 @@ export const adminApi = {
       create: (fields: {
         name: string
         mode: string
-        domain_id?: number
+        domain?: string
         endpoint_url?: string
       }) => api.post<{ route: Route }>(base, fields),
       update: (id: number, fields: Record<string, unknown>) =>
@@ -1238,6 +1239,13 @@ export function serverApi(key: string) {
         api.patch<{ layout: Layout }>(`/api/v2/server/layouts/${permalink}`, fields, h),
       delete: (permalink: string) =>
         api.delete<{ deleted: boolean }>(`/api/v2/server/layouts/${permalink}`, h),
+      // Upload a logo (as a base64 data: URL); returns its public serve URL.
+      uploadLogo: (permalink: string, dataUrl: string) =>
+        api.post<{ url: string }>(
+          `/api/v2/server/layouts/${permalink}/logo`,
+          { data_url: dataUrl },
+          h,
+        ),
     },
   }
 }

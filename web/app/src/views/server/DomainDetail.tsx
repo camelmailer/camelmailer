@@ -6,7 +6,7 @@
 // the exact missing record, live health traffic lights (SPF/DKIM/DMARC)
 // and the delegation flow ("email the records to whoever owns the DNS").
 
-import { useState } from "react"
+import { useState, type ReactNode } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   BadgeCheckIcon,
@@ -31,17 +31,16 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Textarea } from "@/components/ui/textarea"
 import {
   adminApi,
   ApiError,
   type DnsRecord,
-  type DomainHealth,
-  type DomainHealthCheck,
   type HealthStatus,
 } from "@/lib/api"
 import { dnsInstructionsMailto, getDomain } from "@/lib/api-p2"
+import { cn } from "@/lib/utils"
 
 type Scope = { org: string; server: string; name: string }
 
@@ -73,71 +72,61 @@ function MonoValue({ label, value }: { label: string; value: string }) {
   )
 }
 
-function RecordRow({ record, pill }: { record: DnsRecord; pill: React.ReactNode }) {
-  return (
-    <div className="flex flex-wrap items-start justify-between gap-3 rounded-md border p-3">
-      <div className="grid min-w-0 flex-1 gap-1.5">
-        <div className="flex items-center gap-2">
-          <Badge variant="outline">{record.type}</Badge>
-          {pill}
-        </div>
-        <MonoValue label="Name" value={record.name} />
-        <MonoValue label="Value" value={record.value} />
-      </div>
-    </div>
-  )
+/** Status pill for a live DNS check — a skeleton while the check loads. */
+function CheckPill({ status, loading }: { status?: HealthStatus; loading: boolean }) {
+  if (loading) return <Skeleton className="h-5 w-16 rounded-full" />
+  if (!status) return <StatusPill status="unchecked" />
+  return healthPill(status)
 }
 
-// ------------------------------------------------------------ sections
-
-function HealthCard({
+/** A DNS record combined with its live status: what to publish plus whether
+ *  it is already live, in one card (verification / SPF / DKIM / DMARC). */
+function RecordCard({
   title,
-  check,
+  purpose,
+  pill,
+  record,
+  problems,
   extra,
 }: {
   title: string
-  check: DomainHealthCheck
-  extra?: React.ReactNode
+  purpose: string
+  pill: ReactNode
+  record?: DnsRecord | null
+  problems?: string[]
+  extra?: ReactNode
 }) {
+  const hasProblems = !!problems && problems.length > 0
   return (
     <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="flex items-center justify-between text-base">
-          {title} {healthPill(check.status)}
-        </CardTitle>
-        <CardDescription className="break-all font-mono text-xs">
-          {check.record_name}
-        </CardDescription>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-base">{title}</CardTitle>
+          {pill}
+        </div>
+        <CardDescription>{purpose}</CardDescription>
       </CardHeader>
-      <CardContent className="grid gap-2 text-sm">
-        {check.problems.length > 0 && (
-          <ul className="list-disc space-y-1 pl-4 text-muted-foreground">
-            {check.problems.map((problem) => (
+      <CardContent className="grid gap-3">
+        {record ? (
+          <div className="grid gap-1.5 rounded-md border p-3">
+            <Badge variant="outline" className="w-fit">
+              {record.type}
+            </Badge>
+            <MonoValue label="Name" value={record.name} />
+            <MonoValue label="Value" value={record.value} />
+          </div>
+        ) : hasProblems ? null : (
+          <div className="grid gap-2 rounded-md border p-3">
+            <Skeleton className="h-5 w-12" />
+            <Skeleton className="h-6 w-full" />
+          </div>
+        )}
+        {hasProblems && (
+          <ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">
+            {problems!.map((problem) => (
               <li key={problem}>{problem}</li>
             ))}
           </ul>
-        )}
-        {check.found.length > 0 ? (
-          <div className="grid gap-1">
-            <span className="text-xs text-muted-foreground">Found:</span>
-            {check.found.map((record) => (
-              <code key={record} className="break-all rounded bg-muted px-2 py-1 text-xs">
-                {record}
-              </code>
-            ))}
-          </div>
-        ) : (
-          check.expected && (
-            <div className="grid gap-1">
-              <span className="text-xs text-muted-foreground">Expected:</span>
-              <div className="flex items-start gap-2">
-                <code className="min-w-0 flex-1 break-all rounded bg-muted px-2 py-1 text-xs">
-                  {check.expected}
-                </code>
-                <CopyButton value={check.expected} />
-              </div>
-            </div>
-          )
         )}
         {extra}
       </CardContent>
@@ -145,46 +134,24 @@ function HealthCard({
   )
 }
 
-function HealthTab({ health, refetching, onRecheck }: {
-  health: DomainHealth | undefined
-  refetching: boolean
-  onRecheck: () => void
-}) {
-  if (!health) {
-    return <p className="text-sm text-muted-foreground">Checking DNS…</p>
-  }
+function RecordCardSkeleton() {
   return (
-    <div className="space-y-4">
-      <Alert>
-        <BadgeCheckIcon className="size-4" />
-        <AlertTitle className="flex items-center gap-2">
-          Overall {healthPill(health.overall)}
-        </AlertTitle>
-        <AlertDescription>{health.next_step}</AlertDescription>
-      </Alert>
-      <div className="grid gap-4 lg:grid-cols-3">
-        <HealthCard title="SPF" check={health.checks.spf} />
-        <HealthCard title="DKIM" check={health.checks.dkim} />
-        <HealthCard
-          title="DMARC"
-          check={health.checks.dmarc}
-          extra={
-            health.checks.dmarc.policy && (
-              <div className="flex flex-wrap gap-1 text-xs">
-                <Badge variant="outline">p={health.checks.dmarc.policy.p ?? "?"}</Badge>
-                {health.checks.dmarc.policy.sp && (
-                  <Badge variant="outline">sp={health.checks.dmarc.policy.sp}</Badge>
-                )}
-                <Badge variant="outline">pct={health.checks.dmarc.policy.pct}</Badge>
-              </div>
-            )
-          }
-        />
-      </div>
-      <Button variant="outline" size="sm" onClick={onRecheck} disabled={refetching}>
-        <RefreshCwIcon className="size-4" /> Re-check DNS
-      </Button>
-    </div>
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between gap-2">
+          <Skeleton className="h-5 w-28" />
+          <Skeleton className="h-5 w-16 rounded-full" />
+        </div>
+        <Skeleton className="h-4 w-3/4" />
+      </CardHeader>
+      <CardContent>
+        <div className="grid gap-2 rounded-md border p-3">
+          <Skeleton className="h-5 w-12" />
+          <Skeleton className="h-6 w-full" />
+          <Skeleton className="h-6 w-5/6" />
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -200,7 +167,6 @@ export function DomainDetail({ org, server, name }: Scope) {
     queryKey: ["domain-health", org, server, name],
     queryFn: () => adminApi.domains(org, server).health(name),
   })
-  const [tab, setTab] = useState("records")
   const [verifyError, setVerifyError] = useState<string | null>(null)
   const [emailOpen, setEmailOpen] = useState(false)
   const [recipient, setRecipient] = useState("")
@@ -224,11 +190,6 @@ export function DomainDetail({ org, server, name }: Scope) {
     },
   })
 
-  /// Pill of the SPF/DKIM records: graded by the live health check
-  /// when available, "unchecked" until then.
-  const sendingPill = (status: HealthStatus | undefined) =>
-    status ? healthPill(status) : <StatusPill status="unchecked" />
-
   return (
     <Page
       header={
@@ -250,10 +211,14 @@ export function DomainDetail({ org, server, name }: Scope) {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => health.refetch()}
+                onClick={async () => {
+                  await health.refetch()
+                  toast.success("DNS re-checked")
+                }}
                 disabled={health.isFetching}
               >
-                <RefreshCwIcon className="size-4" /> Re-check DNS
+                <RefreshCwIcon className={cn("size-4", health.isFetching && "animate-spin")} />
+                {health.isFetching ? "Checking…" : "Re-check DNS"}
               </Button>
               <Button variant="outline" size="sm" onClick={() => setEmailOpen(true)}>
                 <MailIcon className="size-4" /> Email instructions to a teammate
@@ -282,71 +247,98 @@ export function DomainDetail({ org, server, name }: Scope) {
         </Alert>
       )}
 
-      <Tabs value={tab} onValueChange={setTab}>
-        <TabsList className="mb-4">
-          <TabsTrigger value="records">Records</TabsTrigger>
-          <TabsTrigger value="health">Health</TabsTrigger>
-        </TabsList>
-      </Tabs>
+      {/* Overall DNS health summary */}
+      {health.isPending ? (
+        <Skeleton className="h-16 w-full rounded-lg" />
+      ) : result ? (
+        <Alert>
+          <BadgeCheckIcon className="size-4" />
+          <AlertTitle className="flex items-center gap-2">
+            DNS health {healthPill(result.overall)}
+          </AlertTitle>
+          <AlertDescription>{result.next_step}</AlertDescription>
+        </Alert>
+      ) : null}
 
-      {tab === "records" &&
-        (domain ? (
-          <div className="space-y-6">
-            <section className="space-y-2">
-              <h2 className="text-sm font-medium">Domain verification</h2>
-              <p className="text-sm text-muted-foreground">
-                Proves you control the domain. Publish this TXT record, then hit Verify.
-              </p>
-              <RecordRow
-                record={domain.verification_record}
-                pill={
-                  domain.verified ? (
-                    <StatusPill status="verified" />
-                  ) : (
-                    <StatusPill status="pending" />
-                  )
-                }
-              />
-            </section>
-            <section className="space-y-2">
-              <h2 className="text-sm font-medium">Sending</h2>
-              <p className="text-sm text-muted-foreground">
-                SPF and DKIM authenticate the mail itself; both should be in place before
-                real traffic.
-              </p>
-              <div className="grid gap-2">
-                <RecordRow
-                  record={domain.spf_record}
-                  pill={sendingPill(result?.checks.spf.status)}
-                />
-                {domain.dkim_record ? (
-                  <RecordRow
-                    record={domain.dkim_record}
-                    pill={sendingPill(result?.checks.dkim.status)}
-                  />
+      {/* One card per record: what to publish + its live status */}
+      <div className="grid gap-4 lg:grid-cols-2">
+        {domainQuery.isPending ? (
+          <>
+            <RecordCardSkeleton />
+            <RecordCardSkeleton />
+            <RecordCardSkeleton />
+            <RecordCardSkeleton />
+          </>
+        ) : domain ? (
+          <>
+            <RecordCard
+              title="Domain verification"
+              purpose="Proves you control the domain. Publish this TXT record, then hit Verify."
+              pill={
+                domain.verified ? (
+                  <StatusPill status="verified" />
                 ) : (
-                  <Alert>
-                    <AlertTitle>No DKIM key</AlertTitle>
-                    <AlertDescription>
-                      Neither this domain nor the installation has a DKIM signing key, so
-                      outgoing mail will not be DKIM-signed.
-                    </AlertDescription>
-                  </Alert>
-                )}
-              </div>
-            </section>
-          </div>
-        ) : (
-          <p className="text-sm text-muted-foreground">Loading…</p>
-        ))}
-
-      {tab === "health" && (
-        <HealthTab
-          health={result}
-          refetching={health.isFetching}
-          onRecheck={() => health.refetch()}
-        />
-      )}
+                  <StatusPill status="pending" />
+                )
+              }
+              record={domain.verification_record}
+            />
+            <RecordCard
+              title="SPF"
+              purpose="Authorizes this server to send mail for the domain."
+              pill={<CheckPill status={result?.checks.spf.status} loading={health.isPending} />}
+              record={domain.spf_record}
+              problems={result?.checks.spf.problems}
+            />
+            <RecordCard
+              title="DKIM"
+              purpose="Cryptographically signs your outgoing mail."
+              pill={
+                domain.dkim_record ? (
+                  <CheckPill status={result?.checks.dkim.status} loading={health.isPending} />
+                ) : (
+                  <StatusPill status="missing" />
+                )
+              }
+              record={domain.dkim_record}
+              problems={
+                domain.dkim_record
+                  ? result?.checks.dkim.problems
+                  : [
+                      "Neither this domain nor the installation has a DKIM signing key, so outgoing mail will not be DKIM-signed.",
+                    ]
+              }
+            />
+            <RecordCard
+              title="DMARC"
+              purpose="Tells receivers what to do with mail that fails SPF or DKIM."
+              pill={<CheckPill status={result?.checks.dmarc.status} loading={health.isPending} />}
+              record={
+                result
+                  ? {
+                      type: "TXT",
+                      name: result.checks.dmarc.record_name,
+                      value:
+                        result.checks.dmarc.found[0] ?? result.checks.dmarc.expected ?? "",
+                    }
+                  : null
+              }
+              problems={result?.checks.dmarc.problems}
+              extra={
+                result?.checks.dmarc.policy && (
+                  <div className="flex flex-wrap gap-1 text-xs">
+                    <Badge variant="outline">p={result.checks.dmarc.policy.p ?? "?"}</Badge>
+                    {result.checks.dmarc.policy.sp && (
+                      <Badge variant="outline">sp={result.checks.dmarc.policy.sp}</Badge>
+                    )}
+                    <Badge variant="outline">pct={result.checks.dmarc.policy.pct}</Badge>
+                  </div>
+                )
+              }
+            />
+          </>
+        ) : null}
+      </div>
 
       <FormDialog
         open={emailOpen}

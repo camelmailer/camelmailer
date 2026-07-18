@@ -1943,6 +1943,45 @@ impl camelmailer_core::ServerStore for PgStore {
             .map_err(Self::sqlx_error)
     }
 
+    async fn set_layout_logo(
+        &self,
+        server_id: Id,
+        layout_id: Id,
+        data: Vec<u8>,
+        content_type: String,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE layouts SET logo = $1, logo_content_type = $2 WHERE id = $3 AND server_id = $4",
+        )
+        .bind(data)
+        .bind(content_type)
+        .bind(layout_id as i64)
+        .bind(server_id as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(())
+    }
+
+    async fn layout_logo(
+        &self,
+        layout_uuid: &str,
+    ) -> Result<Option<(Vec<u8>, String)>, StoreError> {
+        let row = sqlx::query("SELECT logo, logo_content_type FROM layouts WHERE uuid = $1")
+            .bind(layout_uuid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(row.and_then(|r| {
+            let data: Option<Vec<u8>> = r.get("logo");
+            let content_type: Option<String> = r.get("logo_content_type");
+            match (data, content_type) {
+                (Some(d), Some(c)) => Some((d, c)),
+                _ => None,
+            }
+        }))
+    }
+
     // DMARC aggregate reports — tenant tables: every query runs inside a
     // transaction that enters the tenant context first; RLS scopes the rows.
 
@@ -3532,6 +3571,9 @@ impl PgMessageSink {
         if let Some(stream_id) = filter.stream_id {
             qb.push(" AND stream_id = ").push_bind(stream_id as i64);
         }
+        if let Some(campaign_id) = filter.campaign_id {
+            qb.push(" AND campaign_id = ").push_bind(campaign_id as i64);
+        }
         if let Some(query) = &filter.query {
             let like = format!("%{query}%");
             qb.push(" AND (subject ILIKE ")
@@ -3824,6 +3866,7 @@ fn message_record_from_row(row: &PgRow) -> MessageRecord {
         size: row.get("size"),
         metadata: row.get("metadata"),
         stream_id: row.get::<Option<i64>, _>("stream_id").map(|id| id as Id),
+        campaign_id: row.get::<Option<i64>, _>("campaign_id").map(|id| id as Id),
         bypassed: row.get("bypassed"),
         created_at: row.get("created_at"),
         raw_message: row.get("raw_message"),

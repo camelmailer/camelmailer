@@ -23,7 +23,7 @@ mod xmldsig;
 
 mod insights;
 
-pub use app::{build_router, ApiState};
+pub use app::{build_assets_router, build_router, ApiState};
 pub use auth_api::build_auth_router;
 pub use billing::{BillingError, BillingProvider, MockBilling, StripeBilling};
 pub use cors::cors_layer;
