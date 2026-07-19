@@ -2865,6 +2865,89 @@ impl camelmailer_core::ServerStore for PgStore {
             .map(|result| result.rows_affected())
             .map_err(Self::sqlx_error)
     }
+
+    async fn prune_messages(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StoreError> {
+        // `messages` is RLS-protected, so a cross-tenant DELETE cannot run in
+        // one statement (a query with no tenant context sees no rows). Fan out
+        // over every server — the plain `servers` table is a cross-tenant read,
+        // like the in-process scheduler does — and prune each inside its own
+        // tenant context, deleting dependent rows in FK-safe order.
+        let server_ids: Vec<i64> = sqlx::query("SELECT id FROM servers ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?
+            .iter()
+            .map(|row| row.get::<i64, _>("id"))
+            .collect();
+
+        let mut removed_total: u64 = 0;
+        for server_id in server_ids {
+            let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+            set_tenant_context(&mut tx, server_id as Id)
+                .await
+                .map_err(Self::sqlx_error)?;
+
+            // The RLS policy scopes this to the current server.
+            let expired: Vec<i64> = sqlx::query("SELECT id FROM messages WHERE created_at < $1")
+                .bind(older_than)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(Self::sqlx_error)?
+                .iter()
+                .map(|row| row.get::<i64, _>("id"))
+                .collect();
+            if expired.is_empty() {
+                tx.commit().await.map_err(Self::sqlx_error)?;
+                continue;
+            }
+
+            // Children first. link_clicks references links (ON DELETE CASCADE),
+            // but delete it explicitly for clarity; the rest carry no FK to
+            // messages, so order is enforced here.
+            sqlx::query(
+                "DELETE FROM link_clicks
+                 WHERE link_id IN (SELECT id FROM links WHERE message_id = ANY($1))",
+            )
+            .bind(&expired)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+
+            for table in ["links", "loads", "deliveries"] {
+                sqlx::query(&format!("DELETE FROM {table} WHERE message_id = ANY($1)"))
+                    .bind(&expired)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(Self::sqlx_error)?;
+            }
+
+            // tracking_tokens and queued_messages are cross-tenant (not RLS),
+            // so scope them explicitly by server_id.
+            for table in ["tracking_tokens", "queued_messages"] {
+                sqlx::query(&format!(
+                    "DELETE FROM {table} WHERE server_id = $1 AND message_id = ANY($2)"
+                ))
+                .bind(server_id)
+                .bind(&expired)
+                .execute(&mut *tx)
+                .await
+                .map_err(Self::sqlx_error)?;
+            }
+
+            let removed = sqlx::query("DELETE FROM messages WHERE id = ANY($1)")
+                .bind(&expired)
+                .execute(&mut *tx)
+                .await
+                .map_err(Self::sqlx_error)?
+                .rows_affected();
+            tx.commit().await.map_err(Self::sqlx_error)?;
+            removed_total += removed;
+        }
+        Ok(removed_total)
+    }
 }
 
 fn api_request_from_row(row: &PgRow) -> camelmailer_core::ApiRequestRecord {

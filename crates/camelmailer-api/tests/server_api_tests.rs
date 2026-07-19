@@ -2718,3 +2718,91 @@ async fn complaint_suppresses_the_address_and_closes_the_opt_in_gate() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+// ---------------------------------------------- P: send body-size limit
+
+/// Build a server router whose send routes carry a body limit derived from a
+/// deliberately small `smtp_server.max_message_size` (1 MB → a few-MB cap),
+/// so the over-limit path is cheap to exercise. Returns (router, token).
+async fn build_with_small_body_limit() -> (Router, String) {
+    let store = Arc::new(MS::new());
+    let org = store
+        .create_organization(NewOrganization {
+            name: "Org".into(),
+            permalink: "org".into(),
+        })
+        .await
+        .unwrap();
+    let server = store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "S".into(),
+            permalink: "s".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    store.insert_domain(camelmailer_core::Domain {
+        id: store.next_id(),
+        uuid: "d".into(),
+        owner: DomainOwner::Server(server.id),
+        name: "org.example".into(),
+        verified: true,
+        verification_token: "vtoken".into(),
+        dkim_private_key: None,
+    });
+    let token = "send-token-0000000000".to_string();
+    store
+        .create_credential_record(NewCredential {
+            server_id: server.id,
+            credential_type: CredentialType::Api,
+            name: "api".into(),
+            key: Some(token.clone()),
+        })
+        .await
+        .unwrap();
+
+    let mut config = camelmailer_config::Config::default();
+    config.smtp_server.max_message_size = 1; // MB → limit ≈ 3 MiB
+    let state = ApiState::full(store.clone(), Some(store.clone()), None, None, config);
+    (build_server_router(state), token)
+}
+
+#[tokio::test]
+async fn oversized_send_body_is_rejected() {
+    let (app, token) = build_with_small_body_limit().await;
+    // ~5 MiB body — over the ≈3 MiB cap for a 1 MB max_message_size.
+    let huge = "x".repeat(5 * 1024 * 1024);
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example"],
+            "subject": "Hi",
+            "text_body": huge,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn in_limit_send_body_is_accepted() {
+    let (app, token) = build_with_small_body_limit().await;
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example"],
+            "subject": "Hi",
+            "text_body": "a small body",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["data"]["message_id"].is_number());
+}

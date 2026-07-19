@@ -7,9 +7,10 @@
 //! parallel without interfering.
 
 use camelmailer_core::{
-    AdminStore, CredentialType, DomainOwner, MessageScope, NewOrgEmailDomain, NewOrgSsoConnection,
-    NewOrganization, NewServer, OrgSsoConnectionUpdate, OrgSsoStore, QueuedMessage, Role,
-    RouteMode, ServerMode, SsoKind, Store,
+    AdminStore, CredentialType, DomainOwner, ImportClick, ImportDelivery, ImportEvent,
+    ImportMessage, MessageFilter, MessageScope, NewOrgEmailDomain, NewOrgSsoConnection,
+    NewOrganization, NewRoute, NewServer, OrgSsoConnectionUpdate, OrgSsoStore, QueuedMessage, Role,
+    RouteMode, ServerMode, ServerStore, SsoKind, Store, TrackingStore, TrackingTarget,
 };
 use camelmailer_db::{PgMessageSink, PgStore};
 use rand::Rng;
@@ -4222,4 +4223,221 @@ async fn layouts_round_trip_and_unhook_templates_on_delete() {
         .unwrap();
     assert_eq!(read.layout_id, None);
     assert!(store.list_layouts(f.server.id).await.unwrap().is_empty());
+}
+
+// ------------------------------------------- Postal-audit robustness fixes
+
+/// Item 2: free-text columns are `TEXT` (unbounded in Postgres). An overlong,
+/// attacker-controlled User-Agent stores rather than erroring with
+/// "Data too long for column" (the truncation cap lives in the API layer).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlong_user_agent_stores_without_erroring() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let (message_id, _) = sink
+        .insert_message_returning(&message_for(f.server.id, "a@dest.example"))
+        .await
+        .unwrap();
+
+    let huge_ua = "M".repeat(100_000);
+    let target = TrackingTarget {
+        kind: "open".into(),
+        server_id: f.server.id,
+        message_id,
+        link_id: None,
+        target_url: None,
+    };
+    f.store
+        .record_open(&target, "1.2.3.4", &huge_ua)
+        .await
+        .expect("overlong user-agent must insert, not error");
+
+    let opens = ServerStore::opens(&f.store, f.server.id, message_id)
+        .await
+        .unwrap();
+    assert_eq!(opens.len(), 1);
+    assert_eq!(opens[0].user_agent.as_deref(), Some(huge_ua.as_str()));
+}
+
+/// Item 3: deleting a domain a route references leaves the route intact with a
+/// null domain (the `ON DELETE SET NULL` FK), never a dangling reference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_domain_nulls_referencing_routes() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let domain = f
+        .store
+        .create_server_domain(f.server.id, "inbound.example", None)
+        .await
+        .unwrap();
+    let route = f
+        .store
+        .create_route_record(NewRoute {
+            server_id: f.server.id,
+            domain_id: Some(domain.id),
+            name: "catch-all".into(),
+            mode: RouteMode::Endpoint,
+            endpoint_url: Some("https://hook.example/inbound".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(route.domain_id, Some(domain.id));
+
+    assert!(f.store.delete_domain(domain.id).await.unwrap());
+
+    let surviving = f
+        .store
+        .route_by_id(f.server.id, route.id)
+        .await
+        .unwrap()
+        .expect("route survives its domain's deletion");
+    assert_eq!(surviving.domain_id, None);
+    assert_eq!(
+        surviving.endpoint_url.as_deref(),
+        Some("https://hook.example/inbound")
+    );
+}
+
+fn import_for(server_id: camelmailer_core::Id, at: chrono::DateTime<chrono::Utc>) -> ImportMessage {
+    ImportMessage {
+        server_id,
+        scope: MessageScope::Outgoing,
+        mail_from: "from@example.com".into(),
+        rcpt_to: "to@example.com".into(),
+        raw_message: b"Subject: T\r\n\r\nx\r\n".to_vec(),
+        received_with_ssl: false,
+        bounce: false,
+        tag: None,
+        domain_id: None,
+        credential_id: None,
+        created_at: at,
+        deliveries: vec![ImportDelivery {
+            status: "Sent".into(),
+            details: None,
+            output: Some("250 OK".into()),
+            sent_with_ssl: true,
+            created_at: at,
+        }],
+        opens: vec![ImportEvent {
+            created_at: at,
+            ip: Some("1.2.3.4".into()),
+            user_agent: Some("agent".into()),
+        }],
+        clicks: vec![ImportClick {
+            url: "https://example.com".into(),
+            created_at: at,
+        }],
+    }
+}
+
+/// Item 4: message retention prunes messages older than the cutoff together
+/// with every dependent row, in FK-safe order and per-tenant (RLS), while
+/// keeping recent messages; a far-past cutoff prunes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prune_messages_removes_expired_with_dependents_and_keeps_recent() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let now = chrono::Utc::now();
+
+    let old_id = ServerStore::import_message(
+        &f.store,
+        import_for(f.server.id, now - chrono::Duration::days(90)),
+    )
+    .await
+    .unwrap();
+    let recent_id = ServerStore::import_message(
+        &f.store,
+        import_for(f.server.id, now - chrono::Duration::days(1)),
+    )
+    .await
+    .unwrap();
+
+    // A far-past cutoff prunes nothing.
+    let none = ServerStore::prune_messages(&f.store, now - chrono::Duration::days(365))
+        .await
+        .unwrap();
+    assert_eq!(none, 0);
+    assert_eq!(
+        ServerStore::messages(&f.store, f.server.id, &MessageFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A 30-day cutoff prunes only the old message and its dependents.
+    let removed = ServerStore::prune_messages(&f.store, now - chrono::Duration::days(30))
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+
+    assert!(ServerStore::message(&f.store, f.server.id, old_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(ServerStore::deliveries(&f.store, f.server.id, old_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(ServerStore::opens(&f.store, f.server.id, old_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(ServerStore::clicks(&f.store, f.server.id, old_id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The recent message and all its activity survive.
+    assert!(ServerStore::message(&f.store, f.server.id, recent_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        ServerStore::deliveries(&f.store, f.server.id, recent_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        ServerStore::opens(&f.store, f.server.id, recent_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        ServerStore::clicks(&f.store, f.server.id, recent_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The dependent tables backing the old message are physically gone: no
+    // orphaned deliveries/loads/links/link_clicks remain for the whole server.
+    let orphan_deliveries: i64 = {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+            .bind(f.server.id.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query("SELECT count(*) AS c FROM deliveries")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap()
+            .get("c");
+        tx.commit().await.unwrap();
+        count
+    };
+    assert_eq!(
+        orphan_deliveries, 1,
+        "only the recent message's delivery remains"
+    );
 }

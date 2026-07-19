@@ -77,6 +77,10 @@ pub struct Worker {
     /// Address guard for outbound webhook / route-endpoint requests (SSRF).
     ssrf_guard: SsrfGuard,
     max_attempts: i32,
+    /// `camelmailer.message_retention_days`. `0` disables message retention
+    /// (keep forever); a positive value prunes messages older than that many
+    /// days during housekeeping.
+    message_retention_days: i64,
     worker_id: String,
 }
 
@@ -124,6 +128,7 @@ impl Worker {
             http,
             ssrf_guard: SsrfGuard::from_config(config),
             max_attempts: config.camelmailer.default_maximum_delivery_attempts as i32,
+            message_retention_days: config.camelmailer.message_retention_days as i64,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
         }
     }
@@ -907,11 +912,29 @@ impl Worker {
     }
 
     /// Housekeeping: prune API request-log entries older than the 30-day
-    /// retention. Returns how many rows were removed. Runs periodically
-    /// from [`Worker::run`].
+    /// retention and, when `camelmailer.message_retention_days > 0`, stored
+    /// messages older than that window (with their deliveries, opens, clicks,
+    /// tracking tokens and any queued entries). Returns how many API-request
+    /// rows were removed. Runs periodically from [`Worker::run`].
     pub async fn housekeep(&self) -> Result<u64, camelmailer_core::StoreError> {
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(API_REQUEST_RETENTION_DAYS);
-        camelmailer_core::ServerStore::prune_api_requests(&self.store, cutoff).await
+        let now = chrono::Utc::now();
+        let api_cutoff = now - chrono::Duration::days(API_REQUEST_RETENTION_DAYS);
+        let removed =
+            camelmailer_core::ServerStore::prune_api_requests(&self.store, api_cutoff).await?;
+
+        if self.message_retention_days > 0 {
+            let message_cutoff = now - chrono::Duration::days(self.message_retention_days);
+            match camelmailer_core::ServerStore::prune_messages(&self.store, message_cutoff).await {
+                Ok(0) => {}
+                Ok(pruned) => tracing::info!(
+                    pruned,
+                    retention_days = self.message_retention_days,
+                    "pruned expired messages"
+                ),
+                Err(error) => tracing::error!(%error, "message retention pruning error"),
+            }
+        }
+        Ok(removed)
     }
 
     /// The long-running worker loop: drain the queue, then poll. Runs

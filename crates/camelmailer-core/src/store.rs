@@ -266,7 +266,17 @@ impl MemoryStore {
     }
 
     pub fn delete_domain(&self, id: Id) -> bool {
-        self.inner.write().unwrap().domains.remove(&id).is_some()
+        let mut inner = self.inner.write().unwrap();
+        let removed = inner.domains.remove(&id).is_some();
+        // Mirror the `routes.domain_id … ON DELETE SET NULL` foreign key: a
+        // route that targeted this domain survives with a null domain, rather
+        // than dangling at a now-missing row.
+        for route in inner.routes.values_mut() {
+            if route.domain_id == Some(id) {
+                route.domain_id = None;
+            }
+        }
+        removed
     }
 
     pub fn organizations(&self) -> Vec<Organization> {
@@ -901,6 +911,36 @@ impl MemoryStore {
         let before = inner.api_requests.len();
         inner.api_requests.retain(|r| r.created_at >= older_than);
         (before - inner.api_requests.len()) as u64
+    }
+
+    /// Delete stored messages older than the cutoff (all servers), together
+    /// with their deliveries, opens and clicks. Returns how many messages
+    /// were removed — the in-memory analogue of [`ServerStore::prune_messages`].
+    pub fn prune_messages_before(&self, older_than: chrono::DateTime<chrono::Utc>) -> u64 {
+        let mut inner = self.inner.write().unwrap();
+        let expired: std::collections::HashSet<i64> = inner
+            .messages
+            .iter()
+            .filter(|m| m.created_at < older_than)
+            .map(|m| m.id)
+            .collect();
+        if expired.is_empty() {
+            return 0;
+        }
+        inner.messages.retain(|m| !expired.contains(&m.id));
+        inner
+            .message_deliveries
+            .retain(|(message_id, _)| !expired.contains(message_id));
+        inner
+            .message_opens
+            .retain(|(message_id, _)| !expired.contains(message_id));
+        inner
+            .message_clicks
+            .retain(|(message_id, _)| !expired.contains(message_id));
+        inner
+            .message_campaigns
+            .retain(|message_id, _| !expired.contains(message_id));
+        expired.len() as u64
     }
 
     /// Override a logged request's created_at (test seeding for retention).

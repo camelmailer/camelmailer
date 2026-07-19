@@ -1505,4 +1505,57 @@ mod tests {
             .await
             .is_err());
     }
+
+    #[tokio::test]
+    async fn deleting_a_domain_nulls_referencing_routes_rather_than_breaking_them() {
+        // Mirrors the Postgres `routes.domain_id … ON DELETE SET NULL` FK:
+        // deleting a domain a route points at leaves the route intact with a
+        // null domain, never a dangling reference (Postal-audit item 3).
+        let store = MemoryStore::new();
+        let org = store
+            .create_organization(NewOrganization {
+                name: "Org".into(),
+                permalink: "org".into(),
+            })
+            .await
+            .unwrap();
+        let server = store
+            .create_server(NewServer {
+                organization_id: org.id,
+                name: "S".into(),
+                permalink: "s".into(),
+                mode: ServerMode::Live,
+            })
+            .await
+            .unwrap();
+        let domain = store
+            .create_server_domain(server.id, "inbound.example", None)
+            .await
+            .unwrap();
+        let route = store
+            .create_route_record(NewRoute {
+                server_id: server.id,
+                domain_id: Some(domain.id),
+                name: "catch-all".into(),
+                mode: RouteMode::Endpoint,
+                endpoint_url: Some("https://hook.example/inbound".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(route.domain_id, Some(domain.id));
+
+        assert!(AdminStore::delete_domain(&store, domain.id).await.unwrap());
+
+        // The route survives, its endpoint intact, with the domain nulled.
+        let surviving = store
+            .route_by_id(server.id, route.id)
+            .await
+            .unwrap()
+            .expect("route still exists after its domain is deleted");
+        assert_eq!(surviving.domain_id, None);
+        assert_eq!(
+            surviving.endpoint_url.as_deref(),
+            Some("https://hook.example/inbound")
+        );
+    }
 }

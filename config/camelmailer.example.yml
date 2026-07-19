@@ -38,6 +38,12 @@ camelmailer:
   default_spam_threshold: 5
   default_spam_failure_threshold: 20
 
+  # Delete stored messages (and their deliveries, opens, clicks and tracking
+  # tokens) once they are older than this many days. The worker enforces it
+  # hourly. 0 (the default) keeps messages forever — set a positive value to
+  # opt in to automatic retention.
+  # message_retention_days: 0
+
   # SSRF guard on outbound webhook / HTTP-route-endpoint requests. On by
   # default: the destination host is resolved and the request refused when it
   # maps to a loopback, private, link-local, unique-local or otherwise

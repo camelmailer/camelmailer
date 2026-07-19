@@ -90,6 +90,11 @@ pub struct CamelMailer {
     /// deliberately deliver webhooks / routes to a known internal endpoint.
     #[serde(default)]
     pub outbound_allowed_hosts: Vec<String>,
+    /// How many days to keep stored messages (and their deliveries, opens,
+    /// clicks and tracking tokens) before the worker's housekeeping deletes
+    /// them. `0` (the default) keeps messages forever — retention is opt-in.
+    #[serde(default)]
+    pub message_retention_days: u32,
 }
 
 impl Default for CamelMailer {
@@ -117,6 +122,7 @@ impl Default for CamelMailer {
             admin_api_key: None,
             outbound_ssrf_protection: true,
             outbound_allowed_hosts: vec![],
+            message_retention_days: 0,
         }
     }
 }

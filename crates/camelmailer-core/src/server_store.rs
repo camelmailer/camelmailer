@@ -451,6 +451,18 @@ pub trait ServerStore: Send + Sync {
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, StoreError>;
 
+    /// Delete stored messages (of every server) created before `older_than`,
+    /// together with their dependent rows (deliveries, opens/loads, links +
+    /// link_clicks, tracking tokens and any pending queue entries), in
+    /// FK-safe order. Cross-tenant like [`Self::prune_api_requests`], but the
+    /// `messages` table is RLS-protected so each server is pruned inside its
+    /// own tenant context. Returns how many messages were removed. Worker
+    /// housekeeping — gated on `camelmailer.message_retention_days > 0`.
+    async fn prune_messages(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StoreError>;
+
     // message streams (config; server-scoped)
     async fn list_streams(&self, server_id: Id) -> Result<Vec<MessageStream>, StoreError>;
     async fn stream_by_permalink(
@@ -873,6 +885,13 @@ impl ServerStore for crate::store::MemoryStore {
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, StoreError> {
         Ok(self.prune_api_requests_before(older_than))
+    }
+
+    async fn prune_messages(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StoreError> {
+        Ok(self.prune_messages_before(older_than))
     }
 
     async fn list_streams(&self, server_id: Id) -> Result<Vec<MessageStream>, StoreError> {
@@ -1779,6 +1798,116 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, all[0].id);
+    }
+
+    /// Build an imported (completed) message carrying one delivery, one open
+    /// and one click, timestamped `at`.
+    fn imported(server_id: Id, at: chrono::DateTime<Utc>) -> ImportMessage {
+        ImportMessage {
+            server_id,
+            scope: MessageScope::Outgoing,
+            mail_from: "from@example.com".into(),
+            rcpt_to: "to@example.com".into(),
+            raw_message: b"Subject: T\r\n\r\nx\r\n".to_vec(),
+            received_with_ssl: false,
+            bounce: false,
+            tag: None,
+            domain_id: None,
+            credential_id: None,
+            created_at: at,
+            deliveries: vec![ImportDelivery {
+                status: "Sent".into(),
+                details: None,
+                output: Some("250 OK".into()),
+                sent_with_ssl: true,
+                created_at: at,
+            }],
+            opens: vec![ImportEvent {
+                created_at: at,
+                ip: Some("1.2.3.4".into()),
+                user_agent: Some("agent".into()),
+            }],
+            clicks: vec![ImportClick {
+                url: "https://example.com".into(),
+                created_at: at,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_messages_removes_expired_with_dependents_and_keeps_recent() {
+        let store = MemoryStore::new();
+        let old_id =
+            ServerStore::import_message(&store, imported(1, Utc::now() - Duration::days(90)))
+                .await
+                .unwrap();
+        let recent_id =
+            ServerStore::import_message(&store, imported(1, Utc::now() - Duration::days(1)))
+                .await
+                .unwrap();
+
+        // A far-past cutoff prunes nothing.
+        let none = ServerStore::prune_messages(&store, Utc::now() - Duration::days(365))
+            .await
+            .unwrap();
+        assert_eq!(none, 0);
+        assert_eq!(
+            ServerStore::messages(&store, 1, &MessageFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // A 30-day cutoff prunes the old message and its dependents only.
+        let removed = ServerStore::prune_messages(&store, Utc::now() - Duration::days(30))
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        assert!(ServerStore::message(&store, 1, old_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(ServerStore::deliveries(&store, 1, old_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(ServerStore::opens(&store, 1, old_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(ServerStore::clicks(&store, 1, old_id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The recent message and its activity survive intact.
+        assert!(ServerStore::message(&store, 1, recent_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            ServerStore::deliveries(&store, 1, recent_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            ServerStore::opens(&store, 1, recent_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            ServerStore::clicks(&store, 1, recent_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

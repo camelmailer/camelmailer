@@ -11,7 +11,7 @@ use crate::app::{
     paginate, permalink_from, render_error, render_success, server_json, timing_middleware,
     ApiState, PaginationParams, RequestStart,
 };
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -3668,16 +3668,38 @@ async fn dmarc_report_show(
 }
 
 /// Build the `/api/v2/server` router (server-token authenticated).
+/// Maximum request-body size (bytes) accepted on the message-send routes.
+/// Derived from `smtp_server.max_message_size` (MB): a message may itself be
+/// that large, and it arrives base64-encoded (~4/3 inflation) inside a JSON
+/// envelope, so allow a generous 2× plus 1 MiB of slack for the other fields.
+/// Guards the send handlers against an oversized body exhausting memory.
+fn send_body_limit(config: &camelmailer_config::Config) -> usize {
+    let message_bytes = (config.smtp_server.max_message_size.max(1) as usize) * 1024 * 1024;
+    message_bytes * 2 + 1024 * 1024
+}
+
 pub fn build_server_router(state: Arc<ApiState>) -> Router {
+    // Cap the send routes' request body so an oversized base64/raw message
+    // cannot exhaust memory (a 413 is returned when exceeded).
+    let body_limit = DefaultBodyLimit::max(send_body_limit(&state.config));
     let server = Router::new()
         .route("/", get(server_show))
         .route("/ping", get(ping))
-        .route("/messages", get(messages_index).post(messages_send))
-        .route("/messages/batch", post(messages_send_batch))
-        .route("/messages/with_template", post(messages_send_with_template))
+        .route(
+            "/messages",
+            get(messages_index).post(messages_send).layer(body_limit),
+        )
+        .route(
+            "/messages/batch",
+            post(messages_send_batch).layer(body_limit),
+        )
+        .route(
+            "/messages/with_template",
+            post(messages_send_with_template).layer(body_limit),
+        )
         .route(
             "/messages/with_template/batch",
-            post(messages_send_with_template_batch),
+            post(messages_send_with_template_batch).layer(body_limit),
         )
         .route("/messages/{id}", get(message_show))
         .route("/messages/{id}/deliveries", get(message_deliveries))

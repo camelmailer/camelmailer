@@ -29,8 +29,28 @@ integration tests) is green.
   by default and configurable via the new `camelmailer.outbound_ssrf_protection`
   (bool, default true) and `camelmailer.outbound_allowed_hosts` (explicit
   allowlist) settings. Mirrors Postal's v3.3.7 address-guard fix.
+- **Explicit request-body size limit on the message-send routes.** The HTTP
+  send handlers (`POST /api/v2/server/messages`, its `/batch`,
+  `/with_template` and `/with_template/batch` siblings) now carry an axum
+  `DefaultBodyLimit` sized from `smtp_server.max_message_size` (MB) plus
+  base64/JSON overhead, so an oversized body is rejected with `413 Payload Too
+  Large` instead of being buffered into memory. Previously these routes had no
+  explicit cap.
 
 ### Fixed
+
+- **Long free-text values no longer risk insert failures.** All free-text
+  columns (delivery `output`/`details`, tracking `user_agent`, etc.) are
+  Postgres `TEXT` (unbounded), and the public, unauthenticated click/open
+  tracking endpoints now additionally truncate the attacker-controlled
+  `User-Agent` header to 255 characters before storing it. Guards against the
+  Postal "Data too long for column" class of crash.
+- **Deleting a domain no longer leaves routes dangling in the in-memory
+  store.** `MemoryStore::delete_domain` now nulls the `domain_id` of any route
+  that referenced the deleted domain, matching the Postgres
+  `routes.domain_id … ON DELETE SET NULL` foreign key — so the two stores stay
+  in behavioural lockstep and a referenced route survives its domain's
+  deletion (Postal-audit route/endpoint-deletion class).
 
 - **Stale delivery/webhook queue locks are now reclaimed.** A worker that
   crashed mid-delivery previously stranded a message or webhook request as
@@ -46,6 +66,16 @@ integration tests) is green.
 
 ### Added
 
+- **Configurable message retention housekeeper.** A new
+  `camelmailer.message_retention_days` setting (default `0` = keep forever)
+  lets an operator opt in to automatic deletion of old stored messages. When
+  set above zero, the worker's hourly housekeeping (`Worker::housekeep`) prunes
+  messages older than the window together with their dependent rows
+  (deliveries, opens/loads, links, link_clicks, tracking tokens and any queued
+  entries), in FK-safe order and per-tenant under row-level security, via the
+  new `ServerStore::prune_messages` (implemented on both `MemoryStore` and
+  `PgStore`). The default keeps every message, so nothing is deleted unless
+  configured.
 - **Non-sending historical message import.** A new admin endpoint,
   `POST …/servers/{server}/messages/import`, writes past messages as
   completed records (with their original timestamps, delivery attempts,

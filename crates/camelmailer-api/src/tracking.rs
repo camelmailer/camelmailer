@@ -36,12 +36,19 @@ fn client_ip(headers: &HeaderMap) -> String {
         .unwrap_or_default()
 }
 
+/// Longest User-Agent we store. The column is `TEXT` (unbounded in Postgres),
+/// but a hostile client controls this header on the public, unauthenticated
+/// tracking endpoints, so cap it defensively before it reaches the database.
+const MAX_USER_AGENT_LEN: usize = 255;
+
 fn user_agent(headers: &HeaderMap) -> String {
     headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
-        .to_string()
+        .chars()
+        .take(MAX_USER_AGENT_LEN)
+        .collect()
 }
 
 async fn track_click(
@@ -133,4 +140,32 @@ pub fn unsubscribe_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/track/u/{token}", get(unsubscribe).post(unsubscribe_post))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{user_agent, MAX_USER_AGENT_LEN};
+    use axum::http::{header, HeaderMap, HeaderValue};
+
+    #[test]
+    fn user_agent_is_truncated_to_a_sane_max() {
+        let mut headers = HeaderMap::new();
+        let long = "M".repeat(10_000);
+        headers.insert(header::USER_AGENT, HeaderValue::from_str(&long).unwrap());
+        let captured = user_agent(&headers);
+        assert_eq!(captured.chars().count(), MAX_USER_AGENT_LEN);
+        assert!(long.starts_with(&captured));
+    }
+
+    #[test]
+    fn short_user_agent_is_preserved() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("curl/8.0"));
+        assert_eq!(user_agent(&headers), "curl/8.0");
+    }
+
+    #[test]
+    fn missing_user_agent_is_empty() {
+        assert_eq!(user_agent(&HeaderMap::new()), "");
+    }
 }
