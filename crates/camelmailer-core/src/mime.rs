@@ -47,6 +47,23 @@ pub struct BuildParams {
     pub message_id: Option<String>,
 }
 
+/// Build the content of a synthesized `Message-ID` (without the angle
+/// brackets `mail-builder` adds) for an outgoing message that carries none,
+/// anchored to the sending domain. Returns `None` when the From address has
+/// no usable domain, letting `mail-builder` fall back to its own default.
+fn synthesized_message_id(from_email: &str) -> Option<String> {
+    let domain = from_email.rsplit_once('@').map(|(_, domain)| domain)?;
+    let domain = domain.trim();
+    if domain.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}@{}",
+        crate::token::generate_uuid(),
+        domain.to_ascii_lowercase()
+    ))
+}
+
 fn to_mail_addresses(addresses: &[Address]) -> Vec<(String, String)> {
     addresses
         .iter()
@@ -94,8 +111,20 @@ pub fn build_message(params: &BuildParams) -> Vec<u8> {
         builder = builder.reply_to(to_mail_addresses(&params.reply_to));
     }
     builder = builder.subject(params.subject.clone());
-    if let Some(message_id) = &params.message_id {
-        builder = builder.message_id(message_id.clone());
+    // Message-ID: honour an explicit override, otherwise synthesize one whose
+    // host part is the *sending* domain (the From address's domain), not the
+    // installation's SMTP hostname. Left to `mail-builder`'s default, a
+    // missing Message-ID would be stamped `<...@<gethostname()>>`, leaking the
+    // server hostname and hurting DKIM/DMARC alignment for the sender.
+    match &params.message_id {
+        Some(message_id) => {
+            builder = builder.message_id(message_id.clone());
+        }
+        None => {
+            if let Some(message_id) = synthesized_message_id(&params.from.email) {
+                builder = builder.message_id(message_id);
+            }
+        }
     }
 
     for (name, value) in &params.headers {
@@ -353,6 +382,38 @@ mod tests {
         let raw = as_string(&build_message(&p));
         assert!(raw.to_lowercase().contains("multipart/mixed"));
         assert!(raw.contains("hello.txt"));
+    }
+
+    #[test]
+    fn synthesized_message_id_uses_the_sending_domain_not_the_hostname() {
+        let mut p = params();
+        p.from = Address::new("noreply@acme.com");
+        p.message_id = None;
+        let raw = as_string(&build_message(&p));
+        // A synthesized Message-ID must be anchored to the From domain.
+        let line = raw
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("message-id:"))
+            .expect("a Message-ID header is present");
+        assert!(
+            line.trim_end().ends_with("@acme.com>"),
+            "Message-ID should end with @acme.com, got: {line:?}"
+        );
+        // And it must not fall back to `localhost` (mail-builder's default
+        // host when the gethostname feature is off), i.e. it is really the
+        // sending domain that anchors the id.
+        assert!(
+            !line.contains("@localhost>"),
+            "Message-ID leaked the default host: {line:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_message_id_override_is_respected() {
+        let mut p = params();
+        p.message_id = Some("fixed-id@override.example".into());
+        let raw = as_string(&build_message(&p));
+        assert!(raw.contains("Message-ID: <fixed-id@override.example>"));
     }
 
     #[test]

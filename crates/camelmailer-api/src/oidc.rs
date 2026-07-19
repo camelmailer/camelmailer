@@ -151,6 +151,56 @@ async fn oidc_start(
     }
 }
 
+/// Derive `(first_name, last_name)` for SSO/OIDC provisioning, tolerant of an
+/// identity provider that omits the combined `name`, the `given_name`, and/or
+/// the `family_name` claim. Prefers the discrete `given_name`/`family_name`,
+/// falls back to splitting the combined `name`, and finally to the email
+/// local-part — so a provisioned account is never left with an empty name (the
+/// failure mode Postal hit when an IdP sent no `family_name`). A single-token
+/// name legitimately yields an empty last name.
+pub(crate) fn provisioned_name(
+    name: &str,
+    given_name: &str,
+    family_name: &str,
+    email: &str,
+) -> (String, String) {
+    let given = given_name.trim();
+    let family = family_name.trim();
+
+    // The combined `name` claim, split on its first space, is the fallback
+    // source for either half.
+    let name = name.trim();
+    let (name_first, name_last) = match name.split_once(' ') {
+        Some((first, last)) => (first.trim(), last.trim()),
+        None => (name, ""),
+    };
+
+    let first_name = if !given.is_empty() {
+        given.to_string()
+    } else if !name_first.is_empty() {
+        name_first.to_string()
+    } else {
+        email_local_part(email)
+    };
+    let last_name = if !family.is_empty() {
+        family.to_string()
+    } else {
+        name_last.to_string()
+    };
+    (first_name, last_name)
+}
+
+/// The part of an email address before `@`, or `"user"` when unusable —
+/// a last-resort non-empty first name for provisioning.
+fn email_local_part(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or("").trim();
+    if local.is_empty() {
+        "user".to_string()
+    } else {
+        local.to_string()
+    }
+}
+
 pub(crate) fn urlencode(value: &str) -> String {
     value
         .bytes()
@@ -442,10 +492,15 @@ async fn resolve_user(
         .get(&oidc.name_field)
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let (first_name, last_name) = match name.split_once(' ') {
-        Some((first, last)) => (first.to_string(), last.to_string()),
-        None => (name.to_string(), String::new()),
-    };
+    let given_name = claims
+        .get("given_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let family_name = claims
+        .get("family_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let (first_name, last_name) = provisioned_name(name, given_name, family_name, email);
     let user = state
         .store
         .create_user(camelmailer_core::NewUser {
@@ -518,4 +573,66 @@ pub fn build_oidc_router(state: Arc<ApiState>) -> Router {
         .layer(middleware::from_fn(
             |request: Request, next: axum::middleware::Next| timing_middleware(request, next),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provisioned_name;
+
+    #[test]
+    fn discrete_given_and_family_names_are_preferred() {
+        assert_eq!(
+            provisioned_name("ignored combined", "Ada", "Lovelace", "ada@corp.example"),
+            ("Ada".into(), "Lovelace".into())
+        );
+    }
+
+    #[test]
+    fn combined_name_is_split_when_discrete_claims_are_absent() {
+        assert_eq!(
+            provisioned_name("Ada Lovelace", "", "", "ada@corp.example"),
+            ("Ada".into(), "Lovelace".into())
+        );
+    }
+
+    #[test]
+    fn missing_family_name_keeps_a_non_empty_first_name() {
+        // The Postal failure: IdP sends given_name but no family_name.
+        assert_eq!(
+            provisioned_name("", "Grace", "", "grace@corp.example"),
+            ("Grace".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn a_single_token_name_yields_an_empty_last_name() {
+        assert_eq!(
+            provisioned_name("Cher", "", "", "cher@corp.example"),
+            ("Cher".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn no_name_claims_fall_back_to_the_email_local_part() {
+        assert_eq!(
+            provisioned_name("", "", "", "grace.hopper@corp.example"),
+            ("grace.hopper".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn a_blank_everything_never_panics_or_returns_empty_first_name() {
+        assert_eq!(
+            provisioned_name("   ", "", "", ""),
+            ("user".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn family_name_without_given_name_still_fills_the_first_name() {
+        assert_eq!(
+            provisioned_name("", "", "Lovelace", "ada@corp.example"),
+            ("ada".into(), "Lovelace".into())
+        );
+    }
 }

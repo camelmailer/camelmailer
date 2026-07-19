@@ -44,7 +44,7 @@ use crate::app::{
     render_error, render_success, timing_middleware, ApiResponse, ApiState, RequestStart,
 };
 use crate::auth_api::{client_ip, issue_session, user_json};
-use crate::oidc::{fetch_discovery, sso_error, urlencode, Discovery};
+use crate::oidc::{fetch_discovery, provisioned_name, sso_error, urlencode, Discovery};
 
 const STATE_TTL_MINUTES: i64 = 10;
 
@@ -357,7 +357,11 @@ struct SsoIdentity {
     subject: String,
     /// Lowercased email address ("" when the provider supplied none).
     email: String,
+    /// Combined display name ("" when the provider supplied none).
     name: String,
+    /// Discrete OIDC name claims ("" when absent); GitHub supplies neither.
+    given_name: String,
+    family_name: String,
 }
 
 async fn sso_callback(
@@ -517,10 +521,22 @@ async fn oidc_identity(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let given_name = claims
+        .get("given_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let family_name = claims
+        .get("family_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     Ok(SsoIdentity {
         subject: subject.to_string(),
         email,
         name,
+        given_name,
+        family_name,
     })
 }
 
@@ -611,6 +627,9 @@ async fn github_identity(
         subject: user.id.to_string(),
         email: email.email.to_lowercase(),
         name,
+        // GitHub exposes only a combined `name`; no discrete name parts.
+        given_name: String::new(),
+        family_name: String::new(),
     }))
 }
 
@@ -673,10 +692,12 @@ async fn resolve_user(
             "no account exists for this identity and provisioning is disabled",
         ));
     }
-    let (first_name, last_name) = match identity.name.split_once(' ') {
-        Some((first, last)) => (first.to_string(), last.to_string()),
-        None => (identity.name.clone(), String::new()),
-    };
+    let (first_name, last_name) = provisioned_name(
+        &identity.name,
+        &identity.given_name,
+        &identity.family_name,
+        &identity.email,
+    );
     let user = state
         .store
         .create_user(camelmailer_core::NewUser {

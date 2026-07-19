@@ -541,12 +541,20 @@ async fn admin_api_keys_validate_and_record_use() {
     assert!(f.store.admin_api_key_valid("test-admin-key").await.unwrap());
     assert!(!f.store.admin_api_key_valid("wrong").await.unwrap());
 
-    let last_used: Option<chrono::DateTime<chrono::Utc>> =
-        sqlx::query("SELECT last_used_at FROM admin_api_keys WHERE key = 'test-admin-key'")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get("last_used_at");
+    // The plaintext key is never persisted: the row stores its SHA-256 hash.
+    let row = sqlx::query("SELECT key_hash, key_prefix, last_used_at FROM admin_api_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let key_hash: String = row.get("key_hash");
+    assert_eq!(
+        key_hash,
+        camelmailer_core::auth::hash_token("test-admin-key")
+    );
+    assert_ne!(key_hash, "test-admin-key");
+    let key_prefix: String = row.get("key_prefix");
+    assert_eq!(key_prefix, "test-a");
+    let last_used: Option<chrono::DateTime<chrono::Utc>> = row.get("last_used_at");
     assert!(last_used.is_some());
 }
 

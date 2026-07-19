@@ -17,6 +17,18 @@ integration tests) is green.
 
 ### Security
 
+- **Admin API keys are now stored hashed (SHA-256), never in cleartext.**
+  `admin_api_keys` previously kept the full secret in the `key` column and
+  compared it literally, so a database read yielded working full-access keys.
+  Keys are now stored as the SHA-256 hash of the token (mirroring session,
+  invitation and reset tokens) plus a short non-secret display prefix; the
+  plaintext is generated at creation, returned/printed exactly once (the
+  `POST /api/v2/admin/admin_api_keys` response and the `make-admin-api-key`
+  CLI), and never persisted. Presented `X-Admin-API-Key` values are hashed
+  before lookup. Migration `0038` replaces the `key` column with `key_hash` +
+  `key_prefix`; as there are no real keys yet, existing rows are truncated and
+  operators regenerate their keys. Both `MemoryStore` and `PgStore` were
+  updated in lockstep.
 - **SSRF guard on outbound webhook and HTTP-route-endpoint requests.** The
   delivery worker now resolves the destination host before POSTing to a
   tenant-controlled webhook URL (`camelmailer-worker` `process_next_webhook`)
@@ -39,6 +51,17 @@ integration tests) is green.
 
 ### Fixed
 
+- **OIDC/SSO provisioning tolerates missing name claims.** An identity
+  provider that omits `family_name` (or `given_name`, or the combined `name`)
+  no longer provisions an account with an empty name or fails to log in. User
+  provisioning now prefers the discrete `given_name`/`family_name` claims,
+  falls back to splitting the combined `name`, and finally to the email
+  local-part, so the first name is always non-empty (a single-token name still
+  yields an empty last name, which is correct). Applies to all three flows
+  (`oidc.rs`, `sso.rs`, `org_sso_login.rs`) via a shared helper. Authorize-URL
+  scopes were verified to be space-separated (URL-encoded to `%20`), not
+  concatenated, and a regression test now pins this. Mirrors Postal's OIDC
+  login-failure fixes.
 - **Long free-text values no longer risk insert failures.** All free-text
   columns (delivery `output`/`details`, tracking `user_agent`, etc.) are
   Postgres `TEXT` (unbounded), and the public, unauthenticated click/open
@@ -63,6 +86,25 @@ integration tests) is green.
   click-link rewriting and open-pixel injection for cryptographically signed
   messages (top-level `multipart/signed` S/MIME or PGP/MIME, and inline PGP
   clearsigned bodies), which a rewrite would otherwise invalidate.
+- **IDN destination domains are Punycode-encoded before MX resolution.** The
+  delivery worker now IDNA/ASCII-encodes the recipient domain before the
+  DNS/MX lookup and connection (`camelmailer-worker` `sender.rs`), so mail to a
+  Unicode domain such as `münchen.de` is correctly resolved as
+  `xn--mnchen-3ya.de` instead of failing to find any MX records. ASCII domains
+  are unaffected.
+- **Synthesized Message-IDs use the sending domain, not the server hostname.**
+  When an outgoing message built via the HTTP send API carries no `Message-ID`,
+  one is now synthesized with the From-address domain as its host part
+  (`camelmailer-core` `mime::build_message`) instead of leaking the
+  installation's `gethostname()` into `<…@host>`. This keeps the Message-ID
+  aligned with the sending domain for DKIM/DMARC and threading. An explicit
+  Message-ID override is still respected.
+- **Click-tracking preserves the exact original URL.** The link rewrite now
+  HTML-entity-decodes `href` values (`&amp;` → `&`, numeric `&#38;`/`&#x26;`)
+  before storing them (`camelmailer-worker` `tracking::rewrite_links`), so the
+  `/track/c/<token>` redirect reconstructs the URL the sender intended rather
+  than a literal `a=1&amp;b=2`. URL percent-encoding (`%20`) is left untouched,
+  and long URLs are stored unbounded (`TEXT`), so nothing is truncated.
 
 ### Added
 
@@ -93,6 +135,17 @@ integration tests) is green.
   key over unchanged. This backs the
   [camelmailer-migrate](https://github.com/camelmailer/camelmailer-migrate)
   Postal migration tool.
+- **Inbound SPF evaluation (record-only, non-blocking).** Received mail is now
+  SPF-checked: the SMTP server evaluates the envelope-From (MAIL FROM) domain's
+  SPF policy against the connecting client IP and prepends the verdict as a
+  `Received-SPF:` header on the stored message
+  (pass/fail/softfail/neutral/none/temperror/permerror). It is purely
+  informational — the receive path never rejects on the result. The bounded
+  evaluator (`camelmailer-core` `spf`) supports `all`, `ip4`, `ip6`, `a`, `mx`,
+  `include` and `redirect=` with the RFC 7208 ten-lookup cap (no macro engine),
+  behind the reusable `SpfResolver` DNS abstraction; production uses a
+  hickory-backed resolver (`camelmailer-smtp` `HickorySpfResolver`) wired in by
+  `SmtpServer::run`, and tests drive it with an in-memory stub.
 
 ## [0.6.0] - 2026-07-18
 

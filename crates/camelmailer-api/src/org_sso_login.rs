@@ -36,7 +36,9 @@ use crate::app::{
     RequestStart,
 };
 use crate::auth_api::{client_ip, issue_session, user_json};
-use crate::oidc::{decoding_key_from_jwks, fetch_discovery, sso_error, urlencode, Discovery};
+use crate::oidc::{
+    decoding_key_from_jwks, fetch_discovery, provisioned_name, sso_error, urlencode, Discovery,
+};
 
 const STATE_TTL_MINUTES: i64 = 10;
 
@@ -382,11 +384,23 @@ pub(crate) async fn org_callback(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_lowercase();
-            let name = claims
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            // Prefer the combined `name`; fall back to discrete
+            // `given_name`/`family_name` so an IdP that omits `name` (or
+            // sends only one part) still yields a usable name downstream.
+            let claim = |key: &str| {
+                claims
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            };
+            let name = match claim("name") {
+                combined if !combined.is_empty() => combined,
+                _ => format!("{} {}", claim("given_name"), claim("family_name"))
+                    .trim()
+                    .to_string(),
+            };
             (uid.to_string(), email, name)
         }
     };
@@ -599,10 +613,9 @@ async fn resolve_org_user(
             "no account exists for this identity and provisioning is disabled for this connection",
         ));
     }
-    let (first_name, last_name) = match name.split_once(' ') {
-        Some((first, last)) => (first.to_string(), last.to_string()),
-        None => (name.to_string(), String::new()),
-    };
+    // `given_name`/`family_name` were already folded into `name` upstream;
+    // the helper still guarantees a non-empty first name via the email.
+    let (first_name, last_name) = provisioned_name(name, "", "", email);
     let user = state
         .store
         .create_user(NewUser {

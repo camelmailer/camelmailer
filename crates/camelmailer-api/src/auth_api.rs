@@ -512,6 +512,13 @@ pub(crate) async fn session_middleware(
 
 // ------------------------------------------------------- authenticated
 
+// Logout is local session revocation only. RP-initiated OIDC single-logout
+// (redirecting to the IdP `end_session_endpoint` with an `id_token_hint`) is
+// deliberately out of scope: this is a JSON API the dashboard calls via fetch,
+// not a browser navigation, and sessions do not retain the originating
+// id_token or issuer — a correct SLO flow would need a session-schema change,
+// a discovery `end_session_endpoint` lookup, and a redirecting GET endpoint.
+// Killing the local session already blocks all further access here.
 async fn logout(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,

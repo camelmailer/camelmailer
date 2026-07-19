@@ -126,6 +126,10 @@ pub struct Session {
     /// The reverse-DNS hostname of the client, resolved by the server layer
     /// before DATA. Falls back to the IP address.
     resolved_hostname: Option<String>,
+    /// A `Received-SPF:` header value computed by the server layer (envelope
+    /// -From SPF evaluated against the client IP) and prepended to the stored
+    /// message. `None` when SPF is not evaluated (record-only, never blocks).
+    received_spf: Option<String>,
     helo_name: Option<String>,
     tls: bool,
     start_tls: bool,
@@ -165,6 +169,7 @@ impl Session {
             trace_id: camelmailer_core::token::generate_trace_id(),
             ip_address,
             resolved_hostname: None,
+            received_spf: None,
             helo_name: None,
             tls: false,
             start_tls: false,
@@ -242,6 +247,13 @@ impl Session {
 
     pub fn set_resolved_hostname(&mut self, hostname: String) {
         self.resolved_hostname = Some(hostname);
+    }
+
+    /// Record the `Received-SPF:` header value (computed by the async server
+    /// layer once MAIL FROM and the client IP are known). Prepended to the
+    /// stored message in [`Session::data_command`]; purely informational.
+    pub fn set_received_spf(&mut self, header_value: String) {
+        self.received_spf = Some(header_value);
     }
 
     /// Replace the clock (tests freeze time with this).
@@ -699,6 +711,15 @@ impl Session {
             &self.config.smtp_hostname,
             (self.clock)(),
         );
+
+        // Record the inbound SPF verdict (if the server layer computed one)
+        // as a header on the stored message. It is prepended above the trace
+        // headers, mirroring how a receiving MTA stamps Received-SPF, and is
+        // informational only — the session never rejects on it.
+        if let Some(received_spf) = &self.received_spf {
+            data.extend_from_slice(format!("Received-SPF: {received_spf}\r\n").as_bytes());
+            headers.insert("received-spf".into(), vec![received_spf.clone()]);
+        }
 
         let envelope_header = format!("<{}>", self.mail_from.as_deref().unwrap_or_default());
         data.extend_from_slice(format!("X-Envelope-From: {envelope_header}\r\n").as_bytes());

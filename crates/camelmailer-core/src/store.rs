@@ -119,8 +119,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) routes: HashMap<Id, Route>,
     pub(crate) credentials: HashMap<Id, Credential>,
     pub(crate) credential_uses: HashMap<Id, u64>,
-    /// full key -> record (record holds only prefix for display; the map key
-    /// is the secret used for validation).
+    /// SHA-256(key) -> record (record holds only the prefix for display; the
+    /// map key is the token hash, never the plaintext).
     pub(crate) admin_api_keys: HashMap<String, AdminApiKey>,
     pub(crate) users: HashMap<Id, User>,
     pub(crate) ip_pools: HashMap<Id, IpPool>,
@@ -333,16 +333,22 @@ impl MemoryStore {
             name: name.to_string(),
             key_prefix: key.chars().take(6).collect(),
         };
+        // Keyed by the SHA-256 hash, never the plaintext: the store mirrors
+        // sessions/invitations and never holds a working key.
         self.inner
             .write()
             .unwrap()
             .admin_api_keys
-            .insert(key.to_string(), record.clone());
+            .insert(crate::auth::hash_token(key), record.clone());
         record
     }
 
     pub fn admin_api_key_exists(&self, key: &str) -> bool {
-        self.inner.read().unwrap().admin_api_keys.contains_key(key)
+        self.inner
+            .read()
+            .unwrap()
+            .admin_api_keys
+            .contains_key(&crate::auth::hash_token(key))
     }
 
     /// Store an accepted outbound message as a read-model record and return

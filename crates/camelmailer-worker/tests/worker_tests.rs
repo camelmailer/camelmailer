@@ -653,6 +653,65 @@ async fn stream_scoped_suppression_holds_broadcast_but_not_transactional() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_wide_suppression_holds_on_every_stream() {
+    use camelmailer_core::{NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    // A server-wide suppression (stream_id NULL) blocks the address on ALL
+    // streams — transactional and broadcast alike.
+    s.store
+        .create_suppression(NewSuppression {
+            server_id: s.server.id,
+            suppression_type: "recipient".into(),
+            address: "blocked@dest.example".into(),
+            reason: Some("hard bounce".into()),
+            stream_id: None,
+        })
+        .await
+        .unwrap();
+
+    let stream = ServerStore::create_stream(
+        &s.store,
+        NewStream {
+            server_id: s.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // A message on the broadcast stream is held despite the suppression being
+    // server-wide, not stream-scoped.
+    let mut on_stream = outgoing_message(s.server.id, "blocked@dest.example");
+    on_stream.stream_id = Some(stream.id);
+    s.sink.insert_message(&on_stream).await.unwrap();
+
+    // And so is one on the default (transactional) stream.
+    let mut on_default = outgoing_message(s.server.id, "blocked@dest.example");
+    on_default.stream_id = s.server.default_stream_id;
+    s.sink.insert_message(&on_default).await.unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Held
+    );
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Held
+    );
+    // Nothing was delivered on either stream.
+    assert!(smtp.received.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incoming_route_messages_are_posted_to_their_endpoint() {
     let base = require_db!();
     let pool = test_pool(&base).await;

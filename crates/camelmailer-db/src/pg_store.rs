@@ -7,9 +7,9 @@
 
 use async_trait::async_trait;
 use camelmailer_core::{
-    store, token, ActivityEvent, AdminApiKey, AdminStore, Campaign, CampaignStats, CampaignUpdate,
-    Credential, CredentialType, DeliveryRecord, Domain, DomainOwner, Id, IpAddress, IpPool,
-    MessageFilter, MessageRecord, MessageScope, MessageSink, NewCampaign, NewCredential,
+    auth, store, token, ActivityEvent, AdminApiKey, AdminStore, Campaign, CampaignStats,
+    CampaignUpdate, Credential, CredentialType, DeliveryRecord, Domain, DomainOwner, Id, IpAddress,
+    IpPool, MessageFilter, MessageRecord, MessageScope, MessageSink, NewCampaign, NewCredential,
     NewIpAddress, NewOrganization, NewRoute, NewSenderAddress, NewServer, NewSuppression, NewUser,
     NewWebhook, Organization, QueuedMessage, ResolvedRoute, Route, RouteMode, SenderAddress,
     Server, ServerMode, Store, StoreError, Subscription, Suppression, User, Webhook,
@@ -769,8 +769,9 @@ impl AdminStore for PgStore {
     }
 
     async fn admin_api_key_valid(&self, key: &str) -> Result<bool, StoreError> {
-        sqlx::query("UPDATE admin_api_keys SET last_used_at = now() WHERE key = $1")
-            .bind(key)
+        // Look up by the hash of the presented key; the plaintext is never stored.
+        sqlx::query("UPDATE admin_api_keys SET last_used_at = now() WHERE key_hash = $1")
+            .bind(auth::hash_token(key))
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() > 0)
@@ -826,7 +827,7 @@ impl AdminStore for PgStore {
     }
 
     async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError> {
-        sqlx::query("SELECT id, uuid, name, key FROM admin_api_keys ORDER BY id")
+        sqlx::query("SELECT id, uuid, name, key_prefix FROM admin_api_keys ORDER BY id")
             .fetch_all(&self.pool)
             .await
             .map(|rows| {
@@ -835,7 +836,7 @@ impl AdminStore for PgStore {
                         id: row.get::<i64, _>("id") as Id,
                         uuid: row.get("uuid"),
                         name: row.get("name"),
-                        key_prefix: row.get::<String, _>("key").chars().take(6).collect(),
+                        key_prefix: row.get("key_prefix"),
                     })
                     .collect()
             })
@@ -848,12 +849,17 @@ impl AdminStore for PgStore {
         key: &str,
     ) -> Result<AdminApiKey, StoreError> {
         let uuid = token::generate_uuid();
+        let key_prefix: String = key.chars().take(6).collect();
+        // Store only the hash and a short display prefix; the caller returns
+        // the plaintext to the operator exactly once.
         let row = sqlx::query(
-            "INSERT INTO admin_api_keys (uuid, name, key) VALUES ($1, $2, $3) RETURNING id",
+            "INSERT INTO admin_api_keys (uuid, name, key_hash, key_prefix)
+             VALUES ($1, $2, $3, $4) RETURNING id",
         )
         .bind(&uuid)
         .bind(name)
-        .bind(key)
+        .bind(auth::hash_token(key))
+        .bind(&key_prefix)
         .fetch_one(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -861,7 +867,7 @@ impl AdminStore for PgStore {
             id: row.get::<i64, _>("id") as Id,
             uuid,
             name: name.into(),
-            key_prefix: key.chars().take(6).collect(),
+            key_prefix,
         })
     }
 

@@ -169,6 +169,12 @@ impl SmtpSender {
         if !self.relays.is_empty() {
             return self.relays.clone();
         }
+        // IDNA/Punycode-encode before any DNS work: a Unicode domain such as
+        // `münchen.de` has no MX records under its Unicode form — it must be
+        // looked up (and connected to) as its ASCII-compatible
+        // `xn--mnchen-3ya.de` form.
+        let domain = to_ascii_domain(domain);
+        let domain = domain.as_str();
         match hickory_resolver::TokioAsyncResolver::tokio_from_system_conf() {
             Ok(resolver) => match resolver.mx_lookup(format!("{domain}.")).await {
                 Ok(lookup) => {
@@ -232,6 +238,15 @@ impl SmtpSender {
 
 fn implicit_mx(domain: &str) -> Endpoint {
     Endpoint::mx(domain.to_string())
+}
+
+/// IDNA/Punycode-encode a destination domain for DNS/MX resolution. A Unicode
+/// domain like `münchen.de` must be resolved and connected to as its
+/// ASCII-compatible `xn--mnchen-3ya.de` form; ASCII domains pass through
+/// (lower-cased). If encoding fails we fall back to the input so delivery
+/// still attempts and fails visibly downstream rather than silently vanishing.
+fn to_ascii_domain(domain: &str) -> String {
+    idna::domain_to_ascii(domain).unwrap_or_else(|_| domain.to_string())
 }
 
 #[cfg(test)]
@@ -361,6 +376,17 @@ mod tests {
         assert_eq!(endpoint.port, 25);
         assert_eq!(endpoint.security, ConnectionSecurity::Opportunistic);
         assert_eq!(endpoint.tls_mode, TlsMode::AcceptAny);
+    }
+
+    // IDN destination domains must be Punycode-encoded before the MX lookup:
+    // a Unicode domain has no DNS records under its raw Unicode form.
+    #[test]
+    fn idn_domains_are_punycode_encoded_before_lookup() {
+        assert_eq!(to_ascii_domain("münchen.de"), "xn--mnchen-3ya.de");
+        assert_eq!(to_ascii_domain("例え.jp"), "xn--r8jz45g.jp");
+        // ASCII domains pass through (lower-cased), never mangled.
+        assert_eq!(to_ascii_domain("mx.example.com"), "mx.example.com");
+        assert_eq!(to_ascii_domain("Example.COM"), "example.com");
     }
 
     // `openssl_verify_mode` governs configured relays only: `peer` verifies a

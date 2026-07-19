@@ -12,6 +12,7 @@ camelmailer-db = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
 hickory-resolver = { workspace = true }
+idna = { workspace = true }
 quick-xml = { workspace = true }
 reqwest = { workspace = true }
 rsa = { workspace = true }

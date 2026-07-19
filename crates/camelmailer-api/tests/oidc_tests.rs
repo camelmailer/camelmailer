@@ -115,6 +115,82 @@ async fn start_mock_idp(email: &'static str, name: &'static str) -> String {
     issuer
 }
 
+/// Like `start_mock_idp`, but the id_token carries a `given_name` claim and
+/// deliberately omits both the combined `name` and `family_name` — the shape
+/// that broke Postal provisioning.
+async fn start_mock_idp_given_only(email: &'static str, given: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let issuer = format!("http://{}", listener.local_addr().unwrap());
+    let issuer_for_discovery = issuer.clone();
+    let issuer_for_token = issuer.clone();
+
+    let app = Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let issuer = issuer_for_discovery.clone();
+                async move {
+                    Json(json!({
+                        "issuer": issuer,
+                        "authorization_endpoint": format!("{issuer}/authorize"),
+                        "token_endpoint": format!("{issuer}/token"),
+                        "jwks_uri": format!("{issuer}/jwks"),
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/jwks",
+            get(|| async {
+                let public = idp_key().to_public_key();
+                Json(json!({
+                    "keys": [{
+                        "kty": "RSA",
+                        "kid": "test",
+                        "alg": "RS256",
+                        "use": "sig",
+                        "n": URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
+                        "e": URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/token",
+            post(move |Form(form): Form<Vec<(String, String)>>| {
+                let issuer = issuer_for_token.clone();
+                async move {
+                    let code = form
+                        .iter()
+                        .find(|(key, _)| key == "code")
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or_default();
+                    let now = chrono::Utc::now().timestamp();
+                    let id_token = sign_id_token(&json!({
+                        "iss": issuer,
+                        "aud": "client-1",
+                        "sub": "sso-user-2",
+                        "email": email,
+                        "given_name": given,
+                        "nonce": code,
+                        "iat": now,
+                        "exp": now + 300,
+                    }));
+                    Json(json!({
+                        "access_token": "at-1",
+                        "token_type": "Bearer",
+                        "id_token": id_token,
+                    }))
+                }
+            }),
+        );
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    issuer
+}
+
 struct Harness {
     app: Router,
     store: Arc<MemoryStore>,
@@ -204,6 +280,8 @@ async fn start_redirects_to_the_authorization_endpoint() {
         "code_challenge=",
         "code_challenge_method=S256",
         "client_id=client-1",
+        // Scopes are space-separated (URL-encoded to %20), never concatenated.
+        "scope=openid%20email%20profile",
     ] {
         assert!(location.contains(param), "missing {param} in {location}");
     }
@@ -262,6 +340,20 @@ async fn a_full_login_provisions_the_account_and_issues_a_session() {
         .collect();
     assert!(events.contains(&"sso.provision".to_string()));
     assert!(events.iter().filter(|event| *event == "sso.login").count() >= 2);
+}
+
+#[tokio::test]
+async fn provisioning_tolerates_a_missing_family_name() {
+    // IdP sends given_name only (no combined name, no family_name): the
+    // account is still provisioned with a non-empty first name and no error.
+    let issuer = start_mock_idp_given_only("grace@corp.example", "Grace").await;
+    let h = harness(&issuer, |_| {}).await;
+
+    let (status, body) = h.sso_login().await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["data"]["user"]["email_address"], "grace@corp.example");
+    assert_eq!(body["data"]["user"]["first_name"], "Grace");
+    assert_eq!(body["data"]["user"]["last_name"], "");
 }
 
 #[tokio::test]

@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 camelmailer-config = { workspace = true }
 camelmailer-core = { workspace = true }
+async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+hickory-resolver = { workspace = true }
 hmac = { workspace = true }
 md-5 = { workspace = true }
 rustls = { workspace = true }

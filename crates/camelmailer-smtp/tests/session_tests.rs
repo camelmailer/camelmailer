@@ -636,6 +636,40 @@ fn data_adds_a_received_header_for_itself() {
 }
 
 #[test]
+fn data_prepends_the_received_spf_header_when_the_server_set_one() {
+    let mut setup = setup_with_route();
+    begin_data_transaction(&mut setup.session);
+    // The async server layer evaluates SPF and hands the value in before DATA.
+    setup.session.set_received_spf(
+        "pass (postal.example.com: domain of test@test.com designates 1.2.3.4 as permitted sender) client-ip=1.2.3.4; envelope-from=<test@test.com>;".into(),
+    );
+    setup.session.handle("DATA");
+    let headers = setup.session.headers().unwrap();
+    assert!(headers.contains_key("received-spf"));
+    assert!(headers["received-spf"][0].starts_with("pass ("));
+    // The header lands in the stored raw, above the trace headers.
+    let raw = String::from_utf8_lossy(setup.session.raw_data().unwrap());
+    assert!(raw.contains("Received-SPF: pass ("));
+    let spf_at = raw.find("Received-SPF:").unwrap();
+    let received_at = raw.find("Received:").unwrap();
+    assert!(spf_at < received_at, "Received-SPF should precede Received");
+}
+
+#[test]
+fn data_has_no_received_spf_header_by_default() {
+    let mut setup = setup_with_route();
+    begin_data_transaction(&mut setup.session);
+    setup.session.handle("DATA");
+    assert!(!setup
+        .session
+        .headers()
+        .unwrap()
+        .contains_key("received-spf"));
+    let raw = String::from_utf8_lossy(setup.session.raw_data().unwrap());
+    assert!(!raw.contains("Received-SPF:"));
+}
+
+#[test]
 fn data_logs_headers_including_multiline_continuations() {
     let mut setup = setup_with_route();
     begin_data_transaction(&mut setup.session);

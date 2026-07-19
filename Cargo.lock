@@ -445,10 +445,12 @@ dependencies = [
 name = "camelmailer-smtp"
 version = "0.6.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "camelmailer-config",
  "camelmailer-core",
  "chrono",
+ "hickory-resolver",
  "hmac 0.12.1",
  "md-5",
  "rcgen",
@@ -473,6 +475,7 @@ dependencies = [
  "flate2",
  "hickory-resolver",
  "http-body-util",
+ "idna",
  "quick-xml",
  "rand 0.8.6",
  "rcgen",

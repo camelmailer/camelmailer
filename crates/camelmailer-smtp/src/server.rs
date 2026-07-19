@@ -8,7 +8,7 @@
 //! the first byte, the classic port 465). The session state machine is
 //! identical for all of them — only the I/O wrapper in front differs.
 
-use crate::session::{Reply, Session, SessionConfig};
+use crate::session::{Reply, Session, SessionConfig, State};
 use camelmailer_config::SmtpListenerMode;
 use camelmailer_core::{MessageSink, Store};
 use std::net::SocketAddr;
@@ -107,6 +107,13 @@ pub struct SmtpServer {
     config: camelmailer_config::Config,
     store: Arc<dyn Store>,
     sink: Arc<dyn MessageSink>,
+    /// Optional inbound-SPF resolver. When set, each transaction's
+    /// envelope-From is SPF-checked against the client IP and the verdict is
+    /// stamped as a `Received-SPF:` header on the stored message. Record-only
+    /// — SPF never rejects a message. `None` disables the check (the default,
+    /// and what tests using `serve`/`serve_listeners` get); `run` wires the
+    /// production hickory resolver in.
+    spf_resolver: Option<Arc<dyn camelmailer_core::SpfResolver>>,
 }
 
 impl SmtpServer {
@@ -119,10 +126,28 @@ impl SmtpServer {
             config,
             store,
             sink,
+            spf_resolver: None,
         }
     }
 
-    pub async fn run(self) -> std::io::Result<()> {
+    /// Enable inbound SPF evaluation with the given resolver. Purely
+    /// informational (a `Received-SPF:` header on the stored message); it
+    /// never blocks or rejects mail.
+    pub fn with_spf_resolver(mut self, resolver: Arc<dyn camelmailer_core::SpfResolver>) -> Self {
+        self.spf_resolver = Some(resolver);
+        self
+    }
+
+    pub async fn run(mut self) -> std::io::Result<()> {
+        // Enable inbound SPF in production: evaluate the envelope-From against
+        // the client IP and record a Received-SPF header (never blocking).
+        // Tests that call serve()/serve_listeners() directly leave it off.
+        if self.spf_resolver.is_none() {
+            match crate::spf_resolver::HickorySpfResolver::from_system() {
+                Some(resolver) => self.spf_resolver = Some(Arc::new(resolver)),
+                None => tracing::warn!("could not build SPF resolver; inbound SPF disabled"),
+            }
+        }
         let port = std::env::var("PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok())
@@ -239,6 +264,13 @@ impl SmtpServer {
             ip_address,
         );
 
+        // Context for the (optional) inbound SPF check, evaluated just before
+        // DATA once MAIL FROM and the client IP are known.
+        let spf = self.spf_resolver.as_ref().map(|resolver| SpfContext {
+            resolver: resolver.clone(),
+            receiver: self.config.camelmailer.smtp_hostname.clone(),
+        });
+
         if mode == SmtpListenerMode::Smtps {
             // Implicit TLS: handshake before the first SMTP byte, then run
             // the same session over the encrypted stream. The session starts
@@ -255,7 +287,7 @@ impl SmtpServer {
             if send_banner {
                 lines.write_line(&session.banner()).await?;
             }
-            drive_session(&mut session, &mut lines).await?;
+            drive_session(&mut session, &mut lines, spf.as_ref()).await?;
             lines.stream.shutdown().await.ok();
             return Ok(());
         }
@@ -267,7 +299,7 @@ impl SmtpServer {
 
         // Plaintext phase: run until the connection ends or STARTTLS asks
         // for an upgrade.
-        let upgrade = drive_session(&mut session, &mut lines).await?;
+        let upgrade = drive_session(&mut session, &mut lines, spf.as_ref()).await?;
         if !upgrade {
             return Ok(());
         }
@@ -284,10 +316,52 @@ impl SmtpServer {
         let tls_stream = tls_acceptor.accept(lines.into_inner()).await?;
         session.set_tls(true);
         let mut tls_lines = LineStream::new(tls_stream);
-        drive_session(&mut session, &mut tls_lines).await?;
+        drive_session(&mut session, &mut tls_lines, spf.as_ref()).await?;
         tls_lines.stream.shutdown().await.ok();
         Ok(())
     }
+}
+
+/// True when a line is the `DATA` command (case-insensitive, ignoring leading
+/// whitespace), the point at which the SMTP envelope is complete.
+fn is_data_command(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("DATA")
+}
+
+/// Everything the inbound SPF check needs, captured per connection.
+struct SpfContext {
+    resolver: Arc<dyn camelmailer_core::SpfResolver>,
+    receiver: String,
+}
+
+/// Evaluate the envelope-From's SPF policy against the client IP and stamp
+/// the result onto the session as a `Received-SPF:` header. Best-effort and
+/// non-blocking: any missing piece (no client IP, a null/`<>` return path, an
+/// address without a domain) simply skips the check. Never rejects mail.
+async fn evaluate_inbound_spf(session: &mut Session, spf: &SpfContext) {
+    let Some(ip) = session
+        .ip_address()
+        .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+    else {
+        return;
+    };
+    let Some(envelope_from) = session.mail_from().map(str::to_string) else {
+        return;
+    };
+    let Some(domain) = envelope_from
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.to_string())
+        .filter(|domain| !domain.is_empty())
+    else {
+        return;
+    };
+    let helo = session.helo_name().unwrap_or_default().to_string();
+
+    let result = camelmailer_core::evaluate_spf(spf.resolver.as_ref(), &domain, ip).await;
+    let header =
+        camelmailer_core::received_spf_header(result, &spf.receiver, &envelope_from, ip, &helo);
+    session.set_received_spf(header);
 }
 
 /// Pump lines through the session until the client disconnects, the session
@@ -296,11 +370,22 @@ impl SmtpServer {
 async fn drive_session<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Session,
     lines: &mut LineStream<S>,
+    spf: Option<&SpfContext>,
 ) -> std::io::Result<bool> {
+    let mut spf_evaluated = false;
     loop {
         let Some(line) = lines.read_line().await? else {
             return Ok(false);
         };
+        // Right before the client sends DATA (envelope complete), evaluate SPF
+        // once so the verdict can be prepended to the stored message. Skipped
+        // when SPF is disabled or the transaction never reached RCPT TO.
+        if !spf_evaluated && session.state() == State::RcptToReceived && is_data_command(&line) {
+            if let Some(spf) = spf {
+                evaluate_inbound_spf(session, spf).await;
+            }
+            spf_evaluated = true;
+        }
         let reply = session.handle(&line);
         lines.write_reply(&reply).await?;
         if session.take_start_tls() {

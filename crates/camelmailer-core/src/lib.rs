@@ -16,6 +16,7 @@ pub mod model;
 pub mod org_sso;
 pub mod received_header;
 pub mod server_store;
+pub mod spf;
 pub mod store;
 pub mod template;
 pub mod testing;
@@ -51,6 +52,7 @@ pub use server_store::{
     NewMessageShare, NewStream, NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter,
     TagCount, DELIVERY_STATUSES,
 };
+pub use spf::{evaluate as evaluate_spf, received_spf_header, SpfResolver, SpfResult};
 pub use store::{MemoryStore, Store};
 pub use template::{
     render as render_template, render_in_layout, wrapper_has_raw_content, RenderError,

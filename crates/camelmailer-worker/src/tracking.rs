@@ -82,13 +82,20 @@ pub fn rewrite_links<F: FnMut(&str) -> String>(
         if let Some((attr_end, quote)) = match_href(&html[index..]) {
             let value_start = index + attr_end;
             if let Some(close) = html[value_start..].find(quote) {
-                let url = &html[value_start..value_start + close];
+                let raw_url = &html[value_start..value_start + close];
                 output.push_str(&html[index..value_start]);
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    output.push_str(&make_click_url(url));
-                    rewritten.push(url.to_string());
+                // The href as written in HTML may carry HTML entities
+                // (`&amp;`, `&#38;`, …). Decode them to recover the *real*
+                // URL to store and redirect to, so the click endpoint hands
+                // back the exact link the sender intended (`a=1&b=2`), not a
+                // literal `a=1&amp;b=2`. Percent-encoding (`%20`) is part of
+                // the URL itself and is deliberately left untouched.
+                let decoded = decode_html_entities(raw_url);
+                if decoded.starts_with("http://") || decoded.starts_with("https://") {
+                    output.push_str(&make_click_url(&decoded));
+                    rewritten.push(decoded);
                 } else {
-                    output.push_str(url);
+                    output.push_str(raw_url);
                 }
                 index = value_start + close;
                 continue;
@@ -104,6 +111,57 @@ pub fn rewrite_links<F: FnMut(&str) -> String>(
         index += ch_len;
     }
     (output, rewritten)
+}
+
+/// Decode the HTML character references an `href` value can legitimately
+/// carry (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, and numeric `&#NN;` /
+/// `&#xHH;`) back into the characters they stand for. This recovers the true
+/// URL that a browser would navigate to. It intentionally does **not** touch
+/// percent-encoding (`%20` stays `%20`): that is part of the URL, not an HTML
+/// entity. Unknown or malformed references are left verbatim.
+fn decode_html_entities(input: &str) -> String {
+    if !input.contains('&') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'&' {
+            if let Some(semicolon) = input[index..].find(';') {
+                let entity = &input[index + 1..index + semicolon];
+                if let Some(decoded) = decode_one_entity(entity) {
+                    out.push(decoded);
+                    index += semicolon + 1;
+                    continue;
+                }
+            }
+        }
+        // not a recognised entity: copy one UTF-8 char verbatim
+        let ch = input[index..].chars().next().unwrap();
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+/// Decode the body of a single entity (the text between `&` and `;`).
+fn decode_one_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => {
+            let number = entity.strip_prefix('#')?;
+            let code = match number.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => number.parse::<u32>().ok()?,
+            };
+            char::from_u32(code)
+        }
+    }
 }
 
 /// If `slice` starts with an `href=` attribute, return (offset of the value
@@ -233,5 +291,114 @@ mod tests {
         let (headers, body) = html_body(raw).unwrap();
         let rebuilt = reassemble(&headers, &body);
         assert_eq!(rebuilt, raw);
+    }
+
+    // Item 4: a long href carrying HTML entities and percent-encoding must
+    // round-trip so the click endpoint redirects to the *exact* original URL.
+    // `&amp;` decodes to `&`; `%20` (real URL bytes) is preserved verbatim.
+    #[test]
+    fn long_urls_with_entities_round_trip_to_the_original() {
+        let long_query: String = (0..40).map(|i| format!("k{i}=v{i}&amp;")).collect();
+        let original_href =
+            format!("https://example.com/path%20with%20space/page?{long_query}end=1&amp;x=%2F");
+        let html = format!("<a href=\"{original_href}\">link</a>");
+
+        let mut stored: Vec<String> = Vec::new();
+        let (out, urls) = rewrite_links(&html, |url| {
+            stored.push(url.to_string());
+            "TRACK".to_string()
+        });
+
+        // What we store (and hand to the redirect) is the decoded, true URL.
+        let expected: String = original_href.replace("&amp;", "&");
+        assert_eq!(stored, vec![expected.clone()]);
+        assert_eq!(urls, vec![expected.clone()]);
+        // Long URLs are never truncated (storage columns are unbounded TEXT).
+        assert!(expected.len() > 255);
+        // Percent-encoding is preserved exactly; no HTML entities remain.
+        assert!(expected.contains("%20with%20space"));
+        assert!(expected.contains("x=%2F"));
+        assert!(!expected.contains("&amp;"));
+        assert!(expected.contains("end=1&x=%2F"));
+        // The href in the outgoing HTML is replaced by the tracking URL.
+        assert!(out.contains("href=\"TRACK\""));
+    }
+
+    #[test]
+    fn decode_html_entities_leaves_percent_encoding_and_unknown_refs() {
+        assert_eq!(decode_html_entities("a=1&amp;b=2"), "a=1&b=2");
+        assert_eq!(decode_html_entities("x%20y"), "x%20y");
+        assert_eq!(decode_html_entities("a&#38;b&#x26;c"), "a&b&c");
+        // A stray ampersand that is not an entity is preserved.
+        assert_eq!(decode_html_entities("a & b"), "a & b");
+        assert_eq!(decode_html_entities("no entities"), "no entities");
+    }
+
+    // Item 3 (body fidelity): a MIME message whose top level is not text/html
+    // — the common case of a multipart message carrying a base64 attachment
+    // with bare LFs and mixed CRLF/LF line endings — must pass through the
+    // tracking pass byte-for-byte. `html_body` returns None for it, so the
+    // worker returns the raw message unchanged: no line-ending rewrite, no
+    // dropped bytes, no mangled base64. Regression guard.
+    #[test]
+    fn multipart_with_bare_lf_attachment_is_left_untouched() {
+        use base64::Engine;
+        // A binary attachment payload, base64-encoded as a single stream and
+        // then split with a BARE LF (not CRLF) mid-way — the exact shape that
+        // upstream mangled (bare LF → CRLF, dropped bytes).
+        let payload: &[u8] = b"\x00\x01\x02 bare-LF attachment bytes, preserved verbatim \xfe\xff";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        let split = b64.len() / 2;
+        let attachment_body = format!("{}\n{}", &b64[..split], &b64[split..]);
+
+        let raw = format!(
+            "From: sender@acme.com\r\n\
+Content-Type: multipart/mixed; boundary=\"b0\"\r\n\
+\r\n\
+--b0\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+hello\nworld\r\n\
+--b0\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"a.bin\"\r\n\
+\r\n\
+{attachment_body}\r\n\
+--b0--"
+        );
+        let raw = raw.into_bytes();
+
+        // Not an HTML top level, so the tracking pass never rewrites it: the
+        // worker returns the raw message byte-for-byte (no line-ending rewrite,
+        // no dropped bytes). Regression guard for the mangled-attachment bug.
+        assert!(html_body(&raw).is_none());
+        assert!(!is_signed(&raw));
+
+        // And the (untouched) base64 still decodes to the exact payload — the
+        // bare LF between chunks is pure whitespace to a base64 decoder.
+        let compact: String = attachment_body
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(compact.as_bytes())
+            .unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    // Item 3: a single-part text/html body with mixed line endings and
+    // non-ASCII UTF-8 round-trips through split → (no-op) rewrite → reassemble
+    // with every byte intact.
+    #[test]
+    fn html_body_round_trips_mixed_endings_and_utf8() {
+        let raw = "Content-Type: text/html; charset=utf-8\r\n\r\n\
+<p>Grüße\nüber\r\nZeilen — ohne Verlust</p>"
+            .as_bytes();
+        let (headers, body) = html_body(raw).unwrap();
+        let (rewritten, urls) = rewrite_links(&body, |u| u.to_string());
+        assert!(urls.is_empty());
+        let rebuilt = reassemble(&headers, &rewritten);
+        assert_eq!(rebuilt, raw, "no bytes may be dropped or altered");
     }
 }
