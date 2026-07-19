@@ -2247,6 +2247,54 @@ async fn inbound_bypass_retry_requeue_and_scope() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dequeue_reclaims_stale_locks_but_not_fresh_ones() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    // A one-day stale window: a lock older than a day is abandoned.
+    let queue = camelmailer_db::PgQueue::with_stale_lock_days(pool.clone(), 1);
+
+    // Two queued messages (message_id carries no FK, so bare ids are fine).
+    let stale = queue
+        .enqueue(1001, f.server.id, "stale.example")
+        .await
+        .unwrap();
+    let fresh = queue
+        .enqueue(1002, f.server.id, "fresh.example")
+        .await
+        .unwrap();
+
+    // Simulate a worker that crashed two days ago still "holding" `stale`,
+    // and a healthy worker that just locked `fresh`.
+    sqlx::query(
+        "UPDATE queued_messages SET locked_by = 'dead', locked_at = now() - interval '2 days' \
+         WHERE id = $1",
+    )
+    .bind(stale)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE queued_messages SET locked_by = 'alive', locked_at = now() WHERE id = $1")
+        .bind(fresh)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The stale lock is reclaimed (re-dequeued to a live worker)...
+    let reclaimed = queue
+        .dequeue("reaper")
+        .await
+        .unwrap()
+        .expect("stale lock should be reclaimed");
+    assert_eq!(reclaimed.id, stale);
+    assert_eq!(reclaimed.message_id, 1001);
+
+    // ...but the freshly locked message is left untouched, so nothing else is
+    // ready (the just-reclaimed row now carries a fresh lock too).
+    assert!(queue.dequeue("reaper").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn templates_crud_and_scoping() {
     use camelmailer_core::{NewTemplate, ServerStore};
 

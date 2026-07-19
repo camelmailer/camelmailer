@@ -8,6 +8,7 @@ pub mod inspection;
 pub mod sender;
 pub mod signer;
 pub mod smtp_client;
+pub mod ssrf;
 pub mod tracking;
 pub mod worker;
 

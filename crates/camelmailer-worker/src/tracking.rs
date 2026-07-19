@@ -29,6 +29,42 @@ fn is_html(headers: &str) -> bool {
     headers.to_lowercase().contains("text/html")
 }
 
+/// True when the message carries a cryptographic signature that a tracking
+/// rewrite would invalidate, so tracking must leave it untouched:
+///
+/// * a top-level `multipart/signed` container — the S/MIME and PGP/MIME
+///   detached-signature form (the signature covers the exact bytes of the
+///   signed part), or
+/// * an inline PGP clearsigned body (`-----BEGIN PGP SIGNED MESSAGE-----`),
+///   whose signature covers the body text a rewrite would change.
+///
+/// Deliberately narrow: it only inspects the top-level Content-Type header and
+/// the body for well-known signature markers, so a normal tracked HTML mail is
+/// never misclassified.
+pub fn is_signed(raw_message: &[u8]) -> bool {
+    let offset = body_offset(raw_message).unwrap_or(raw_message.len());
+    let headers = String::from_utf8_lossy(&raw_message[..offset]).to_lowercase();
+    // A top-level multipart/signed container: the signature is detached and
+    // covers the signed part verbatim, so any rewrite breaks verification.
+    if header_is_multipart_signed(&headers) {
+        return true;
+    }
+    // Inline PGP clearsigned content (RFC 4880). The markers are ASCII, so a
+    // lossy decode is exact for detection purposes.
+    let body = String::from_utf8_lossy(&raw_message[offset..]);
+    body.contains("-----BEGIN PGP SIGNED MESSAGE-----")
+        || body.contains("-----BEGIN PGP SIGNATURE-----")
+}
+
+/// True when the top-level `Content-Type` is `multipart/signed`. Matching the
+/// header value (not the whole header block) avoids a false positive from the
+/// literal string appearing elsewhere.
+fn header_is_multipart_signed(lowercased_headers: &str) -> bool {
+    lowercased_headers
+        .lines()
+        .any(|line| line.starts_with("content-type:") && line.contains("multipart/signed"))
+}
+
 /// Rewrite HTTP(S) `href="…"` links using the provided registrar, which
 /// returns the tracking URL for an original URL. Returns the rewritten HTML
 /// and the list of (original_url) that were rewritten, in order.
@@ -165,6 +201,30 @@ mod tests {
 
         let text = b"Content-Type: text/plain\r\n\r\nplain";
         assert!(html_body(text).is_none());
+    }
+
+    #[test]
+    fn detects_signed_messages() {
+        // top-level multipart/signed (S/MIME or PGP/MIME)
+        let smime = b"Content-Type: multipart/signed; protocol=\"application/pkcs7-signature\"; \
+            micalg=sha-256; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html\r\n\r\n\
+            <body><a href=\"https://x.example\">x</a></body>\r\n--b--\r\n";
+        assert!(is_signed(smime));
+
+        // inline PGP clearsigned HTML body
+        let pgp = b"Content-Type: text/html\r\n\r\n-----BEGIN PGP SIGNED MESSAGE-----\r\n\
+            Hash: SHA256\r\n\r\n<body><a href=\"https://x.example\">x</a></body>\r\n\
+            -----BEGIN PGP SIGNATURE-----\r\n...\r\n-----END PGP SIGNATURE-----\r\n";
+        assert!(is_signed(pgp));
+
+        // ordinary HTML mail is NOT flagged
+        let plain =
+            b"Content-Type: text/html\r\n\r\n<body><a href=\"https://x.example\">x</a></body>";
+        assert!(!is_signed(plain));
+
+        // the literal string in body text must not trip the header check
+        let mentions = b"Content-Type: text/html\r\n\r\n<body>we use multipart/signed mail</body>";
+        assert!(!is_signed(mentions));
     }
 
     #[test]

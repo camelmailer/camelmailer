@@ -60,14 +60,34 @@ fn log_entry_from_row(row: &PgRow) -> WebhookLogEntry {
     }
 }
 
+/// Default stale-lock window (days) when a caller does not configure one.
+/// Matches `camelmailer.queued_message_lock_stale_days`'s default.
+const DEFAULT_STALE_LOCK_DAYS: i32 = 1;
+
 #[derive(Clone)]
 pub struct PgWebhookQueue {
     pool: PgPool,
+    /// A request locked (`locked_by` set) longer ago than this is treated as
+    /// abandoned by a crashed worker and re-dequeued.
+    stale_lock_days: i32,
 }
 
 impl PgWebhookQueue {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            stale_lock_days: DEFAULT_STALE_LOCK_DAYS,
+        }
+    }
+
+    /// Like [`PgWebhookQueue::new`] but with an explicit stale-lock window
+    /// (from `camelmailer.queued_message_lock_stale_days`). A value `<= 0` is
+    /// clamped to 1 day.
+    pub fn with_stale_lock_days(pool: PgPool, stale_lock_days: i32) -> Self {
+        Self {
+            pool,
+            stale_lock_days: stale_lock_days.max(1),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -101,12 +121,17 @@ impl PgWebhookQueue {
         Ok(row.get("id"))
     }
 
+    /// Lock and return the next ready webhook request, if any. Reclaims stale
+    /// locks (held since before `now() - queued_message_lock_stale_days`) so a
+    /// crash mid-delivery does not strand a request permanently.
     pub async fn dequeue(&self, worker_id: &str) -> Result<Option<WebhookRequestRow>, sqlx::Error> {
         let row = sqlx::query(
             "UPDATE webhook_requests SET locked_by = $1, locked_at = now()
              WHERE id = (
                  SELECT id FROM webhook_requests
-                 WHERE locked_by IS NULL AND (retry_after IS NULL OR retry_after <= now())
+                 WHERE (locked_by IS NULL
+                        OR locked_at < now() - make_interval(days => $2::int))
+                   AND (retry_after IS NULL OR retry_after <= now())
                  ORDER BY id
                  LIMIT 1
                  FOR UPDATE SKIP LOCKED
@@ -114,6 +139,7 @@ impl PgWebhookQueue {
              RETURNING *",
         )
         .bind(worker_id)
+        .bind(self.stale_lock_days)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.as_ref().map(request_from_row))

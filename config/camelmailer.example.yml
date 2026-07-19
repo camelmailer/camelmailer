@@ -38,6 +38,16 @@ camelmailer:
   default_spam_threshold: 5
   default_spam_failure_threshold: 20
 
+  # SSRF guard on outbound webhook / HTTP-route-endpoint requests. On by
+  # default: the destination host is resolved and the request refused when it
+  # maps to a loopback, private, link-local, unique-local or otherwise
+  # non-global address (blocks e.g. http://169.254.169.254/ metadata reads).
+  # outbound_ssrf_protection: true
+  # Narrow exception — hosts (domains or IP literals) allowed through the guard
+  # even when they resolve to an internal address, for deliberate internal
+  # webhook/route targets:
+  # outbound_allowed_hosts: ["hooks.internal.example.com", "10.0.0.5"]
+
 web_server:
   # Browser origins allowed to call the APIs (CORS). Empty = no CORS.
   # cors_origins:

@@ -77,6 +77,19 @@ pub struct CamelMailer {
     /// The global API key for the Admin API. If not set, only database-backed
     /// admin API keys are accepted.
     pub admin_api_key: Option<String>,
+    /// Guard outbound webhook / HTTP-route-endpoint requests against SSRF:
+    /// resolve the destination host and refuse to send when it maps to a
+    /// loopback, private, link-local, unique-local or otherwise non-global
+    /// address. On by default. Turn it off only for a trusted, isolated
+    /// self-hosted install that must target internal endpoints wholesale;
+    /// prefer `outbound_allowed_hosts` for a narrow exception.
+    #[serde(default = "default_true")]
+    pub outbound_ssrf_protection: bool,
+    /// Hosts (domains or IP literals) that bypass the SSRF guard even when
+    /// they resolve to a non-global address — for self-hosters that
+    /// deliberately deliver webhooks / routes to a known internal endpoint.
+    #[serde(default)]
+    pub outbound_allowed_hosts: Vec<String>,
 }
 
 impl Default for CamelMailer {
@@ -102,6 +115,8 @@ impl Default for CamelMailer {
             batch_queued_messages: true,
             batch_queued_messages_limit: 100,
             admin_api_key: None,
+            outbound_ssrf_protection: true,
+            outbound_allowed_hosts: vec![],
         }
     }
 }

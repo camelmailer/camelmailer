@@ -10,6 +10,7 @@ use crate::inspection::{ClamavInspector, RspamdInspector};
 use crate::sender::SmtpSender;
 use crate::signer::Signer;
 use crate::smtp_client::SendOutcome;
+use crate::ssrf::SsrfGuard;
 use crate::tracking;
 use base64::Engine;
 use camelmailer_core::{AdminStore, Id, RouteMode};
@@ -73,13 +74,16 @@ pub struct Worker {
     /// Base URL for tracking links, e.g. `https://track.example.com`.
     tracking_base_url: String,
     http: reqwest::Client,
+    /// Address guard for outbound webhook / route-endpoint requests (SSRF).
+    ssrf_guard: SsrfGuard,
     max_attempts: i32,
     worker_id: String,
 }
 
 impl Worker {
     pub fn new(config: &camelmailer_config::Config, store: PgStore) -> Self {
-        let queue = PgQueue::new(store.pool().clone());
+        let stale_lock_days = config.camelmailer.queued_message_lock_stale_days as i32;
+        let queue = PgQueue::with_stale_lock_days(store.pool().clone(), stale_lock_days);
         let sink = PgMessageSink::new(store.clone());
         let sender = SmtpSender::new(config);
         let http = reqwest::Client::builder()
@@ -91,7 +95,8 @@ impl Worker {
                 tracing::warn!(%error, "could not load signing key; webhook signing disabled");
                 None
             });
-        let webhook_queue = PgWebhookQueue::new(store.pool().clone());
+        let webhook_queue =
+            PgWebhookQueue::with_stale_lock_days(store.pool().clone(), stale_lock_days);
         let rspamd = config
             .rspamd
             .enabled
@@ -117,6 +122,7 @@ impl Worker {
             ),
             sender,
             http,
+            ssrf_guard: SsrfGuard::from_config(config),
             max_attempts: config.camelmailer.default_maximum_delivery_attempts as i32,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
         }
@@ -460,6 +466,22 @@ impl Worker {
             return self.ingest_dmarc_report(queued, message).await;
         }
 
+        // SSRF guard: refuse to POST to a route endpoint that resolves to a
+        // non-global (loopback / private / link-local / …) address unless the
+        // operator explicitly allowed it. Treat a blocked endpoint like any
+        // other failed delivery (retry with backoff, then terminal fail).
+        if let Err(error) = self.ssrf_guard.check_url(&endpoint_url).await {
+            tracing::warn!(%error, endpoint = %endpoint_url, "route endpoint blocked by SSRF guard");
+            let response = format!("route endpoint blocked by address guard: {error}");
+            return if queued.attempts + 1 >= self.max_attempts {
+                self.queue.complete(queued.id).await?;
+                Ok(ProcessOutcome::Failed { response })
+            } else {
+                self.queue.retry(queued.id, queued.attempts).await?;
+                Ok(ProcessOutcome::Delayed { response })
+            };
+        }
+
         let payload = json!({
             "message": {
                 "id": message.id,
@@ -681,6 +703,13 @@ impl Worker {
     /// message. No-op for non-HTML messages. Returns the (possibly
     /// rewritten) raw message.
     async fn apply_tracking(&self, message: &StoredMessage) -> Result<Vec<u8>, sqlx::Error> {
+        // Never rewrite a cryptographically signed message: injecting the open
+        // pixel or rewriting a link would invalidate an S/MIME, PGP/MIME or
+        // inline-PGP signature over the body.
+        if tracking::is_signed(&message.raw_message) {
+            return Ok(message.raw_message.clone());
+        }
+
         let Some((headers, body)) = tracking::html_body(&message.raw_message) else {
             return Ok(message.raw_message.clone());
         };
@@ -787,6 +816,28 @@ impl Worker {
             return Ok(None);
         };
 
+        // SSRF guard: never fetch a webhook URL that resolves to a non-global
+        // address (would otherwise leak up to 2 KB of the reply into the
+        // tenant-visible audit log). Record the blocked attempt and retry /
+        // give up like any other failure — but never make the request.
+        let attempt = request.attempts + 1;
+        if let Err(error) = self.ssrf_guard.check_url(&request.url).await {
+            tracing::warn!(%error, url = %request.url, "webhook blocked by SSRF guard");
+            let detail = format!("blocked by address guard: {error}");
+            self.webhook_queue
+                .log_attempt(&request, attempt, None, false, &detail)
+                .await?;
+            return if attempt >= WEBHOOK_MAX_ATTEMPTS {
+                self.webhook_queue.complete(request.id).await?;
+                Ok(Some(WebhookOutcome::GivenUp))
+            } else {
+                self.webhook_queue
+                    .retry(request.id, request.attempts)
+                    .await?;
+                Ok(Some(WebhookOutcome::Retrying))
+            };
+        }
+
         let mut http_request = self
             .http
             .post(&request.url)
@@ -818,7 +869,6 @@ impl Worker {
             }
         }
 
-        let attempt = request.attempts + 1;
         let result = http_request.body(request.payload.clone()).send().await;
         let (status_code, success, response_body) = match result {
             Ok(response) => {

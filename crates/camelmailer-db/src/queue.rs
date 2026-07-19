@@ -29,14 +29,35 @@ fn queued_from_row(row: &PgRow) -> QueuedMessageRow {
     }
 }
 
+/// Default stale-lock window (days) when a caller does not configure one.
+/// Matches `camelmailer.queued_message_lock_stale_days`'s default.
+const DEFAULT_STALE_LOCK_DAYS: i32 = 1;
+
 #[derive(Clone)]
 pub struct PgQueue {
     pool: PgPool,
+    /// A message locked (`locked_by` set) longer ago than this is treated as
+    /// abandoned by a crashed worker and re-dequeued.
+    stale_lock_days: i32,
 }
 
 impl PgQueue {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            stale_lock_days: DEFAULT_STALE_LOCK_DAYS,
+        }
+    }
+
+    /// Like [`PgQueue::new`] but with an explicit stale-lock window (from
+    /// `camelmailer.queued_message_lock_stale_days`). A value `<= 0` is
+    /// clamped to 1 day so a misconfiguration can never reclaim actively
+    /// locked messages.
+    pub fn with_stale_lock_days(pool: PgPool, stale_lock_days: i32) -> Self {
+        Self {
+            pool,
+            stale_lock_days: stale_lock_days.max(1),
+        }
     }
 
     pub async fn enqueue(
@@ -58,12 +79,19 @@ impl PgQueue {
     }
 
     /// Lock and return the next ready queued message, if any.
+    ///
+    /// A row is ready when it is unlocked, *or* when its lock is stale — held
+    /// since before `now() - queued_message_lock_stale_days`, i.e. by a worker
+    /// that crashed mid-delivery. Without the stale branch such a row would
+    /// stay "sending" forever; with it, a surviving worker reclaims it.
     pub async fn dequeue(&self, worker_id: &str) -> Result<Option<QueuedMessageRow>, sqlx::Error> {
         let row = sqlx::query(
             "UPDATE queued_messages SET locked_by = $1, locked_at = now()
              WHERE id = (
                  SELECT id FROM queued_messages
-                 WHERE locked_by IS NULL AND (retry_after IS NULL OR retry_after <= now())
+                 WHERE (locked_by IS NULL
+                        OR locked_at < now() - make_interval(days => $2::int))
+                   AND (retry_after IS NULL OR retry_after <= now())
                  ORDER BY id
                  LIMIT 1
                  FOR UPDATE SKIP LOCKED
@@ -71,6 +99,7 @@ impl PgQueue {
              RETURNING *",
         )
         .bind(worker_id)
+        .bind(self.stale_lock_days)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.as_ref().map(queued_from_row))

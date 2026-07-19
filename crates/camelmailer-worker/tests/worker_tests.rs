@@ -188,6 +188,11 @@ fn worker_config(relay_port: u16) -> camelmailer_config::Config {
     config.camelmailer.smtp_relays = vec![format!("smtp://127.0.0.1:{relay_port}")];
     config.camelmailer.default_maximum_delivery_attempts = 3;
     config.smtp_client.open_timeout = 5;
+    // The webhook / route-endpoint mock servers in these tests bind to
+    // 127.0.0.1, which the SSRF guard blocks by default. Allowlist loopback so
+    // the delivery-path tests exercise the real request; the guard's blocking
+    // behaviour has its own dedicated test (`webhook_to_a_blocked_host_...`).
+    config.camelmailer.outbound_allowed_hosts = vec!["127.0.0.1".into()];
     config
 }
 
@@ -894,6 +899,57 @@ async fn failing_webhooks_are_retried_with_backoff_and_logged() {
     assert_eq!(log[1].attempt, 2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_to_a_blocked_host_is_refused_by_the_ssrf_guard() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    // The mock binds to loopback — a non-global address the guard blocks.
+    let hook = mock_http(axum::http::StatusCode::OK).await;
+
+    let webhook = s
+        .store
+        .create_webhook(NewWebhook::all(s.server.id, "internal", &hook.url, false))
+        .await
+        .unwrap();
+
+    let queue = camelmailer_db::PgWebhookQueue::new(s.store.pool().clone());
+    queue
+        .enqueue(
+            s.server.id,
+            webhook.id,
+            "uuid-blocked",
+            "MessageSent",
+            &hook.url,
+            "{}",
+            false,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+
+    // Guard ON with loopback NOT allowlisted: the request must be refused.
+    let mut config = worker_config(1);
+    config.camelmailer.outbound_allowed_hosts = vec![];
+    let worker = Worker::new(&config, s.store.clone());
+
+    let outcome = worker.process_next_webhook().await.unwrap().unwrap();
+    assert_eq!(outcome, camelmailer_worker::WebhookOutcome::Retrying);
+
+    // The request was never sent...
+    assert!(hook.requests.lock().unwrap().is_empty());
+    // ...and the audit log recorded a blocked attempt (no HTTP status).
+    let log = queue.log_for_server(s.server.id).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert!(!log[0].success);
+    assert_eq!(log[0].status_code, None);
+    assert!(log[0]
+        .response_body
+        .as_deref()
+        .unwrap_or_default()
+        .contains("address guard"));
+}
+
 // --------------------------------------------------------- DKIM (commit B)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1344,6 +1400,47 @@ async fn html_outgoing_mail_gets_click_links_rewritten_and_an_open_pixel() {
         .unwrap();
     assert_eq!(clicks, 1);
     assert_eq!(opens, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_html_mail_is_not_rewritten_for_tracking() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    // An inline-PGP-signed HTML body: top-level text/html (so it would
+    // normally be tracked), but a rewrite would break the signature.
+    let mut message = outgoing_message(s.server.id, "user@dest.example");
+    message.raw_message = b"Content-Type: text/html\r\n\r\n\
+        -----BEGIN PGP SIGNED MESSAGE-----\r\nHash: SHA256\r\n\r\n\
+        <html><body><a href=\"https://example.com/offer\">Offer</a></body></html>\r\n\
+        -----BEGIN PGP SIGNATURE-----\r\nabc\r\n-----END PGP SIGNATURE-----\r\n"
+        .to_vec();
+    let message_id = s.sink.insert_message(&message).await.unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.web_protocol = "https".into();
+    config.dns.track_domain = "track.example.com".into();
+    let worker = Worker::new(&config, s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+
+    let seen = smtp.received.lock().unwrap().clone();
+    let body = seen.join("\n");
+    // the signature and original link survive untouched; no tracking injected
+    assert!(body.contains("-----BEGIN PGP SIGNATURE-----"));
+    assert!(body.contains("href=\"https://example.com/offer\""));
+    assert!(!body.contains("track.example.com/track/c/"));
+    assert!(!body.contains("/track/o/"));
+
+    // and no click/open tokens were registered for it
+    let (clicks, opens) = s
+        .sink
+        .activity_counts(s.server.id, message_id)
+        .await
+        .unwrap();
+    assert_eq!(clicks, 0);
+    assert_eq!(opens, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

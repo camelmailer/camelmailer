@@ -15,6 +15,35 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Security
+
+- **SSRF guard on outbound webhook and HTTP-route-endpoint requests.** The
+  delivery worker now resolves the destination host before POSTing to a
+  tenant-controlled webhook URL (`camelmailer-worker` `process_next_webhook`)
+  or HTTP route endpoint (`process_incoming`) and refuses the request when the
+  host is, or resolves to, a loopback, private (RFC1918), link-local,
+  unique-local (`fc00::/7`), IPv4-mapped/compatible IPv6, or otherwise
+  non-global address. This closes a semi-blind SSRF read primitive (webhook
+  reply bodies are stored in the tenant-visible audit log) — for example a
+  webhook pointed at `http://169.254.169.254/` cloud metadata. The guard is on
+  by default and configurable via the new `camelmailer.outbound_ssrf_protection`
+  (bool, default true) and `camelmailer.outbound_allowed_hosts` (explicit
+  allowlist) settings. Mirrors Postal's v3.3.7 address-guard fix.
+
+### Fixed
+
+- **Stale delivery/webhook queue locks are now reclaimed.** A worker that
+  crashed mid-delivery previously stranded a message or webhook request as
+  "locked" forever, because dequeue only considered `locked_by IS NULL`. The
+  dequeue predicate now also picks up rows whose lock is older than
+  `camelmailer.queued_message_lock_stale_days` (default 1 day) — the config
+  knob that existed but was wired to nothing. Applies to both
+  `queued_messages` and `webhook_requests`.
+- **Tracking rewrites no longer corrupt signed mail.** `apply_tracking` skips
+  click-link rewriting and open-pixel injection for cryptographically signed
+  messages (top-level `multipart/signed` S/MIME or PGP/MIME, and inline PGP
+  clearsigned bodies), which a rewrite would otherwise invalidate.
+
 ### Added
 
 - **Non-sending historical message import.** A new admin endpoint,
