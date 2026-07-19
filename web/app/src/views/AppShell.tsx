@@ -13,6 +13,7 @@ import { useMutation, useQuery } from "@tanstack/react-query"
 import {
   AtSignIcon,
   BadgeCheckIcon,
+  Building2Icon,
   BanIcon,
   BookOpenIcon,
   CheckIcon,
@@ -113,6 +114,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   streams: "Streams",
   campaigns: "Campaigns",
   templates: "Templates",
+  organizations: "Organizations",
   users: "Users",
   "ip-pools": "IP pools",
   "api-keys": "Admin API keys",
@@ -637,6 +639,7 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
               <SidebarMenu>
                 {(
                   [
+                    ["/admin/organizations", "Organizations", Building2Icon],
                     ["/admin/users", "Users", UsersIcon],
                     ["/admin/ip-pools", "IP pools", NetworkIcon],
                     ["/admin/api-keys", "Admin API keys", KeyRoundIcon],
