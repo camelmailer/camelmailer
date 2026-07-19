@@ -1143,14 +1143,20 @@ async fn mock_clamd(reply: &'static str) -> u16 {
                 return;
             };
             tokio::spawn(async move {
-                // drain the INSTREAM upload until the zero-length terminator
-                let mut buffer = vec![0u8; 4096];
+                // Drain the INSTREAM upload until the client's zero-length
+                // terminator (a 4-byte length prefix of 0) arrives as the final
+                // four bytes. We accumulate only the bytes actually read and
+                // inspect the tail, so we neither false-match on the zeroed
+                // read buffer (which would close the socket mid-upload and make
+                // the scan flake) nor miss a terminator split across reads.
+                let mut received = Vec::new();
+                let mut chunk = [0u8; 4096];
                 loop {
-                    match stream.read(&mut buffer).await {
+                    match stream.read(&mut chunk).await {
                         Ok(0) => break,
-                        Ok(_) => {
-                            // crude: once we've seen data, respond after a beat
-                            if buffer.windows(4).any(|w| w == [0, 0, 0, 0]) {
+                        Ok(n) => {
+                            received.extend_from_slice(&chunk[..n]);
+                            if received.ends_with(&[0, 0, 0, 0]) {
                                 break;
                             }
                         }
@@ -1158,6 +1164,7 @@ async fn mock_clamd(reply: &'static str) -> u16 {
                     }
                 }
                 stream.write_all(format!("{reply}\0").as_bytes()).await.ok();
+                stream.flush().await.ok();
                 stream.shutdown().await.ok();
             });
         }
