@@ -1174,7 +1174,12 @@ async fn import_message_writes_a_completed_record_and_never_enqueues() {
     let f = fixtures(pool.clone()).await;
     let sink = PgMessageSink::new(f.store.clone());
 
-    let at = chrono::Utc::now() - chrono::Duration::days(10);
+    // Postgres timestamptz has microsecond precision; truncate the source
+    // timestamp to microseconds so the round-tripped value compares exactly.
+    // (Utc::now() carries nanoseconds on Linux but only microseconds on macOS,
+    // so an untruncated comparison passes locally and fails in CI.)
+    use chrono::SubsecRound;
+    let at = (chrono::Utc::now() - chrono::Duration::days(10)).trunc_subsecs(6);
     let id = ServerStore::import_message(
         &f.store,
         ImportMessage {
