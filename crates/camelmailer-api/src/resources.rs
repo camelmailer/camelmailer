@@ -1652,6 +1652,279 @@ pub(crate) async fn templates_copy_to(
     }
 }
 
+// -------------------------------------------------- historical message import
+
+/// Cap the number of messages one import request may carry (cloud rate
+/// guard — a client over the cap should split the batch and retry).
+const MAX_IMPORT_MESSAGES: usize = 500;
+/// Cap the total decoded raw-message bytes one import request may carry
+/// (cloud size guard). 50 MiB.
+const MAX_IMPORT_RAW_BYTES: usize = 50 * 1024 * 1024;
+
+/// A timestamp accepted either as Unix seconds (a JSON number) or as an
+/// RFC3339 string.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ImportTimestamp {
+    Unix(i64),
+    Rfc3339(String),
+}
+
+impl ImportTimestamp {
+    fn parse(&self) -> Result<chrono::DateTime<chrono::Utc>, String> {
+        match self {
+            ImportTimestamp::Unix(secs) => chrono::DateTime::from_timestamp(*secs, 0)
+                .ok_or_else(|| format!("timestamp out of range: {secs}")),
+            ImportTimestamp::Rfc3339(text) => chrono::DateTime::parse_from_rfc3339(text)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|error| format!("invalid RFC3339 timestamp {text:?}: {error}")),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportDeliveryJson {
+    status: String,
+    #[serde(default)]
+    details: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    sent_with_ssl: bool,
+    timestamp: ImportTimestamp,
+}
+
+#[derive(Deserialize)]
+struct ImportOpenJson {
+    timestamp: ImportTimestamp,
+    #[serde(default)]
+    ip: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportClickJson {
+    url: String,
+    timestamp: ImportTimestamp,
+}
+
+#[derive(Deserialize)]
+struct ImportMessageJson {
+    scope: String,
+    mail_from: String,
+    rcpt_to: String,
+    raw_message_base64: String,
+    #[serde(default)]
+    received_with_ssl: bool,
+    #[serde(default)]
+    bounce: bool,
+    #[serde(default)]
+    tag: Option<String>,
+    timestamp: ImportTimestamp,
+    /// Optional domain name to attribute the message to (resolved to an id
+    /// best-effort; ignored if unknown).
+    #[serde(default)]
+    domain: Option<String>,
+    /// Optional credential name to attribute the message to (resolved
+    /// best-effort; ignored if unknown).
+    #[serde(default)]
+    credential_name: Option<String>,
+    #[serde(default)]
+    deliveries: Vec<ImportDeliveryJson>,
+    #[serde(default)]
+    opens: Vec<ImportOpenJson>,
+    #[serde(default)]
+    clicks: Vec<ImportClickJson>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ImportBatch {
+    messages: Vec<ImportMessageJson>,
+}
+
+/// Build one [`camelmailer_core::ImportMessage`] from its JSON form + the
+/// pre-decoded raw and the server's resolved domain/credential name maps.
+fn build_import_message(
+    server_id: u64,
+    item: ImportMessageJson,
+    raw_message: Vec<u8>,
+    domains: &std::collections::HashMap<String, u64>,
+    credentials: &std::collections::HashMap<String, u64>,
+) -> Result<camelmailer_core::ImportMessage, String> {
+    let scope = match item.scope.as_str() {
+        "incoming" => camelmailer_core::MessageScope::Incoming,
+        "outgoing" => camelmailer_core::MessageScope::Outgoing,
+        other => {
+            return Err(format!(
+                "invalid scope {other:?} (expected incoming|outgoing)"
+            ))
+        }
+    };
+    let created_at = item.timestamp.parse()?;
+    let deliveries = item
+        .deliveries
+        .into_iter()
+        .map(|d| {
+            Ok(camelmailer_core::ImportDelivery {
+                status: d.status,
+                details: d.details,
+                output: d.output,
+                sent_with_ssl: d.sent_with_ssl,
+                created_at: d.timestamp.parse()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let opens = item
+        .opens
+        .into_iter()
+        .map(|o| {
+            Ok(camelmailer_core::ImportEvent {
+                created_at: o.timestamp.parse()?,
+                ip: o.ip,
+                user_agent: o.user_agent,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let clicks = item
+        .clicks
+        .into_iter()
+        .map(|c| {
+            Ok(camelmailer_core::ImportClick {
+                url: c.url,
+                created_at: c.timestamp.parse()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(camelmailer_core::ImportMessage {
+        server_id,
+        scope,
+        mail_from: item.mail_from,
+        rcpt_to: item.rcpt_to,
+        raw_message,
+        received_with_ssl: item.received_with_ssl,
+        bounce: item.bounce,
+        tag: item.tag,
+        domain_id: item
+            .domain
+            .as_deref()
+            .and_then(|name| domains.get(name).copied()),
+        credential_id: item
+            .credential_name
+            .as_deref()
+            .and_then(|name| credentials.get(name).copied()),
+        created_at,
+        deliveries,
+        opens,
+        clicks,
+    })
+}
+
+/// `POST …/servers/{server}/messages/import` — import past messages (from a
+/// Postal migration) as completed records WITHOUT ever queuing or sending
+/// them. Each item carries its raw message (base64) plus its historical
+/// deliveries, opens and clicks with their original timestamps. Per-item
+/// failures are reported in `failed` rather than failing the whole batch;
+/// the batch-size and total-raw-size caps are the cloud rate/size guard and
+/// reject the whole request (422) so a client can back off.
+pub(crate) async fn messages_import(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server)): Path<(String, String)>,
+    Json(batch): Json<ImportBatch>,
+) -> ApiResponse {
+    use base64::Engine;
+
+    let server = match require_server(&state, &start, &org, &server).await {
+        Ok(server) => server,
+        Err(response) => return response,
+    };
+    let Some(server_store) = state.server_store.as_ref() else {
+        return render_store_error(
+            Some(&start),
+            StoreError::Other("message storage is not configured".into()),
+        );
+    };
+
+    if batch.messages.len() > MAX_IMPORT_MESSAGES {
+        return render_validation_error(
+            Some(&start),
+            &format!(
+                "too many messages in one import request: {} (max {MAX_IMPORT_MESSAGES})",
+                batch.messages.len()
+            ),
+        );
+    }
+
+    // Decode every raw up front so the total-size cap is enforced BEFORE any
+    // row is written. A per-item decode failure is deferred to the import
+    // loop (reported in `failed`); the size cap rejects the whole request.
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut raws: Vec<Result<Vec<u8>, String>> = Vec::with_capacity(batch.messages.len());
+    let mut total_bytes: usize = 0;
+    for item in &batch.messages {
+        match engine.decode(item.raw_message_base64.as_bytes()) {
+            Ok(bytes) => {
+                total_bytes = total_bytes.saturating_add(bytes.len());
+                raws.push(Ok(bytes));
+            }
+            Err(error) => raws.push(Err(format!("invalid base64 raw_message: {error}"))),
+        }
+    }
+    if total_bytes > MAX_IMPORT_RAW_BYTES {
+        return render_validation_error(
+            Some(&start),
+            &format!(
+                "import request too large: {total_bytes} bytes of raw messages (max {MAX_IMPORT_RAW_BYTES})"
+            ),
+        );
+    }
+
+    // Resolve the server's domain/credential names to ids once (best effort;
+    // an unknown name simply leaves the attribution null).
+    let domains: std::collections::HashMap<String, u64> =
+        match state.store.list_domains(server.id).await {
+            Ok(list) => list.into_iter().map(|d| (d.name, d.id)).collect(),
+            Err(error) => return render_store_error(Some(&start), error),
+        };
+    let credentials: std::collections::HashMap<String, u64> =
+        match state.store.list_credentials(server.id).await {
+            Ok(list) => list.into_iter().map(|c| (c.name, c.id)).collect(),
+            Err(error) => return render_store_error(Some(&start), error),
+        };
+
+    let mut imported = 0u64;
+    let mut failed: Vec<Value> = Vec::new();
+    for (index, (item, raw)) in batch.messages.into_iter().zip(raws).enumerate() {
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(error) => {
+                failed.push(json!({ "index": index, "error": error }));
+                continue;
+            }
+        };
+        let import = match build_import_message(server.id, item, raw, &domains, &credentials) {
+            Ok(import) => import,
+            Err(error) => {
+                failed.push(json!({ "index": index, "error": error }));
+                continue;
+            }
+        };
+        match server_store.import_message(import).await {
+            Ok(_) => imported += 1,
+            Err(error) => {
+                let message = match error {
+                    StoreError::Conflict(message) | StoreError::Other(message) => message,
+                };
+                failed.push(json!({ "index": index, "error": message }));
+            }
+        }
+    }
+
+    created(&start, json!({ "imported": imported, "failed": failed }))
+}
+
 // ------------------------------------------------------------ suppressions
 
 fn suppression_json(suppression: &Suppression) -> Value {

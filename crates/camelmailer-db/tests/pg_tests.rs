@@ -1155,6 +1155,126 @@ async fn clicks_and_opens_are_recorded_per_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_message_writes_a_completed_record_and_never_enqueues() {
+    use camelmailer_core::{
+        ImportClick, ImportDelivery, ImportEvent, ImportMessage, MessageScope, ServerStore,
+    };
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    let at = chrono::Utc::now() - chrono::Duration::days(10);
+    let id = ServerStore::import_message(
+        &f.store,
+        ImportMessage {
+            server_id: f.server.id,
+            scope: MessageScope::Outgoing,
+            mail_from: "sender@example.com".into(),
+            rcpt_to: "user@example.net".into(),
+            raw_message:
+                b"Subject: Historical Import\r\nMessage-ID: <hist@org.example>\r\n\r\nBody\r\n"
+                    .to_vec(),
+            received_with_ssl: true,
+            bounce: false,
+            tag: Some("migrated".into()),
+            domain_id: None,
+            credential_id: None,
+            created_at: at,
+            deliveries: vec![ImportDelivery {
+                status: "Sent".into(),
+                details: Some("accepted".into()),
+                output: Some("250 OK".into()),
+                sent_with_ssl: true,
+                created_at: at,
+            }],
+            opens: vec![ImportEvent {
+                created_at: at,
+                ip: Some("1.2.3.4".into()),
+                user_agent: Some("UA/1.0".into()),
+            }],
+            clicks: vec![ImportClick {
+                url: "https://example.com/offer".into(),
+                created_at: at,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+
+    // The message is stored with its delivery-derived status, indexed subject
+    // and original timestamp.
+    let stored = sink.message_by_id(f.server.id, id).await.unwrap().unwrap();
+    assert_eq!(stored.status, "Sent");
+    assert!(!stored.held);
+    assert_eq!(stored.subject.as_deref(), Some("Historical Import"));
+    assert_eq!(stored.created_at, at);
+
+    // Its delivery, open and click all landed.
+    let deliveries = sink.deliveries_for_message(f.server.id, id).await.unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, "Sent");
+    let (clicks, opens) = sink.activity_counts(f.server.id, id).await.unwrap();
+    assert_eq!(clicks, 1);
+    assert_eq!(opens, 1);
+
+    // CRUCIAL: the import path never enqueues a delivery — no queue row exists
+    // for this message (nothing will ever be sent).
+    let queued: i64 =
+        sqlx::query("SELECT count(*) AS c FROM queued_messages WHERE message_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("c");
+    assert_eq!(queued, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_message_rejects_an_invalid_delivery_status() {
+    use camelmailer_core::{ImportDelivery, ImportMessage, MessageScope, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    let at = chrono::Utc::now();
+    let result = ServerStore::import_message(
+        &f.store,
+        ImportMessage {
+            server_id: f.server.id,
+            scope: MessageScope::Outgoing,
+            mail_from: "sender@example.com".into(),
+            rcpt_to: "user@example.net".into(),
+            raw_message: b"Subject: X\r\n\r\nBody\r\n".to_vec(),
+            received_with_ssl: false,
+            bounce: false,
+            tag: None,
+            domain_id: None,
+            credential_id: None,
+            created_at: at,
+            deliveries: vec![ImportDelivery {
+                status: "Delivered".into(), // not one of the 5 allowed
+                details: None,
+                output: None,
+                sent_with_ssl: false,
+                created_at: at,
+            }],
+            opens: vec![],
+            clicks: vec![],
+        },
+    )
+    .await;
+    assert!(result.is_err());
+
+    // No message row was written (validation happens before the insert).
+    let stored = sink.messages_for_server(f.server.id).await.unwrap();
+    assert!(stored.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn campaign_stats_aggregate_over_attributed_messages() {
     use camelmailer_core::{NewCampaign, NewStream, NewSuppression, ServerStore};
 

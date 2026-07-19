@@ -1550,6 +1550,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             axum::routing::post(resources::templates_copy_to),
         )
         .route(
+            "/organizations/{permalink}/servers/{server_permalink}/messages/import",
+            axum::routing::post(resources::messages_import),
+        )
+        .route(
             "/organizations/{permalink}/servers/{server_permalink}/suppressions",
             get(resources::suppressions_index).post(resources::suppressions_create),
         )

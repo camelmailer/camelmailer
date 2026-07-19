@@ -1512,6 +1512,15 @@ impl camelmailer_core::ServerStore for PgStore {
         Ok(camelmailer_core::SentMessage { id, token, rcpt_to })
     }
 
+    async fn import_message(
+        &self,
+        message: camelmailer_core::ImportMessage,
+    ) -> Result<i64, StoreError> {
+        PgMessageSink::new(self.clone())
+            .import_message(&message)
+            .await
+    }
+
     async fn messages(
         &self,
         server_id: Id,
@@ -3265,6 +3274,144 @@ impl PgMessageSink {
 
         tx.commit().await?;
         Ok((message_id, public_token))
+    }
+
+    /// Import a historical message as a completed record WITHOUT queuing it
+    /// for delivery. Inserts the message (explicit `created_at`, indexed
+    /// subject/message_id, status derived from the imported deliveries), then
+    /// its delivery attempts, opens (`loads`) and clicks (`links` +
+    /// `link_clicks`), each with its own `created_at`, all in ONE RLS
+    /// transaction. It deliberately never touches `queued_messages`, so an
+    /// imported message is never enqueued or sent. Returns the new message id.
+    pub async fn import_message(
+        &self,
+        message: &camelmailer_core::ImportMessage,
+    ) -> Result<i64, StoreError> {
+        // Validate every delivery status up front so a bad status is a clean
+        // error rather than a mid-transaction CHECK-constraint violation.
+        for delivery in &message.deliveries {
+            if !camelmailer_core::is_valid_delivery_status(&delivery.status) {
+                return Err(StoreError::Other(format!(
+                    "invalid delivery status: {:?}",
+                    delivery.status
+                )));
+            }
+        }
+
+        let subject = camelmailer_core::message::header_value(&message.raw_message, "subject");
+        let message_id_header =
+            camelmailer_core::message::header_value(&message.raw_message, "message-id");
+        let public_token = token::generate_token(12);
+        let status = message.resulting_status();
+        let held = status == "Held";
+        let scope = message.scope.as_str();
+
+        let mut tx = self
+            .store
+            .pool
+            .begin()
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        set_tenant_context(&mut tx, message.server_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+
+        // NOTE: no `queued_messages` insert here — a historical import is a
+        // completed record, never a pending delivery.
+        let row = sqlx::query(
+            "INSERT INTO messages
+                 (server_id, token, scope, rcpt_to, mail_from, bounce,
+                  received_with_ssl, domain_id, credential_id, raw_message,
+                  subject, message_id_header, size, tag, status, held, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+             RETURNING id",
+        )
+        .bind(message.server_id as i64)
+        .bind(&public_token)
+        .bind(scope)
+        .bind(&message.rcpt_to)
+        .bind(&message.mail_from)
+        .bind(message.bounce)
+        .bind(message.received_with_ssl)
+        .bind(message.domain_id.map(|id| id as i64))
+        .bind(message.credential_id.map(|id| id as i64))
+        .bind(&message.raw_message)
+        .bind(&subject)
+        .bind(&message_id_header)
+        .bind(message.raw_message.len() as i64)
+        .bind(&message.tag)
+        .bind(status)
+        .bind(held)
+        .bind(message.created_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| StoreError::Other(e.to_string()))?;
+        let message_id: i64 = row.get("id");
+
+        for delivery in &message.deliveries {
+            sqlx::query(
+                "INSERT INTO deliveries
+                     (server_id, message_id, status, details, output, sent_with_ssl, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(message.server_id as i64)
+            .bind(message_id)
+            .bind(&delivery.status)
+            .bind(&delivery.details)
+            .bind(&delivery.output)
+            .bind(delivery.sent_with_ssl)
+            .bind(delivery.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        }
+
+        for open in &message.opens {
+            sqlx::query(
+                "INSERT INTO loads (server_id, message_id, ip_address, user_agent, created_at)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(message.server_id as i64)
+            .bind(message_id)
+            .bind(&open.ip)
+            .bind(&open.user_agent)
+            .bind(open.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        }
+
+        for click in &message.clicks {
+            // A click needs a link to hang off (link_clicks references links);
+            // synthesize one per imported click carrying the clicked URL.
+            let link_row = sqlx::query(
+                "INSERT INTO links (server_id, message_id, token, url)
+                 VALUES ($1, $2, $3, $4) RETURNING id",
+            )
+            .bind(message.server_id as i64)
+            .bind(message_id)
+            .bind(token::generate_token(16))
+            .bind(&click.url)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+            let link_id: i64 = link_row.get("id");
+            sqlx::query(
+                "INSERT INTO link_clicks (server_id, link_id, ip_address, user_agent, created_at)
+                 VALUES ($1, $2, NULL, NULL, $3)",
+            )
+            .bind(message.server_id as i64)
+            .bind(link_id)
+            .bind(click.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        Ok(message_id)
     }
 
     /// Load one message within its tenant's RLS context.

@@ -379,6 +379,97 @@ impl MemoryStore {
         }
     }
 
+    /// Import a historical message as a completed record WITHOUT queuing it
+    /// (the in-memory analogue of the Postgres import path). Inserts the
+    /// message with its original `created_at` and a status derived from the
+    /// imported deliveries, then attaches the deliveries, opens and clicks —
+    /// so a read-back reflects them. Nothing is enqueued. Returns the new id.
+    pub fn import_message_record(
+        &self,
+        message: crate::server_store::ImportMessage,
+    ) -> Result<i64, crate::admin_store::StoreError> {
+        // Validate every delivery status before writing anything (parity with
+        // the Postgres CHECK constraint the tenant transaction would hit).
+        for delivery in &message.deliveries {
+            if !crate::server_store::is_valid_delivery_status(&delivery.status) {
+                return Err(crate::admin_store::StoreError::Other(format!(
+                    "invalid delivery status: {:?}",
+                    delivery.status
+                )));
+            }
+        }
+
+        let status = message.resulting_status().to_string();
+        let held = status == "Held";
+        let id = self.next_id() as i64;
+        let token = crate::token::generate_token(12);
+        let record = crate::message::MessageRecord {
+            id,
+            token,
+            server_id: message.server_id,
+            scope: message.scope.as_str().into(),
+            rcpt_to: message.rcpt_to,
+            mail_from: message.mail_from,
+            subject: crate::message::header_value(&message.raw_message, "subject"),
+            message_id_header: crate::message::header_value(&message.raw_message, "message-id"),
+            tag: message.tag,
+            status,
+            bounce: message.bounce,
+            bounce_category: None,
+            spam_status: "NotChecked".into(),
+            spam_score: 0.0,
+            held,
+            threat: false,
+            size: message.raw_message.len() as i64,
+            metadata: None,
+            stream_id: None,
+            campaign_id: None,
+            bypassed: false,
+            created_at: message.created_at,
+            raw_message: message.raw_message,
+        };
+
+        let mut inner = self.inner.write().unwrap();
+        inner.messages.push(record);
+        for delivery in message.deliveries {
+            let delivery_id = self.next_id() as i64;
+            inner.message_deliveries.push((
+                id,
+                crate::server_store::DeliveryRecord {
+                    id: delivery_id,
+                    status: delivery.status,
+                    details: delivery.details,
+                    output: delivery.output,
+                    sent_with_ssl: delivery.sent_with_ssl,
+                    created_at: delivery.created_at,
+                },
+            ));
+        }
+        for open in message.opens {
+            inner.message_opens.push((
+                id,
+                crate::server_store::ActivityEvent {
+                    ip_address: open.ip,
+                    user_agent: open.user_agent,
+                    url: None,
+                    created_at: open.created_at,
+                },
+            ));
+        }
+        for click in message.clicks {
+            inner.message_clicks.push((
+                id,
+                crate::server_store::ActivityEvent {
+                    ip_address: None,
+                    user_agent: None,
+                    url: Some(click.url),
+                    created_at: click.created_at,
+                },
+            ));
+        }
+        Ok(id)
+    }
+
     /// Insert a campaign record (honoring `new.status`/`scheduled_at`, `sent =
     /// 0`) and return it.
     pub fn insert_campaign(&self, new: crate::model::NewCampaign) -> crate::model::Campaign {

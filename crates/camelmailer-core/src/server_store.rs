@@ -90,6 +90,79 @@ pub struct DeliveryRecord {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// The delivery-attempt statuses the `deliveries.status` CHECK constraint
+/// permits. Shared by both store impls so an imported delivery is validated
+/// identically before it ever reaches the database.
+pub const DELIVERY_STATUSES: [&str; 5] = ["Sent", "SoftFail", "HardFail", "Held", "Bounced"];
+
+/// Is `status` one of the five values the `deliveries.status` CHECK allows?
+pub fn is_valid_delivery_status(status: &str) -> bool {
+    DELIVERY_STATUSES.contains(&status)
+}
+
+/// One delivery attempt of a historically imported message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportDelivery {
+    /// One of [`DELIVERY_STATUSES`]; validated by [`ServerStore::import_message`].
+    pub status: String,
+    pub details: Option<String>,
+    pub output: Option<String>,
+    pub sent_with_ssl: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One open (pixel load) of a historically imported message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportEvent {
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+/// One link click of a historically imported message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportClick {
+    pub url: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A past message to write into the store as a completed record, WITHOUT
+/// ever queuing it for delivery. The migration path (camelmailer-migrate)
+/// hands one of these per historical Postal message; the store inserts the
+/// message, its delivery attempts, opens and clicks with their original
+/// timestamps and never touches the outbound queue.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportMessage {
+    pub server_id: Id,
+    pub scope: crate::message::MessageScope,
+    pub mail_from: String,
+    pub rcpt_to: String,
+    /// The raw RFC822 message (the caller always supplies at least the
+    /// synthesized headers). Subject and Message-ID are indexed from it.
+    pub raw_message: Vec<u8>,
+    pub received_with_ssl: bool,
+    pub bounce: bool,
+    pub tag: Option<String>,
+    pub domain_id: Option<Id>,
+    pub credential_id: Option<Id>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub deliveries: Vec<ImportDelivery>,
+    pub opens: Vec<ImportEvent>,
+    pub clicks: Vec<ImportClick>,
+}
+
+impl ImportMessage {
+    /// The message status implied by the imported delivery attempts: the last
+    /// attempt's status, or `Pending` when no delivery is imported. Shared by
+    /// both store impls so a read-back reports the same status.
+    pub fn resulting_status(&self) -> &str {
+        self.deliveries
+            .last()
+            .map(|d| d.status.as_str())
+            .unwrap_or("Pending")
+    }
+}
+
 /// Optional time window for statistics (`created_at` bounds, inclusive),
 /// plus an optional tag to scope every counter to.
 #[derive(Debug, Clone, Default)]
@@ -279,6 +352,17 @@ pub trait ServerStore: Send + Sync {
     /// (the worker applies DKIM + tracking at delivery time). Returns the
     /// message's public identity.
     async fn store_outgoing(&self, message: QueuedMessage) -> Result<SentMessage, StoreError>;
+
+    /// Import ONE historical message as a completed record WITHOUT queuing it
+    /// for delivery: insert the message (with its original `created_at`, an
+    /// indexed subject/message_id, and a status derived from the imported
+    /// deliveries), then its delivery attempts, opens (loads) and clicks
+    /// (links + link_clicks), each with its own timestamp. Nothing is ever
+    /// written to the outbound queue, so no import is ever sent. Returns the
+    /// new message id. Every `deliveries[..].status` must be one of
+    /// [`DELIVERY_STATUSES`]; an invalid status is a [`StoreError`] and no
+    /// rows are written.
+    async fn import_message(&self, message: ImportMessage) -> Result<i64, StoreError>;
 
     /// The server's messages matching `filter`, newest first. Tenant-scoped
     /// (RLS in Postgres; explicit `server_id` filter in memory).
@@ -683,6 +767,10 @@ pub trait ServerStore: Send + Sync {
 impl ServerStore for crate::store::MemoryStore {
     async fn store_outgoing(&self, message: QueuedMessage) -> Result<SentMessage, StoreError> {
         Ok(self.insert_message_record(message))
+    }
+
+    async fn import_message(&self, message: ImportMessage) -> Result<i64, StoreError> {
+        self.import_message_record(message)
     }
 
     async fn messages(
@@ -2061,5 +2149,108 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn import_message_writes_a_completed_record_without_queuing() {
+        let store = MemoryStore::new();
+        let at = Utc::now() - Duration::days(5);
+        let id = ServerStore::import_message(
+            &store,
+            ImportMessage {
+                server_id: 1,
+                scope: MessageScope::Outgoing,
+                mail_from: "from@example.com".into(),
+                rcpt_to: "to@example.net".into(),
+                raw_message: b"Subject: Historical\r\nMessage-ID: <h1@x>\r\n\r\nBody\r\n".to_vec(),
+                received_with_ssl: true,
+                bounce: false,
+                tag: Some("migrated".into()),
+                domain_id: None,
+                credential_id: None,
+                created_at: at,
+                deliveries: vec![ImportDelivery {
+                    status: "Sent".into(),
+                    details: Some("accepted".into()),
+                    output: Some("250 OK".into()),
+                    sent_with_ssl: true,
+                    created_at: at,
+                }],
+                opens: vec![ImportEvent {
+                    created_at: at,
+                    ip: Some("1.2.3.4".into()),
+                    user_agent: Some("UA/1.0".into()),
+                }],
+                clicks: vec![ImportClick {
+                    url: "https://example.com/a".into(),
+                    created_at: at,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+
+        // The message shows up with the delivery-derived status, its original
+        // timestamp, subject and tag.
+        let record = ServerStore::message(&store, 1, id).await.unwrap().unwrap();
+        assert_eq!(record.status, "Sent");
+        assert_eq!(record.subject.as_deref(), Some("Historical"));
+        assert_eq!(record.tag.as_deref(), Some("migrated"));
+        assert_eq!(record.created_at, at);
+
+        // Its deliveries, opens and clicks read back.
+        assert_eq!(
+            ServerStore::deliveries(&store, 1, id).await.unwrap().len(),
+            1
+        );
+        let opens = ServerStore::opens(&store, 1, id).await.unwrap();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].ip_address.as_deref(), Some("1.2.3.4"));
+        let clicks = ServerStore::clicks(&store, 1, id).await.unwrap();
+        assert_eq!(clicks.len(), 1);
+        assert_eq!(clicks[0].url.as_deref(), Some("https://example.com/a"));
+
+        // Nothing was enqueued: the delivery-queue view stays empty (the
+        // in-memory queue proxy only counts Pending outgoing messages).
+        let queue = ServerStore::delivery_stats(&store, 1).await.unwrap();
+        assert_eq!(queue.queued, 0);
+    }
+
+    #[tokio::test]
+    async fn import_message_rejects_an_invalid_delivery_status() {
+        let store = MemoryStore::new();
+        let at = Utc::now();
+        let result = ServerStore::import_message(
+            &store,
+            ImportMessage {
+                server_id: 1,
+                scope: MessageScope::Outgoing,
+                mail_from: "from@example.com".into(),
+                rcpt_to: "to@example.net".into(),
+                raw_message: b"Subject: X\r\n\r\nBody\r\n".to_vec(),
+                received_with_ssl: false,
+                bounce: false,
+                tag: None,
+                domain_id: None,
+                credential_id: None,
+                created_at: at,
+                deliveries: vec![ImportDelivery {
+                    status: "Delivered".into(), // not one of the 5 allowed
+                    details: None,
+                    output: None,
+                    sent_with_ssl: false,
+                    created_at: at,
+                }],
+                opens: vec![],
+                clicks: vec![],
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        // And nothing was written.
+        assert!(ServerStore::messages(&store, 1, &MessageFilter::default())
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

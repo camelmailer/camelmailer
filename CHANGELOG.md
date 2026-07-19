@@ -17,6 +17,16 @@ integration tests) is green.
 
 ### Added
 
+- **Non-sending historical message import.** A new admin endpoint,
+  `POST …/servers/{server}/messages/import`, writes past messages as
+  completed records (with their original timestamps, delivery attempts,
+  opens and clicks) WITHOUT ever queuing or delivering them, so a migration
+  can carry a server's message history over without re-sending a single
+  mail. The batch is capped (500 messages and 50 MB of decoded raw per
+  request) as a cloud rate/size guard, and per-message failures are reported
+  individually rather than failing the whole batch. This backs the
+  [camelmailer-migrate](https://github.com/camelmailer/camelmailer-migrate)
+  Postal history import.
 - **DKIM key import on domain creation.** `POST …/servers/{server}/domains`
   now accepts an optional `dkim_private_key` (PKCS#8 or PKCS#1 PEM). When
   present it is validated and stored as the domain's signing key instead of
