@@ -242,11 +242,36 @@ fn tls_connector(mode: TlsMode) -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
+/// The remote address to connect to. A bound source address pins the
+/// address family: an IPv4 source can never reach an AAAA-only candidate
+/// (the connect fails with EAFNOSUPPORT), so the resolved addresses are
+/// filtered to the source's family. Without a source the first resolved
+/// address wins, as before.
+fn pick_remote_address(
+    addresses: impl Iterator<Item = SocketAddr>,
+    source_ip: Option<std::net::IpAddr>,
+    host: &str,
+) -> std::io::Result<SocketAddr> {
+    let mut addresses = addresses.peekable();
+    if addresses.peek().is_none() {
+        return Err(std::io::Error::other(format!("no address for {host}")));
+    }
+    match source_ip {
+        Some(source_ip) => addresses
+            .find(|address| address.is_ipv4() == source_ip.is_ipv4())
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "no {} address for {host} (required by the bound source address)",
+                    if source_ip.is_ipv4() { "IPv4" } else { "IPv6" },
+                ))
+            }),
+        None => Ok(addresses.next().expect("peeked non-empty")),
+    }
+}
+
 async fn connect(params: &SendParams) -> std::io::Result<TcpStream> {
-    let address: SocketAddr = tokio::net::lookup_host((params.host.as_str(), params.port))
-        .await?
-        .next()
-        .ok_or_else(|| std::io::Error::other(format!("no address for {}", params.host)))?;
+    let addresses = tokio::net::lookup_host((params.host.as_str(), params.port)).await?;
+    let address = pick_remote_address(addresses, params.source_ip, &params.host)?;
     let connect_future = match params.source_ip {
         Some(source_ip) => {
             let socket = if source_ip.is_ipv4() {
@@ -504,5 +529,38 @@ mod tests {
         assert_eq!(TlsMode::from_verify_mode("peer", true), TlsMode::Verify);
         assert_eq!(TlsMode::from_verify_mode("none", true), TlsMode::AcceptAny);
         assert_eq!(TlsMode::from_verify_mode("peer", false), TlsMode::Disabled);
+    }
+
+    #[test]
+    fn remote_address_follows_the_bound_source_family() {
+        let v6: SocketAddr = "[2001:db8::1]:25".parse().unwrap();
+        let v4: SocketAddr = "192.0.2.10:25".parse().unwrap();
+        let source_v4: std::net::IpAddr = "198.51.100.5".parse().unwrap();
+        let source_v6: std::net::IpAddr = "2001:db8::5".parse().unwrap();
+
+        // an IPv4 source skips a leading AAAA candidate (MX hosts often
+        // resolve IPv6-first) and picks the A record
+        let picked =
+            pick_remote_address([v6, v4].into_iter(), Some(source_v4), "mx.example").unwrap();
+        assert_eq!(picked, v4);
+
+        // an IPv6 source picks the AAAA candidate
+        let picked =
+            pick_remote_address([v4, v6].into_iter(), Some(source_v6), "mx.example").unwrap();
+        assert_eq!(picked, v6);
+
+        // no candidate in the source's family is a clear error, not EAFNOSUPPORT
+        let error = pick_remote_address([v6].into_iter(), Some(source_v4), "mx.example")
+            .expect_err("family mismatch must error");
+        assert!(error.to_string().contains("no IPv4 address"));
+
+        // without a source the first resolved address wins (previous behaviour)
+        let picked = pick_remote_address([v6, v4].into_iter(), None, "mx.example").unwrap();
+        assert_eq!(picked, v6);
+
+        // an empty resolution is still "no address"
+        let error = pick_remote_address(std::iter::empty(), None, "mx.example")
+            .expect_err("empty resolution must error");
+        assert!(error.to_string().contains("no address"));
     }
 }

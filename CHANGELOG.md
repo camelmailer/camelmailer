@@ -13,6 +13,18 @@ version in `Cargo.toml` and a matching section in this file agree, and
 unless the full test suite (including the PostgreSQL row-level-security
 integration tests) is green.
 
+## [0.7.2] - 2026-07-22
+
+### Fixed
+
+- **IP-pool deliveries to dual-stack MX hosts.** With an IP-pool source
+  address bound (IPv4), the SMTP client connected to the first resolved
+  address of the MX host — when that was an AAAA record (Microsoft 365,
+  Google resolve IPv6-first) the connect failed with `Address family not
+  supported` and the delivery soft-failed forever. The client now filters
+  the resolved addresses to the bound source's family and reports a clear
+  error when the host has no address in that family.
+
 ## [0.7.1] - 2026-07-22
 
 ### Added
