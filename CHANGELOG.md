@@ -13,6 +13,17 @@ version in `Cargo.toml` and a matching section in this file agree, and
 unless the full test suite (including the PostgreSQL row-level-security
 integration tests) is green.
 
+## [0.7.3] - 2026-07-23
+
+### Fixed
+
+- **Credentials addressable by uuid.** `GET/PATCH/DELETE
+  …/credentials/{id}` also accepts the credential's uuid — Postal's Admin
+  API v2 addressed credentials by uuid, so integrations built against it
+  (provisioners fetching an SMTP secret by the uuid they stored) received
+  `400 Invalid URL … to a u64` instead of the credential. Unknown uuids
+  answer 404 like unknown ids.
+
 ## [0.7.2] - 2026-07-22
 
 ### Fixed

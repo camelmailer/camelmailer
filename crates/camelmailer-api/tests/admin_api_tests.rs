@@ -1818,3 +1818,65 @@ async fn track_domain_force_verify_is_machine_key_only_wire_shape() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["track_domain"]["verified"], true);
 }
+
+#[tokio::test]
+async fn credentials_are_addressable_by_uuid_for_postal_compatibility() {
+    let app = build_app_with_server().await;
+    let (_, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/credentials"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "smtp-cred", "type": "SMTP" })),
+    )
+    .await;
+    let credential = &body["data"]["credential"];
+    let id = credential["id"].as_u64().unwrap();
+    let uuid = credential["uuid"].as_str().unwrap().to_string();
+
+    // show by uuid returns the same credential (incl. the key) as by id
+    let (status, by_uuid) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/credentials/{uuid}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(by_uuid["data"]["credential"]["id"].as_u64(), Some(id));
+    assert!(by_uuid["data"]["credential"]["key"].is_string());
+
+    // update by uuid works too
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("{BASE}/credentials/{uuid}"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "hold": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // unknown uuids are a 404, not a routing error
+    let (status, _) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/credentials/00000000-0000-0000-0000-000000000000"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // delete by uuid
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/credentials/{uuid}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}

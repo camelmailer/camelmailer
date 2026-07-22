@@ -973,15 +973,31 @@ pub(crate) async fn credentials_create(
     )
 }
 
+/// Resolve a credential by numeric id or by uuid. Postal's Admin API v2
+/// addressed credentials by uuid, so integrations built against it keep
+/// working unchanged.
 async fn require_credential(
     state: &ApiState,
     start: &RequestStart,
     org: &str,
     server: &str,
-    id: u64,
+    id_or_uuid: &str,
 ) -> Result<Credential, ApiResponse> {
     let server = require_server(state, start, org, server).await?;
-    match state.store.credential_by_id(server.id, id).await {
+    let credential = if let Ok(id) = id_or_uuid.parse::<u64>() {
+        state.store.credential_by_id(server.id, id).await
+    } else {
+        state
+            .store
+            .list_credentials(server.id)
+            .await
+            .map(|credentials| {
+                credentials
+                    .into_iter()
+                    .find(|credential| credential.uuid == id_or_uuid)
+            })
+    };
+    match credential {
         Ok(Some(credential)) => Ok(credential),
         Ok(None) => Err(render_not_found(Some(start))),
         Err(error) => Err(render_store_error(Some(start), error)),
@@ -991,9 +1007,9 @@ async fn require_credential(
 pub(crate) async fn credentials_show(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
-    Path((org, server, id)): Path<(String, String, u64)>,
+    Path((org, server, id)): Path<(String, String, String)>,
 ) -> ApiResponse {
-    match require_credential(&state, &start, &org, &server, id).await {
+    match require_credential(&state, &start, &org, &server, &id).await {
         Ok(credential) => ok(
             &start,
             json!({ "credential": credential_json(&credential) }),
@@ -1011,10 +1027,10 @@ pub(crate) struct UpdateCredential {
 pub(crate) async fn credentials_update(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
-    Path((org, server, id)): Path<(String, String, u64)>,
+    Path((org, server, id)): Path<(String, String, String)>,
     Json(body): Json<UpdateCredential>,
 ) -> ApiResponse {
-    match require_credential(&state, &start, &org, &server, id).await {
+    match require_credential(&state, &start, &org, &server, &id).await {
         Ok(mut credential) => {
             if let Some(name) = body.name {
                 credential.name = name;
@@ -1040,9 +1056,9 @@ pub(crate) async fn credentials_update(
 pub(crate) async fn credentials_destroy(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
-    Path((org, server, id)): Path<(String, String, u64)>,
+    Path((org, server, id)): Path<(String, String, String)>,
 ) -> ApiResponse {
-    match require_credential(&state, &start, &org, &server, id).await {
+    match require_credential(&state, &start, &org, &server, &id).await {
         Ok(credential) => from_result(
             &start,
             state.store.delete_credential(credential.id).await,
