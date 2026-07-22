@@ -13,6 +13,19 @@ version in `Cargo.toml` and a matching section in this file agree, and
 unless the full test suite (including the PostgreSQL row-level-security
 integration tests) is green.
 
+## [0.7.1] - 2026-07-22
+
+### Added
+
+- **Published web dashboard image.** The release pipeline now builds and
+  pushes `ghcr.io/camelmailer/camelmailer-web` (multi-arch, same tags as the
+  engine image) from the new `web/app/Dockerfile`. The Next server inside
+  proxies `/api` and `/health` to a compose service named `web` on port 5000
+  (override at build time with `--build-arg API_PROXY_URL=…`), so the app is
+  same-origin and needs no CORS setup. `install/docker-compose.yml` now
+  starts the dashboard on `:3000` (`DASHBOARD_PORT` to change it) — the
+  prebuilt install is no longer headless.
+
 ## [0.7.0] - 2026-07-22
 
 ### Security

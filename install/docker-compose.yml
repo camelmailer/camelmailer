@@ -100,5 +100,17 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # The web dashboard (Next.js). It proxies /api and /health to the `web`
+  # service, so no CORS setup is needed — open http://localhost:3000 and
+  # sign in with the account from `make-user`.
+  dashboard:
+    image: ghcr.io/camelmailer/camelmailer-web:${CAMELMAILER_VERSION:-latest}
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+
 volumes:
   postgres-data:

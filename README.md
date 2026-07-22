@@ -73,7 +73,9 @@ docker compose exec web camelmailer make-admin-api-key ops
 ```
 
 Each path gives you PostgreSQL + migrations + the HTTP API (`:5000`) + SMTP
-(`:25`) + the delivery worker. Follow **[docs/quickstart.md](docs/quickstart.md)**
+(`:25`) + the delivery worker; the Docker paths also start the **web
+dashboard** on `:3000` (image `ghcr.io/camelmailer/camelmailer-web`, a Next.js
+server that proxies to the API — sign in with the `make-user` account). Follow **[docs/quickstart.md](docs/quickstart.md)**
 for the five-minute zero-to-first-mail walkthrough, and
 **[docs/configuration.md](docs/configuration.md)** for DKIM, DNS records,
 TLS, and the production checklist. Accounts, roles and SSO are covered in
