@@ -13,7 +13,7 @@ version in `Cargo.toml` and a matching section in this file agree, and
 unless the full test suite (including the PostgreSQL row-level-security
 integration tests) is green.
 
-## [Unreleased]
+## [0.7.0] - 2026-07-22
 
 ### Security
 
