@@ -203,6 +203,27 @@ billing portal. Stripe outages surface as the stable error code
 - [ ] Admin API keys are database-backed (`make-admin-api-key`), the global
       `admin_api_key` is unset
 
+### Scoped admin API keys
+
+Database-backed admin keys can be **scoped**: created with an
+organization (and optionally one server inside it), the key only reaches
+that subtree — every other path answers 404. Platform integrations give
+each tenant server its own key instead of sharing the installation-wide
+one, so a leaked key never crosses tenants:
+
+```bash
+camelmailer make-admin-api-key tenant-acme --org acme --server transactional
+# or via the API:
+curl -s -X POST "$API/api/v2/admin/admin_api_keys" \
+  -H "X-Admin-API-Key: $ROOT_KEY" -H "Content-Type: application/json" \
+  -d '{"name": "tenant-acme", "organization": "acme", "server": "transactional"}'
+```
+
+Scoped keys still count as machine keys inside their subtree (they may
+`{"force": true}` domain verification, for example). Global resources —
+users, IP pools, key management, `GET /servers/find/{permalink}` — stay
+reserved for unscoped keys and instance admins.
+
 ## Process model
 
 One binary, four roles — scale each independently:

@@ -30,10 +30,7 @@ fn main() -> ExitCode {
         Some("smtp-server") => run_async(smtp_server()),
         Some("worker") => run_async(worker()),
         Some("initialize") | Some("update") | Some("upgrade") => run_async(initialize()),
-        Some("make-admin-api-key") => {
-            let name = args.get(2).cloned().unwrap_or_else(|| "cli".to_string());
-            run_async(make_admin_api_key(name))
-        }
+        Some("make-admin-api-key") => run_async(make_admin_api_key(args[2..].to_vec())),
         Some("make-user") => run_async(make_user(args[2..].to_vec())),
         Some("version") => {
             println!("CamelMailer v{VERSION}");
@@ -89,20 +86,80 @@ async fn initialize() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn make_admin_api_key(name: String) -> std::io::Result<()> {
+/// `make-admin-api-key [name] [--org <permalink>] [--server <permalink>]` —
+/// create an admin API key, optionally scoped to an organization or, more
+/// narrowly, to one server inside it. Unscoped keys have full access.
+async fn make_admin_api_key(args: Vec<String>) -> std::io::Result<()> {
     let config = load_config();
     if !postgres_enabled(&config) {
         return Err(std::io::Error::other(
             "make-admin-api-key requires PostgreSQL (postgres.enabled: true or DATABASE_URL)",
         ));
     }
+    let flag_value = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|index| args.get(index + 1))
+            .cloned()
+    };
+    let org_permalink = flag_value("--org");
+    let server_permalink = flag_value("--server");
+    // the first positional argument that is not a flag or a flag's value
+    let mut name = "cli".to_string();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--org" | "--server" => index += 2,
+            value => {
+                name = value.to_string();
+                break;
+            }
+        }
+    }
+
     let store = connect_pg(&config).await?;
+    let (organization_id, server_id) = match (&org_permalink, &server_permalink) {
+        (None, Some(_)) => {
+            return Err(std::io::Error::other(
+                "--server also needs --org <permalink>",
+            ))
+        }
+        (None, None) => (None, None),
+        (Some(org), server) => {
+            let organization = store
+                .organization_by_permalink(org)
+                .await
+                .map_err(std::io::Error::other)?
+                .ok_or_else(|| std::io::Error::other(format!("organization {org:?} not found")))?;
+            let server_id = match server {
+                Some(permalink) => Some(
+                    store
+                        .server_by_permalink(organization.id, permalink)
+                        .await
+                        .map_err(std::io::Error::other)?
+                        .ok_or_else(|| {
+                            std::io::Error::other(format!(
+                                "server {permalink:?} not found in organization {org:?}"
+                            ))
+                        })?
+                        .id,
+                ),
+                None => None,
+            };
+            (Some(organization.id), server_id)
+        }
+    };
     let key = camelmailer_core::token::generate_key();
     store
-        .create_admin_api_key(&name, &key)
+        .create_admin_api_key_record(&name, &key, organization_id, server_id)
         .await
         .map_err(std::io::Error::other)?;
-    println!("Admin API key '{name}' created:");
+    let scope = match (&org_permalink, &server_permalink) {
+        (Some(org), Some(server)) => format!(" (scoped to {org}/{server})"),
+        (Some(org), None) => format!(" (scoped to {org})"),
+        _ => String::new(),
+    };
+    println!("Admin API key '{name}'{scope} created:");
     println!("{key}");
     Ok(())
 }
@@ -294,7 +351,7 @@ fn print_usage() {
     println!("Setup/upgrade tools:");
     println!();
     println!(" * initialize - create/upgrade the PostgreSQL schema");
-    println!(" * make-admin-api-key [name] - create an Admin API key");
+    println!(" * make-admin-api-key [name] [--org <permalink>] [--server <permalink>] - create an Admin API key (optionally scoped)");
     println!(" * make-user <email> [first] [last] [--admin] - create a user account");
     println!();
     println!("Other tools:");

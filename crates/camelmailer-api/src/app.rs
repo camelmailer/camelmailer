@@ -297,17 +297,26 @@ impl ApiState {
         Arc::new(state)
     }
 
-    async fn key_is_valid(&self, key: &str) -> bool {
+    /// Resolve a presented machine key to its scope. `None` = invalid key;
+    /// database-backed keys carry their organization/server scope, the
+    /// configured global key is always unscoped (full access).
+    async fn key_scope(&self, key: &str) -> Result<Option<AdminKeyScope>, StoreError> {
         // 1. database-backed admin API keys (records their use)
-        if self.store.admin_api_key_valid(key).await.unwrap_or(false) {
-            return true;
+        if let Some(record) = self.store.admin_api_key_auth(key).await? {
+            return Ok(Some(AdminKeyScope {
+                organization_id: record.organization_id,
+                server_id: record.server_id,
+            }));
         }
         // 2. the configured global key, compared in constant time
         match &self.global_admin_api_key {
-            Some(configured) if !configured.is_empty() => {
-                configured.as_bytes().ct_eq(key.as_bytes()).into()
+            Some(configured)
+                if !configured.is_empty()
+                    && bool::from(configured.as_bytes().ct_eq(key.as_bytes())) =>
+            {
+                Ok(Some(AdminKeyScope::default()))
             }
-            _ => false,
+            _ => Ok(None),
         }
     }
 }
@@ -413,26 +422,44 @@ pub(crate) async fn timing_middleware(mut request: Request, next: Next) -> Respo
     next.run(request).await
 }
 
-/// The authenticated caller of an admin API request: a machine key (full
-/// access) or a signed-in user (subject to RBAC).
+/// The organization/server scope of a machine key. `Default` (both `None`)
+/// is an unscoped, full-access key; a scoped key may only act inside its
+/// organization's (or, narrower, its server's) subtree — the central
+/// [`auth_middleware`] enforces this before any handler runs.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AdminKeyScope {
+    pub(crate) organization_id: Option<camelmailer_core::Id>,
+    pub(crate) server_id: Option<camelmailer_core::Id>,
+}
+
+impl AdminKeyScope {
+    pub(crate) fn is_global(&self) -> bool {
+        self.organization_id.is_none() && self.server_id.is_none()
+    }
+}
+
+/// The authenticated caller of an admin API request: a machine key
+/// (carrying its scope) or a signed-in user (subject to RBAC).
 #[derive(Clone)]
 pub(crate) enum Principal {
-    AdminKey,
+    AdminKey(AdminKeyScope),
     User(camelmailer_core::User),
 }
 
 impl Principal {
-    /// Full, unscoped access: the machine key or a global admin account.
+    /// Full, unscoped access: the unscoped machine key or a global admin
+    /// account. Scoped machine keys are not root — they never see past
+    /// their subtree.
     pub(crate) fn is_root(&self) -> bool {
         match self {
-            Principal::AdminKey => true,
+            Principal::AdminKey(scope) => scope.is_global(),
             Principal::User(user) => user.admin,
         }
     }
 
     pub(crate) fn user(&self) -> Option<&camelmailer_core::User> {
         match self {
-            Principal::AdminKey => None,
+            Principal::AdminKey(_) => None,
             Principal::User(user) => Some(user),
         }
     }
@@ -507,6 +534,49 @@ fn required_role(rest: &[&str], method: &axum::http::Method) -> camelmailer_core
     }
 }
 
+/// Does a scoped machine key reach this request path? Only
+/// `/organizations/{org}/…` paths are ever in scope; the org (and for
+/// server-scoped keys the `/servers/{server}/…` below it) must resolve to
+/// the ids the key is scoped to. Global resources (users, ip_pools,
+/// admin_api_keys, `/servers/find`, the organizations index) stay reserved
+/// for unscoped keys.
+async fn key_scope_allows(
+    state: &ApiState,
+    scope: &AdminKeyScope,
+    path: &str,
+) -> Result<bool, StoreError> {
+    let path = path.to_string();
+    let segments: Vec<&str> = path
+        .strip_prefix("/api/v2/admin")
+        .unwrap_or(&path)
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let (Some(&"organizations"), Some(org_permalink)) = (segments.first(), segments.get(1)) else {
+        return Ok(false);
+    };
+    let Some(organization) = state.store.organization_by_permalink(org_permalink).await? else {
+        return Ok(false);
+    };
+    if Some(organization.id) != scope.organization_id {
+        return Ok(false);
+    }
+    let Some(scoped_server_id) = scope.server_id else {
+        return Ok(true);
+    };
+    let (Some(&"servers"), Some(server_permalink)) = (segments.get(2), segments.get(3)) else {
+        return Ok(false);
+    };
+    let Some(server) = state
+        .store
+        .server_by_permalink(organization.id, server_permalink)
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(server.id == scoped_server_id)
+}
+
 async fn auth_middleware(
     State(state): State<Arc<ApiState>>,
     mut request: Request,
@@ -522,7 +592,11 @@ async fn auth_middleware(
         .unwrap_or("");
     if !key.is_empty() {
         let key = key.to_string();
-        if !state.key_is_valid(&key).await {
+        let scope = match state.key_scope(&key).await {
+            Ok(scope) => scope,
+            Err(error) => return render_store_error(start.as_ref(), error).into_response(),
+        };
+        let Some(scope) = scope else {
             return render_error(
                 start.as_ref(),
                 StatusCode::UNAUTHORIZED,
@@ -530,8 +604,20 @@ async fn auth_middleware(
                 "Invalid API key",
             )
             .into_response();
+        };
+        // A scoped key may only act inside its organization (and, when
+        // server-scoped, inside that server's subtree). Out-of-scope paths
+        // answer 404 — like RBAC for non-members, existence is not leaked.
+        if !scope.is_global() {
+            let allowed = match key_scope_allows(&state, &scope, request.uri().path()).await {
+                Ok(allowed) => allowed,
+                Err(error) => return render_store_error(start.as_ref(), error).into_response(),
+            };
+            if !allowed {
+                return render_not_found(start.as_ref()).into_response();
+            }
         }
-        request.extensions_mut().insert(Principal::AdminKey);
+        request.extensions_mut().insert(Principal::AdminKey(scope));
         request.extensions_mut().insert(ActingRole(None));
         return next.run(request).await;
     }
@@ -1339,6 +1425,8 @@ fn admin_api_key_json(key: &camelmailer_core::AdminApiKey) -> Value {
         "uuid": key.uuid,
         "name": key.name,
         "key_prefix": key.key_prefix,
+        "organization_id": key.organization_id,
+        "server_id": key.server_id,
     })
 }
 
@@ -1366,6 +1454,11 @@ async fn admin_api_keys_index(
 #[derive(Debug, Deserialize)]
 struct CreateAdminApiKey {
     name: Option<String>,
+    /// Scope the key to an organization (permalink). Optional.
+    organization: Option<String>,
+    /// Scope the key to a single server (permalink) inside `organization`.
+    /// Optional; requires `organization`.
+    server: Option<String>,
 }
 
 async fn admin_api_keys_create(
@@ -1379,8 +1472,57 @@ async fn admin_api_keys_create(
             "param is missing or the value is empty: name",
         );
     };
+    let organization_permalink = body.organization.filter(|o| !o.is_empty());
+    let server_permalink = body.server.filter(|s| !s.is_empty());
+    let organization = match &organization_permalink {
+        Some(permalink) => match state.store.organization_by_permalink(permalink).await {
+            Ok(Some(organization)) => Some(organization),
+            Ok(None) => {
+                return render_validation_error(
+                    Some(&start.0),
+                    &format!("Organization {permalink:?} does not exist"),
+                )
+            }
+            Err(error) => return render_store_error(Some(&start.0), error),
+        },
+        None => None,
+    };
+    let server_id = match &server_permalink {
+        Some(permalink) => {
+            let Some(organization) = &organization else {
+                return render_validation_error(
+                    Some(&start.0),
+                    "A server-scoped key also needs its organization",
+                );
+            };
+            match state
+                .store
+                .server_by_permalink(organization.id, permalink)
+                .await
+            {
+                Ok(Some(server)) => Some(server.id),
+                Ok(None) => {
+                    return render_validation_error(
+                        Some(&start.0),
+                        &format!("Server {permalink:?} does not exist in this organization"),
+                    )
+                }
+                Err(error) => return render_store_error(Some(&start.0), error),
+            }
+        }
+        None => None,
+    };
     let key = camelmailer_core::token::generate_key();
-    match state.store.create_admin_api_key_record(&name, &key).await {
+    match state
+        .store
+        .create_admin_api_key_record(
+            &name,
+            &key,
+            organization.as_ref().map(|organization| organization.id),
+            server_id,
+        )
+        .await
+    {
         Ok(record) => {
             // The one time the full secret is returned.
             let mut data = admin_api_key_json(&record);
@@ -1403,6 +1545,42 @@ async fn admin_api_keys_destroy(
     match state.store.delete_admin_api_key(id).await {
         Ok(true) => render_deleted(Some(&start.0)),
         Ok(false) => render_not_found(Some(&start.0)),
+        Err(error) => render_store_error(Some(&start.0), error),
+    }
+}
+
+/// `GET /servers/find/{permalink}` — the global slug resolver: find a
+/// server by its permalink across all organizations and return it together
+/// with its organization, so platform integrations can map a tenant slug to
+/// its org/server pair in one call. Reserved for unscoped machine keys and
+/// global admin accounts (the central [`auth_middleware`] already denies
+/// everyone else on non-organization paths). When several organizations
+/// carry a server with the same permalink the lookup is ambiguous and
+/// answers 422.
+async fn servers_find(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path(permalink): Path<String>,
+) -> ApiResponse {
+    match state.store.find_servers_by_permalink(&permalink).await {
+        Ok(matches) => match matches.as_slice() {
+            [] => render_not_found(Some(&start.0)),
+            [(organization, server)] => render_success(
+                Some(&start.0),
+                StatusCode::OK,
+                json!({
+                    "organization": organization_json(organization),
+                    "server": server_json(server),
+                }),
+            ),
+            matches => render_validation_error(
+                Some(&start.0),
+                &format!(
+                    "Server permalink {permalink:?} is ambiguous: {} organizations have one",
+                    matches.len()
+                ),
+            ),
+        },
         Err(error) => render_store_error(Some(&start.0), error),
     }
 }
@@ -1463,6 +1641,7 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             "/organizations/{permalink}/servers/{server_permalink}/stats",
             get(server_stats_show),
         )
+        .route("/servers/find/{permalink}", get(servers_find))
         .route(
             "/admin_api_keys",
             get(admin_api_keys_index).post(admin_api_keys_create),
@@ -1536,6 +1715,18 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/webhooks/{id}/test",
             axum::routing::post(resources::webhooks_test),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/track_domains",
+            get(resources::track_domains_index).post(resources::track_domains_create),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/track_domains/{id}",
+            get(resources::track_domains_show).delete(resources::track_domains_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/track_domains/{id}/verify",
+            axum::routing::post(resources::track_domains_verify),
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/sender_addresses",

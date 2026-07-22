@@ -73,6 +73,8 @@ pub struct Worker {
     spam_failure_threshold: f64,
     /// Base URL for tracking links, e.g. `https://track.example.com`.
     tracking_base_url: String,
+    /// `camelmailer.web_protocol` — scheme for per-server track domain URLs.
+    web_protocol: String,
     http: reqwest::Client,
     /// Address guard for outbound webhook / route-endpoint requests (SSRF).
     ssrf_guard: SsrfGuard,
@@ -124,6 +126,7 @@ impl Worker {
                 "{}://{}",
                 config.camelmailer.web_protocol, config.dns.track_domain
             ),
+            web_protocol: config.camelmailer.web_protocol.clone(),
             sender,
             http,
             ssrf_guard: SsrfGuard::from_config(config),
@@ -719,6 +722,17 @@ impl Worker {
             return Ok(message.raw_message.clone());
         };
 
+        // Per-server track domains take precedence over the installation-wide
+        // `dns.track_domain`; a lookup failure falls back to the global base
+        // rather than failing the delivery.
+        let tracking_base_url =
+            camelmailer_core::AdminStore::effective_track_domain(&self.store, message.server_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|host| format!("{}://{host}", self.web_protocol))
+                .unwrap_or_else(|| self.tracking_base_url.clone());
+
         // register a link + click token for every rewritten URL
         let mut pending_links: Vec<String> = Vec::new();
         let (rewritten, urls) = tracking::rewrite_links(&body, |url| {
@@ -744,7 +758,7 @@ impl Worker {
         for (index, token) in click_tokens.iter().enumerate() {
             rewritten = rewritten.replace(
                 &format!("__CM_CLICK_{index}__"),
-                &format!("{}/track/c/{token}", self.tracking_base_url),
+                &format!("{tracking_base_url}/track/c/{token}"),
             );
         }
 
@@ -753,7 +767,7 @@ impl Worker {
             .store
             .create_open_token(message.server_id, message.id)
             .await?;
-        let pixel_url = format!("{}/track/o/{open_token}.gif", self.tracking_base_url);
+        let pixel_url = format!("{tracking_base_url}/track/o/{open_token}.gif");
         let rewritten = tracking::inject_open_pixel(&rewritten, &pixel_url);
 
         Ok(tracking::reassemble(&headers, &rewritten))

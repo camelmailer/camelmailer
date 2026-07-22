@@ -362,10 +362,17 @@ pub(crate) async fn enqueue_send(
     } else {
         Some(mime::build_message(&params))
     };
-    let track_base = format!(
-        "{}://{}",
-        state.config.camelmailer.web_protocol, state.config.dns.track_domain
-    );
+    // Per-server track domains take precedence over the installation-wide
+    // `dns.track_domain` (a verified one must CNAME here, so the /track/*
+    // endpoints still receive the hits).
+    let track_host = state
+        .store
+        .effective_track_domain(server.id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| state.config.dns.track_domain.clone());
+    let track_base = format!("{}://{}", state.config.camelmailer.web_protocol, track_host);
 
     // one stored message per recipient (matches SMTP intake semantics)
     let recipients: Vec<Address> = to.into_iter().chain(cc).chain(bcc).collect();
@@ -407,10 +414,7 @@ pub(crate) async fn enqueue_send(
             let mut params = params.clone();
             params.headers.push((
                 "List-Unsubscribe".into(),
-                format!(
-                    "<{track_base}/track/u/{token}>, <mailto:unsubscribe@{}>",
-                    state.config.dns.track_domain
-                ),
+                format!("<{track_base}/track/u/{token}>, <mailto:unsubscribe@{track_host}>",),
             ));
             params.headers.push((
                 "List-Unsubscribe-Post".into(),

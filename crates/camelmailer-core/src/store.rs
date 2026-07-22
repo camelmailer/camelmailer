@@ -122,6 +122,8 @@ pub(crate) struct MemoryStoreInner {
     /// SHA-256(key) -> record (record holds only the prefix for display; the
     /// map key is the token hash, never the plaintext).
     pub(crate) admin_api_keys: HashMap<String, AdminApiKey>,
+    /// Per-server click/open tracking domains (config records, like routes).
+    pub(crate) track_domains: HashMap<Id, TrackDomain>,
     pub(crate) users: HashMap<Id, User>,
     pub(crate) ip_pools: HashMap<Id, IpPool>,
     pub(crate) ip_addresses: HashMap<Id, IpAddress>,
@@ -327,11 +329,23 @@ impl MemoryStore {
     }
 
     pub fn insert_admin_api_key_named(&self, name: &str, key: &str) -> AdminApiKey {
+        self.insert_admin_api_key_scoped(name, key, None, None)
+    }
+
+    pub fn insert_admin_api_key_scoped(
+        &self,
+        name: &str,
+        key: &str,
+        organization_id: Option<Id>,
+        server_id: Option<Id>,
+    ) -> AdminApiKey {
         let record = AdminApiKey {
             id: self.next_id(),
             uuid: crate::token::generate_uuid(),
             name: name.to_string(),
             key_prefix: key.chars().take(6).collect(),
+            organization_id,
+            server_id,
         };
         // Keyed by the SHA-256 hash, never the plaintext: the store mirrors
         // sessions/invitations and never holds a working key.
@@ -349,6 +363,16 @@ impl MemoryStore {
             .unwrap()
             .admin_api_keys
             .contains_key(&crate::auth::hash_token(key))
+    }
+
+    /// Resolve a presented key to its record (scope included), by hash.
+    pub fn admin_api_key_lookup(&self, key: &str) -> Option<AdminApiKey> {
+        self.inner
+            .read()
+            .unwrap()
+            .admin_api_keys
+            .get(&crate::auth::hash_token(key))
+            .cloned()
     }
 
     /// Store an accepted outbound message as a read-model record and return

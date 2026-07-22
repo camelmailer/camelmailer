@@ -108,6 +108,35 @@ integration tests) is green.
 
 ### Added
 
+- **Scoped admin API keys.** Database-backed admin keys can be created with
+  an organization scope or, narrower, a single-server scope
+  (`POST /api/v2/admin/admin_api_keys` with `organization`/`server`
+  permalinks; `make-admin-api-key [name] --org <permalink> --server
+  <permalink>`). A scoped key only reaches its subtree — every other path,
+  including the organizations index and all global resources, answers 404 so
+  existence is never leaked. Inside its subtree a scoped key still counts as
+  a machine key (it may `{"force": true}` domain verification). Unscoped
+  keys and the global config key keep full access. Migration `0039` adds the
+  nullable `organization_id`/`server_id` columns with `ON DELETE CASCADE`,
+  so deleting a tenant revokes its keys.
+- **Per-server track domains.** A mail server can carry its own click/open
+  tracking domains
+  (`/api/v2/admin/organizations/{org}/servers/{server}/track_domains`,
+  CRUD + `POST …/{id}/verify`): when a server has a verified track domain,
+  the delivery worker's link/pixel rewrites and the broadcast
+  List-Unsubscribe headers use it (first verified by id) instead of the
+  installation-wide `dns.track_domain`, which stays the fallback.
+  Verification resolves the domain's CNAME live (it must point at the web
+  hostname or the installation track domain; the `DnsResolver` trait gained
+  a `cname` lookup) and machine keys may skip the check with
+  `{"force": true}`, mirroring sending domains. Migration `0040` adds the
+  `track_domains` table (`ON DELETE CASCADE` with the server).
+- **Global server resolver.** `GET /api/v2/admin/servers/find/{permalink}`
+  finds a server by permalink across all organizations and returns it joined
+  with its organization — the one-call tenant-slug resolver for platform
+  integrations. 404 when no server matches; 422 when the permalink exists in
+  several organizations (ambiguous). Reserved for unscoped machine keys and
+  instance admins.
 - **Configurable message retention housekeeper.** A new
   `camelmailer.message_retention_days` setting (default `0` = keep forever)
   lets an operator opt in to automatic deletion of old stored messages. When

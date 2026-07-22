@@ -4454,3 +4454,170 @@ async fn prune_messages_removes_expired_with_dependents_and_keeps_recent() {
         "only the recent message's delivery remains"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_api_keys_carry_their_scope_and_resolve_on_auth() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+
+    f.store
+        .create_admin_api_key_record(
+            "tenant",
+            "scoped-key",
+            Some(f.organization.id),
+            Some(f.server.id),
+        )
+        .await
+        .unwrap();
+    let record = f
+        .store
+        .admin_api_key_auth("scoped-key")
+        .await
+        .unwrap()
+        .expect("key must resolve");
+    assert_eq!(record.organization_id, Some(f.organization.id));
+    assert_eq!(record.server_id, Some(f.server.id));
+    assert!(f.store.admin_api_key_auth("wrong").await.unwrap().is_none());
+
+    // listing carries the scope too
+    let keys = f.store.list_admin_api_keys().await.unwrap();
+    assert_eq!(keys[0].server_id, Some(f.server.id));
+
+    // deleting the server cascades the scoped key away
+    assert!(f.store.delete_server(f.server.id).await.unwrap());
+    assert!(f
+        .store
+        .admin_api_key_auth("scoped-key")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn find_servers_by_permalink_joins_the_organization() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+
+    let matches = f
+        .store
+        .find_servers_by_permalink("example-server")
+        .await
+        .unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].0.id, f.organization.id);
+    assert_eq!(matches[0].1.id, f.server.id);
+    assert!(f
+        .store
+        .find_servers_by_permalink("nope")
+        .await
+        .unwrap()
+        .is_empty());
+
+    // a second organization with the same server permalink both match
+    let other_org = f
+        .store
+        .create_organization(NewOrganization {
+            name: "Other".into(),
+            permalink: "other-org".into(),
+        })
+        .await
+        .unwrap();
+    f.store
+        .create_server(NewServer {
+            organization_id: other_org.id,
+            name: "Example Server".into(),
+            permalink: "example-server".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let matches = f
+        .store
+        .find_servers_by_permalink("example-server")
+        .await
+        .unwrap();
+    assert_eq!(matches.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn track_domains_crud_and_effective_domain() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+
+    // none yet: no effective track domain (callers fall back to config)
+    assert!(f
+        .store
+        .effective_track_domain(f.server.id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let first = f
+        .store
+        .create_track_domain(f.server.id, "track.one.example")
+        .await
+        .unwrap();
+    let second = f
+        .store
+        .create_track_domain(f.server.id, "track.two.example")
+        .await
+        .unwrap();
+    assert!(!first.verified);
+
+    // duplicates conflict per server
+    let error = f
+        .store
+        .create_track_domain(f.server.id, "track.one.example")
+        .await
+        .expect_err("duplicate must conflict");
+    assert!(matches!(error, camelmailer_core::StoreError::Conflict(_)));
+
+    // unverified domains are never effective; the first verified one wins
+    f.store
+        .set_track_domain_verified(second.id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .effective_track_domain(f.server.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("track.two.example")
+    );
+    f.store
+        .set_track_domain_verified(first.id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .effective_track_domain(f.server.id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("track.one.example")
+    );
+
+    // scoping + delete
+    assert!(f
+        .store
+        .track_domain_by_id(f.server.id, first.id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(f
+        .store
+        .track_domain_by_id(f.server.id + 1, first.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(f.store.delete_track_domain(first.id).await.unwrap());
+    assert!(!f.store.delete_track_domain(first.id).await.unwrap());
+    assert_eq!(
+        f.store.list_track_domains(f.server.id).await.unwrap().len(),
+        1
+    );
+}

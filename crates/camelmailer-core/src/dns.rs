@@ -20,6 +20,10 @@ pub enum DnsError {
 pub trait DnsResolver: Send + Sync {
     /// All TXT records published at `name` (empty when none exist).
     async fn txt_records(&self, name: &str) -> Result<Vec<String>, DnsError>;
+
+    /// The CNAME target of `name`, without the trailing dot (`None` when the
+    /// name has no CNAME record). Used by track-domain verification.
+    async fn cname(&self, name: &str) -> Result<Option<String>, DnsError>;
 }
 
 /// In-memory resolver for tests: a name → TXT-values map plus an optional
@@ -27,6 +31,7 @@ pub trait DnsResolver: Send + Sync {
 #[derive(Default)]
 pub struct StaticDnsResolver {
     records: RwLock<HashMap<String, Vec<String>>>,
+    cnames: RwLock<HashMap<String, String>>,
     error: RwLock<Option<String>>,
 }
 
@@ -43,6 +48,14 @@ impl StaticDnsResolver {
             .entry(name.to_string())
             .or_default()
             .push(value.to_string());
+    }
+
+    /// Publish a CNAME record.
+    pub fn add_cname(&self, name: &str, target: &str) {
+        self.cnames
+            .write()
+            .unwrap()
+            .insert(name.to_string(), target.to_string());
     }
 
     /// Make every subsequent lookup fail with `message`.
@@ -69,6 +82,13 @@ impl DnsResolver for StaticDnsResolver {
             .get(name)
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn cname(&self, name: &str) -> Result<Option<String>, DnsError> {
+        if let Some(message) = self.error.read().unwrap().clone() {
+            return Err(DnsError::Lookup(message));
+        }
+        Ok(self.cnames.read().unwrap().get(name).cloned())
     }
 }
 

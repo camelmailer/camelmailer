@@ -79,6 +79,38 @@ as `<web_protocol>://<track_domain>`, for example
 and reachable over the web protocol for the pixel to load and the
 redirect to work.
 
+### Per-server track domains
+
+The installation-wide `dns.track_domain` is the default. A mail server
+can carry its **own** track domains on top, so tracking links live under
+the sender's brand (`track.acme.com`) instead of the platform's. When a
+server has at least one **verified** track domain, the worker and the
+List-Unsubscribe headers use it (the first verified one, by id) instead
+of the global default. Servers without one keep using
+`dns.track_domain` — nothing changes for them.
+
+Manage them under
+`/api/v2/admin/organizations/{org}/servers/{server}/track_domains`:
+
+```bash
+# add — the response carries the CNAME record to publish
+curl -s -X POST "$API/…/track_domains" \
+  -H "X-Admin-API-Key: $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"name": "track.acme.com"}'
+
+# publish:  track.acme.com.  CNAME  mail.example.com.
+
+# verify — resolves the CNAME live; machine keys may pass {"force": true}
+curl -s -X POST "$API/…/track_domains/{id}/verify" -H "X-Admin-API-Key: $ADMIN_KEY"
+```
+
+A track domain must CNAME to this installation (the web hostname or the
+installation-wide track domain): the public `/track/*` endpoints resolve
+tokens regardless of the host they were reached on, so the CNAME is all
+it takes. Verification checks exactly that record and names it in the
+error until it is in place; `{"force": true}` (machine key only) skips
+the check, mirroring sending-domain verification.
+
 ## The public endpoints
 
 Both endpoints are unauthenticated: the incoming request carries only an

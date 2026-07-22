@@ -208,7 +208,7 @@ pub(crate) async fn sso_domains_verify(
         .map(|Json(b)| b.force.unwrap_or(false))
         .unwrap_or(false);
     if force {
-        if !matches!(principal.0, Principal::AdminKey) {
+        if !matches!(principal.0, Principal::AdminKey(_)) {
             return render_error(
                 Some(&start),
                 StatusCode::FORBIDDEN,

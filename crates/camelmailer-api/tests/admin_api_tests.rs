@@ -1418,3 +1418,403 @@ async fn credential_listings_carry_last_used_at_after_a_use() {
     .await;
     assert!(body["data"]["credentials"][0]["last_used_at"].is_string());
 }
+
+// -------------------------------------------------- global server resolver
+
+#[tokio::test]
+async fn servers_find_resolves_a_permalink_across_organizations() {
+    let app = build_app_with_server().await;
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/servers/find/mail",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["organization"]["permalink"], "acme");
+    assert_eq!(body["data"]["server"]["permalink"], "mail");
+
+    // unknown permalinks are a 404
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/servers/find/nope",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // the same permalink in a second organization makes the lookup ambiguous
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Beta", "permalink": "beta" })),
+    )
+    .await;
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations/beta/servers",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Mail", "permalink": "mail" })),
+    )
+    .await;
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/servers/find/mail",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+}
+
+// ---------------------------------------------------- scoped admin API keys
+
+/// Create a scoped key via the API and return its plaintext.
+async fn create_scoped_key(app: &Router, body: Value) -> String {
+    let (status, body) = request(
+        app,
+        "POST",
+        "/api/v2/admin/admin_api_keys",
+        Some(GLOBAL_KEY),
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    body["data"]["admin_api_key"]["key"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn scoped_admin_api_keys_only_reach_their_subtree() {
+    let app = build_app_with_server().await;
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations/acme/servers",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Second", "permalink": "second" })),
+    )
+    .await;
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Beta", "permalink": "beta" })),
+    )
+    .await;
+
+    let org_key =
+        create_scoped_key(&app, json!({ "name": "acme-key", "organization": "acme" })).await;
+    let server_key = create_scoped_key(
+        &app,
+        json!({ "name": "mail-key", "organization": "acme", "server": "mail" }),
+    )
+    .await;
+
+    // the org-scoped key reaches its organization and every server in it
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations/acme",
+        Some(&org_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations/acme/servers/second",
+        Some(&org_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // …but never a foreign organization or global resources — both 404-shaped
+    // or denied, without leaking existence
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations/beta",
+        Some(&org_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = request(&app, "GET", "/api/v2/admin/users", Some(&org_key), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations",
+        Some(&org_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/servers/find/mail",
+        Some(&org_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // the server-scoped key reaches only its server's subtree
+    let (status, _) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/credentials"),
+        Some(&server_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/domains"),
+        Some(&server_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations/acme/servers/second/credentials",
+        Some(&server_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations/acme",
+        Some(&server_key),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // a scoped machine key still counts as a machine key: force-verify works
+    request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains"),
+        Some(&server_key),
+        Some(json!({ "name": "acme.com" })),
+    )
+    .await;
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains/acme.com/verify"),
+        Some(&server_key),
+        Some(json!({ "force": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["domain"]["verified"], true);
+}
+
+#[tokio::test]
+async fn scoped_key_creation_validates_its_scope() {
+    let app = build_app_with_server().await;
+
+    // a server scope needs its organization
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/admin_api_keys",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "x", "server": "mail" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+
+    // unknown organizations and servers are validation errors
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/admin_api_keys",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "x", "organization": "nope" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/admin_api_keys",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "x", "organization": "acme", "server": "nope" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // the scope is visible on the record (ids), the secret only at creation
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/admin_api_keys",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "scoped", "organization": "acme", "server": "mail" })),
+    )
+    .await;
+    let created = &body["data"]["admin_api_key"];
+    assert!(created["organization_id"].is_u64());
+    assert!(created["server_id"].is_u64());
+}
+
+// ------------------------------------------------------------ track domains
+
+#[tokio::test]
+async fn track_domains_crud_and_cname_verification() {
+    let (app, resolver) = build_app_with_resolver().await;
+
+    // create returns the CNAME record to publish
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/track_domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Track.Acme.com" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created = &body["data"]["track_domain"];
+    assert_eq!(created["name"], "track.acme.com");
+    assert_eq!(created["verified"], false);
+    assert_eq!(created["cname_record"]["type"], "CNAME");
+    let id = created["id"].as_u64().unwrap();
+
+    // duplicates conflict; a bare word is not a hostname
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/track_domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "track.acme.com" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/track_domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "track" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // verify fails while the CNAME is missing and names the record to publish
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/track_domains/{id}/verify"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(body["error"]["message"].as_str().unwrap().contains("CNAME"));
+
+    // with the CNAME pointing at the installation (the default config's
+    // web hostname; a trailing dot is tolerated) it verifies
+    resolver.add_cname("track.acme.com", "postal.example.com.");
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/track_domains/{id}/verify"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["track_domain"]["verified"], true);
+
+    // list + show
+    let (_, body) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/track_domains"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(body["data"]["track_domains"][0]["verified"], true);
+    let (status, _) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/track_domains/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // delete
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("{BASE}/track_domains/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/track_domains/{id}"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn track_domain_force_verify_is_machine_key_only_wire_shape() {
+    let (app, _) = build_app_with_resolver().await;
+    let (_, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/track_domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "t.acme.com" })),
+    )
+    .await;
+    let id = body["data"]["track_domain"]["id"].as_u64().unwrap();
+
+    // machine key force-verifies without any DNS record
+    let (status, body) = request(
+        &app,
+        "POST",
+        &format!("{BASE}/track_domains/{id}/verify"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "force": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["track_domain"]["verified"], true);
+}

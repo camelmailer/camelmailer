@@ -1442,6 +1442,22 @@ paths:
       parameters: [{ $ref: "#/components/parameters/Org" }]
       responses:
         "201": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/servers/find/{permalink}:
+    get:
+      tags: [Servers]
+      summary: Find a server by permalink across all organizations
+      description: >-
+        The global slug resolver: returns the server and its organization
+        in one call, so platform integrations can map a tenant slug to its
+        org/server pair. Reserved for unscoped machine keys and instance
+        admins; 404 when no server carries the permalink, 422 when several
+        organizations do (ambiguous).
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: permalink, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
   /api/v2/admin/organizations/{org}/servers/{server}:
     get:
       tags: [Servers]
@@ -1636,6 +1652,86 @@ paths:
                           health: { $ref: "#/components/schemas/DomainHealth" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /api/v2/admin/organizations/{org}/servers/{server}/track_domains:
+    get:
+      tags: [Domains]
+      summary: List track domains
+      description: >-
+        Per-server click/open tracking domains. A verified track domain
+        takes precedence over the installation-wide `dns.track_domain` for
+        this server's outgoing mail; each entry carries the `cname_record`
+        to publish (the domain must CNAME to this installation).
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Domains]
+      summary: Add a track domain
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, example: track.acme.com }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/admin/organizations/{org}/servers/{server}/track_domains/{id}:
+    get:
+      tags: [Domains]
+      summary: Show a track domain
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Domains]
+      summary: Remove a track domain
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/organizations/{org}/servers/{server}/track_domains/{id}/verify:
+    post:
+      tags: [Domains]
+      summary: Verify a track domain via its CNAME
+      description: >-
+        Resolves the domain's CNAME live; it must point at this
+        installation (the web hostname or the installation-wide track
+        domain). Machine keys may skip the check with `{"force": true}`,
+        exactly like sending-domain verification.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { $ref: "#/components/parameters/Id" }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force: { type: boolean, description: Machine key only }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
   /api/v2/admin/organizations/{org}/servers/{server}/credentials:
     get:
       tags: [Credentials]
@@ -2078,9 +2174,26 @@ paths:
     post:
       tags: [Instance]
       summary: Create an admin API key (secret returned once)
+      description: >-
+        Optionally scoped: with `organization` (permalink) the key only
+        reaches that organization's subtree; with `server` (permalink,
+        requires `organization`) only that server's. Unscoped keys have
+        full access. Out-of-scope requests answer 404.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                organization: { type: string, description: Organization permalink to scope the key to }
+                server: { type: string, description: Server permalink inside the organization }
       responses:
         "201": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
   /api/v2/admin/admin_api_keys/{id}:
     delete:
       tags: [Instance]
@@ -2110,7 +2223,10 @@ components:
       type: apiKey
       in: header
       name: X-Admin-API-Key
-      description: A machine key with full management access.
+      description: >-
+        A machine key with management access. Unscoped keys reach
+        everything; keys created with an organization/server scope only
+        reach that subtree (everything else answers 404).
     SessionToken:
       type: http
       scheme: bearer

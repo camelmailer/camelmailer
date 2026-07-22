@@ -12,7 +12,7 @@ use camelmailer_core::{
     IpPool, MessageFilter, MessageRecord, MessageScope, MessageSink, NewCampaign, NewCredential,
     NewIpAddress, NewOrganization, NewRoute, NewSenderAddress, NewServer, NewSuppression, NewUser,
     NewWebhook, Organization, QueuedMessage, ResolvedRoute, Route, RouteMode, SenderAddress,
-    Server, ServerMode, Store, StoreError, Subscription, Suppression, User, Webhook,
+    Server, ServerMode, Store, StoreError, Subscription, Suppression, TrackDomain, User, Webhook,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, QueryBuilder, Row};
@@ -51,7 +51,10 @@ impl PgStore {
         if let sqlx::Error::Database(db_error) = &error {
             if db_error.code().as_deref() == Some("23505") {
                 let message = match db_error.constraint() {
-                    Some(constraint) if constraint.starts_with("domains") => {
+                    Some(constraint)
+                        if constraint.starts_with("domains")
+                            || constraint.starts_with("track_domains") =>
+                    {
                         "Name has already been taken"
                     }
                     Some(constraint) if constraint.starts_with("suppressions") => {
@@ -76,6 +79,29 @@ fn organization_from_row(row: &PgRow) -> Organization {
         name: row.get("name"),
         permalink: row.get("permalink"),
         require_two_factor: row.get("require_two_factor"),
+    }
+}
+
+fn admin_api_key_from_row(row: &PgRow) -> AdminApiKey {
+    AdminApiKey {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        name: row.get("name"),
+        key_prefix: row.get("key_prefix"),
+        organization_id: row
+            .get::<Option<i64>, _>("organization_id")
+            .map(|id| id as Id),
+        server_id: row.get::<Option<i64>, _>("server_id").map(|id| id as Id),
+    }
+}
+
+fn track_domain_from_row(row: &PgRow) -> TrackDomain {
+    TrackDomain {
+        id: row.get::<i64, _>("id") as Id,
+        uuid: row.get("uuid"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        name: row.get("name"),
+        verified: row.get("verified"),
     }
 }
 
@@ -778,10 +804,56 @@ impl AdminStore for PgStore {
             .map_err(Self::sqlx_error)
     }
 
+    async fn admin_api_key_auth(&self, key: &str) -> Result<Option<AdminApiKey>, StoreError> {
+        sqlx::query(
+            "UPDATE admin_api_keys SET last_used_at = now() WHERE key_hash = $1
+             RETURNING id, uuid, name, key_prefix, organization_id, server_id",
+        )
+        .bind(auth::hash_token(key))
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.as_ref().map(admin_api_key_from_row))
+        .map_err(Self::sqlx_error)
+    }
+
     async fn create_admin_api_key(&self, name: &str, key: &str) -> Result<(), StoreError> {
-        self.create_admin_api_key_record(name, key)
+        self.create_admin_api_key_record(name, key, None, None)
             .await
             .map(|_| ())
+    }
+
+    async fn find_servers_by_permalink(
+        &self,
+        permalink: &str,
+    ) -> Result<Vec<(Organization, Server)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT s.*,
+                    o.id AS o_id, o.uuid AS o_uuid, o.name AS o_name,
+                    o.permalink AS o_permalink, o.require_two_factor AS o_require_two_factor
+             FROM servers s
+             JOIN organizations o ON o.id = s.organization_id
+             WHERE s.permalink = $1
+             ORDER BY s.id",
+        )
+        .bind(permalink)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                (
+                    Organization {
+                        id: row.get::<i64, _>("o_id") as Id,
+                        uuid: row.get("o_uuid"),
+                        name: row.get("o_name"),
+                        permalink: row.get("o_permalink"),
+                        require_two_factor: row.get("o_require_two_factor"),
+                    },
+                    server_from_row(row),
+                )
+            })
+            .collect())
     }
 
     async fn server_for_api_token(&self, key: &str) -> Result<Option<Server>, StoreError> {
@@ -827,39 +899,37 @@ impl AdminStore for PgStore {
     }
 
     async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError> {
-        sqlx::query("SELECT id, uuid, name, key_prefix FROM admin_api_keys ORDER BY id")
-            .fetch_all(&self.pool)
-            .await
-            .map(|rows| {
-                rows.iter()
-                    .map(|row| AdminApiKey {
-                        id: row.get::<i64, _>("id") as Id,
-                        uuid: row.get("uuid"),
-                        name: row.get("name"),
-                        key_prefix: row.get("key_prefix"),
-                    })
-                    .collect()
-            })
-            .map_err(Self::sqlx_error)
+        sqlx::query(
+            "SELECT id, uuid, name, key_prefix, organization_id, server_id
+             FROM admin_api_keys ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.iter().map(admin_api_key_from_row).collect())
+        .map_err(Self::sqlx_error)
     }
 
     async fn create_admin_api_key_record(
         &self,
         name: &str,
         key: &str,
+        organization_id: Option<Id>,
+        server_id: Option<Id>,
     ) -> Result<AdminApiKey, StoreError> {
         let uuid = token::generate_uuid();
         let key_prefix: String = key.chars().take(6).collect();
         // Store only the hash and a short display prefix; the caller returns
         // the plaintext to the operator exactly once.
         let row = sqlx::query(
-            "INSERT INTO admin_api_keys (uuid, name, key_hash, key_prefix)
-             VALUES ($1, $2, $3, $4) RETURNING id",
+            "INSERT INTO admin_api_keys (uuid, name, key_hash, key_prefix, organization_id, server_id)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
         )
         .bind(&uuid)
         .bind(name)
         .bind(auth::hash_token(key))
         .bind(&key_prefix)
+        .bind(organization_id.map(|id| id as i64))
+        .bind(server_id.map(|id| id as i64))
         .fetch_one(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -868,11 +938,74 @@ impl AdminStore for PgStore {
             uuid,
             name: name.into(),
             key_prefix,
+            organization_id,
+            server_id,
         })
     }
 
     async fn delete_admin_api_key(&self, id: Id) -> Result<bool, StoreError> {
         sqlx::query("DELETE FROM admin_api_keys WHERE id = $1")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn list_track_domains(&self, server_id: Id) -> Result<Vec<TrackDomain>, StoreError> {
+        sqlx::query("SELECT * FROM track_domains WHERE server_id = $1 ORDER BY id")
+            .bind(server_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.iter().map(track_domain_from_row).collect())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn track_domain_by_id(
+        &self,
+        server_id: Id,
+        id: Id,
+    ) -> Result<Option<TrackDomain>, StoreError> {
+        sqlx::query("SELECT * FROM track_domains WHERE server_id = $1 AND id = $2")
+            .bind(server_id as i64)
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.as_ref().map(track_domain_from_row))
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn create_track_domain(
+        &self,
+        server_id: Id,
+        name: &str,
+    ) -> Result<TrackDomain, StoreError> {
+        let uuid = token::generate_uuid();
+        let row = sqlx::query(
+            "INSERT INTO track_domains (uuid, server_id, name)
+             VALUES ($1, $2, $3) RETURNING *",
+        )
+        .bind(&uuid)
+        .bind(server_id as i64)
+        .bind(name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(track_domain_from_row(&row))
+    }
+
+    async fn set_track_domain_verified(&self, id: Id, verified: bool) -> Result<(), StoreError> {
+        sqlx::query("UPDATE track_domains SET verified = $2 WHERE id = $1")
+            .bind(id as i64)
+            .bind(verified)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn delete_track_domain(&self, id: Id) -> Result<bool, StoreError> {
+        sqlx::query("DELETE FROM track_domains WHERE id = $1")
             .bind(id as i64)
             .execute(&self.pool)
             .await

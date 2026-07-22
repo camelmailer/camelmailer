@@ -177,7 +177,19 @@ pub trait AdminStore: Send + Sync {
     /// Is this a valid database-backed admin API key? Implementations also
     /// record the use (`last_used_at`).
     async fn admin_api_key_valid(&self, key: &str) -> Result<bool, StoreError>;
+    /// Resolve a presented admin API key to its record (including its
+    /// organization/server scope). `None` for unknown keys; a successful
+    /// resolution records the use (`last_used_at`).
+    async fn admin_api_key_auth(&self, key: &str) -> Result<Option<AdminApiKey>, StoreError>;
     async fn create_admin_api_key(&self, name: &str, key: &str) -> Result<(), StoreError>;
+
+    /// Every server named `permalink` across all organizations, joined with
+    /// its organization — the global slug resolver behind
+    /// `GET /api/v2/admin/servers/find/{permalink}`.
+    async fn find_servers_by_permalink(
+        &self,
+        permalink: &str,
+    ) -> Result<Vec<(Organization, Server)>, StoreError>;
 
     // domains (server-scoped; addressed by name)
     async fn list_domains(&self, server_id: Id) -> Result<Vec<Domain>, StoreError>;
@@ -309,12 +321,43 @@ pub trait AdminStore: Send + Sync {
 
     // admin API key management (returns display records; never the secret)
     async fn list_admin_api_keys(&self) -> Result<Vec<AdminApiKey>, StoreError>;
+    /// Create an admin API key, optionally scoped to an organization (and,
+    /// within it, a single server). Unscoped keys have full access.
     async fn create_admin_api_key_record(
         &self,
         name: &str,
         key: &str,
+        organization_id: Option<Id>,
+        server_id: Option<Id>,
     ) -> Result<AdminApiKey, StoreError>;
     async fn delete_admin_api_key(&self, id: Id) -> Result<bool, StoreError>;
+
+    // track domains (server-scoped): per-server click/open tracking hosts
+    // that take precedence over the installation-wide `dns.track_domain`
+    async fn list_track_domains(&self, server_id: Id) -> Result<Vec<TrackDomain>, StoreError>;
+    async fn track_domain_by_id(
+        &self,
+        server_id: Id,
+        id: Id,
+    ) -> Result<Option<TrackDomain>, StoreError>;
+    async fn create_track_domain(
+        &self,
+        server_id: Id,
+        name: &str,
+    ) -> Result<TrackDomain, StoreError>;
+    async fn set_track_domain_verified(&self, id: Id, verified: bool) -> Result<(), StoreError>;
+    async fn delete_track_domain(&self, id: Id) -> Result<bool, StoreError>;
+    /// The track domain outgoing mail of this server should use: the first
+    /// verified track domain (by id), or `None` when the server has none —
+    /// callers then fall back to the installation-wide `dns.track_domain`.
+    async fn effective_track_domain(&self, server_id: Id) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .list_track_domains(server_id)
+            .await?
+            .into_iter()
+            .find(|domain| domain.verified)
+            .map(|domain| domain.name))
+    }
 }
 
 #[async_trait]
@@ -459,9 +502,33 @@ impl AdminStore for crate::store::MemoryStore {
         Ok(self.admin_api_key_exists(key))
     }
 
+    async fn admin_api_key_auth(&self, key: &str) -> Result<Option<AdminApiKey>, StoreError> {
+        Ok(self.admin_api_key_lookup(key))
+    }
+
     async fn create_admin_api_key(&self, name: &str, key: &str) -> Result<(), StoreError> {
         self.insert_admin_api_key_named(name, key);
         Ok(())
+    }
+
+    async fn find_servers_by_permalink(
+        &self,
+        permalink: &str,
+    ) -> Result<Vec<(Organization, Server)>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let mut matches: Vec<(Organization, Server)> = inner
+            .servers
+            .values()
+            .filter(|server| server.permalink == permalink)
+            .filter_map(|server| {
+                inner
+                    .organizations
+                    .get(&server.organization_id)
+                    .map(|organization| (organization.clone(), server.clone()))
+            })
+            .collect();
+        matches.sort_by_key(|(_, server)| server.id);
+        Ok(matches)
     }
 
     async fn server_for_api_token(&self, key: &str) -> Result<Option<Server>, StoreError> {
@@ -536,12 +603,91 @@ impl AdminStore for crate::store::MemoryStore {
         &self,
         name: &str,
         key: &str,
+        organization_id: Option<Id>,
+        server_id: Option<Id>,
     ) -> Result<AdminApiKey, StoreError> {
-        Ok(self.insert_admin_api_key_named(name, key))
+        Ok(self.insert_admin_api_key_scoped(name, key, organization_id, server_id))
     }
 
     async fn delete_admin_api_key(&self, id: Id) -> Result<bool, StoreError> {
         Ok(crate::store::MemoryStore::delete_admin_api_key(self, id))
+    }
+
+    async fn list_track_domains(&self, server_id: Id) -> Result<Vec<TrackDomain>, StoreError> {
+        let mut domains: Vec<TrackDomain> = self
+            .inner
+            .read()
+            .unwrap()
+            .track_domains
+            .values()
+            .filter(|d| d.server_id == server_id)
+            .cloned()
+            .collect();
+        domains.sort_by_key(|d| d.id);
+        Ok(domains)
+    }
+
+    async fn track_domain_by_id(
+        &self,
+        server_id: Id,
+        id: Id,
+    ) -> Result<Option<TrackDomain>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .track_domains
+            .get(&id)
+            .filter(|d| d.server_id == server_id)
+            .cloned())
+    }
+
+    async fn create_track_domain(
+        &self,
+        server_id: Id,
+        name: &str,
+    ) -> Result<TrackDomain, StoreError> {
+        {
+            let inner = self.inner.read().unwrap();
+            if inner
+                .track_domains
+                .values()
+                .any(|d| d.server_id == server_id && d.name == name)
+            {
+                return Err(StoreError::Conflict("Name has already been taken".into()));
+            }
+        }
+        let domain = TrackDomain {
+            id: self.next_id(),
+            uuid: crate::token::generate_uuid(),
+            server_id,
+            name: name.into(),
+            verified: false,
+        };
+        self.inner
+            .write()
+            .unwrap()
+            .track_domains
+            .insert(domain.id, domain.clone());
+        Ok(domain)
+    }
+
+    async fn set_track_domain_verified(&self, id: Id, verified: bool) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(domain) = inner.track_domains.get_mut(&id) {
+            domain.verified = verified;
+        }
+        Ok(())
+    }
+
+    async fn delete_track_domain(&self, id: Id) -> Result<bool, StoreError> {
+        Ok(self
+            .inner
+            .write()
+            .unwrap()
+            .track_domains
+            .remove(&id)
+            .is_some())
     }
 
     async fn list_domains(&self, server_id: Id) -> Result<Vec<Domain>, StoreError> {

@@ -162,6 +162,33 @@ pub struct AdminApiKey {
     pub name: String,
     /// First few characters of the key, for display; never the full secret.
     pub key_prefix: String,
+    /// Organization this key is scoped to (`None` = installation-wide).
+    /// A scoped key may only act inside its organization's subtree.
+    pub organization_id: Option<Id>,
+    /// Server this key is scoped to (always inside `organization_id`).
+    /// The narrowest scope: only that server's resources are reachable.
+    pub server_id: Option<Id>,
+}
+
+impl AdminApiKey {
+    /// An installation-wide key (no organization/server scope).
+    pub fn is_global(&self) -> bool {
+        self.organization_id.is_none() && self.server_id.is_none()
+    }
+}
+
+/// A per-server click/open tracking domain. When a server has at least one
+/// verified track domain, tracking URLs in its outgoing mail use it instead
+/// of the installation-wide `dns.track_domain`. The domain must CNAME to
+/// this installation so the public `/track/*` endpoints receive the hits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrackDomain {
+    pub id: Id,
+    pub uuid: String,
+    pub server_id: Id,
+    /// Full hostname, e.g. `track.acme.com`.
+    pub name: String,
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

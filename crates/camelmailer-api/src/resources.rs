@@ -257,7 +257,7 @@ pub(crate) async fn domains_verify(
         .map(|Json(b)| b.force.unwrap_or(false))
         .unwrap_or(false);
     if force {
-        if !matches!(principal.0, Principal::AdminKey) {
+        if !matches!(principal.0, Principal::AdminKey(_)) {
             return render_error(
                 Some(&start),
                 StatusCode::FORBIDDEN,
@@ -304,6 +304,214 @@ pub(crate) async fn domains_destroy(
         Ok(domain) => from_result(&start, state.store.delete_domain(domain.id).await, |_| {
             render_deleted(Some(&start))
         }),
+        Err(response) => response,
+    }
+}
+
+// ----------------------------------------------------------- track domains
+
+/// A track domain plus the CNAME record to publish for it: the domain must
+/// point at this installation's web server so the public `/track/*`
+/// endpoints receive the clicks and opens.
+fn track_domain_json(state: &ApiState, domain: &camelmailer_core::TrackDomain) -> Value {
+    json!({
+        "id": domain.id,
+        "uuid": domain.uuid,
+        "name": domain.name,
+        "verified": domain.verified,
+        "cname_record": {
+            "name": domain.name,
+            "type": "CNAME",
+            "value": state.config.camelmailer.web_hostname,
+        },
+    })
+}
+
+pub(crate) async fn track_domains_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server)): Path<(String, String)>,
+    Query(params): Query<PaginationParams>,
+) -> ApiResponse {
+    let server = match require_server(&state, &start, &org, &server).await {
+        Ok(server) => server,
+        Err(response) => return response,
+    };
+    from_result(
+        &start,
+        state.store.list_track_domains(server.id).await,
+        |domains| {
+            let result = paginate(&domains, &params);
+            ok(
+                &start,
+                json!({
+                    "track_domains": result
+                        .items
+                        .iter()
+                        .map(|domain| track_domain_json(&state, domain))
+                        .collect::<Vec<_>>(),
+                    "pagination": result.pagination,
+                }),
+            )
+        },
+    )
+}
+
+#[derive(Deserialize)]
+pub(crate) struct CreateTrackDomain {
+    name: Option<String>,
+}
+
+pub(crate) async fn track_domains_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server)): Path<(String, String)>,
+    Json(body): Json<CreateTrackDomain>,
+) -> ApiResponse {
+    let server = match require_server(&state, &start, &org, &server).await {
+        Ok(server) => server,
+        Err(response) => return response,
+    };
+    let Some(name) = body
+        .name
+        .map(|n| n.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+    else {
+        return render_parameter_missing(
+            Some(&start),
+            "param is missing or the value is empty: name",
+        );
+    };
+    if !name.contains('.') || name.contains(char::is_whitespace) {
+        return render_validation_error(
+            Some(&start),
+            "name must be a full hostname, e.g. track.example.com",
+        );
+    }
+    from_result(
+        &start,
+        state.store.create_track_domain(server.id, &name).await,
+        |domain| {
+            created(
+                &start,
+                json!({ "track_domain": track_domain_json(&state, &domain) }),
+            )
+        },
+    )
+}
+
+async fn require_track_domain(
+    state: &ApiState,
+    start: &RequestStart,
+    org: &str,
+    server: &str,
+    id: camelmailer_core::Id,
+) -> Result<camelmailer_core::TrackDomain, ApiResponse> {
+    let server = require_server(state, start, org, server).await?;
+    match state.store.track_domain_by_id(server.id, id).await {
+        Ok(Some(domain)) => Ok(domain),
+        Ok(None) => Err(render_not_found(Some(start))),
+        Err(error) => Err(render_store_error(Some(start), error)),
+    }
+}
+
+pub(crate) async fn track_domains_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server, id)): Path<(String, String, u64)>,
+) -> ApiResponse {
+    match require_track_domain(&state, &start, &org, &server, id).await {
+        Ok(domain) => ok(
+            &start,
+            json!({ "track_domain": track_domain_json(&state, &domain) }),
+        ),
+        Err(response) => response,
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct VerifyTrackDomain {
+    force: Option<bool>,
+}
+
+/// `POST …/track_domains/{id}/verify` — check that the track domain CNAMEs
+/// to this installation (the web server or the installation-wide track
+/// domain). Machine keys may skip the check with `{"force": true}`, exactly
+/// like sending-domain verification.
+pub(crate) async fn track_domains_verify(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    principal: axum::Extension<Principal>,
+    Path((org, server, id)): Path<(String, String, u64)>,
+    body: Option<Json<VerifyTrackDomain>>,
+) -> ApiResponse {
+    let mut domain = match require_track_domain(&state, &start, &org, &server, id).await {
+        Ok(domain) => domain,
+        Err(response) => return response,
+    };
+    let force = body
+        .map(|Json(b)| b.force.unwrap_or(false))
+        .unwrap_or(false);
+    if force {
+        if !matches!(principal.0, Principal::AdminKey(_)) {
+            return render_error(
+                Some(&start),
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+                "Forced verification requires the X-Admin-API-Key machine key",
+            );
+        }
+    } else {
+        let mut targets = vec![state.config.camelmailer.web_hostname.to_ascii_lowercase()];
+        let global_track = state.config.dns.track_domain.to_ascii_lowercase();
+        if !global_track.is_empty() {
+            targets.push(global_track);
+        }
+        match state.dns_resolver.cname(&domain.name).await {
+            Ok(Some(target))
+                if targets.contains(&target.trim_end_matches('.').to_ascii_lowercase()) => {}
+            Ok(_) => {
+                return render_validation_error(
+                    Some(&start),
+                    &format!(
+                        "The track domain does not point here yet: publish a CNAME record \
+                         at {} with the value \"{}\", wait for DNS to propagate, then retry",
+                        domain.name, targets[0]
+                    ),
+                )
+            }
+            Err(error) => {
+                return render_validation_error(
+                    Some(&start),
+                    &format!(
+                        "Could not check the CNAME record at {}: {error}",
+                        domain.name
+                    ),
+                )
+            }
+        }
+    }
+    if let Err(error) = state.store.set_track_domain_verified(domain.id, true).await {
+        return render_store_error(Some(&start), error);
+    }
+    domain.verified = true;
+    ok(
+        &start,
+        json!({ "track_domain": track_domain_json(&state, &domain) }),
+    )
+}
+
+pub(crate) async fn track_domains_destroy(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server, id)): Path<(String, String, u64)>,
+) -> ApiResponse {
+    match require_track_domain(&state, &start, &org, &server, id).await {
+        Ok(domain) => from_result(
+            &start,
+            state.store.delete_track_domain(domain.id).await,
+            |_| render_deleted(Some(&start)),
+        ),
         Err(response) => response,
     }
 }
