@@ -17,7 +17,7 @@ Rust rewrite of [Postal](https://github.com/postalserver/postal).
 covering the entire API — registration and login with 2FA/SSO,
 organizations and roles, servers with all resources, sending and message
 browsing. The public [OpenAPI spec](web/app/public/openapi.yaml) documents
-all 74 endpoints. A library of 20 ready-to-clone transactional email
+all endpoints. A library of 20 ready-to-clone transactional email
 templates lives in [templates/](templates/README.md). See
 [web/README.md](web/README.md).
 
