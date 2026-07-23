@@ -205,6 +205,12 @@ pub trait AdminStore: Send + Sync {
         dkim_private_key: Option<String>,
     ) -> Result<Domain, StoreError>;
     async fn set_domain_verified(&self, domain_id: Id, verified: bool) -> Result<(), StoreError>;
+    /// Enable/disable the DMARC health check for a domain (`false` = ignore).
+    async fn set_domain_dmarc_check(
+        &self,
+        domain_id: Id,
+        check_dmarc: bool,
+    ) -> Result<(), StoreError>;
     async fn delete_domain(&self, domain_id: Id) -> Result<bool, StoreError>;
 
     // credentials
@@ -735,8 +741,21 @@ impl AdminStore for crate::store::MemoryStore {
             name: name.into(),
             verified: false,
             verification_token: crate::token::generate_token(32),
+            check_dmarc: true,
             dkim_private_key,
         }))
+    }
+
+    async fn set_domain_dmarc_check(
+        &self,
+        domain_id: Id,
+        check_dmarc: bool,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(domain) = inner.domains.get_mut(&domain_id) {
+            domain.check_dmarc = check_dmarc;
+        }
+        Ok(())
     }
 
     async fn set_domain_verified(&self, domain_id: Id, verified: bool) -> Result<(), StoreError> {

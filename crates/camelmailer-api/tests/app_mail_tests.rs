@@ -69,6 +69,7 @@ async fn build(config: camelmailer_config::Config) -> (Router, Arc<MemoryStore>,
         name: "platform.example".into(),
         verified: true,
         verification_token: "vtoken".into(),
+        check_dmarc: true,
         dkim_private_key: None,
     });
     store

@@ -82,6 +82,11 @@ pub struct Domain {
     /// `_camelmailer-challenge.<domain>` to prove ownership. Generated once
     /// when the domain is created.
     pub verification_token: String,
+    /// Whether the domain health check evaluates DMARC. `false` opts the
+    /// domain out — the DMARC check reports `ignored` and is excluded from
+    /// the overall grade. For domains whose DNS (and thus DMARC policy) is
+    /// managed externally, where a "missing" DMARC would be noise.
+    pub check_dmarc: bool,
     /// Per-domain DKIM RSA private key (PEM). `None` means the domain signs
     /// with the installation key (`camelmailer.signing_key_path`) — that
     /// fallback stays valid forever. Never serialized.

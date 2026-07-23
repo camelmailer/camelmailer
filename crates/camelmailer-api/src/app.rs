@@ -1664,7 +1664,9 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/domains/{name}",
-            get(resources::domains_show).delete(resources::domains_destroy),
+            get(resources::domains_show)
+                .patch(resources::domains_update)
+                .delete(resources::domains_destroy),
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/domains/{name}/verify",

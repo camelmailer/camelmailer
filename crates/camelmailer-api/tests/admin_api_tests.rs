@@ -1880,3 +1880,86 @@ async fn credentials_are_addressable_by_uuid_for_postal_compatibility() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn domain_dmarc_check_can_be_disabled_and_reads_ignored() {
+    let (app, resolver) = build_app_with_resolver().await;
+    // a domain with no DMARC record → the check is "missing" and drags overall
+    request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "ext.example" })),
+    )
+    .await;
+
+    let (_, body) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/domains/ext.example"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(body["data"]["domain"]["check_dmarc"], true);
+
+    let (status, health) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/domains/ext.example/health"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        health["data"]["health"]["checks"]["dmarc"]["status"],
+        "missing"
+    );
+
+    // disable the DMARC check
+    let (status, patched) = request(
+        &app,
+        "PATCH",
+        &format!("{BASE}/domains/ext.example"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "check_dmarc": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["data"]["domain"]["check_dmarc"], false);
+
+    // now DMARC reads "ignored" and no longer worsens the overall grade
+    let (_, health) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/domains/ext.example/health"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(
+        health["data"]["health"]["checks"]["dmarc"]["status"],
+        "ignored"
+    );
+    assert!(health["data"]["health"]["checks"]["dmarc"]["problems"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    // an ignored DMARC check ranks like "ok" and never sets the overall grade
+    // (SPF/DKIM are still missing here, so overall reflects only those).
+    assert_ne!(health["data"]["health"]["checks"]["dmarc"]["status"], "missing");
+
+    // re-enable round-trips
+    let (_, re) = request(
+        &app,
+        "PATCH",
+        &format!("{BASE}/domains/ext.example"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "check_dmarc": true })),
+    )
+    .await;
+    assert_eq!(re["data"]["domain"]["check_dmarc"], true);
+    let _ = resolver;
+}

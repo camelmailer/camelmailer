@@ -208,6 +208,7 @@ fn domain_from_row(row: &PgRow) -> Domain {
         name: row.get("name"),
         verified: row.get("verified"),
         verification_token: row.get("verification_token"),
+        check_dmarc: row.get("check_dmarc"),
         dkim_private_key: row.get("dkim_private_key"),
     }
 }
@@ -466,6 +467,7 @@ impl PgStore {
             name: name.into(),
             verified,
             verification_token,
+            check_dmarc: true,
             dkim_private_key: dkim_private_key.map(str::to_string),
         })
     }
@@ -1059,6 +1061,20 @@ impl AdminStore for PgStore {
         sqlx::query("UPDATE domains SET verified = $2 WHERE id = $1")
             .bind(domain_id as i64)
             .bind(verified)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn set_domain_dmarc_check(
+        &self,
+        domain_id: Id,
+        check_dmarc: bool,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE domains SET check_dmarc = $2 WHERE id = $1")
+            .bind(domain_id as i64)
+            .bind(check_dmarc)
             .execute(&self.pool)
             .await
             .map(|_| ())

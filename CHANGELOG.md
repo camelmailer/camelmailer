@@ -13,6 +13,20 @@ version in `Cargo.toml` and a matching section in this file agree, and
 unless the full test suite (including the PostgreSQL row-level-security
 integration tests) is green.
 
+## [0.7.5] - 2026-07-23
+
+### Added
+
+- **Per-domain DMARC opt-out.** A sending domain can disable its DMARC
+  health check via `PATCH …/domains/{name}` with `{"check_dmarc": false}`
+  (new `check_dmarc` field on the domain, default `true`, migration `0041`).
+  When disabled the domain health check reports the DMARC row as `ignored`
+  (no problems, and it no longer affects the `overall` grade) — for domains
+  whose DNS and DMARC policy are managed externally, where a "missing"
+  DMARC record is noise. `AdminStore` gained `set_domain_dmarc_check`
+  (both `MemoryStore` and `PgStore`); the health `overall` ranks `ignored`
+  like `ok`.
+
 ## [0.7.4] - 2026-07-23
 
 ### Added

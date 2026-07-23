@@ -101,6 +101,7 @@ fn domain_json(state: &ApiState, domain: &Domain) -> Value {
         "uuid": domain.uuid,
         "name": domain.name,
         "verified": domain.verified,
+        "check_dmarc": domain.check_dmarc,
         "dkim_record": dkim_public.map(|p| dns_record_json(
             format!("{}._domainkey.{}", dns.dkim_identifier, domain.name),
             format!("v=DKIM1; k=rsa; p={p}"),
@@ -230,6 +231,44 @@ pub(crate) async fn domains_show(
         Ok(domain) => ok(&start, json!({ "domain": domain_json(&state, &domain) })),
         Err(response) => response,
     }
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct UpdateDomain {
+    /// Toggle the DMARC health check for this domain. `false` opts out —
+    /// the health check reports DMARC as `ignored` and drops it from the
+    /// overall grade.
+    check_dmarc: Option<bool>,
+}
+
+/// `PATCH …/domains/{name}` — update per-domain settings. Currently the one
+/// mutable setting is `check_dmarc` (opt a domain out of the DMARC check,
+/// e.g. when its DNS/DMARC policy is managed externally).
+pub(crate) async fn domains_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server, name)): Path<(String, String, String)>,
+    Json(body): Json<UpdateDomain>,
+) -> ApiResponse {
+    let mut domain = match require_domain(&state, &start, &org, &server, &name).await {
+        Ok(domain) => domain,
+        Err(response) => return response,
+    };
+    let Some(check_dmarc) = body.check_dmarc else {
+        return render_parameter_missing(
+            Some(&start),
+            "param is missing or the value is empty: check_dmarc",
+        );
+    };
+    if let Err(error) = state
+        .store
+        .set_domain_dmarc_check(domain.id, check_dmarc)
+        .await
+    {
+        return render_store_error(Some(&start), error);
+    }
+    domain.check_dmarc = check_dmarc;
+    ok(&start, json!({ "domain": domain_json(&state, &domain) }))
 }
 
 #[derive(Deserialize, Default)]
@@ -525,7 +564,8 @@ pub(crate) async fn track_domains_destroy(
 /// Order of severity for the health traffic light.
 fn health_rank(status: &str) -> u8 {
     match status {
-        "ok" => 0,
+        // `ok` and `ignored` (an opted-out check) never worsen the overall grade
+        "ok" | "ignored" => 0,
         "warning" => 1,
         _ => 2, // missing
     }
@@ -762,6 +802,15 @@ pub(crate) async fn domains_health(
         }
     };
 
+    // A domain can opt out of the DMARC check (externally managed DNS): the
+    // check then reads `ignored` — no problems, no bearing on `overall`.
+    let dmarc_status = if domain.check_dmarc {
+        dmarc_status
+    } else {
+        dmarc_problems.clear();
+        "ignored"
+    };
+
     // ---- the RUA address of this server's internal DMARC route, if any
     let rua_address = match state.store.list_routes(server.id).await {
         Ok(routes) => {
@@ -788,8 +837,12 @@ pub(crate) async fn domains_health(
         Err(_) => None,
     };
 
-    // ---- next step: walk the policy journey
-    let policy = dmarc_policy.as_ref().and_then(|p| p.p.as_deref());
+    // ---- next step: walk the policy journey (skipped for opted-out domains)
+    let policy = if domain.check_dmarc {
+        dmarc_policy.as_ref().and_then(|p| p.p.as_deref())
+    } else {
+        None
+    };
     let high_compliance = compliance.as_ref().is_some_and(|summary| {
         summary.total >= DMARC_ESCALATION_MIN_VOLUME
             && summary.pass_rate >= DMARC_ESCALATION_MIN_PASS_RATE

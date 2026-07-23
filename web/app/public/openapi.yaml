@@ -1571,6 +1571,30 @@ paths:
         - { name: name, in: path, required: true, schema: { type: string } }
       responses:
         "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Domains]
+      summary: Update per-domain settings
+      description: >-
+        Currently the one mutable setting is `check_dmarc`. Set it to
+        `false` to opt the domain out of the DMARC health check (for
+        externally managed DNS): the check then reports `ignored` and does
+        not affect the overall grade.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                check_dmarc: { type: boolean }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/ValidationError" }
     delete:
       tags: [Domains]
       summary: Delete a domain
