@@ -98,6 +98,11 @@ dns:
   route_domain: routes.example.com
   track_domain: track.example.com
   dkim_identifier: camelmailer
+  # Domain-ownership challenge record (brandable). The API looks up a TXT
+  # at "<verification_record_label>.<domain>" whose value is
+  # "<verification_value_prefix>=<token>".
+  verification_record_label: _camelmailer-challenge
+  verification_value_prefix: camelmailer-verification
 
 # Optional inbound message inspection (both disabled by default).
 rspamd:

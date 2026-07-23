@@ -106,8 +106,8 @@ fn domain_json(state: &ApiState, domain: &Domain) -> Value {
             format!("v=DKIM1; k=rsa; p={p}"),
         )),
         "verification_record": dns_record_json(
-            format!("_camelmailer-challenge.{}", domain.name),
-            format!("camelmailer-verification={}", domain.verification_token),
+            format!("{}.{}", dns.verification_record_label, domain.name),
+            format!("{}={}", dns.verification_value_prefix, domain.verification_token),
         ),
         "spf_record": dns_record_json(
             domain.name.clone(),
@@ -266,8 +266,12 @@ pub(crate) async fn domains_verify(
             );
         }
     } else {
-        let record_name = format!("_camelmailer-challenge.{}", domain.name);
-        let expected = format!("camelmailer-verification={}", domain.verification_token);
+        let dns = &state.config.dns;
+        let record_name = format!("{}.{}", dns.verification_record_label, domain.name);
+        let expected = format!(
+            "{}={}",
+            dns.verification_value_prefix, domain.verification_token
+        );
         match state.dns_resolver.txt_records(&record_name).await {
             Ok(records) if records.iter().any(|record| record.trim() == expected) => {}
             Ok(_) => {
@@ -579,7 +583,11 @@ pub(crate) async fn domains_health(
     } else {
         format!("include:{}", dns.spf_include)
     };
-    let expected_spf = format!("v=spf1 {spf_mechanism} ~all");
+    // Default proposal (no SPF yet): a standalone record. When the domain
+    // already publishes one, we replace this below with that record extended
+    // by our mechanism, so operators merge into their single record instead
+    // of adding a second (invalid) v=spf1.
+    let mut expected_spf = format!("v=spf1 {spf_mechanism} ~all");
     let mut spf_problems: Vec<String> = Vec::new();
     let mut spf_found: Vec<String> = Vec::new();
     let spf_status = match state.dns_resolver.txt_records(&domain.name).await {
@@ -601,8 +609,11 @@ pub(crate) async fn domains_health(
                 1 => {
                     let record = &spf_found[0];
                     if !dmarc_rules::spf_contains_mechanism(record, &spf_mechanism) {
+                        // Propose the domain's own record extended with our
+                        // mechanism, not a fresh standalone one.
+                        expected_spf = dmarc_rules::spf_with_mechanism(record, &spf_mechanism);
                         spf_problems.push(format!(
-                            "the record does not include this installation ({spf_mechanism})"
+                            "add {spf_mechanism} to the existing record — publish \"{expected_spf}\" (keep it to one v=spf1 record)"
                         ));
                     }
                     match dmarc_rules::spf_all_qualifier(record) {

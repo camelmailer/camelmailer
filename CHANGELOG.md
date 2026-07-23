@@ -13,6 +13,30 @@ version in `Cargo.toml` and a matching section in this file agree, and
 unless the full test suite (including the PostgreSQL row-level-security
 integration tests) is green.
 
+## [0.7.4] - 2026-07-23
+
+### Added
+
+- **Brandable domain-verification challenge.** The ownership-challenge TXT
+  record was hardcoded to `_camelmailer-challenge.<domain>` /
+  `camelmailer-verification=<token>`. Two new `dns` settings —
+  `verification_record_label` (default `_camelmailer-challenge`) and
+  `verification_value_prefix` (default `camelmailer-verification`) — let an
+  installation rebrand it (e.g. `_revenexxmailer-challenge` /
+  `revenexx-verification`). Applied to both sending-domain and org-SSO-domain
+  verification, in the record the API returns and in the DNS lookup it checks.
+
+### Changed
+
+- **SPF health proposes a merged record when one already exists.** When a
+  sending domain already publishes an SPF record that does not include this
+  installation, the domain health check now returns the domain's own record
+  *extended* with our mechanism (inserted before the `all` term) as the
+  value to publish, instead of a standalone `v=spf1 … ~all` that would create
+  a second, invalid `v=spf1` record. New helper
+  `camelmailer_core::dmarc::spf_with_mechanism`. Domains with no SPF record
+  still get the standalone proposal.
+
 ## [0.7.3] - 2026-07-23
 
 ### Fixed

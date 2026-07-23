@@ -605,6 +605,13 @@ pub struct Dns {
     pub helo_hostname: Option<String>,
     pub dkim_identifier: String,
     pub domain_verify_prefix: String,
+    /// DNS name label of the domain-ownership challenge record: the TXT is
+    /// looked up at `<verification_record_label>.<domain>`. Brandable — an
+    /// installation can set e.g. `_revenexxmailer-challenge`.
+    pub verification_record_label: String,
+    /// Prefix of the challenge TXT value: the record reads
+    /// `<verification_value_prefix>=<token>` (e.g. `revenexx-verification`).
+    pub verification_value_prefix: String,
     pub custom_return_path_prefix: String,
     pub timeout: u32,
     pub resolv_conf_path: String,
@@ -624,6 +631,8 @@ impl Default for Dns {
             helo_hostname: None,
             dkim_identifier: "postal".into(),
             domain_verify_prefix: "postal-verification".into(),
+            verification_record_label: "_camelmailer-challenge".into(),
+            verification_value_prefix: "camelmailer-verification".into(),
             custom_return_path_prefix: "psrp".into(),
             timeout: 5,
             resolv_conf_path: "/etc/resolv.conf".into(),

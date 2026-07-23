@@ -333,6 +333,34 @@ pub fn spf_contains_mechanism(txt: &str, mechanism: &str) -> bool {
     })
 }
 
+/// Merge `mechanism` (e.g. `include:spf.example.com`) into an existing
+/// SPF record, inserting it just before the `all` term so it is evaluated
+/// ahead of the catch-all. Preserves the record's other mechanisms and its
+/// `all` qualifier — the point is to *extend* a domain's existing SPF into
+/// one valid record rather than proposing a second `v=spf1` (which
+/// receivers treat as a permanent error). If the mechanism is already
+/// present the record is returned unchanged; if there is no `all` term the
+/// mechanism is appended.
+pub fn spf_with_mechanism(txt: &str, mechanism: &str) -> String {
+    if spf_contains_mechanism(txt, mechanism) {
+        return txt.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut inserted = false;
+    for term in txt.split_whitespace() {
+        let bare = term.trim_start_matches(['-', '~', '?', '+']);
+        if !inserted && bare.eq_ignore_ascii_case("all") {
+            out.push(mechanism.to_string());
+            inserted = true;
+        }
+        out.push(term.to_string());
+    }
+    if !inserted {
+        out.push(mechanism.to_string());
+    }
+    out.join(" ")
+}
+
 /// The `p=` value of a DKIM TXT record (concatenated), or `None` when
 /// the record carries no `p=` tag.
 pub fn dkim_public_key_of_record(txt: &str) -> Option<String> {
@@ -350,6 +378,47 @@ pub fn dkim_public_key_of_record(txt: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spf_with_mechanism_merges_into_an_existing_record() {
+        // inserts before the all term, preserving the qualifier and the
+        // domain's other mechanisms
+        assert_eq!(
+            spf_with_mechanism(
+                "v=spf1 include:_spf.google.com ~all",
+                "include:spf.mail.revenexx.com"
+            ),
+            "v=spf1 include:_spf.google.com include:spf.mail.revenexx.com ~all"
+        );
+        // hard-fail qualifier kept
+        assert_eq!(
+            spf_with_mechanism("v=spf1 mx -all", "include:spf.mail.revenexx.com"),
+            "v=spf1 mx include:spf.mail.revenexx.com -all"
+        );
+        // already present → unchanged (whitespace normalised)
+        assert_eq!(
+            spf_with_mechanism(
+                "v=spf1   include:spf.mail.revenexx.com  ~all",
+                "include:spf.mail.revenexx.com"
+            ),
+            "v=spf1 include:spf.mail.revenexx.com ~all"
+        );
+        // no all term → appended
+        assert_eq!(
+            spf_with_mechanism("v=spf1 a", "include:spf.mail.revenexx.com"),
+            "v=spf1 a include:spf.mail.revenexx.com"
+        );
+        // the merged record still passes the contains-check and stays a single record
+        let merged = spf_with_mechanism(
+            "v=spf1 include:_spf.google.com ~all",
+            "include:spf.mail.revenexx.com",
+        );
+        assert!(spf_contains_mechanism(
+            &merged,
+            "include:spf.mail.revenexx.com"
+        ));
+        assert!(is_spf_record(&merged));
+    }
 
     fn row(
         source_ip: &str,

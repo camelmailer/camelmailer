@@ -92,16 +92,16 @@ fn merge_secrets(mut incoming: Value, stored: &Value) -> Value {
     incoming
 }
 
-fn domain_json(domain: &camelmailer_core::OrgEmailDomain) -> Value {
+fn domain_json(domain: &camelmailer_core::OrgEmailDomain, dns: &camelmailer_config::Dns) -> Value {
     json!({
         "id": domain.id,
         "domain": domain.domain,
         "verified": domain.verified,
         "created_at": domain.created_at,
         "dns_record": {
-            "name": format!("_camelmailer-challenge.{}", domain.domain),
+            "name": format!("{}.{}", dns.verification_record_label, domain.domain),
             "type": "TXT",
-            "value": format!("camelmailer-verification={}", domain.verification_token),
+            "value": format!("{}={}", dns.verification_value_prefix, domain.verification_token),
         },
     })
 }
@@ -138,7 +138,7 @@ pub(crate) async fn sso_domains_index(
         Ok(domains) => render_success(
             Some(&start),
             StatusCode::OK,
-            json!({ "domains": domains.iter().map(domain_json).collect::<Vec<_>>() }),
+            json!({ "domains": domains.iter().map(|d| domain_json(d, &state.config.dns)).collect::<Vec<_>>() }),
         ),
         Err(error) => render_store_error(Some(&start), error),
     }
@@ -172,7 +172,7 @@ pub(crate) async fn sso_domains_create(
         Ok(domain) => render_success(
             Some(&start),
             StatusCode::CREATED,
-            json!({ "domain": domain_json(&domain) }),
+            json!({ "domain": domain_json(&domain, &state.config.dns) }),
         ),
         Err(error) => render_store_error(Some(&start), error),
     }
@@ -217,8 +217,12 @@ pub(crate) async fn sso_domains_verify(
             );
         }
     } else {
-        let record_name = format!("_camelmailer-challenge.{}", domain.domain);
-        let expected = format!("camelmailer-verification={}", domain.verification_token);
+        let dns = &state.config.dns;
+        let record_name = format!("{}.{}", dns.verification_record_label, domain.domain);
+        let expected = format!(
+            "{}={}",
+            dns.verification_value_prefix, domain.verification_token
+        );
         match state.dns_resolver.txt_records(&record_name).await {
             Ok(records) if records.iter().any(|record| record.trim() == expected) => {}
             Ok(_) => {
@@ -252,7 +256,7 @@ pub(crate) async fn sso_domains_verify(
     render_success(
         Some(&start),
         StatusCode::OK,
-        json!({ "domain": domain_json(&refreshed) }),
+        json!({ "domain": domain_json(&refreshed, &state.config.dns) }),
     )
 }
 
