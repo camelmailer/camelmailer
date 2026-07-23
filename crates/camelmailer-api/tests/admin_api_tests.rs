@@ -1949,7 +1949,10 @@ async fn domain_dmarc_check_can_be_disabled_and_reads_ignored() {
         .is_empty());
     // an ignored DMARC check ranks like "ok" and never sets the overall grade
     // (SPF/DKIM are still missing here, so overall reflects only those).
-    assert_ne!(health["data"]["health"]["checks"]["dmarc"]["status"], "missing");
+    assert_ne!(
+        health["data"]["health"]["checks"]["dmarc"]["status"],
+        "missing"
+    );
 
     // re-enable round-trips
     let (_, re) = request(
