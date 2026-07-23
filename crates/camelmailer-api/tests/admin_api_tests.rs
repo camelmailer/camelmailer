@@ -1966,3 +1966,81 @@ async fn domain_dmarc_check_can_be_disabled_and_reads_ignored() {
     assert_eq!(re["data"]["domain"]["check_dmarc"], true);
     let _ = resolver;
 }
+
+#[tokio::test]
+async fn domain_spf_check_can_be_disabled_and_reads_ignored() {
+    let (app, resolver) = build_app_with_resolver().await;
+    // publish an existing SPF that does NOT include this installation → warning
+    resolver.add_txt("ext-spf.example", "v=spf1 include:_spf.google.com ~all");
+    request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "ext-spf.example" })),
+    )
+    .await;
+
+    let (_, health) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/domains/ext-spf.example/health"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(
+        health["data"]["health"]["checks"]["spf"]["status"],
+        "warning"
+    );
+    // the proposal merges our mechanism into the existing record
+    assert!(health["data"]["health"]["checks"]["spf"]["expected"]
+        .as_str()
+        .unwrap()
+        .contains("include:_spf.google.com"));
+
+    // disable the SPF check
+    let (status, patched) = request(
+        &app,
+        "PATCH",
+        &format!("{BASE}/domains/ext-spf.example"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "check_spf": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["data"]["domain"]["check_spf"], false);
+    assert_eq!(
+        patched["data"]["domain"]["check_dmarc"], true,
+        "toggling SPF must not touch DMARC"
+    );
+
+    let (_, health) = request(
+        &app,
+        "GET",
+        &format!("{BASE}/domains/ext-spf.example/health"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(
+        health["data"]["health"]["checks"]["spf"]["status"],
+        "ignored"
+    );
+    assert!(health["data"]["health"]["checks"]["spf"]["problems"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // a PATCH with neither field is a parameter error
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("{BASE}/domains/ext-spf.example"),
+        Some(GLOBAL_KEY),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let _ = resolver;
+}

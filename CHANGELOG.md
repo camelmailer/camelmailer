@@ -13,6 +13,20 @@ version in `Cargo.toml` and a matching section in this file agree, and
 unless the full test suite (including the PostgreSQL row-level-security
 integration tests) is green.
 
+## [0.7.6] - 2026-07-23
+
+### Added
+
+- **Per-domain SPF opt-out**, mirroring the DMARC opt-out (0.7.5). A domain
+  whose SPF is managed externally — an existing multi-provider record the
+  owner will not extend with our `include:` — can disable its SPF health
+  check via `PATCH …/domains/{name}` with `{"check_spf": false}` (new
+  `check_spf` field, default `true`, migration `0042`). The check then
+  reports SPF as `ignored` (no problems, excluded from the `overall` grade
+  and from the DMARC "fix SPF/DKIM" next-step). `PATCH` now accepts
+  `check_dmarc` and/or `check_spf` (at least one required);
+  `AdminStore::set_domain_spf_check` on both stores.
+
 ## [0.7.5] - 2026-07-23
 
 ### Added

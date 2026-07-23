@@ -102,6 +102,7 @@ fn domain_json(state: &ApiState, domain: &Domain) -> Value {
         "name": domain.name,
         "verified": domain.verified,
         "check_dmarc": domain.check_dmarc,
+        "check_spf": domain.check_spf,
         "dkim_record": dkim_public.map(|p| dns_record_json(
             format!("{}._domainkey.{}", dns.dkim_identifier, domain.name),
             format!("v=DKIM1; k=rsa; p={p}"),
@@ -239,11 +240,16 @@ pub(crate) struct UpdateDomain {
     /// the health check reports DMARC as `ignored` and drops it from the
     /// overall grade.
     check_dmarc: Option<bool>,
+    /// Toggle the SPF health check for this domain (same semantics as
+    /// `check_dmarc`): `false` reports SPF as `ignored` for domains whose
+    /// SPF is managed externally.
+    check_spf: Option<bool>,
 }
 
-/// `PATCH …/domains/{name}` — update per-domain settings. Currently the one
-/// mutable setting is `check_dmarc` (opt a domain out of the DMARC check,
-/// e.g. when its DNS/DMARC policy is managed externally).
+/// `PATCH …/domains/{name}` — update per-domain settings. The mutable
+/// settings are `check_dmarc` and `check_spf` (opt a domain out of the
+/// respective health check, e.g. when its DNS is managed externally). At
+/// least one must be present.
 pub(crate) async fn domains_update(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
@@ -254,20 +260,28 @@ pub(crate) async fn domains_update(
         Ok(domain) => domain,
         Err(response) => return response,
     };
-    let Some(check_dmarc) = body.check_dmarc else {
+    if body.check_dmarc.is_none() && body.check_spf.is_none() {
         return render_parameter_missing(
             Some(&start),
-            "param is missing or the value is empty: check_dmarc",
+            "param is missing or the value is empty: check_dmarc or check_spf",
         );
-    };
-    if let Err(error) = state
-        .store
-        .set_domain_dmarc_check(domain.id, check_dmarc)
-        .await
-    {
-        return render_store_error(Some(&start), error);
     }
-    domain.check_dmarc = check_dmarc;
+    if let Some(check_dmarc) = body.check_dmarc {
+        if let Err(error) = state
+            .store
+            .set_domain_dmarc_check(domain.id, check_dmarc)
+            .await
+        {
+            return render_store_error(Some(&start), error);
+        }
+        domain.check_dmarc = check_dmarc;
+    }
+    if let Some(check_spf) = body.check_spf {
+        if let Err(error) = state.store.set_domain_spf_check(domain.id, check_spf).await {
+            return render_store_error(Some(&start), error);
+        }
+        domain.check_spf = check_spf;
+    }
     ok(&start, json!({ "domain": domain_json(&state, &domain) }))
 }
 
@@ -681,6 +695,16 @@ pub(crate) async fn domains_health(
         }
     };
 
+    // A domain can opt out of the SPF check (externally managed SPF the owner
+    // will not extend): the check then reads `ignored` — no problems, no
+    // bearing on `overall`.
+    let spf_status = if domain.check_spf {
+        spf_status
+    } else {
+        spf_problems.clear();
+        "ignored"
+    };
+
     // ---- DKIM: TXT at <selector>._domainkey.<domain>
     let dkim_record_name = format!("{}._domainkey.{}", dns.dkim_identifier, domain.name);
     let expected_dkim_key = domain
@@ -874,7 +898,9 @@ pub(crate) async fn domains_health(
     } else if policy == Some("quarantine") && high_compliance {
         "Compliance is high on recent aggregate reports — consider the final step to p=reject."
             .to_string()
-    } else if spf_status != "ok" || dkim_status != "ok" {
+    } else if (spf_status != "ok" && spf_status != "ignored")
+        || (dkim_status != "ok" && dkim_status != "ignored")
+    {
         "Fix the SPF/DKIM issues listed in the checks so aligned mail passes DMARC.".to_string()
     } else {
         "Everything looks good — keep monitoring the aggregate reports.".to_string()

@@ -1575,10 +1575,10 @@ paths:
       tags: [Domains]
       summary: Update per-domain settings
       description: >-
-        Currently the one mutable setting is `check_dmarc`. Set it to
-        `false` to opt the domain out of the DMARC health check (for
-        externally managed DNS): the check then reports `ignored` and does
-        not affect the overall grade.
+        Mutable settings are `check_dmarc` and `check_spf` (at least one
+        required). Set either to `false` to opt the domain out of that
+        health check (for externally managed DNS): the check then reports
+        `ignored` and does not affect the overall grade.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters:
         - { $ref: "#/components/parameters/Org" }
@@ -1592,6 +1592,7 @@ paths:
               type: object
               properties:
                 check_dmarc: { type: boolean }
+                check_spf: { type: boolean }
       responses:
         "200": { $ref: "#/components/responses/Success" }
         "400": { $ref: "#/components/responses/ValidationError" }

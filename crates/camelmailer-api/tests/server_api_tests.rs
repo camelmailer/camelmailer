@@ -241,6 +241,7 @@ async fn build_with_verified_domain() -> (Router, String, Arc<MS>, u64) {
         verified: true,
         verification_token: "vtoken".into(),
         check_dmarc: true,
+        check_spf: true,
         dkim_private_key: None,
     });
     let token = "send-token-0000000000".to_string();
@@ -422,6 +423,7 @@ async fn build_two_with_domains() -> (Router, String, String, Arc<MS>) {
             verified: true,
             verification_token: "vtoken".into(),
             check_dmarc: true,
+            check_spf: true,
             dkim_private_key: None,
         });
         let token = format!("tok-{}-000000000000", name.to_lowercase());
@@ -2328,6 +2330,7 @@ async fn build_with_state() -> (Router, Arc<ApiState>, String, Arc<MS>, u64) {
         verified: true,
         verification_token: "vtoken".into(),
         check_dmarc: true,
+        check_spf: true,
         dkim_private_key: None,
     });
     let token = "sched-token-000000000".to_string();
@@ -2753,6 +2756,7 @@ async fn build_with_small_body_limit() -> (Router, String) {
         verified: true,
         verification_token: "vtoken".into(),
         check_dmarc: true,
+        check_spf: true,
         dkim_private_key: None,
     });
     let token = "send-token-0000000000".to_string();

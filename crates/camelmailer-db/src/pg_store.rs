@@ -209,6 +209,7 @@ fn domain_from_row(row: &PgRow) -> Domain {
         verified: row.get("verified"),
         verification_token: row.get("verification_token"),
         check_dmarc: row.get("check_dmarc"),
+        check_spf: row.get("check_spf"),
         dkim_private_key: row.get("dkim_private_key"),
     }
 }
@@ -468,6 +469,7 @@ impl PgStore {
             verified,
             verification_token,
             check_dmarc: true,
+            check_spf: true,
             dkim_private_key: dkim_private_key.map(str::to_string),
         })
     }
@@ -1075,6 +1077,16 @@ impl AdminStore for PgStore {
         sqlx::query("UPDATE domains SET check_dmarc = $2 WHERE id = $1")
             .bind(domain_id as i64)
             .bind(check_dmarc)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn set_domain_spf_check(&self, domain_id: Id, check_spf: bool) -> Result<(), StoreError> {
+        sqlx::query("UPDATE domains SET check_spf = $2 WHERE id = $1")
+            .bind(domain_id as i64)
+            .bind(check_spf)
             .execute(&self.pool)
             .await
             .map(|_| ())

@@ -62,6 +62,7 @@ async fn build() -> Setup {
         verified: true,
         verification_token: "vt".into(),
         check_dmarc: true,
+        check_spf: true,
         dkim_private_key: Some("-- test key --".into()),
     });
 

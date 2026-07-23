@@ -114,6 +114,7 @@ impl Fixtures {
             verified: true,
             verification_token: token::generate_token(32),
             check_dmarc: true,
+            check_spf: true,
             dkim_private_key: None,
         })
     }
@@ -127,6 +128,7 @@ impl Fixtures {
             verified: false,
             verification_token: token::generate_token(32),
             check_dmarc: true,
+            check_spf: true,
             dkim_private_key: None,
         })
     }

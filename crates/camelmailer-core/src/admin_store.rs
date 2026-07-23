@@ -211,6 +211,8 @@ pub trait AdminStore: Send + Sync {
         domain_id: Id,
         check_dmarc: bool,
     ) -> Result<(), StoreError>;
+    /// Enable/disable the SPF health check for a domain (`false` = ignore).
+    async fn set_domain_spf_check(&self, domain_id: Id, check_spf: bool) -> Result<(), StoreError>;
     async fn delete_domain(&self, domain_id: Id) -> Result<bool, StoreError>;
 
     // credentials
@@ -742,6 +744,7 @@ impl AdminStore for crate::store::MemoryStore {
             verified: false,
             verification_token: crate::token::generate_token(32),
             check_dmarc: true,
+            check_spf: true,
             dkim_private_key,
         }))
     }
@@ -754,6 +757,14 @@ impl AdminStore for crate::store::MemoryStore {
         let mut inner = self.inner.write().unwrap();
         if let Some(domain) = inner.domains.get_mut(&domain_id) {
             domain.check_dmarc = check_dmarc;
+        }
+        Ok(())
+    }
+
+    async fn set_domain_spf_check(&self, domain_id: Id, check_spf: bool) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(domain) = inner.domains.get_mut(&domain_id) {
+            domain.check_spf = check_spf;
         }
         Ok(())
     }

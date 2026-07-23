@@ -87,6 +87,12 @@ pub struct Domain {
     /// the overall grade. For domains whose DNS (and thus DMARC policy) is
     /// managed externally, where a "missing" DMARC would be noise.
     pub check_dmarc: bool,
+    /// Whether the domain health check evaluates SPF. `false` opts the
+    /// domain out — the SPF check reports `ignored` and is excluded from the
+    /// overall grade. For domains whose SPF is managed externally (an
+    /// existing multi-provider record the owner will not extend), where a
+    /// "warning" would be permanent noise.
+    pub check_spf: bool,
     /// Per-domain DKIM RSA private key (PEM). `None` means the domain signs
     /// with the installation key (`camelmailer.signing_key_path`) — that
     /// fallback stays valid forever. Never serialized.
