@@ -113,12 +113,38 @@ fn sample_details(event: &str) -> &'static str {
 /// A realistic sample body for `event`, marked as a test (`"test": true`)
 /// and shaped exactly like the worker's real deliveries.
 pub fn sample_payload(event: &str, uuid: &str) -> Value {
-    json!({
-        "event": event,
-        "timestamp": chrono::Utc::now().timestamp(),
-        "uuid": uuid,
-        "test": true,
-        "payload": {
+    let now = chrono::Utc::now();
+    let timestamp = now.timestamp();
+    let message_timestamp = now.timestamp_millis() as f64 / 1000.0;
+    let payload = if event == "MessageBounced" {
+        json!({
+            "original_message": {
+                "id": 1234,
+                "token": "abc123message",
+                "direction": "outgoing",
+                "message_id": "original@example.com",
+                "to": "recipient@example.com",
+                "from": "sender@yourdomain.com",
+                "subject": "Example message",
+                "timestamp": message_timestamp - 60.0,
+                "spam_status": "NotChecked",
+                "tag": null,
+            },
+            "bounce": {
+                "id": 1235,
+                "token": "def456bounce",
+                "direction": "incoming",
+                "message_id": "bounce@mx.example.com",
+                "to": "server1@rp.example.com",
+                "from": "mailer-daemon@mx.example.com",
+                "subject": "Delivery Status Notification (Failure)",
+                "timestamp": message_timestamp,
+                "spam_status": "NotChecked",
+                "tag": null,
+            },
+        })
+    } else {
+        json!({
             "message": {
                 "id": 1234,
                 "token": "AbCdEf123456",
@@ -128,7 +154,14 @@ pub fn sample_payload(event: &str, uuid: &str) -> Value {
                 "bounce": false,
             },
             "details": sample_details(event),
-        },
+        })
+    };
+    json!({
+        "event": event,
+        "timestamp": timestamp,
+        "uuid": uuid,
+        "test": true,
+        "payload": payload,
     })
 }
 
@@ -217,6 +250,52 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("accepted"));
+    }
+
+    #[test]
+    fn bounced_sample_matches_the_shared_dashboard_shape() {
+        let expected: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/message_bounced_sample_shape.json"
+        ))
+        .unwrap();
+        let payload = sample_payload("MessageBounced", "uuid-1");
+        let sorted_keys = |value: &Value| {
+            let mut keys: Vec<String> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(ToString::to_string)
+                .collect();
+            keys.sort();
+            keys
+        };
+        let expected_keys = |name: &str| {
+            expected[name]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(sorted_keys(&payload), expected_keys("top_level"));
+        assert_eq!(sorted_keys(&payload["payload"]), expected_keys("payload"));
+        assert_eq!(
+            sorted_keys(&payload["payload"]["original_message"]),
+            expected_keys("message")
+        );
+        assert_eq!(
+            sorted_keys(&payload["payload"]["bounce"]),
+            expected_keys("message")
+        );
+        assert_eq!(
+            payload["payload"]["original_message"]["message_id"],
+            "original@example.com"
+        );
+        assert_eq!(
+            payload["payload"]["bounce"]["message_id"],
+            "bounce@mx.example.com"
+        );
     }
 
     #[test]

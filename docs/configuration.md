@@ -122,7 +122,7 @@ For deliverability you publish, per installation:
 | MX for inbound | `dns.mx_records` | `mx.example.com` |
 | SPF include | `dns.spf_include` | `v=spf1 include:spf.example.com ~all` on sender domains |
 | DKIM selector | `dns.dkim_identifier` | `camelmailer._domainkey.<domain>` TXT with the domain key's public part (installation key for pre-existing domains) |
-| Return-path | `dns.return_path_domain` | `rp.example.com` |
+| Return-path | `dns.return_path_domain` | MX to CamelMailer plus an SPF TXT record authorizing its outbound senders |
 | Click/open tracking | `dns.track_domain` | CNAME → the web server |
 
 You don't have to assemble these by hand for sending domains:
@@ -133,6 +133,19 @@ the TXT record `_camelmailer-challenge.<domain>` with the value
 `camelmailer-verification=<token>` and call
 `POST …/domains/{name}/verify`. Operators can skip the check with
 `{"force": true}` using the `X-Admin-API-Key` machine key.
+
+The return-path domain is installation-wide, so the domain API does not
+publish its records. Replace the sample `rp.example.com`, route the real
+domain's MX to CamelMailer, and add an SPF TXT record for every IP or relay
+used by the worker. Until the value is a usable non-placeholder domain, the
+worker preserves each message's submitted envelope sender and cannot
+correlate returned DSNs through the shared return path. The SMTP intake still
+accepts return-path mail addressed to a syntactically valid configured
+placeholder domain, since the reserved-name check applies only to the outbound
+send-side fallback. Empty or malformed values cannot match an inbound domain.
+CamelMailer canonicalizes a configured value to lowercase ASCII, including
+IDNA conversion and removal of a trailing root dot, and uses that same form for
+sending and SMTP intake.
 
 ### `rspamd:` / `clamav:` — inbound inspection (optional)
 

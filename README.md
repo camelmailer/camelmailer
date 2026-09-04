@@ -188,8 +188,12 @@ unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
   message (no BYPASSRLS role needed), checks the suppression list, sends via
   configured relays or MX lookup, retries soft failures with exponential
   backoff, records every attempt in `deliveries`, and fires webhooks
-  (MessageSent/MessageDelayed/MessageDeliveryFailed/MessageHeld). Incoming
-  route mail is POSTed to the route's HTTP endpoint (`routes.endpoint_url`).
+  (MessageSent/MessageDelayed/MessageDeliveryFailed/MessageHeld/MessageBounced).
+  With a usable return-path domain, outgoing SMTP uses the server's return
+  path and carries an `X-CamelMailer-MsgID` token so returned DSNs can update
+  the original message.
+  Incoming route mail is POSTed to the route's HTTP endpoint
+  (`routes.endpoint_url`).
 
 ## Delivery, inspection and signing
 

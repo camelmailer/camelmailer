@@ -346,7 +346,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "camelmailer"
-version = "0.7.6"
+version = "0.7.7"
 dependencies = [
  "axum",
  "camelmailer-api",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-api"
-version = "0.7.6"
+version = "0.7.7"
 dependencies = [
  "async-trait",
  "axum",
@@ -396,8 +396,9 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-config"
-version = "0.7.6"
+version = "0.7.7"
 dependencies = [
+ "idna",
  "serde",
  "serde_yaml",
  "thiserror 2.0.18",
@@ -405,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-core"
-version = "0.7.6"
+version = "0.7.7"
 dependencies = [
  "argon2",
  "async-trait",
@@ -425,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-db"
-version = "0.7.6"
+version = "0.7.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -443,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-smtp"
-version = "0.7.6"
+version = "0.7.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -463,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "camelmailer-worker"
-version = "0.7.6"
+version = "0.7.7"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -476,6 +477,7 @@ dependencies = [
  "hickory-resolver",
  "http-body-util",
  "idna",
+ "mailparse",
  "quick-xml",
  "rand 0.8.6",
  "rcgen",
@@ -534,6 +536,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "charset"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1f927b07c74ba84c7e5fe4db2baeb3e996ab2688992e39ac68ce3220a677c7e"
+dependencies = [
+ "base64 0.22.1",
+ "encoding_rs",
 ]
 
 [[package]]
@@ -917,6 +929,15 @@ dependencies = [
  "sec1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -1785,6 +1806,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mailparse"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60819a97ddcb831a5614eb3b0174f3620e793e97e09195a395bfa948fd68ed2f"
+dependencies = [
+ "charset",
+ "data-encoding",
+ "quoted_printable",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2256,6 +2288,12 @@ checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "quoted_printable"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "478e0585659a122aa407eb7e3c0e1fa51b1d8a870038bd29f0cf4a8551eea972"
 
 [[package]]
 name = "r-efi"

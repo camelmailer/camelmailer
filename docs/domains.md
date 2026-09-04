@@ -2,10 +2,11 @@
 
 Before a mail server may send as `you@acme.com`, CamelMailer needs to
 know that you control `acme.com` and needs the DNS in place so receivers
-trust the mail. A **sending domain** ties those together: you add the
-domain to a mail server, CamelMailer hands you the DNS records to
-publish, you verify ownership, and from then on outgoing mail from that
-domain is DKIM-signed and passes SPF.
+can authenticate the mail. A **sending domain** ties those together: you
+add the domain to a mail server, CamelMailer hands you the DNS records to
+publish, and you verify ownership. The worker DKIM-signs mail when it has
+a valid domain or installation key. SPF is evaluated against the shared
+return-path domain described below.
 
 This page covers adding a domain, the records CamelMailer expects, how
 DKIM keys and the verification challenge work, and where to manage all
@@ -30,7 +31,7 @@ publish. Each record is `{ name, type, value }`:
 | Record | Name | Value | Purpose |
 |---|---|---|---|
 | Verification | `_camelmailer-challenge.acme.com` | `camelmailer-verification=<token>` | Proves you control the domain |
-| SPF | `acme.com` | `v=spf1 include:spf.example.com ~all` | Authorizes this installation to send for the domain |
+| SPF | `acme.com` | `v=spf1 include:spf.example.com ~all` | Sending-domain SPF record checked by CamelMailer's domain health tools |
 | DKIM | `camelmailer._domainkey.acme.com` | `v=DKIM1; k=rsa; p=<base64 public key>` | Lets receivers verify the signature the worker adds |
 
 All three are TXT records. The SPF mechanism and the DKIM selector come
@@ -39,11 +40,18 @@ the exact `name`/`value` you get reflects your installation's
 configuration. The DKIM record is `null` in the rare case that neither
 the domain nor the installation has a signing key.
 
+The worker's default envelope sender is on the installation-wide return-path
+domain, so receivers evaluate SPF there. The sending-domain SPF record above
+does not provide SPF alignment for those messages. It remains part of the
+domain health response for compatibility and for deployments that use the
+sending domain as an envelope sender outside the built-in worker.
+
 Two records CamelMailer does **not** generate for you, on purpose:
 
-- **DMARC.** You publish `_dmarc.acme.com` yourself once SPF and DKIM
-  pass. The health check and the [DMARC monitoring](dmarc.md) flow walk
-  you through the policy journey and the `rua=` reporting address.
+- **DMARC.** You publish `_dmarc.acme.com` yourself. The health check and the
+  [DMARC monitoring](dmarc.md) flow walk you through DKIM alignment, the
+  policy journey, and the `rua=` reporting address. Sending-domain SPF health
+  is reported too, but the shared return path does not align it for DMARC.
 - **A per-domain Return-Path record.** Bounces are received on the
   installation's shared return-path domain. See
   [Return-Path and bounces](#return-path-and-bounces).
@@ -90,6 +98,10 @@ this server would sign with. When neither a domain key nor an
 installation key exists, outgoing mail simply goes out unsigned and the
 dashboard shows a "No DKIM key" notice.
 
+The shared return-path domain normally does not align with each customer's
+From domain. DMARC therefore relies on the DKIM signature. A message sent
+without either key has no aligned DKIM result and no aligned SPF result.
+
 A message is only DKIM-signed when it carries an **authenticated
 domain**. Mail authorized only by a confirmed single sender address has
 no domain to attach, so it goes out unsigned on that count. The signature
@@ -135,8 +147,8 @@ turn what triggers DKIM signing for it.
 
 ## SPF
 
-The SPF record authorizes this installation's sending infrastructure for
-your domain. CamelMailer builds the expected value from config:
+CamelMailer's domain health tools build a sending-domain SPF record from
+config:
 
 - With `dns.spf_include` set (the usual case), the mechanism is
   `include:<dns.spf_include>`, for example
@@ -155,24 +167,54 @@ If the domain already sends through another provider, keep it to one
 record by merging the mechanisms, for example
 `v=spf1 include:spf.example.com include:_spf.google.com ~all`.
 
+This check concerns the sending domain. For mail sent by the built-in worker,
+receivers check the SPF record on `dns.return_path_domain` instead. Publish a
+separate SPF record there as part of the installation setup.
+
 ## Return-Path and bounces
 
-On the HTTP send path the envelope sender (`MAIL FROM`) is the message's
-From address, so bounces flow back toward the sending domain. CamelMailer
-receives them on the installation's shared **return-path domain**
-(`dns.return_path_domain`, for example `rp.example.com`): the SMTP intake
-recognizes a recipient as a return path when its domain is that
-return-path domain or begins with the custom return-path prefix
-(`dns.custom_return_path_prefix`, default `psrp`), then matches it to the
-originating server by token and processes the DSN.
+When `dns.return_path_domain` names a usable, non-placeholder domain,
+CamelMailer replaces the submitted envelope sender with
+`<server-token>@<dns.return_path_domain>` and adds the stored message token as
+`X-CamelMailer-MsgID`. An empty, malformed or reserved example domain keeps
+the submitted envelope sender, so an untouched sample configuration cannot
+break outbound delivery. Mixed-case, IDNA and trailing-dot forms are
+canonicalized once and shared by outbound mail and SMTP intake matching; the
+reserved-example rejection is a send-side-only fallback, so the SMTP intake
+still accepts return-path mail addressed to a reserved or placeholder
+`dns.return_path_domain` — it just cannot yet correlate bounces, since the
+worker never sent from that domain. A receiving mail server sends its DSN to
+that return path and normally includes the original headers.
+CamelMailer's SMTP intake recognizes the server token. After inspection and
+feedback-report handling, the worker correlates only a delivery-status-shaped
+message carrying the returned token whose recipient action is `failed`.
+Delay and successful-delivery notifications do not mark the original
+`Bounced`; neither do auto-replies and other return-path mail.
 
-The per-domain records above do not include a return-path entry, because
-the return-path domain is installation-wide and shared across every
-sending domain. If you want a domain's bounces to travel under its own
-subdomain,
-publish a CNAME from `psrp.<domain>` to the installation's return-path
-domain as an operator-level step. This is optional; bounce classification
-works either way.
+The SMTP intake recognizes a recipient as a return path when its domain is
+the installation's shared **return-path domain** (`dns.return_path_domain`,
+for example `rp.example.com`) or begins with the custom return-path prefix
+(`dns.custom_return_path_prefix`, default `psrp`). A DSN that does not carry
+a known message token follows its configured route when one exists. Without a
+route it remains stored as an uncorrelated inbound bounce with `HardFail`
+status.
+For migrations, the worker also recognizes Postal's `X-Postal-MsgID` header.
+
+Set up the return-path domain before putting its real name in the config:
+
+1. Route its MX to CamelMailer's SMTP intake.
+2. Publish an SPF TXT record that authorizes the worker's outbound IPs or SMTP
+   relay. For example, use `v=spf1 include:<dns.spf_include> ~all` when that
+   include covers every sending host.
+
+The API does not generate these installation-wide records. The per-domain
+records above cannot represent them because every sending domain shares the
+same return path.
+
+The SMTP intake also accepts a custom return-path subdomain beginning with
+`dns.custom_return_path_prefix`, such as `psrp.acme.com`, when its DNS routes
+to CamelMailer. The built-in worker does not select that address; it uses the
+shared return-path domain when configured.
 
 ## Managing domains
 

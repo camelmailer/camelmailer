@@ -546,6 +546,8 @@ pub(crate) fn message_json(message: &MessageRecord) -> Value {
         "tag": message.tag,
         "status": message.status,
         "bounce": message.bounce,
+        "bounce_for_id": message.bounce_for_id,
+        "bounce_correlated_at": message.bounce_correlated_at.map(|t| t.to_rfc3339()),
         "bounce_category": message.bounce_category,
         "spam_status": message.spam_status,
         "spam_score": message.spam_score,

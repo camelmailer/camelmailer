@@ -19,7 +19,10 @@ mod queue;
 mod tracking;
 mod webhook_queue;
 
-pub use pg_store::{Delivery, PgMessageSink, PgStore, StoredMessage};
+pub use pg_store::{
+    BounceCorrelationOutcome, BounceOriginal, Delivery, OutboundQueueAction, PgMessageSink,
+    PgStore, StoredMessage,
+};
 pub use queue::{PgQueue, QueuedMessageRow};
 pub use webhook_queue::{PgWebhookQueue, WebhookLogEntry, WebhookRequestRow};
 

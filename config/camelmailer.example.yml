@@ -94,6 +94,9 @@ dns:
   mx_records:
     - mx.example.com
   spf_include: spf.example.com
+  # Replace this placeholder only after its MX routes here and its SPF record
+  # authorizes every outbound worker IP or relay. Until then, the worker keeps
+  # each message's submitted envelope sender.
   return_path_domain: rp.example.com
   route_domain: routes.example.com
   track_domain: track.example.com

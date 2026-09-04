@@ -398,6 +398,8 @@ impl MemoryStore {
             tag: message.tag,
             status: "Pending".into(),
             bounce: message.bounce,
+            bounce_for_id: None,
+            bounce_correlated_at: None,
             bounce_category: None,
             spam_status: "NotChecked".into(),
             spam_score: 0.0,
@@ -455,6 +457,8 @@ impl MemoryStore {
             tag: message.tag,
             status,
             bounce: message.bounce,
+            bounce_for_id: None,
+            bounce_correlated_at: None,
             bounce_category: None,
             spam_status: "NotChecked".into(),
             spam_score: 0.0,
@@ -555,6 +559,15 @@ impl MemoryStore {
         let mut inner = self.inner.write().unwrap();
         if let Some(message) = inner.messages.iter_mut().find(|m| m.id == message_id) {
             message.bounce_category = Some(category.as_str().to_string());
+        }
+    }
+
+    /// Link a stored bounce to its original message (test seeding).
+    pub fn set_bounce_for_id(&self, message_id: i64, original_message_id: i64) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(message) = inner.messages.iter_mut().find(|m| m.id == message_id) {
+            message.bounce_for_id = Some(original_message_id);
+            message.bounce_correlated_at = Some(chrono::Utc::now());
         }
     }
 
@@ -767,6 +780,12 @@ impl MemoryStore {
                 "Pending" => stats.pending += 1,
                 _ => {}
             }
+            // A correlated inbound DSN is bookkeeping for the original
+            // message's bounce. The durable marker survives retention
+            // removing the original and clearing bounce_for_id.
+            if message.bounce && message.bounce_correlated_at.is_some() {
+                continue;
+            }
             match message.bounce_category.as_deref() {
                 Some("hard") => stats.bounces_hard += 1,
                 Some("soft") => stats.bounces_soft += 1,
@@ -956,6 +975,14 @@ impl MemoryStore {
             .collect();
         if expired.is_empty() {
             return 0;
+        }
+        for message in &mut inner.messages {
+            if message
+                .bounce_for_id
+                .is_some_and(|original_id| expired.contains(&original_id))
+            {
+                message.bounce_for_id = None;
+            }
         }
         inner.messages.retain(|m| !expired.contains(&m.id));
         inner

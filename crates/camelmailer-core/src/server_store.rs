@@ -1685,12 +1685,29 @@ mod tests {
         // an unclassified bounce counts as undetermined
         let dsn = store.insert_message_record(queued(1, None)).id;
         store.set_message_status(dsn, "Bounced");
+        // a correlated inbound DSN is excluded because its original owns the
+        // bounce count
+        let mut correlated = queued(1, None);
+        correlated.scope = MessageScope::Incoming;
+        correlated.bounce = true;
+        let correlated = store.insert_message_record(correlated).id;
+        store.set_bounce_category(correlated, BounceCategory::Hard);
+        store.set_bounce_for_id(correlated, hard);
+        store.set_message_status(correlated, "Processed");
+        // A processed return-path message that was not correlated still owns
+        // its category and must remain visible in the breakdown.
+        let mut uncorrelated = queued(1, None);
+        uncorrelated.scope = MessageScope::Incoming;
+        uncorrelated.bounce = true;
+        let uncorrelated = store.insert_message_record(uncorrelated).id;
+        store.set_bounce_category(uncorrelated, BounceCategory::Hard);
+        store.set_message_status(uncorrelated, "Processed");
 
         let all = ServerStore::message_stats(&store, 1, &StatsFilter::default())
             .await
             .unwrap();
-        assert_eq!(all.total, 4);
-        assert_eq!(all.bounces_hard, 1);
+        assert_eq!(all.total, 6);
+        assert_eq!(all.bounces_hard, 2);
         assert_eq!(all.bounces_soft, 1);
         assert_eq!(all.bounces_undetermined, 1);
 
@@ -1907,6 +1924,56 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_an_original_clears_the_link_without_recounting_its_dsn() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let original_id =
+            ServerStore::import_message(&store, imported(1, now - Duration::days(90)))
+                .await
+                .unwrap();
+        let mut dsn = queued(1, None);
+        dsn.scope = MessageScope::Incoming;
+        dsn.bounce = true;
+        let dsn_id = store.insert_message_record(dsn).id;
+        store.set_message_created_at(dsn_id, now - Duration::days(1));
+        store.set_bounce_category(dsn_id, BounceCategory::Hard);
+        store.set_bounce_for_id(dsn_id, original_id);
+        store.set_message_status(dsn_id, "Processed");
+
+        let recent = StatsFilter {
+            from: Some(now - Duration::days(30)),
+            ..Default::default()
+        };
+        assert_eq!(
+            ServerStore::message_stats(&store, 1, &recent)
+                .await
+                .unwrap()
+                .bounces_hard,
+            0
+        );
+
+        assert_eq!(
+            ServerStore::prune_messages(&store, now - Duration::days(30))
+                .await
+                .unwrap(),
+            1
+        );
+        let retained_dsn = ServerStore::message(&store, 1, dsn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained_dsn.bounce_for_id, None);
+        assert!(retained_dsn.bounce_correlated_at.is_some());
+        assert_eq!(
+            ServerStore::message_stats(&store, 1, &recent)
+                .await
+                .unwrap()
+                .bounces_hard,
+            0
         );
     }
 

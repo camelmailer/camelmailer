@@ -640,6 +640,64 @@ impl Default for Dns {
     }
 }
 
+/// Convert a DNS name to the canonical ASCII form used for comparisons.
+///
+/// SMTP domain names are case-insensitive. Accept an operator-friendly
+/// trailing root dot and Unicode input, but reject malformed labels.
+pub fn normalize_dns_domain_name(value: &str) -> Option<String> {
+    let domain = value.trim().trim_end_matches('.');
+    let domain = idna::domain_to_ascii(domain).ok()?.to_ascii_lowercase();
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2
+        || domain.len() > 253
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || !label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+    {
+        return None;
+    }
+    Some(domain)
+}
+
+impl Dns {
+    /// The shared return-path domain in canonical form, when it can receive
+    /// real mail. Reserved documentation domains deliberately remain unusable
+    /// so an untouched sample configuration cannot change outbound MAIL FROM.
+    pub fn normalized_return_path_domain(&self) -> Option<String> {
+        let domain = normalize_dns_domain_name(&self.return_path_domain)?;
+        for suffix in [
+            "example",
+            "example.com",
+            "example.net",
+            "example.org",
+            "invalid",
+            "localhost",
+            "test",
+        ] {
+            if domain == suffix
+                || domain
+                    .strip_suffix(suffix)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+            {
+                return None;
+            }
+        }
+        Some(domain)
+    }
+}
+
 /// Outbound SMTP used for application-level e-mail (password resets etc.).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1092,6 +1150,31 @@ mod tests {
         assert_eq!(config.smtp.port, 25);
         assert_eq!(config.smtp.authentication_type, "login");
         assert!(config.smtp.enable_starttls_auto);
+    }
+
+    #[test]
+    fn dns_domain_names_are_normalized_for_comparison() {
+        assert_eq!(
+            normalize_dns_domain_name("  BÜCHER.CamelMailer.COM.  ").as_deref(),
+            Some("xn--bcher-kva.camelmailer.com")
+        );
+        assert_eq!(normalize_dns_domain_name("bad_label.example"), None);
+        assert_eq!(normalize_dns_domain_name("localhost"), None);
+    }
+
+    #[test]
+    fn return_path_domain_rejects_reserved_values_after_normalizing() {
+        let mut dns = Dns::default();
+        for value in ["", "RP.Example.COM.", "foo.test", "localhost"] {
+            dns.return_path_domain = value.into();
+            assert_eq!(dns.normalized_return_path_domain(), None, "{value}");
+        }
+
+        dns.return_path_domain = "RP.CamelMailer.COM.".into();
+        assert_eq!(
+            dns.normalized_return_path_domain().as_deref(),
+            Some("rp.camelmailer.com")
+        );
     }
 
     #[test]

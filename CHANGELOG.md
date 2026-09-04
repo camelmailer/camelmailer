@@ -13,6 +13,76 @@ version in `Cargo.toml` and a matching section in this file agree, and
 unless the full test suite (including the PostgreSQL row-level-security
 integration tests) is green.
 
+## [Unreleased]
+
+## [0.7.7] - 2026-09-04
+
+### Added
+
+- **Return-path bounce correlation.** With a usable return-path domain,
+  outbound SMTP now uses `<server-token>@<dns.return_path_domain>` as its
+  envelope sender and adds `X-CamelMailer-MsgID` before DKIM signing. The
+  worker also accepts Postal's `X-Postal-MsgID` on inbound DSNs. A returned DSN
+  carrying that token is linked to the original message through
+  `bounce_for_id`; the DSN is recorded as `Processed`, the original as
+  `Bounced`, and subscribed webhooks receive `MessageBounced` with
+  `original_message` and `bounce` details.
+
+### Changed
+
+- **Return-path upgrade note.** Once `dns.return_path_domain` is set to a real
+  domain, the worker changes outbound `MAIL FROM` from the submitted sender to
+  `<server-token>@<dns.return_path_domain>`. Operators must route that domain's
+  MX to CamelMailer and publish an SPF record authorizing the outbound worker
+  IPs or relay. Empty, malformed and reserved example values preserve the
+  submitted envelope sender.
+
+### Fixed
+
+- A DSN containing several returned message tokens now correlates only the
+  first token that matches an outgoing message, consistent with the one-to-one
+  `bounce_for_id` relationship.
+- Failed DSNs without a matching message or route now finish as `HardFail`
+  instead of being dequeued while still reporting `Pending`.
+- Processed DSNs remain excluded from bounce-category statistics after
+  retention removes their original message.
+- Return-path auto-replies and feedback reports no longer correlate as DSNs;
+  all return-path mail is inspected first, and ARF complaints are handled
+  before delivery-status correlation.
+- Only delivery-status reports with `Action: failed` now mark the original
+  message as bounced. Delay and successful-delivery reports remain
+  non-terminal, including `Action: delayed` reports with a 4.x status.
+- Reprocessing a correlated DSN no longer appends duplicate deliveries or
+  emits another `MessageBounced` webhook. Correlation and all subscribed
+  webhook requests now commit in one database transaction, so a worker crash
+  cannot leave the bounce recorded without its event fan-out.
+- A stale queue row for an already `Bounced` message is now removed before
+  suppression checks, tracking, or SMTP. If an outbound send is already in
+  flight when DSN correlation wins the message-row race, none of its `Sent`,
+  `SoftFail`, `HardFail`, or `Held` results can replace the bounce, schedule a
+  retry, append a delivery, or emit an older delivery-state webhook.
+- Concurrent webhook deletion now waits for an in-progress event fan-out to
+  commit. It can no longer roll back a post-SMTP message transition and queue
+  action, which could leave accepted mail eligible for stale-lock redelivery
+  or replace a short soft-failure backoff with the stale-lock interval.
+- `MessageBounced` now reports the DSN's persisted spam verdict when inbound
+  inspection is enabled instead of the pre-inspection `NotChecked` value.
+- `MessageBounced` now decodes and caps subjects and removes angle brackets
+  from message IDs to match Postal's payload values.
+- Return-path domains are normalized consistently for outbound envelopes and
+  SMTP intake, including case, a trailing root dot and IDNA names.
+- Processed but uncorrelated return-path messages remain visible in
+  bounce-category statistics.
+- The SMTP intake once again accepts return-path mail when
+  `dns.return_path_domain` is a syntactically valid reserved placeholder; the
+  reserved-example rejection only applies when choosing the outbound envelope
+  sender. Empty and malformed values remain unable to match an inbound domain.
+- The legacy, non-MIME delivery-status-notification fallback now also
+  requires a `Reporting-MTA:` field, so a forwarded message that merely
+  quotes an earlier DSN's recipient/action/status fields cannot correlate.
+- The messaging API now serializes `bounce_correlated_at`, matching every
+  other `MessageRecord` field.
+
 ## [0.7.6] - 2026-07-23
 
 ### Added
@@ -711,7 +781,15 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/camelmailer/camelmailer/compare/v0.7.6...v0.7.7
+[0.7.6]: https://github.com/camelmailer/camelmailer/compare/v0.7.5...v0.7.6
+[0.7.5]: https://github.com/camelmailer/camelmailer/compare/v0.7.4...v0.7.5
+[0.7.4]: https://github.com/camelmailer/camelmailer/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/camelmailer/camelmailer/compare/v0.7.2...v0.7.3
+[0.7.2]: https://github.com/camelmailer/camelmailer/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/camelmailer/camelmailer/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/camelmailer/camelmailer/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/camelmailer/camelmailer/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/camelmailer/camelmailer/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/camelmailer/camelmailer/compare/v0.4.0...v0.4.1

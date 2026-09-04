@@ -15,7 +15,7 @@ use camelmailer_core::{
     Server, ServerMode, Store, StoreError, Subscription, Suppression, TrackDomain, User, Webhook,
 };
 use sqlx::postgres::PgRow;
-use sqlx::{PgPool, QueryBuilder, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use std::future::Future;
 use std::net::IpAddr;
 
@@ -229,6 +229,58 @@ fn webhook_from_row(row: &PgRow) -> Webhook {
         headers: serde_json::from_value(row.get::<serde_json::Value, _>("headers"))
             .unwrap_or_default(),
     }
+}
+
+async fn enqueue_webhook_requests(
+    tx: &mut Transaction<'_, Postgres>,
+    server_id: Id,
+    event: &str,
+    payload: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    // A webhook request keeps a foreign key to its subscription. Hold each
+    // snapshotted row until the requests and their owning state transition
+    // commit, so a concurrent deletion cannot invalidate a later insert and
+    // roll back the state or queue action.
+    let webhooks = sqlx::query(
+        "SELECT * FROM webhooks
+         WHERE server_id = $1
+         ORDER BY id
+         FOR KEY SHARE",
+    )
+    .bind(server_id as i64)
+    .fetch_all(&mut **tx)
+    .await?;
+    let timestamp = chrono::Utc::now().timestamp();
+    for webhook in webhooks
+        .iter()
+        .map(webhook_from_row)
+        .filter(|webhook| webhook.subscribes_to(event))
+    {
+        let uuid = camelmailer_core::token::generate_uuid();
+        let body = serde_json::json!({
+            "event": event,
+            "timestamp": timestamp,
+            "uuid": uuid,
+            "payload": payload,
+        });
+        let headers = serde_json::to_value(&webhook.headers).unwrap_or_default();
+        sqlx::query(
+            "INSERT INTO webhook_requests
+                 (server_id, webhook_id, uuid, event, url, payload, sign, headers)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(server_id as i64)
+        .bind(webhook.id as i64)
+        .bind(&uuid)
+        .bind(event)
+        .bind(&webhook.url)
+        .bind(body.to_string())
+        .bind(webhook.sign)
+        .bind(&headers)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 fn sender_address_from_row(row: &PgRow) -> SenderAddress {
@@ -3071,6 +3123,17 @@ impl camelmailer_core::ServerStore for PgStore {
                 continue;
             }
 
+            // Correlation follows the repository's no-FK message-reference
+            // convention. Clear links to originals before deleting them.
+            sqlx::query(
+                "UPDATE messages SET bounce_for_id = NULL
+                 WHERE bounce_for_id = ANY($1)",
+            )
+            .bind(&expired)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+
             // Children first. link_clicks references links (ON DELETE CASCADE),
             // but delete it explicitly for clarity; the rest carry no FK to
             // messages, so order is enforced here.
@@ -3371,6 +3434,9 @@ pub struct StoredMessage {
     pub route_id: Option<Id>,
     pub raw_message: Vec<u8>,
     pub status: String,
+    pub bounce_for_id: Option<i64>,
+    pub bounce_correlated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub bounce_category: Option<String>,
     pub subject: Option<String>,
     pub message_id_header: Option<String>,
     pub spam_status: String,
@@ -3384,6 +3450,38 @@ pub struct StoredMessage {
     pub metadata: Option<serde_json::Value>,
     pub stream_id: Option<Id>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The original-message fields needed to correlate a DSN and build Postal's
+/// `MessageBounced` webhook payload. The raw body is deliberately omitted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BounceOriginal {
+    pub id: i64,
+    pub token: String,
+    pub scope: String,
+    pub rcpt_to: String,
+    pub mail_from: String,
+    pub domain_id: Option<Id>,
+    pub subject: Option<String>,
+    pub message_id_header: Option<String>,
+    pub spam_status: String,
+    pub tag: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Result of trying to correlate one inbound delivery-status message.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BounceCorrelationOutcome {
+    Correlated(Box<BounceOriginal>),
+    AlreadyCorrelated,
+    NotMatched,
+}
+
+/// Queue change committed with an outbound delivery result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundQueueAction {
+    Complete,
+    Retry { attempts: i32 },
 }
 
 fn stored_message_from_row(row: &PgRow) -> StoredMessage {
@@ -3403,6 +3501,9 @@ fn stored_message_from_row(row: &PgRow) -> StoredMessage {
         route_id: row.get::<Option<i64>, _>("route_id").map(|id| id as Id),
         raw_message: row.get("raw_message"),
         status: row.get("status"),
+        bounce_for_id: row.get("bounce_for_id"),
+        bounce_correlated_at: row.get("bounce_correlated_at"),
+        bounce_category: row.get("bounce_category"),
         subject: row.get("subject"),
         message_id_header: row.get("message_id_header"),
         spam_status: row.get("spam_status"),
@@ -3415,6 +3516,22 @@ fn stored_message_from_row(row: &PgRow) -> StoredMessage {
         tag: row.get("tag"),
         metadata: row.get("metadata"),
         stream_id: row.get::<Option<i64>, _>("stream_id").map(|id| id as Id),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn bounce_original_from_row(row: &PgRow) -> BounceOriginal {
+    BounceOriginal {
+        id: row.get("id"),
+        token: row.get("token"),
+        scope: row.get("scope"),
+        rcpt_to: row.get("rcpt_to"),
+        mail_from: row.get("mail_from"),
+        domain_id: row.get::<Option<i64>, _>("domain_id").map(|id| id as Id),
+        subject: row.get("subject"),
+        message_id_header: row.get("message_id_header"),
+        spam_status: row.get("spam_status"),
+        tag: row.get("tag"),
         created_at: row.get("created_at"),
     }
 }
@@ -3685,6 +3802,9 @@ impl PgMessageSink {
     /// `Postal::MessageDB::Message#create_delivery`). `bounce_category`
     /// (hard / soft / undetermined) is persisted on the message for
     /// terminal failures; `None` leaves any existing classification alone.
+    /// An outbound result that loses the row race to bounce correlation
+    /// returns `None` without changing the message or inserting a stale
+    /// delivery.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_delivery(
         &self,
@@ -3695,9 +3815,26 @@ impl PgMessageSink {
         output: &str,
         sent_with_ssl: bool,
         bounce_category: Option<&str>,
-    ) -> Result<i64, sqlx::Error> {
+    ) -> Result<Option<i64>, sqlx::Error> {
         let mut tx = self.store.pool.begin().await?;
         set_tenant_context(&mut tx, server_id).await?;
+        let updated = sqlx::query(
+            "UPDATE messages
+             SET status = $2, held = ($2 = 'Held'), last_delivery_attempt = now(),
+                 bounce_category = COALESCE($3, bounce_category)
+             WHERE id = $1
+               AND status <> 'Bounced'",
+        )
+        .bind(message_id)
+        .bind(status)
+        .bind(bounce_category)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
         let row = sqlx::query(
             "INSERT INTO deliveries (server_id, message_id, status, details, output, sent_with_ssl)
              VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
@@ -3710,38 +3847,306 @@ impl PgMessageSink {
         .bind(sent_with_ssl)
         .fetch_one(&mut *tx)
         .await?;
-        sqlx::query(
+        tx.commit().await?;
+        Ok(Some(row.get("id")))
+    }
+
+    /// Apply one outbound SMTP or suppression result together with its queue
+    /// action and webhook outbox rows. The message-row update serializes this
+    /// transaction with bounce correlation. If correlation committed first,
+    /// the stale queue row is completed without changing the message,
+    /// recording a delivery, retrying, or enqueueing the older event.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_outbound_delivery(
+        &self,
+        server_id: Id,
+        message_id: i64,
+        queued_message_id: i64,
+        status: &str,
+        details: &str,
+        output: &str,
+        sent_with_ssl: bool,
+        bounce_category: Option<&str>,
+        queue_action: OutboundQueueAction,
+        event: &str,
+        webhook_payload: &serde_json::Value,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let updated = sqlx::query(
             "UPDATE messages
              SET status = $2, held = ($2 = 'Held'), last_delivery_attempt = now(),
                  bounce_category = COALESCE($3, bounce_category)
-             WHERE id = $1",
+             WHERE id = $1 AND scope = 'outgoing' AND status <> 'Bounced'",
         )
         .bind(message_id)
         .bind(status)
         .bind(bounce_category)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
-        Ok(row.get("id"))
-    }
 
-    /// Persist a bounce classification on a message without touching its
-    /// delivery state (used when an inbound bounce/DSN is processed).
-    pub async fn set_bounce_category(
-        &self,
-        server_id: Id,
-        message_id: i64,
-        bounce_category: &str,
-    ) -> Result<(), sqlx::Error> {
-        let mut tx = self.store.pool.begin().await?;
-        set_tenant_context(&mut tx, server_id).await?;
-        sqlx::query("UPDATE messages SET bounce_category = $2 WHERE id = $1")
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                "DELETE FROM queued_messages
+                 WHERE id = $1 AND message_id = $2 AND server_id = $3",
+            )
+            .bind(queued_message_id)
             .bind(message_id)
-            .bind(bounce_category)
+            .bind(server_id as i64)
             .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let delivery = sqlx::query(
+            "INSERT INTO deliveries (server_id, message_id, status, details, output, sent_with_ssl)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        )
+        .bind(server_id as i64)
+        .bind(message_id)
+        .bind(status)
+        .bind(details)
+        .bind(output)
+        .bind(sent_with_ssl)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        match queue_action {
+            OutboundQueueAction::Complete => {
+                sqlx::query(
+                    "DELETE FROM queued_messages
+                     WHERE id = $1 AND message_id = $2 AND server_id = $3",
+                )
+                .bind(queued_message_id)
+                .bind(message_id)
+                .bind(server_id as i64)
+                .execute(&mut *tx)
+                .await?;
+            }
+            OutboundQueueAction::Retry { attempts } => {
+                let minutes = 2_i64.pow(attempts.min(10) as u32).min(24 * 60);
+                sqlx::query(
+                    "UPDATE queued_messages
+                     SET locked_by = NULL, locked_at = NULL,
+                         attempts = attempts + 1,
+                         retry_after = now() + make_interval(mins => $2::int)
+                     WHERE id = $1 AND message_id = $3 AND server_id = $4",
+                )
+                .bind(queued_message_id)
+                .bind(minutes as i32)
+                .bind(message_id)
+                .bind(server_id as i64)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        enqueue_webhook_requests(&mut tx, server_id, event, webhook_payload).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(Some(delivery.get("id")))
+    }
+
+    /// Record an unmatched, unrouted DSN as a terminal failure and remove its
+    /// queue row in the same transaction.
+    pub async fn record_unmatched_bounce(
+        &self,
+        server_id: Id,
+        bounce_message_id: i64,
+        queued_message_id: i64,
+        bounce_category: &str,
+        details: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let updated = sqlx::query(
+            "UPDATE messages
+             SET status = 'HardFail', held = FALSE, last_delivery_attempt = now(),
+                 bounce_category = $2
+             WHERE id = $1 AND scope = 'incoming' AND bounce",
+        )
+        .bind(bounce_message_id)
+        .bind(bounce_category)
+        .execute(&mut *tx)
+        .await?;
+
+        let delivery_id = if updated.rows_affected() == 1 {
+            let delivery = sqlx::query(
+                "INSERT INTO deliveries
+                     (server_id, message_id, status, details, output, sent_with_ssl)
+                 VALUES ($1, $2, 'HardFail', $3, '', FALSE)
+                 RETURNING id",
+            )
+            .bind(server_id as i64)
+            .bind(bounce_message_id)
+            .bind(details)
+            .fetch_one(&mut *tx)
+            .await?;
+            Some(delivery.get("id"))
+        } else {
+            None
+        };
+
+        sqlx::query(
+            "DELETE FROM queued_messages
+             WHERE id = $1 AND message_id = $2 AND server_id = $3",
+        )
+        .bind(queued_message_id)
+        .bind(bounce_message_id)
+        .bind(server_id as i64)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(delivery_id)
+    }
+
+    /// Correlate an inbound DSN with the first returned token that resolves
+    /// to an outgoing message. The relationship, both sides' delivery state,
+    /// and every subscribed `MessageBounced` webhook request are committed
+    /// together.
+    pub async fn correlate_bounce<F>(
+        &self,
+        server_id: Id,
+        bounce_message_id: i64,
+        message_tokens: &[String],
+        bounce_category: &str,
+        make_webhook_payload: F,
+    ) -> Result<BounceCorrelationOutcome, sqlx::Error>
+    where
+        F: FnOnce(&BounceOriginal) -> serde_json::Value,
+    {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+
+        // Lock the DSN before looking up its original. Concurrent workers and
+        // requeued copies then serialize on this row, so only the first can
+        // create deliveries and a webhook-worthy correlation result.
+        let bounce = sqlx::query(
+            "SELECT bounce_correlated_at IS NOT NULL AS already_correlated
+             FROM messages
+             WHERE id = $1 AND scope = 'incoming' AND bounce
+             FOR UPDATE",
+        )
+        .bind(bounce_message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(bounce) = bounce else {
+            tx.commit().await?;
+            return Ok(BounceCorrelationOutcome::NotMatched);
+        };
+        if bounce.get::<bool, _>("already_correlated") {
+            // An API retry may have reset the visible status to Pending. Put
+            // the durable DSN back in its completed state without appending a
+            // delivery or asking the worker to emit another webhook.
+            sqlx::query(
+                "UPDATE messages SET status = 'Processed', held = FALSE
+                 WHERE id = $1",
+            )
+            .bind(bounce_message_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(BounceCorrelationOutcome::AlreadyCorrelated);
+        }
+
+        // Classification is useful even when the DSN cannot be matched.
+        sqlx::query(
+            "UPDATE messages SET bounce_category = $2
+             WHERE id = $1 AND scope = 'incoming' AND bounce",
+        )
+        .bind(bounce_message_id)
+        .bind(bounce_category)
+        .execute(&mut *tx)
+        .await?;
+
+        if message_tokens.is_empty() {
+            tx.commit().await?;
+            return Ok(BounceCorrelationOutcome::NotMatched);
+        }
+        let original = sqlx::query(
+            "SELECT id, token, scope, rcpt_to, mail_from, domain_id, subject,
+                    message_id_header, spam_status, tag, created_at
+             FROM messages
+             WHERE token = ANY($1::text[]) AND scope = 'outgoing'
+             ORDER BY array_position($1::text[], token), id
+             LIMIT 1
+             FOR UPDATE",
+        )
+        .bind(message_tokens)
+        .fetch_optional(&mut *tx)
+        .await?
+        .as_ref()
+        .map(bounce_original_from_row);
+        let Some(original) = original else {
+            tx.commit().await?;
+            return Ok(BounceCorrelationOutcome::NotMatched);
+        };
+        let webhook_payload = make_webhook_payload(&original);
+
+        let linked = sqlx::query(
+            "UPDATE messages
+             SET bounce_for_id = $2, bounce_correlated_at = now(), domain_id = $3,
+                 status = 'Processed',
+                 held = FALSE, last_delivery_attempt = now()
+             WHERE id = $1 AND scope = 'incoming' AND bounce
+               AND bounce_correlated_at IS NULL",
+        )
+        .bind(bounce_message_id)
+        .bind(original.id)
+        .bind(original.domain_id.map(|id| id as i64))
+        .execute(&mut *tx)
+        .await?;
+        if linked.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(BounceCorrelationOutcome::NotMatched);
+        }
+
+        sqlx::query(
+            "INSERT INTO deliveries
+                 (server_id, message_id, status, details, output, sent_with_ssl)
+             VALUES ($1, $2, 'Processed', $3, '', FALSE)",
+        )
+        .bind(server_id as i64)
+        .bind(bounce_message_id)
+        .bind(format!(
+            "This has been detected as a bounce message for <msg:{}>.",
+            original.id
+        ))
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO deliveries
+                 (server_id, message_id, status, details, output, sent_with_ssl)
+             VALUES ($1, $2, 'Bounced', $3, '', FALSE)",
+        )
+        .bind(server_id as i64)
+        .bind(original.id)
+        .bind(format!(
+            "We've received a bounce message for this e-mail. See <msg:{bounce_message_id}> for details."
+        ))
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE messages
+             SET status = 'Bounced', held = FALSE,
+                 bounce_category = $2, last_delivery_attempt = now()
+             WHERE id = $1",
+        )
+        .bind(original.id)
+        .bind(bounce_category)
+        .execute(&mut *tx)
+        .await?;
+
+        // This is the transactional outbox boundary for bounce correlation.
+        // If listing or inserting any target fails, PostgreSQL rolls back the
+        // correlation marker, both message states, both delivery rows, and
+        // every webhook request already inserted by this loop.
+        enqueue_webhook_requests(&mut tx, server_id, "MessageBounced", &webhook_payload).await?;
+
+        tx.commit().await?;
+        Ok(BounceCorrelationOutcome::Correlated(Box::new(original)))
     }
 
     pub async fn deliveries_for_message(
@@ -4127,10 +4532,13 @@ impl PgMessageSink {
                  count(*) FILTER (WHERE status = 'HardFail') AS hard_fail,
                  count(*) FILTER (WHERE status = 'Bounced') AS bounced,
                  count(*) FILTER (WHERE status = 'Pending') AS pending,
-                 count(*) FILTER (WHERE bounce_category = 'hard') AS bounces_hard,
-                 count(*) FILTER (WHERE bounce_category = 'soft') AS bounces_soft,
-                 count(*) FILTER (WHERE bounce_category = 'undetermined'
+                 count(*) FILTER (WHERE bounce_category = 'hard'
+                     AND NOT (bounce AND bounce_correlated_at IS NOT NULL)) AS bounces_hard,
+                 count(*) FILTER (WHERE bounce_category = 'soft'
+                     AND NOT (bounce AND bounce_correlated_at IS NOT NULL)) AS bounces_soft,
+                 count(*) FILTER (WHERE (bounce_category = 'undetermined'
                      OR (bounce_category IS NULL AND (bounce OR status = 'Bounced')))
+                     AND NOT (bounce AND bounce_correlated_at IS NOT NULL))
                      AS bounces_undetermined
              FROM messages
              WHERE ($1::timestamptz IS NULL OR created_at >= $1)
@@ -4255,6 +4663,8 @@ fn message_record_from_row(row: &PgRow) -> MessageRecord {
         tag: row.get("tag"),
         status: row.get("status"),
         bounce: row.get("bounce"),
+        bounce_for_id: row.get("bounce_for_id"),
+        bounce_correlated_at: row.get("bounce_correlated_at"),
         bounce_category: row.get("bounce_category"),
         spam_status: row.get("spam_status"),
         spam_score: row.get("spam_score"),

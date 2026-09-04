@@ -2,8 +2,9 @@
 
 A webhook is an HTTP callback CamelMailer sends to your application when
 something happens to a message: it was accepted by the recipient's mail
-server, it was deferred, it failed permanently, or it was held before
-sending. You register a URL per mail server, choose which events it
+server, it was deferred, it failed permanently, it was held before
+sending, or a later DSN reported that it bounced. You register a URL per
+mail server, choose which events it
 receives, and CamelMailer POSTs a small JSON body to that URL every time
 a matching event fires. Each request carries an RSA signature so your
 receiver can confirm the payload really came from your installation.
@@ -15,8 +16,8 @@ click and open data, see [Tracking](tracking.md).
 
 ## Event types
 
-CamelMailer fires four events, all about the fate of an outgoing
-message. These names are the single source of truth (`WEBHOOK_EVENTS` in
+CamelMailer fires five events about the fate of outgoing messages. These
+names are the single source of truth (`WEBHOOK_EVENTS` in
 `camelmailer-core`); the API rejects any other value at registration
 time.
 
@@ -26,6 +27,7 @@ time.
 | `MessageDelayed` | A delivery attempt got a temporary (4xx) failure and the message is scheduled for another try. | `SoftFail` |
 | `MessageDeliveryFailed` | Delivery failed for good: a hard (5xx) rejection, or the retry attempts were exhausted. | `HardFail` |
 | `MessageHeld` | An outgoing message was held before sending. Today this fires when the recipient is on the server's [suppression list](suppressions.md). | `Held` |
+| `MessageBounced` | A DSN received at the return path reported `Action: failed` and was correlated to the original outgoing message. Delay and successful-delivery DSNs do not fire this event. | `Bounced` on the original; `Processed` on the DSN |
 
 A message can produce several events over its life. A message that is
 deferred twice and then delivered produces two `MessageDelayed` events
@@ -60,21 +62,63 @@ The envelope fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `event` | string | One of the four event names above. |
+| `event` | string | One of the five event names above. |
 | `timestamp` | integer | When the event was enqueued, Unix seconds. |
 | `uuid` | string | Unique per delivery. Also sent as the `X-CamelMailer-UUID` header, and stable across retries of the same event, so it doubles as an idempotency key. |
 | `payload.message.id` | integer | The message id (matches the id in the messages API and dashboard). |
 | `payload.message.token` | string | The message token used in tracking and observability URLs. |
 | `payload.message.rcpt_to` | string | The envelope recipient. |
-| `payload.message.mail_from` | string | The envelope sender. |
+| `payload.message.mail_from` | string | The submitted envelope sender. SMTP delivery uses the configured shared return path when available. |
 | `payload.message.scope` | string | `outgoing` for the message-delivery events above. |
 | `payload.message.bounce` | boolean | Whether the message is a bounce. |
 | `payload.details` | string | A short human-readable reason. For `MessageSent` it is the remote server's acceptance line; for the failure and delay events it is the SMTP response; for `MessageHeld` it explains the hold. |
 
-The `payload` object is identical for all four events; only `event` and
-the `details` string differ. Test deliveries add one extra top-level
-field, `"test": true` (see [Testing a webhook](#testing-a-webhook)); real
-deliveries never carry it.
+The first four events use the common `message` and `details` payload above.
+`MessageBounced` carries both correlated messages:
+
+CamelMailer inspects the inbound DSN before building this payload, so the
+`bounce.spam_status` value is the stored inspection verdict. Reprocessing an
+already correlated DSN does not emit another `MessageBounced` event. For
+Postal compatibility, `message_id` omits surrounding angle brackets and
+`subject` is MIME-decoded, limited to 200 characters, and represented by an
+empty string when the message has no Subject header.
+
+```json
+{
+  "event": "MessageBounced",
+  "timestamp": 1720000060,
+  "uuid": "5d42fbea-41d8-4701-b5b5-d572166c51fb",
+  "payload": {
+    "original_message": {
+      "id": 1234,
+      "token": "abc123message",
+      "direction": "outgoing",
+      "message_id": "original@example.com",
+      "to": "recipient@example.com",
+      "from": "sender@yourdomain.com",
+      "subject": "Example message",
+      "timestamp": 1720000000.123,
+      "spam_status": "NotChecked",
+      "tag": null
+    },
+    "bounce": {
+      "id": 1235,
+      "token": "def456bounce",
+      "direction": "incoming",
+      "message_id": "bounce@mx.example.com",
+      "to": "server1@rp.example.com",
+      "from": "mailer-daemon@mx.example.com",
+      "subject": "Delivery Status Notification (Failure)",
+      "timestamp": 1720000060.123,
+      "spam_status": "NotChecked",
+      "tag": null
+    }
+  }
+}
+```
+
+Test deliveries add one extra top-level field, `"test": true` (see
+[Testing a webhook](#testing-a-webhook)); real deliveries never carry it.
 
 ## Signing
 
@@ -148,6 +192,21 @@ header. Treat a missing signature as untrusted when you rely on signing.
 Each event is fanned out to every enabled webhook that subscribes to it,
 and each delivery becomes a row in a per-server queue that the worker
 drains.
+
+For `MessageBounced`, CamelMailer inserts every subscribed queue row in the
+same database transaction that links the DSN and marks the original message
+`Bounced`. If any request insert fails, the full correlation rolls back and a
+later message-queue attempt can retry it. A repeated attempt after that
+transaction commits does not queue the event twice. When a DSN beats an
+in-flight outbound result to the message row, the later result cannot enqueue
+`MessageSent`, `MessageDelayed`, `MessageDeliveryFailed`, or `MessageHeld`.
+Each outbound delivery-state transition commits its delivery row, queue
+completion or retry, and subscribed webhook requests together. This ordering
+also prevents a retry or event from escaping after correlation has recorded
+the newer bounce. Subscriber rows stay locked while CamelMailer inserts their
+requests. Deleting a webhook during fan-out waits for this transaction to
+commit, then removes the newly queued request through the existing cascade
+without rolling back the message state or queue action.
 
 - **Queue.** Deliveries are stored in a `webhook_requests` table and
   picked up one at a time with `FOR UPDATE SKIP LOCKED`, so several
@@ -284,12 +343,9 @@ receiver works before real traffic flows.
 
 ## Honest gaps
 
-- The events are the delivery-lifecycle set above. There is no separate
-  bounce, complaint, open, or click webhook today. Bounce classification
-  and feedback-loop (ARF) complaints are recorded on the message and in
-  the observability API; open and click activity lives in
-  [Tracking](tracking.md). `MessageDeliveryFailed` is the event to watch
-  for hard bounces.
+- There is no separate complaint, open, or click webhook today. Feedback-loop
+  (ARF) complaints are recorded on the message and in the observability API;
+  open and click activity lives in [Tracking](tracking.md).
 - `MessageHeld` currently fires for the suppression-list hold on outgoing
   mail. Inbound messages held by spam or virus inspection are stored and
   visible on the message, and do not emit a webhook.
