@@ -490,6 +490,64 @@ fn unauthenticated_rcpt_falls_back_to_ip_credentials() {
 // ----------------------------------------------------------------- auth_spec
 
 #[test]
+fn auth_is_refused_before_the_tls_upgrade() {
+    // EHLO withholds AUTH before STARTTLS, but a client can send a command it
+    // was never offered. Every mechanism must refuse rather than read a
+    // credential off an unprotected connection.
+    let credential_key = "key123";
+    for command in [
+        "AUTH PLAIN",
+        &format!("AUTH PLAIN {}", to_smtp_plain(credential_key)),
+        "AUTH LOGIN",
+        "AUTH CRAM-MD5",
+    ] {
+        let mut tls_config = config();
+        tls_config.tls_enabled = true;
+        let mut setup = TestSetup::with_config(tls_config);
+        setup
+            .fixtures
+            .credential(CredentialType::Smtp, credential_key);
+        setup.session.handle("EHLO test.example.com");
+
+        let reply = setup.session.handle(command);
+        assert_eq!(
+            line(&reply),
+            "538 5.7.11 Encryption required for requested authentication mechanism",
+            "{command}"
+        );
+        assert!(setup.session.credential().is_none(), "{command}");
+
+        // The refusal must not leave the session waiting for credential input,
+        // which would read the next line as a secret.
+        let reply = setup.session.handle("NOOP");
+        assert_eq!(line(&reply), "250 OK", "{command}");
+    }
+}
+
+#[test]
+fn auth_is_accepted_once_the_session_is_tls_protected() {
+    let mut tls_config = config();
+    tls_config.tls_enabled = true;
+    let mut setup = TestSetup::with_config(tls_config);
+    setup.session.set_tls(true);
+    setup.session.handle("EHLO test.example.com");
+    let credential = setup.fixtures.credential(CredentialType::Smtp, "key123");
+    let reply = setup
+        .session
+        .handle(&format!("AUTH PLAIN {}", to_smtp_plain(&credential.key)));
+    assert!(line(&reply).starts_with("235 Granted for"));
+}
+
+#[test]
+fn an_unknown_auth_mechanism_is_refused_without_falling_through() {
+    let mut setup = TestSetup::new();
+    setup.session.handle("HELO test.example.com");
+    let reply = setup.session.handle("AUTH XOAUTH2 dGVzdA==");
+    assert_eq!(line(&reply), "504 5.5.4 Unrecognized authentication type");
+    assert!(setup.session.credential().is_none());
+}
+
+#[test]
 fn auth_plain_without_initial_data_returns_334_and_accepts_credentials_next() {
     let mut setup = TestSetup::new();
     setup.session.handle("HELO test.example.com");
