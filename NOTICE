@@ -1,0 +1,16 @@
+CamelMailer
+Copyright (c) 2026 CamelMailer contributors
+
+This product includes software derived from Postal
+(https://github.com/postalserver/postal), Copyright (c) 2017-2025 Krystal
+Hosting Ltd and the Postal contributors, licensed under the MIT License.
+
+CamelMailer began as a ground-up Rust rewrite of Postal. Portions of its
+design, its data model, its configuration format and its wire behaviour
+derive from that project, and its Postal compatibility surface (the
+`postal:` config group alias, `POSTAL_CONFIG_FILE_PATH`, the
+`X-Postal-MsgID` header and the webhook payload shapes) exists so a Postal
+installation can move across without changing its integrations.
+
+The full text of the MIT License covering both this work and the portions
+derived from Postal is in LICENSE.
