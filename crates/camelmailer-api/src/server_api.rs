@@ -229,6 +229,39 @@ pub(crate) async fn enqueue_send(
         ));
     }
 
+    let internal_error = || {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError".to_string(),
+            "An internal error occurred".to_string(),
+        )
+    };
+
+    // Send limit. Every API send funnels through here, including broadcast
+    // stream sends, campaign expansion and platform mail, so this one check
+    // covers the whole HTTP surface. It runs before anything is stored, and
+    // it counts the whole request: a request for more recipients than the
+    // remainder is refused outright rather than half-stored, which would
+    // leave the caller unable to tell which recipients were accepted.
+    let recipients = (to.len() + cc.len() + bcc.len()) as i64;
+    if let Some(limit) = server.send_limit {
+        let used = server_store
+            .send_usage(server.id)
+            .await
+            .map_err(|_| internal_error())?;
+        let allowance = camelmailer_core::SendAllowance {
+            limit: Some(limit),
+            used,
+        };
+        if !allowance.allows(recipients) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "SendLimitExceeded".into(),
+                allowance.rejection_message(),
+            ));
+        }
+    }
+
     // From authorization: the server (or its org) must own a verified
     // domain matching the From address, OR the exact From address must be
     // a confirmed sender address of the server. SMTP submission applies
@@ -238,13 +271,6 @@ pub(crate) async fn enqueue_send(
         "ValidationError".into(),
         "From address is not a valid email".into(),
     ))?;
-    let internal_error = || {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalServerError".to_string(),
-            "An internal error occurred".to_string(),
-        )
-    };
     let domain_id = match state
         .store
         .authenticated_domain(server.id, from_domain)

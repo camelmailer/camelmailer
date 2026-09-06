@@ -353,6 +353,12 @@ pub trait ServerStore: Send + Sync {
     /// message's public identity.
     async fn store_outgoing(&self, message: QueuedMessage) -> Result<SentMessage, StoreError>;
 
+    /// Outgoing messages counted against the server's send limit in the
+    /// current 30-day window. Paired with `Server::send_limit` this makes a
+    /// [`crate::SendAllowance`]. The synchronous [`crate::Store`] trait
+    /// carries the same method for the SMTP session.
+    async fn send_usage(&self, server_id: Id) -> Result<i64, StoreError>;
+
     /// Import ONE historical message as a completed record WITHOUT queuing it
     /// for delivery: insert the message (with its original `created_at`, an
     /// indexed subject/message_id, and a status derived from the imported
@@ -779,6 +785,10 @@ pub trait ServerStore: Send + Sync {
 impl ServerStore for crate::store::MemoryStore {
     async fn store_outgoing(&self, message: QueuedMessage) -> Result<SentMessage, StoreError> {
         Ok(self.insert_message_record(message))
+    }
+
+    async fn send_usage(&self, server_id: Id) -> Result<i64, StoreError> {
+        Ok(crate::Store::send_usage(self, server_id))
     }
 
     async fn import_message(&self, message: ImportMessage) -> Result<i64, StoreError> {

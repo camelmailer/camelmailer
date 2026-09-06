@@ -15,6 +15,29 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-server send limits.** A server can carry a `send_limit`: outgoing
+  messages allowed in the trailing 30 days (today plus the 29 before it).
+  `NULL` is unlimited, which is every existing server, so the feature is
+  inert until an operator sets a value. Both submission paths refuse before
+  storing anything: the HTTP send API answers `429` with the error code
+  `SendLimitExceeded`, and SMTP answers `550 5.7.1` at `RCPT TO` (a 5xx
+  because the window is 30 days, so a 4xx would have clients retrying for
+  weeks). A request naming more recipients than the remainder is refused
+  whole rather than partly stored. Every API send funnels through
+  `enqueue_send`, so broadcasts, campaigns and platform mail are covered by
+  the same check. Inbound mail and imported history do not count.
+
+  Only a global administrator or a machine key may write `send_limit`
+  (`PATCH …/organizations/{org}/servers/{server}`), since a tenant that can
+  raise its own limit has none. An absent field leaves the limit alone; an
+  explicit `null` clears it. Migration `0044` adds the column plus a
+  `server_send_counters` table of daily buckets, written in the same
+  transaction as the message. Counting buckets rather than rows in
+  `messages` keeps `message_retention_days` from handing a server its quota
+  back early; the worker's hourly housekeeping drops buckets once they leave
+  every window.
 ### Security
 
 - **SMTP AUTH now requires a TLS-protected session.** EHLO already withheld

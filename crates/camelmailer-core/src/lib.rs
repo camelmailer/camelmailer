@@ -15,6 +15,7 @@ pub mod mime;
 pub mod model;
 pub mod org_sso;
 pub mod received_header;
+pub mod send_limit;
 pub mod server_store;
 pub mod spf;
 pub mod store;
@@ -45,6 +46,7 @@ pub use org_sso::{
     NewOrgEmailDomain, NewOrgSsoConnection, OrgEmailDomain, OrgSsoConnection,
     OrgSsoConnectionUpdate, OrgSsoStore, SsoKind,
 };
+pub use send_limit::SendAllowance;
 pub use server_store::{
     is_valid_delivery_status, ActivityEvent, ApiRequestFilter, ApiRequestRecord, CampaignStats,
     CampaignUpdate, DeliveryRecord, DeliveryStats, ImportClick, ImportDelivery, ImportEvent,

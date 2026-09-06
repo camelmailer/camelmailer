@@ -44,6 +44,7 @@ impl Fixtures {
             privacy_mode: false,
             log_smtp_data: false,
             allow_sender: false,
+            send_limit: None,
             ip_pool_id: None,
             track_opens: false,
             track_clicks: false,
@@ -84,6 +85,36 @@ impl Fixtures {
         server.suspended = true;
         server.suspension_reason = Some("Suspended for testing".into());
         self.store.insert_server(server);
+    }
+
+    /// Give the fixture server a send limit (`None` for unlimited).
+    pub fn set_send_limit(&self, limit: Option<i64>) {
+        let mut server = self.server.clone();
+        server.send_limit = limit;
+        self.store.insert_server(server);
+    }
+
+    /// Count `count` outgoing messages against the server's current window,
+    /// without going through the send path.
+    pub fn record_sends(&self, count: usize) {
+        for index in 0..count {
+            self.store
+                .insert_message_record(crate::message::QueuedMessage {
+                    server_id: self.server.id,
+                    rcpt_to: format!("seed{index}@dest.example"),
+                    mail_from: "sender@example.com".into(),
+                    raw_message: b"Subject: seed\r\n\r\nx".to_vec(),
+                    received_with_ssl: false,
+                    scope: crate::message::MessageScope::Outgoing,
+                    bounce: false,
+                    domain_id: None,
+                    credential_id: None,
+                    route_id: None,
+                    tag: None,
+                    metadata: None,
+                    stream_id: None,
+                });
+        }
     }
 
     pub fn set_privacy_mode(&self, enabled: bool) {

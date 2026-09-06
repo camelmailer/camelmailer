@@ -174,6 +174,9 @@ export type Server = {
   default_stream_id: number | null
   // Physical postal address shown in the CAN-SPAM footer of broadcast mail.
   broadcast_physical_address: string | null
+  // Outgoing messages allowed in the trailing 30 days; null is unlimited.
+  // Writable by global administrators only.
+  send_limit: number | null
 }
 
 /// Per-server 30-day message counters (GET .../servers/stats). `server`

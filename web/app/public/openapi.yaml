@@ -109,6 +109,11 @@ paths:
       description: |
         Queues one message per recipient. The `from` domain must be a
         verified sending domain of the server.
+
+        A server with a `send_limit` answers `429` with the error code
+        `SendLimitExceeded` once the trailing 30-day window is full. A
+        request naming more recipients than the remainder is refused whole,
+        so the response never leaves some recipients queued and others not.
       security: [{ ServerApiKey: [] }]
       requestBody:
         required: true
@@ -134,6 +139,7 @@ paths:
                       data: { $ref: "#/components/schemas/SendResult" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/SendLimitExceeded" }
     get:
       tags: [Messages]
       summary: List messages
@@ -1472,12 +1478,44 @@ paths:
     patch:
       tags: [Servers]
       summary: Update server settings
+      description: >
+        `send_limit` caps outgoing messages per 30 days and is writable only
+        by a global administrator or a machine key, because it is the
+        operator's control over a tenant. Omit the field to leave it alone,
+        or send `null` to make the server unlimited again. Every other field
+        follows organization RBAC.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters:
         - { $ref: "#/components/parameters/Org" }
         - { $ref: "#/components/parameters/ServerPermalink" }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                mode: { type: string, enum: [Live, Development] }
+                track_opens: { type: boolean }
+                track_clicks: { type: boolean }
+                spam_threshold: { type: number, nullable: true }
+                outbound_spam_threshold: { type: number, nullable: true }
+                bounce_hook_url: { type: string, nullable: true }
+                delivery_hook_url: { type: string, nullable: true }
+                inbound_domain: { type: string, nullable: true }
+                broadcast_physical_address: { type: string, nullable: true }
+                color: { type: string, nullable: true }
+                send_limit:
+                  type: integer
+                  nullable: true
+                  minimum: 0
+                  example: 5000
+                  description: >
+                    Outgoing messages allowed in the trailing 30 days, or
+                    null for unlimited. Global administrators only.
       responses:
         "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
     delete:
       tags: [Servers]
       summary: Delete a server
@@ -2305,6 +2343,18 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
     ValidationError:
       description: The request was understood but invalid
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Forbidden:
+      description: Authenticated, but not permitted to perform this action
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    SendLimitExceeded:
+      description: >
+        The server has reached its send limit for the current 30-day window.
+        The error code is `SendLimitExceeded`.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }

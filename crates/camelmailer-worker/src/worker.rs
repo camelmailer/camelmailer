@@ -1110,7 +1110,8 @@ impl Worker {
     /// Housekeeping: prune API request-log entries older than the 30-day
     /// retention and, when `camelmailer.message_retention_days > 0`, stored
     /// messages older than that window (with their deliveries, opens, clicks,
-    /// tracking tokens and any queued entries). Returns how many API-request
+    /// tracking tokens and any queued entries), plus send-limit counter
+    /// buckets that have left every window. Returns how many API-request
     /// rows were removed. Runs periodically from [`Worker::run`].
     pub async fn housekeep(&self) -> Result<u64, camelmailer_core::StoreError> {
         let now = chrono::Utc::now();
@@ -1129,6 +1130,15 @@ impl Worker {
                 ),
                 Err(error) => tracing::error!(%error, "message retention pruning error"),
             }
+        }
+
+        // Send-limit counter buckets that have left every 30-day window.
+        // Failing to prune them is a housekeeping annoyance rather than a
+        // reason to abandon the rest of the pass, so it only logs.
+        match self.sink.prune_send_counters().await {
+            Ok(0) => {}
+            Ok(pruned) => tracing::info!(pruned, "pruned expired send-limit counters"),
+            Err(error) => tracing::error!(%error, "send-counter pruning error"),
         }
         Ok(removed)
     }

@@ -5302,3 +5302,177 @@ async fn track_domains_crud_and_effective_domain() {
         1
     );
 }
+
+// ------------------------------------------------------------ send limits
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outgoing_messages_are_counted_and_incoming_ones_are_not() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 0);
+
+    for rcpt in ["a@dest.example", "b@dest.example", "c@dest.example"] {
+        let mut message = message_for(f.server.id, rcpt);
+        message.scope = MessageScope::Outgoing;
+        f.store.store_outgoing(message).await.unwrap();
+    }
+    // Inbound mail is not a send and must not consume the quota.
+    sink.insert_message(&message_for(f.server.id, "inbox@example.com"))
+        .await
+        .unwrap();
+
+    assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_usage_is_scoped_to_its_own_server() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let sink = PgMessageSink::new(f.store.clone());
+
+    let mut mine = message_for(f.server.id, "mine@dest.example");
+    mine.scope = MessageScope::Outgoing;
+    f.store.store_outgoing(mine).await.unwrap();
+
+    assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 1);
+    assert_eq!(sink.send_usage(other.id).await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pruned_message_does_not_return_its_quota() {
+    // The whole reason usage lives in counter buckets rather than a COUNT
+    // over `messages`: retention deletes the rows, and counting them would
+    // hand a server its quota back before the window rolled forward.
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let now = chrono::Utc::now();
+
+    let mut message = message_for(f.server.id, "a@dest.example");
+    message.scope = MessageScope::Outgoing;
+    f.store.store_outgoing(message).await.unwrap();
+    assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 1);
+
+    // Age the message past retention and prune it. `messages` is under RLS,
+    // so the update needs the tenant context the store would set.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+        .bind(f.server.id.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE messages SET created_at = $1")
+        .bind(now - chrono::Duration::days(90))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let pruned = ServerStore::prune_messages(&f.store, now - chrono::Duration::days(30))
+        .await
+        .unwrap();
+    assert_eq!(pruned, 1);
+
+    assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_counts_the_trailing_thirty_days_only() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    // One bucket inside the window (day 29 back) and one just outside it.
+    for offset in [29, 30] {
+        sqlx::query(
+            "INSERT INTO server_send_counters (server_id, day, sent)
+             VALUES ($1, (now() AT TIME ZONE 'UTC')::date - $2::int, 1)",
+        )
+        .bind(f.server.id as i64)
+        .bind(offset)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn housekeeping_prunes_buckets_that_left_every_window() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    // 41 days back is outside the retained margin; 39 is inside it.
+    for offset in [39, 41] {
+        sqlx::query(
+            "INSERT INTO server_send_counters (server_id, day, sent)
+             VALUES ($1, (now() AT TIME ZONE 'UTC')::date - $2::int, 1)",
+        )
+        .bind(f.server.id as i64)
+        .bind(offset)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    assert_eq!(sink.prune_send_counters().await.unwrap(), 1);
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM server_send_counters WHERE server_id = $1")
+            .bind(f.server.id as i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_limit_round_trips_through_the_server_row() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+
+    assert_eq!(f.server.send_limit, None);
+    let mut server = f.server.clone();
+    server.send_limit = Some(5000);
+    f.store.update_server(server).await.unwrap();
+
+    let reloaded = camelmailer_core::AdminStore::server_by_permalink(
+        &f.store,
+        f.organization.id,
+        "example-server",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reloaded.send_limit, Some(5000));
+
+    // and it can be cleared back to unlimited
+    let mut cleared = reloaded.clone();
+    cleared.send_limit = None;
+    f.store.update_server(cleared).await.unwrap();
+    let reloaded = camelmailer_core::AdminStore::server_by_permalink(
+        &f.store,
+        f.organization.id,
+        "example-server",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reloaded.send_limit, None);
+}

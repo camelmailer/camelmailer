@@ -65,6 +65,9 @@ function Settings({ org, server }: { org: string; server: Server }) {
     spam_threshold: server.spam_threshold?.toString() ?? "",
     broadcast_physical_address: server.broadcast_physical_address ?? "",
   })
+  // Kept out of `fields` because the send limit saves on its own button and
+  // through a separate, global-admin-only path.
+  const [sendLimit, setSendLimit] = useState(server.send_limit?.toString() ?? "")
   const [deleteOpen, setDeleteOpen] = useState(false)
   const pools = useQuery({ queryKey: ["admin", "ip-pools"], queryFn: adminApi.ipPools.list })
   const { me } = useAuth()
@@ -232,6 +235,55 @@ function Settings({ org, server }: { org: string; server: Server }) {
                 </SelectContent>
               </Select>
             </Field>
+          </FormSection>
+        )}
+
+        {me?.user.admin && (
+          <FormSection
+            title="Send limit"
+            description="Outgoing messages this server may send in a rolling 30-day window. Leave it empty for no limit."
+          >
+            <Field
+              label="Messages per 30 days"
+              span={4}
+              hint="Only global administrators can change this, so a tenant cannot raise its own limit. The API answers 429 and SMTP answers 550 once the window is full."
+            >
+              <Input
+                type="number"
+                min={0}
+                value={sendLimit}
+                onChange={(e) => setSendLimit(e.target.value)}
+                placeholder="No limit"
+              />
+            </Field>
+            <FormActions>
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  const trimmed = sendLimit.trim()
+                  const parsed = trimmed === "" ? null : Number(trimmed)
+                  if (parsed !== null && (!Number.isInteger(parsed) || parsed < 0)) {
+                    toast.error("Send limit must be a whole number of messages, or empty")
+                    return
+                  }
+                  try {
+                    await adminApi
+                      .servers(org)
+                      .update(server.permalink, { send_limit: parsed })
+                    invalidate()
+                    toast.success(
+                      parsed === null
+                        ? "Send limit removed"
+                        : `Send limit set to ${parsed.toLocaleString()} per 30 days`,
+                    )
+                  } catch (err) {
+                    errorToast(err, "Could not update the send limit")
+                  }
+                }}
+              >
+                Save send limit
+              </Button>
+            </FormActions>
           </FormSection>
         )}
 

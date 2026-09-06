@@ -2870,3 +2870,163 @@ async fn in_limit_send_body_is_accepted() {
     assert_eq!(status, StatusCode::CREATED);
     assert!(body["data"]["message_id"].is_number());
 }
+
+// ------------------------------------------------------------- send limits
+
+/// Set a server's send limit directly, the way an operator would through the
+/// admin API. The per-server API deliberately cannot change it.
+async fn set_send_limit(
+    store: &Arc<MemoryStore>,
+    server_id: camelmailer_core::Id,
+    limit: Option<i64>,
+) {
+    let mut server = camelmailer_core::Store::server(store.as_ref(), server_id).unwrap();
+    server.send_limit = limit;
+    store.update_server(server).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_without_a_send_limit_is_unlimited() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    for index in 0..5 {
+        let (status, _) = post_json(
+            &app,
+            "/api/v2/server/messages",
+            &token,
+            json!({
+                "from": "news@org.example",
+                "to": [format!("r{index}@dest.example")],
+                "subject": "Hi",
+                "text_body": "x"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    assert_eq!(store.messages_for(server_id).len(), 5);
+}
+
+#[tokio::test]
+async fn a_send_past_the_limit_is_refused_and_stores_nothing() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    set_send_limit(&store, server_id, Some(2)).await;
+
+    for index in 0..2 {
+        let (status, _) = post_json(
+            &app,
+            "/api/v2/server/messages",
+            &token,
+            json!({
+                "from": "news@org.example",
+                "to": [format!("r{index}@dest.example")],
+                "subject": "Hi",
+                "text_body": "x"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "message {index}");
+    }
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["over@dest.example"],
+            "subject": "Hi",
+            "text_body": "x"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "SendLimitExceeded");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("2 messages per 30 days"));
+    assert_eq!(store.messages_for(server_id).len(), 2);
+}
+
+#[tokio::test]
+async fn a_request_that_does_not_fit_whole_stores_no_recipients() {
+    // Storing the recipients that fit and dropping the rest would leave the
+    // caller unable to tell which ones went. Refuse the request instead.
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    set_send_limit(&store, server_id, Some(2)).await;
+
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example", "b@dest.example", "c@dest.example"],
+            "subject": "Hi",
+            "text_body": "x"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["code"], "SendLimitExceeded");
+    assert_eq!(store.messages_for(server_id).len(), 0);
+}
+
+#[tokio::test]
+async fn a_zero_limit_refuses_the_first_send() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    set_send_limit(&store, server_id, Some(0)).await;
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example"],
+            "subject": "Hi",
+            "text_body": "x"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(store.messages_for(server_id).len(), 0);
+}
+
+#[tokio::test]
+async fn inbound_messages_do_not_consume_the_send_limit() {
+    // The limit counts what a server sends. Mail arriving for it is not a
+    // send, and a busy inbound route must not exhaust the outbound quota.
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    for index in 0..3 {
+        store.insert_message_record(camelmailer_core::QueuedMessage {
+            server_id,
+            rcpt_to: format!("inbox{index}@org.example"),
+            mail_from: "someone@elsewhere.example".into(),
+            raw_message: b"Subject: In\r\n\r\nhi".to_vec(),
+            received_with_ssl: false,
+            scope: camelmailer_core::MessageScope::Incoming,
+            bounce: false,
+            domain_id: None,
+            credential_id: None,
+            route_id: None,
+            tag: None,
+            metadata: None,
+            stream_id: None,
+        });
+    }
+    set_send_limit(&store, server_id, Some(1)).await;
+
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example"],
+            "subject": "Hi",
+            "text_body": "x"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+}

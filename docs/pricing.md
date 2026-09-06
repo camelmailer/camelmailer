@@ -25,6 +25,18 @@ The first paid plan is the **Base package**:
 Pricing is launching soon, so the Base package appears in the dashboard as a
 preview rather than a purchasable plan today.
 
+## How the cap is enforced
+
+A cloud mail server carries a **send limit** that the operator sets, and both
+submission paths refuse once the trailing 30-day window is full: the HTTP API
+answers `429` with the code `SendLimitExceeded`, and SMTP answers `550 5.7.1`
+at `RCPT TO`. Nothing is stored on a refused send. See
+[Send limits](sending.md#send-limits) for the details, including what counts
+toward the window and what does not.
+
+A self-hosted installation has no limit on any server unless its own operator
+sets one.
+
 ## When you pass your quota
 
 The plan preview also shows the two ways over-quota sending will work, so

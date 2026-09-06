@@ -277,6 +277,61 @@ which is the credential's key). Export from this tab carries credential
 metadata only; the secret key is shown once at creation and is never
 exported (see [Import and export](import-export.md)).
 
+## Send limits
+
+A mail server can carry a **send limit**: the number of outgoing messages it
+may send in the trailing 30 days, meaning today plus the 29 days before it.
+A server without one sends without a cap, which is how every server starts.
+
+The limit is the operator's control over a tenant, so only a global
+administrator or a machine key can set it. An organization owner sees the
+limit on the server's settings page and cannot change it, which is the point:
+a tenant that could raise its own limit has no limit.
+
+Set it through the admin API, or in the dashboard under a server's settings
+when signed in as a global administrator:
+
+```bash
+curl -X PATCH https://api.camelmailer.com/api/v2/admin/organizations/acme/servers/mail \
+  -H "X-Admin-API-Key: $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"send_limit": 5000}'
+```
+
+Send `{"send_limit": null}` to make the server unlimited again. Leaving the
+field out of the request leaves the current limit alone, so an unrelated
+settings change never clears it by accident.
+
+### What happens when a server is full
+
+Both submission paths refuse before anything is stored, so a refused send
+consumes nothing:
+
+| Path | Response |
+|---|---|
+| HTTP send API | `429` with the error code `SendLimitExceeded` |
+| SMTP `RCPT TO` | `550 5.7.1` naming the limit and the window |
+
+SMTP answers `5xx` rather than `4xx` on purpose. The window is 30 days, so a
+transient code would have the sending client retrying for weeks.
+
+A request naming more recipients than the remainder is refused whole rather
+than partly accepted. Queuing the recipients that fit and dropping the rest
+would leave the caller unable to tell which ones went.
+
+### What counts
+
+Every outgoing message counts once, per recipient, whichever path created it:
+the send API, SMTP submission, a broadcast to a stream, a campaign expanded to
+its subscribers, and platform mail such as password resets. Inbound mail does
+not count, so a busy inbound route never exhausts the outbound quota, and
+neither does an imported message, since importing history is not sending.
+
+Usage is counted in daily buckets rather than by counting stored messages.
+That way `message_retention_days` deleting old messages cannot hand a server
+its quota back before the window has rolled forward. The worker's hourly
+housekeeping drops buckets once they have left every window.
+
 ## What happens after a message is accepted
 
 Accepting a message and delivering it are two steps:
