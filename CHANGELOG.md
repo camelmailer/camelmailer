@@ -15,7 +15,23 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-09-07
+
 ### Added
+
+- **Return-path bounce correlation.** With `dns.return_path_envelope: true`
+  and a usable return-path domain, outbound SMTP uses
+  `<server-token>@<dns.return_path_domain>` as its envelope sender. The worker
+  adds `X-CamelMailer-MsgID` before DKIM signing independently of that flag. The
+  worker also accepts Postal's `X-Postal-MsgID` on inbound DSNs. A returned DSN
+  carrying that token is linked to the original message through
+  `bounce_for_id`; the DSN is recorded as `Processed`, the original as
+  `Bounced`, and subscribed webhooks receive `MessageBounced` with
+  `original_message` and `bounce` details.
+
+- The dashboard now shows a correlated bounce notification's category,
+  correlation time, and a link to its original message. Browser tests cover
+  navigation, unmatched notifications, and unavailable originals.
 
 - **Per-server send limits.** A server can carry a `send_limit`: outgoing
   messages allowed in the trailing 30 days (today plus the 29 before it).
@@ -38,6 +54,21 @@ integration tests) is green.
   `messages` keeps `message_retention_days` from handing a server its quota
   back early; the worker's hourly housekeeping drops buckets once they leave
   every window.
+
+### Changed
+
+- **Return-path upgrade note.** `dns.return_path_envelope` defaults to `false`
+  in 0.7.x, including when omitted from YAML. Existing installations preserve
+  their submitted `MAIL FROM` even with a real return-path domain configured.
+  Before enabling rewriting, route that domain's MX to CamelMailer and publish
+  SPF authorizing the outbound worker IPs or relay. Empty, malformed and
+  reserved example values still preserve the submitted sender. Bounce intake
+  and correlation remain independent of the flag.
+- The worker loads the server token alongside the message when rewriting is
+  enabled, avoiding an additional database round trip. Queue completion and
+  retry operations share helpers while retaining their transaction boundaries
+  and existing backoff schedule.
+
 ### Security
 
 - **SMTP AUTH now requires a TLS-protected session.** EHLO already withheld
@@ -53,37 +84,6 @@ integration tests) is green.
   the generic `502`. Installations with `smtp_server.tls_enabled` off are
   unaffected: they advertise AUTH on the plain session as before, since they
   terminate TLS elsewhere.
-## [0.7.7] - 2026-09-04
-
-### Added
-
-- **Return-path bounce correlation.** With `dns.return_path_envelope: true`
-  and a usable return-path domain, outbound SMTP uses
-  `<server-token>@<dns.return_path_domain>` as its envelope sender. The worker
-  adds `X-CamelMailer-MsgID` before DKIM signing independently of that flag. The
-  worker also accepts Postal's `X-Postal-MsgID` on inbound DSNs. A returned DSN
-  carrying that token is linked to the original message through
-  `bounce_for_id`; the DSN is recorded as `Processed`, the original as
-  `Bounced`, and subscribed webhooks receive `MessageBounced` with
-  `original_message` and `bounce` details.
-
-- The dashboard now shows a correlated bounce notification's category,
-  correlation time, and a link to its original message. Browser tests cover
-  navigation, unmatched notifications, and unavailable originals.
-
-### Changed
-
-- **Return-path upgrade note.** `dns.return_path_envelope` defaults to `false`
-  in 0.7.x, including when omitted from YAML. Existing installations preserve
-  their submitted `MAIL FROM` even with a real return-path domain configured.
-  Before enabling rewriting, route that domain's MX to CamelMailer and publish
-  SPF authorizing the outbound worker IPs or relay. Empty, malformed and
-  reserved example values still preserve the submitted sender. Bounce intake
-  and correlation remain independent of the flag.
-- The worker loads the server token alongside the message when rewriting is
-  enabled, avoiding an additional database round trip. Queue completion and
-  retry operations share helpers while retaining their transaction boundaries
-  and existing backoff schedule.
 
 ### Fixed
 
