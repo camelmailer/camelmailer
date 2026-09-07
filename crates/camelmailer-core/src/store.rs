@@ -49,6 +49,12 @@ pub trait Store: Send + Sync {
     /// every address in the header. Returns the domain's id.
     fn find_authenticated_domain(&self, server_id: Id, header_values: &[&str]) -> Option<Id>;
 
+    /// Outgoing messages counted against the server's send limit in the
+    /// current 30-day window. Combined with `Server::send_limit` this gives
+    /// a [`crate::SendAllowance`]. Kept on the synchronous `Store` trait
+    /// because the SMTP session checks it at `RCPT TO`.
+    fn send_usage(&self, server_id: Id) -> i64;
+
     /// Does the server have a `__returnpath__` route?
     fn return_path_route_for_server(&self, server_id: Id) -> Option<ResolvedRoute>;
 
@@ -110,6 +116,9 @@ pub fn match_ip_credential(credentials: Vec<Credential>, ip: IpAddr) -> Option<C
 
 #[derive(Default)]
 pub(crate) struct MemoryStoreInner {
+    /// Daily outgoing-message counts per server, the in-memory analogue of
+    /// the `server_send_counters` table. Keyed by (server id, UTC date).
+    pub(crate) send_counters: HashMap<(Id, chrono::NaiveDate), i64>,
     pub(crate) organizations: HashMap<Id, Organization>,
     /// Stripe customer ids keyed by organization id (the
     /// `organizations.billing_customer_id` column in Postgres).
@@ -383,6 +392,8 @@ impl MemoryStore {
     ) -> crate::message::SentMessage {
         let id = self.next_id() as i64;
         let token = crate::token::generate_token(12);
+        let outgoing = matches!(message.scope, crate::message::MessageScope::Outgoing);
+        let server_id = message.server_id;
         let record = crate::message::MessageRecord {
             id,
             token: token.clone(),
@@ -413,7 +424,16 @@ impl MemoryStore {
             created_at: chrono::Utc::now(),
             raw_message: message.raw_message,
         };
-        self.inner.write().unwrap().messages.push(record);
+        {
+            let mut inner = self.inner.write().unwrap();
+            if outgoing {
+                *inner
+                    .send_counters
+                    .entry((server_id, chrono::Utc::now().date_naive()))
+                    .or_insert(0) += 1;
+            }
+            inner.messages.push(record);
+        }
         crate::message::SentMessage {
             id,
             token,
@@ -1400,6 +1420,21 @@ impl Store for MemoryStore {
             return domains[0];
         }
         None
+    }
+
+    fn send_usage(&self, server_id: Id) -> i64 {
+        let today = chrono::Utc::now().date_naive();
+        let window_start = today - chrono::Duration::days(29);
+        self.inner
+            .read()
+            .unwrap()
+            .send_counters
+            .iter()
+            .filter(|((counted_server, day), _)| {
+                *counted_server == server_id && *day >= window_start && *day <= today
+            })
+            .map(|(_, sent)| *sent)
+            .sum()
     }
 
     fn return_path_route_for_server(&self, server_id: Id) -> Option<ResolvedRoute> {

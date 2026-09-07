@@ -1123,3 +1123,93 @@ fn unknown_commands_are_rejected() {
     let reply = setup.session.handle("WIBBLE");
     assert_eq!(line(&reply), "502 Invalid/unsupported command");
 }
+
+// ------------------------------------------------------------- send limits
+
+/// Authenticate an SMTP session as the fixture server's credential.
+fn authenticated_session(setup: &mut TestSetup) {
+    let credential = setup.fixtures.credential(CredentialType::Smtp, "key123");
+    helo_and_mail_from(&mut setup.session);
+    setup
+        .session
+        .handle(&format!("AUTH PLAIN {}", to_smtp_plain(&credential.key)));
+}
+
+#[test]
+fn rcpt_is_accepted_while_the_send_limit_has_room() {
+    let mut setup = TestSetup::new();
+    setup.fixtures.set_send_limit(Some(3));
+    setup.fixtures.record_sends(1);
+    authenticated_session(&mut setup);
+
+    let reply = setup.session.handle("RCPT TO: first@dest.example");
+    assert_eq!(line(&reply), "250 OK");
+    let reply = setup.session.handle("RCPT TO: second@dest.example");
+    assert_eq!(line(&reply), "250 OK");
+    assert_eq!(setup.session.recipients().len(), 2);
+}
+
+#[test]
+fn rcpt_past_the_send_limit_is_refused_permanently() {
+    let mut setup = TestSetup::new();
+    setup.fixtures.set_send_limit(Some(2));
+    setup.fixtures.record_sends(2);
+    authenticated_session(&mut setup);
+
+    let reply = setup.session.handle("RCPT TO: over@dest.example");
+    // 5xx, not 4xx: the window is 30 days, so a retry loop would run for
+    // weeks. The reply names the limit so the sender knows what happened.
+    assert!(line(&reply).starts_with("550 5.7.1 "), "{}", line(&reply));
+    assert!(line(&reply).contains("2 messages per 30 days"));
+    assert!(setup.session.recipients().is_empty());
+}
+
+#[test]
+fn recipients_named_in_one_transaction_count_against_the_limit() {
+    // Reading stored usage alone would let a single transaction name any
+    // number of recipients, since nothing is stored until DATA.
+    let mut setup = TestSetup::new();
+    setup.fixtures.set_send_limit(Some(2));
+    authenticated_session(&mut setup);
+
+    assert_eq!(
+        line(&setup.session.handle("RCPT TO: a@dest.example")),
+        "250 OK"
+    );
+    assert_eq!(
+        line(&setup.session.handle("RCPT TO: b@dest.example")),
+        "250 OK"
+    );
+    let reply = setup.session.handle("RCPT TO: c@dest.example");
+    assert!(line(&reply).starts_with("550 5.7.1 "), "{}", line(&reply));
+    assert_eq!(setup.session.recipients().len(), 2);
+}
+
+#[test]
+fn a_server_without_a_send_limit_accepts_every_recipient() {
+    let mut setup = TestSetup::new();
+    setup.fixtures.record_sends(50);
+    authenticated_session(&mut setup);
+    for index in 0..10 {
+        let reply = setup
+            .session
+            .handle(&format!("RCPT TO: r{index}@dest.example"));
+        assert_eq!(line(&reply), "250 OK", "recipient {index}");
+    }
+}
+
+#[test]
+fn inbound_route_mail_is_not_held_back_by_the_send_limit() {
+    // The limit governs what a server sends. Mail arriving for a route is
+    // not a send, so a server at its quota still receives.
+    let mut setup = TestSetup::new();
+    setup.fixtures.set_send_limit(Some(0));
+    let domain = setup.fixtures.verified_server_domain("example.com");
+    setup
+        .fixtures
+        .route("info", Some(domain.id), RouteMode::Endpoint);
+    helo_and_mail_from(&mut setup.session);
+
+    let reply = setup.session.handle("RCPT TO: info@example.com");
+    assert_eq!(line(&reply), "250 OK");
+}

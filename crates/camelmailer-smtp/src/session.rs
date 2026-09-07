@@ -145,6 +145,10 @@ pub struct Session {
 
     credential: Option<Credential>,
     recipients: Vec<Recipient>,
+    /// Send-limit usage read once per server per session. Stored usage only
+    /// changes at DATA, so the figure stays correct across the RCPT phase and
+    /// one read serves however many recipients the client names.
+    send_usage: HashMap<camelmailer_core::Id, i64>,
     mail_from: Option<String>,
     data: Option<Vec<u8>>,
     headers: Option<HashMap<String, Vec<String>>>,
@@ -190,6 +194,7 @@ impl Session {
             finished: false,
             credential: None,
             recipients: vec![],
+            send_usage: HashMap::new(),
             mail_from: None,
             data: None,
             headers: None,
@@ -370,6 +375,36 @@ impl Session {
     /// same assumption the capability list already makes.
     fn auth_permitted(&self) -> bool {
         self.tls || !self.config.tls_enabled
+    }
+
+    /// The server's send allowance, or `None` when it is unlimited.
+    fn send_allowance(&mut self, server: &Server) -> Option<camelmailer_core::SendAllowance> {
+        let limit = server.send_limit?;
+        let used = match self.send_usage.get(&server.id) {
+            Some(used) => *used,
+            None => {
+                let used = self.store.send_usage(server.id);
+                self.send_usage.insert(server.id, used);
+                used
+            }
+        };
+        Some(camelmailer_core::SendAllowance {
+            limit: Some(limit),
+            used,
+        })
+    }
+
+    /// Outgoing recipients this session has already accepted for a server and
+    /// not yet stored. They count against the limit alongside the stored
+    /// usage, so one transaction naming more recipients than the remainder is
+    /// cut off at the recipient that crosses it.
+    fn pending_sends(&self, server_id: camelmailer_core::Id) -> i64 {
+        self.recipients
+            .iter()
+            .filter(|recipient| {
+                recipient.kind == RecipientKind::Credential && recipient.server.id == server_id
+            })
+            .count() as i64
     }
 
     fn proxy(&mut self, data: &str) -> Reply {
@@ -682,15 +717,23 @@ impl Session {
                 Some(server) if server.suspended => {
                     Reply::line("535 Mail server has been suspended")
                 }
-                Some(server) => {
-                    self.recipients.push(Recipient {
-                        kind: RecipientKind::Credential,
-                        rcpt_to,
-                        server,
-                        route: None,
-                    });
-                    Reply::line("250 OK")
-                }
+                Some(server) => match self.send_allowance(&server) {
+                    // 550 rather than a 4xx: the quota has a 30-day window,
+                    // so telling the client to retry would have it retrying
+                    // for weeks.
+                    Some(allowance) if !allowance.allows(self.pending_sends(server.id) + 1) => {
+                        Reply::Line(format!("550 5.7.1 {}", allowance.rejection_message()))
+                    }
+                    _ => {
+                        self.recipients.push(Recipient {
+                            kind: RecipientKind::Credential,
+                            rcpt_to,
+                            server,
+                            route: None,
+                        });
+                        Reply::line("250 OK")
+                    }
+                },
                 None => Reply::line("535 Mail server has been suspended"),
             }
         } else if let Some(resolved) = self.store.find_route_by_name_and_domain(uname, domain) {

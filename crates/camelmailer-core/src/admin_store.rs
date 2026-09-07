@@ -468,6 +468,7 @@ impl AdminStore for crate::store::MemoryStore {
             privacy_mode: false,
             log_smtp_data: false,
             allow_sender: false,
+            send_limit: None,
             ip_pool_id: None,
             track_opens: false,
             track_clicks: false,

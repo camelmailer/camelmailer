@@ -1547,3 +1547,134 @@ async fn server_stats_hides_the_org_from_non_members() {
     assert_eq!(status, StatusCode::NOT_FOUND, "unexpected body: {body}");
     assert_eq!(body["error"]["code"], "NotFound");
 }
+
+// ------------------------------------------------------------- send limits
+
+#[tokio::test]
+async fn only_a_global_admin_can_change_a_send_limit() {
+    // The send limit is the operator's control over a tenant. An owner who
+    // could raise their own would have no limit at all.
+    let h = harness().await;
+    let org = h.org("Acme").await;
+    h.member(&org, "owner@example.com", Role::Owner).await;
+    h.user("root@example.com", true).await;
+    h.store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "Mail".into(),
+            permalink: "mail".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let path = "/api/v2/admin/organizations/acme/servers/mail";
+
+    let owner = h.login("owner@example.com").await;
+    let (status, body) = h
+        .request(
+            "PATCH",
+            path,
+            Some(&owner),
+            Some(json!({ "send_limit": 100 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "AccessDenied");
+
+    // The owner may still edit everything else on the same endpoint.
+    let (status, body) = h
+        .request(
+            "PATCH",
+            path,
+            Some(&owner),
+            Some(json!({ "name": "Renamed" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["server"]["name"], "Renamed");
+    assert!(body["data"]["server"]["send_limit"].is_null());
+
+    let root = h.login("root@example.com").await;
+    let (status, body) = h
+        .request(
+            "PATCH",
+            path,
+            Some(&root),
+            Some(json!({ "send_limit": 100 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["server"]["send_limit"], 100);
+}
+
+#[tokio::test]
+async fn a_send_limit_is_cleared_with_an_explicit_null() {
+    // An absent field must leave the limit alone, so clearing it back to
+    // unlimited needs an explicit null rather than an omission.
+    let h = harness().await;
+    let org = h.org("Acme").await;
+    h.user("root@example.com", true).await;
+    h.store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "Mail".into(),
+            permalink: "mail".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let path = "/api/v2/admin/organizations/acme/servers/mail";
+    let root = h.login("root@example.com").await;
+
+    h.request(
+        "PATCH",
+        path,
+        Some(&root),
+        Some(json!({ "send_limit": 100 })),
+    )
+    .await;
+
+    // An unrelated edit leaves it in place.
+    let (_, body) = h
+        .request("PATCH", path, Some(&root), Some(json!({ "name": "Mail" })))
+        .await;
+    assert_eq!(body["data"]["server"]["send_limit"], 100);
+
+    let (status, body) = h
+        .request(
+            "PATCH",
+            path,
+            Some(&root),
+            Some(json!({ "send_limit": null })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["data"]["server"]["send_limit"].is_null());
+}
+
+#[tokio::test]
+async fn a_negative_send_limit_is_rejected() {
+    let h = harness().await;
+    let org = h.org("Acme").await;
+    h.user("root@example.com", true).await;
+    h.store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "Mail".into(),
+            permalink: "mail".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let root = h.login("root@example.com").await;
+    let (status, body) = h
+        .request(
+            "PATCH",
+            "/api/v2/admin/organizations/acme/servers/mail",
+            Some(&root),
+            Some(json!({ "send_limit": -1 })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "ValidationError");
+}

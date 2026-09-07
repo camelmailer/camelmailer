@@ -122,6 +122,7 @@ fn server_from_row(row: &PgRow) -> Server {
         privacy_mode: row.get("privacy_mode"),
         log_smtp_data: row.get("log_smtp_data"),
         allow_sender: row.get("allow_sender"),
+        send_limit: row.get("send_limit"),
         ip_pool_id: row.get::<Option<i64>, _>("ip_pool_id").map(|id| id as Id),
         track_opens: row.get("track_opens"),
         track_clicks: row.get("track_clicks"),
@@ -389,7 +390,7 @@ const ROUTE_WITH_SERVER: &str = r#"
            s.ip_pool_id AS s_ip_pool_id, s.track_opens, s.track_clicks,
            s.spam_threshold, s.outbound_spam_threshold, s.bounce_hook_url,
            s.delivery_hook_url, s.inbound_domain, s.broadcast_physical_address,
-           s.color, s.default_stream_id
+           s.color, s.default_stream_id, s.send_limit
     FROM routes r
     JOIN servers s ON s.id = r.server_id
     LEFT JOIN domains d ON d.id = r.domain_id
@@ -414,6 +415,7 @@ fn resolved_route_from_row(row: &PgRow) -> ResolvedRoute {
             privacy_mode: row.get("privacy_mode"),
             log_smtp_data: row.get("log_smtp_data"),
             allow_sender: row.get("allow_sender"),
+            send_limit: row.get("send_limit"),
             ip_pool_id: row.get::<Option<i64>, _>("s_ip_pool_id").map(|id| id as Id),
             track_opens: row.get("track_opens"),
             track_clicks: row.get("track_clicks"),
@@ -789,6 +791,7 @@ impl AdminStore for PgStore {
             privacy_mode: false,
             log_smtp_data: false,
             allow_sender: false,
+            send_limit: None,
             ip_pool_id: None,
             track_opens: false,
             track_clicks: false,
@@ -811,7 +814,7 @@ impl AdminStore for PgStore {
                     spam_threshold = $11, outbound_spam_threshold = $12,
                     bounce_hook_url = $13, delivery_hook_url = $14,
                     inbound_domain = $15, broadcast_physical_address = $16,
-                    color = $17, default_stream_id = $18
+                    color = $17, default_stream_id = $18, send_limit = $19
              WHERE id = $1",
         )
         .bind(server.id as i64)
@@ -835,6 +838,7 @@ impl AdminStore for PgStore {
         .bind(&server.broadcast_physical_address)
         .bind(&server.color)
         .bind(server.default_stream_id.map(|id| id as i64))
+        .bind(server.send_limit)
         .execute(&self.pool)
         .await
         .map_err(Self::sqlx_error)?;
@@ -1718,6 +1722,13 @@ impl AdminStore for PgStore {
 
 #[async_trait]
 impl camelmailer_core::ServerStore for PgStore {
+    async fn send_usage(&self, server_id: Id) -> Result<i64, StoreError> {
+        PgMessageSink::new(self.clone())
+            .send_usage(server_id)
+            .await
+            .map_err(Self::sqlx_error)
+    }
+
     async fn store_outgoing(
         &self,
         message: QueuedMessage,
@@ -3375,6 +3386,18 @@ impl Store for PgStore {
         None
     }
 
+    fn send_usage(&self, server_id: Id) -> i64 {
+        // A failed read must not open the gate: report the limit as fully
+        // consumed so an unreachable database refuses submissions rather
+        // than waving them through unmetered. The error is logged, and the
+        // rest of the session would fail on the next query anyway.
+        self.wait(PgMessageSink::new(self.clone()).send_usage(server_id))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, server_id, "could not read send usage");
+                i64::MAX
+            })
+    }
+
     fn return_path_route_for_server(&self, server_id: Id) -> Option<ResolvedRoute> {
         self.wait(async {
             sqlx::query(&format!(
@@ -3639,8 +3662,57 @@ impl PgMessageSink {
         .execute(&mut *tx)
         .await?;
 
+        // Count the message against the server's send limit in the same
+        // transaction, so the counter cannot drift from what was stored. The
+        // bucket outlives the message: `message_retention_days` prunes the
+        // `messages` row, and counting rows there would hand a server its
+        // quota back early.
+        if matches!(message.scope, MessageScope::Outgoing) {
+            sqlx::query(
+                "INSERT INTO server_send_counters (server_id, day, sent)
+                 VALUES ($1, (now() AT TIME ZONE 'UTC')::date, 1)
+                 ON CONFLICT (server_id, day)
+                 DO UPDATE SET sent = server_send_counters.sent + 1",
+            )
+            .bind(message.server_id as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
         Ok((message_id, public_token))
+    }
+
+    /// Outgoing messages counted against the server's send limit in the
+    /// trailing 30-day window: today plus the 29 days before it, in UTC, the
+    /// same shape as the 30-day usage figure the dashboard shows.
+    pub async fn send_usage(&self, server_id: Id) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query(
+            // sum(bigint) is numeric in PostgreSQL, so cast it back.
+            "SELECT COALESCE(sum(sent), 0)::bigint AS used
+             FROM server_send_counters
+             WHERE server_id = $1
+               AND day > (now() AT TIME ZONE 'UTC')::date - 30
+               AND day <= (now() AT TIME ZONE 'UTC')::date",
+        )
+        .bind(server_id as i64)
+        .fetch_one(&self.store.pool)
+        .await?;
+        Ok(row.get::<i64, _>("used"))
+    }
+
+    /// Drop counter buckets that have left every window. Called from the
+    /// worker's hourly housekeeping. The margin past 30 days keeps a clock
+    /// skew or a long-running transaction from deleting a bucket that a
+    /// concurrent read still needs.
+    pub async fn prune_send_counters(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM server_send_counters
+             WHERE day < (now() AT TIME ZONE 'UTC')::date - 40",
+        )
+        .execute(&self.store.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Import a historical message as a completed record WITHOUT queuing it

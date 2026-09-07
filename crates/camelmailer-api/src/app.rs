@@ -848,6 +848,7 @@ pub(crate) fn server_json(server: &Server) -> Value {
         "color": server.color,
         "ip_pool_id": server.ip_pool_id,
         "default_stream_id": server.default_stream_id,
+        "send_limit": server.send_limit,
     })
 }
 
@@ -1297,6 +1298,19 @@ async fn servers_unsuspend(
     }
 }
 
+/// Deserialize a JSON `null` as `Some(None)` rather than `None`, so an
+/// `Option<Option<T>>` field can tell "field absent, leave it alone" from
+/// "field set to null, clear it". Plain `#[serde(default)]` collapses both
+/// to `None`, which makes a nullable column impossible to clear through a
+/// PATCH (the class of bug behind postalserver/postal#3562).
+fn null_is_explicit<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct UpdateServer {
     name: Option<String>,
@@ -1310,11 +1324,18 @@ struct UpdateServer {
     inbound_domain: Option<String>,
     broadcast_physical_address: Option<String>,
     color: Option<String>,
+    /// Outgoing messages per 30 days, or `null` for unlimited. The double
+    /// Option tells an absent field (leave it alone) from an explicit
+    /// `null` (clear the limit), which a plain `Option` cannot express.
+    /// Global admins only, see [`servers_update`].
+    #[serde(default, deserialize_with = "null_is_explicit")]
+    send_limit: Option<Option<i64>>,
 }
 
 async fn servers_update(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
+    principal: axum::Extension<Principal>,
     Path((org_permalink, permalink)): Path<(String, String)>,
     Json(body): Json<UpdateServer>,
 ) -> ApiResponse {
@@ -1364,6 +1385,26 @@ async fn servers_update(
     }
     if body.color.is_some() {
         server.color = body.color;
+    }
+    if let Some(send_limit) = body.send_limit {
+        // The send limit is the operator's control over a tenant, so an
+        // organization owner must not be able to raise their own. Only a
+        // global admin or a machine key may write it.
+        if !principal.is_root() {
+            return render_error(
+                Some(&start.0),
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Only a global administrator can change a server's send limit",
+            );
+        }
+        if send_limit.is_some_and(|limit| limit < 0) {
+            return render_validation_error(
+                Some(&start.0),
+                "Send limit must be zero or greater, or null for unlimited",
+            );
+        }
+        server.send_limit = send_limit;
     }
     match state.store.update_server(server).await {
         Ok(server) => render_success(

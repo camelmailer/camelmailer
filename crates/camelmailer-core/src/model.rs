@@ -41,6 +41,10 @@ pub struct Server {
     pub track_opens: bool,
     /// Default click-tracking for mail sent via the HTTP API.
     pub track_clicks: bool,
+    /// Outgoing messages this server may store in the trailing 30-day
+    /// window. `None` is unlimited, which is every server until an operator
+    /// sets a value. See [`crate::send_limit`].
+    pub send_limit: Option<i64>,
     /// Per-server spam threshold override (None = installation default).
     pub spam_threshold: Option<f64>,
     /// Per-server outbound spam threshold override.
