@@ -72,3 +72,10 @@ web server (for API development), messages are accepted and queued but stay
 undelivered until a worker runs, and delivery-time behavior such as DKIM
 signing, open and click tracking, and inbound feedback-loop ingestion does
 not occur. Each page calls out where this applies.
+
+## Getting help
+
+Deployment questions, DNS puzzles and what we are building next happen on
+**[Discord](https://discord.gg/7UQpwx2jQg)**. Anything that should stay
+searchable, a bug or a feature request, belongs in
+[issues](https://github.com/camelmailer/camelmailer/issues).

@@ -2,6 +2,12 @@
   <img src="web/app/public/camelmailer-logo.png" alt="CamelMailer" width="420">
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/7UQpwx2jQg"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://camelmailer.com/docs"><img src="https://img.shields.io/badge/docs-camelmailer.com-0b7285" alt="Documentation"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT licensed"></a>
+</p>
+
 # CamelMailer
 
 **A headless, API-first mail delivery platform in Rust.** SMTP in and out,
@@ -272,6 +278,13 @@ deferred (documented so integrators know what not to expect yet):
 - **Per-address sender signatures** and **template push between servers**.
 - **SAML / SCIM** (OIDC is the SSO path) and **WebAuthn**.
 - **Billing** — planned separately for the hosted cloud.
+
+## Community
+
+Questions, deployment help and what we are building next happen on
+**[Discord](https://discord.gg/7UQpwx2jQg)**. Bug reports and feature
+requests belong in [issues](https://github.com/camelmailer/camelmailer/issues),
+where they stay searchable.
 
 ## License
 
