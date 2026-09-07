@@ -1,6 +1,7 @@
-import { describe, it, expect } from "vitest"
+import { describe, it, expect, vi } from "vitest"
+import messageBouncedSampleShape from "./__fixtures__/message_bounced_sample_shape.json"
 import type { Domain } from "@/lib/api"
-import { maskKey, deriveSmtpHost } from "@/lib/api-p3"
+import { maskKey, deriveSmtpHost, webhookSamplePayload } from "@/lib/api-p3"
 import { relativeTime } from "@/lib/api-p1"
 
 // Regression tests for the credentials-page crash: opening
@@ -84,5 +85,34 @@ describe("relativeTime", () => {
 
   it("formats a very recent timestamp as 'just now'", () => {
     expect(relativeTime(new Date().toISOString())).toBe("just now")
+  })
+})
+
+describe("webhookSamplePayload", () => {
+  it("uses fractional-second timestamps for MessageBounced samples", () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_720_000_000_123)
+    const sample = JSON.parse(webhookSamplePayload("MessageBounced"))
+
+    expect(sample.payload.bounce.timestamp).toBe(1_720_000_000.123)
+    expect(sample.payload.original_message.timestamp).toBe(1_719_999_940.123)
+    expect(Number.isInteger(sample.payload.bounce.timestamp)).toBe(false)
+
+    vi.restoreAllMocks()
+  })
+
+  it("matches the backend MessageBounced sample field contract", () => {
+    const sample = JSON.parse(webhookSamplePayload("MessageBounced"))
+    const keys = (value: object) => Object.keys(value).sort()
+
+    expect(keys(sample)).toEqual(messageBouncedSampleShape.top_level)
+    expect(keys(sample.payload)).toEqual(messageBouncedSampleShape.payload)
+    expect(keys(sample.payload.original_message)).toEqual(
+      messageBouncedSampleShape.message,
+    )
+    expect(keys(sample.payload.bounce)).toEqual(messageBouncedSampleShape.message)
+    expect(sample.payload.original_message.message_id).toBe(
+      "original@example.com",
+    )
+    expect(sample.payload.bounce.message_id).toBe("bounce@mx.example.com")
   })
 })

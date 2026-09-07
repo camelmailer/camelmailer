@@ -1064,7 +1064,7 @@ function initialTab(fallback: string): string {
 /// and the Preview / Plain Text / HTML / Raw / Insights tabs. It owns all
 /// the per-message queries and reads everything from the message id, so it
 /// drops straight into the detail page below.
-function MessageDetailBody({ api, id }: { api: Api; id: number }) {
+function MessageDetailBody({ api, id, org, server }: { api: Api; id: number; org: string; server: string }) {
   const p1 = useMessagingApiP1()
   const message = useQuery({ queryKey: ["sapi-message", id], queryFn: () => api.message(id) })
   const deliveries = useQuery({
@@ -1133,6 +1133,41 @@ function MessageDetailBody({ api, id }: { api: Api; id: number }) {
           }
         />
       </div>
+
+      {m.bounce && (
+        <section aria-label="Bounce notification" className="rounded-md border bg-muted/30 p-3 text-sm">
+          <p className="font-medium">Bounce notification</p>
+          {m.bounce_for_id != null ? (
+            <p className="mt-1">
+              Bounce for{" "}
+              <Link
+                href={`/orgs/${org}/servers/${server}/messaging/${m.bounce_for_id}`}
+                className="text-primary underline underline-offset-4"
+              >
+                original message #{m.bounce_for_id}
+              </Link>
+            </p>
+          ) : (
+            <p className="mt-1 text-muted-foreground">No original message matched.</p>
+          )}
+          {(m.bounce_category || m.bounce_correlated_at) && (
+            <dl className="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-muted-foreground">
+              {m.bounce_category && (
+                <div className="flex gap-1">
+                  <dt>Category:</dt>
+                  <dd>{m.bounce_category === "hard" ? "Hard" : m.bounce_category === "soft" ? "Soft" : "Undetermined"}</dd>
+                </div>
+              )}
+              {m.bounce_correlated_at && (
+                <div className="flex gap-1">
+                  <dt>Matched:</dt>
+                  <dd><time dateTime={m.bounce_correlated_at}>{formatDate(m.bounce_correlated_at)}</time></dd>
+                </div>
+              )}
+            </dl>
+          )}
+        </section>
+      )}
 
       <div className="rounded-md border bg-muted/30 px-2">
         <EventTimeline
@@ -1270,7 +1305,7 @@ export function MessageDetailPage({
         />
       }
     >
-      <MessageDetailBody api={api} id={id} />
+      <MessageDetailBody api={api} id={id} org={org} server={server} />
 
       {sharing && <ShareDialog api={api} id={id} onClose={() => setSharing(false)} />}
     </Page>

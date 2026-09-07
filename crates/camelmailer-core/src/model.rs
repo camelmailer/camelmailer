@@ -234,11 +234,12 @@ pub struct IpAddress {
 /// The webhook event names the worker can fire. The only valid values for
 /// [`Webhook::events`]; API validation and the worker's filter both use
 /// this list, so it is the single source of truth.
-pub const WEBHOOK_EVENTS: [&str; 4] = [
+pub const WEBHOOK_EVENTS: [&str; 5] = [
     "MessageSent",
     "MessageDelayed",
     "MessageDeliveryFailed",
     "MessageHeld",
+    "MessageBounced",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -1083,6 +1083,29 @@ async fn inbound_bypass_and_retry_requeue_the_message() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["message"]["status"], "Pending");
 
+    // A retry may also enqueue a previously correlated DSN. Its durable
+    // marker survives so the worker can recognize the repeat and complete it
+    // without another delivery or webhook.
+    store.set_bounce_for_id(id, id);
+    store.set_message_status(id, "Processed");
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/v2/server/inbound/{id}/retry"),
+        &token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["requeued"], true);
+    assert_eq!(body["data"]["message"]["status"], "Pending");
+    assert_eq!(body["data"]["message"]["bounce_for_id"], id);
+    chrono::DateTime::parse_from_rfc3339(
+        body["data"]["message"]["bounce_correlated_at"]
+            .as_str()
+            .expect("correlation timestamp must survive requeue"),
+    )
+    .expect("correlation timestamp must use RFC 3339");
+
     // an outbound message can't be retried via the inbound endpoint
     let out = send_one(
         &app,
@@ -1399,6 +1422,13 @@ async fn bounce_categories_are_exposed_and_broken_down_in_stats() {
     // an unclassified bounce counts as undetermined
     let unknown = send("Unknown").await;
     store.set_message_status(unknown, "Bounced");
+    // a processed DSN exposes its original id but does not add a second
+    // category count
+    let correlated = send("Correlated DSN").await;
+    store.set_message_status(correlated, "Bounced");
+    store.set_bounce_category(correlated, BounceCategory::Hard);
+    store.set_bounce_for_id(correlated, hard);
+    store.set_message_status(correlated, "Processed");
     // a delivered message contributes to no bucket
     let ok = send("OK").await;
     store.set_message_status(ok, "Sent");
@@ -1416,6 +1446,17 @@ async fn bounce_categories_are_exposed_and_broken_down_in_stats() {
     };
     assert_eq!(category_of("Hard"), json!("hard"));
     assert_eq!(category_of("Unknown"), Value::Null);
+    let correlated_bounce = bounces
+        .iter()
+        .find(|bounce| bounce["subject"] == "Correlated DSN")
+        .unwrap();
+    assert_eq!(correlated_bounce["bounce_for_id"], hard);
+    chrono::DateTime::parse_from_rfc3339(
+        correlated_bounce["bounce_correlated_at"]
+            .as_str()
+            .expect("correlation timestamp must be a string"),
+    )
+    .expect("correlation timestamp must use RFC 3339");
 
     let (status, body) = request(
         &app,
@@ -1425,6 +1466,21 @@ async fn bounce_categories_are_exposed_and_broken_down_in_stats() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["bounce"]["bounce_category"], "hard");
+
+    let (status, body) = request(
+        &app,
+        &format!("/api/v2/server/bounces/{correlated}"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["bounce"]["bounce_for_id"], hard);
+    chrono::DateTime::parse_from_rfc3339(
+        body["data"]["bounce"]["bounce_correlated_at"]
+            .as_str()
+            .expect("correlation timestamp must be a string"),
+    )
+    .expect("correlation timestamp must use RFC 3339");
 
     // GET /stats breaks bounces down by category
     let (_, body) = request(&app, "/api/v2/server/stats", Some(&token)).await;

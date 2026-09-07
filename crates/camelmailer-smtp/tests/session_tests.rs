@@ -286,6 +286,51 @@ fn return_path_rcpt_adds_a_bounce_recipient() {
 }
 
 #[test]
+fn return_path_rcpt_matches_the_normalized_config_domain() {
+    let mut full_config = camelmailer_config::Config::default();
+    full_config.dns.return_path_domain = "RP.CamelMailer.COM.".into();
+    let session_config = SessionConfig::from(&full_config);
+    assert_eq!(session_config.return_path_domain, "rp.camelmailer.com");
+
+    let mut setup = TestSetup::with_config(session_config);
+    let token = setup.fixtures.server().token.clone();
+    helo_and_mail_from(&mut setup.session);
+    let address = format!("{token}@rp.camelmailer.com");
+    let reply = setup.session.handle(&format!("RCPT TO: {address}"));
+
+    assert_eq!(line(&reply), "250 OK");
+    assert_eq!(setup.session.recipients()[0].kind, RecipientKind::Bounce);
+    assert_eq!(setup.session.recipients()[0].rcpt_to, address);
+}
+
+#[test]
+fn return_path_rcpt_accepts_the_shipped_placeholder_domain() {
+    // dns.return_path_domain defaults to the shipped placeholder
+    // (rp.postal.example.com), which is reserved for the outbound
+    // envelope-sender fallback only. The SMTP intake must still accept
+    // return-path mail addressed to it — otherwise an untouched sample
+    // configuration or Docker Compose stack rejects every bounce.
+    let full_config = camelmailer_config::Config::default();
+    assert_eq!(
+        full_config.dns.normalized_return_path_domain(),
+        None,
+        "the shipped placeholder should remain reserved on the send side"
+    );
+    let session_config = SessionConfig::from(&full_config);
+    assert_eq!(session_config.return_path_domain, "rp.postal.example.com");
+
+    let mut setup = TestSetup::with_config(session_config);
+    let token = setup.fixtures.server().token.clone();
+    helo_and_mail_from(&mut setup.session);
+    let address = format!("{token}@rp.postal.example.com");
+    let reply = setup.session.handle(&format!("RCPT TO: {address}"));
+
+    assert_eq!(line(&reply), "250 OK");
+    assert_eq!(setup.session.recipients()[0].kind, RecipientKind::Bounce);
+    assert_eq!(setup.session.recipients()[0].rcpt_to, address);
+}
+
+#[test]
 fn custom_return_path_prefix_behaves_like_the_return_path_domain() {
     let mut setup = TestSetup::new();
     let token = setup.fixtures.server().token.clone();

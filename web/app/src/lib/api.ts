@@ -257,6 +257,7 @@ export const WEBHOOK_EVENTS = [
   "MessageDelayed",
   "MessageDeliveryFailed",
   "MessageHeld",
+  "MessageBounced",
 ] as const
 
 export type SenderAddress = {
@@ -432,6 +433,9 @@ export type Message = {
   campaign_id?: number | null
   held?: boolean
   bounce?: boolean
+  bounce_for_id?: number | null
+  bounce_correlated_at?: string | null
+  bounce_category?: "hard" | "soft" | "undetermined" | null
   bypassed?: boolean
   created_at: string
   metadata?: unknown

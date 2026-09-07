@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.6"
+version = "0.7.7"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/camelmailer/camelmailer"
@@ -59,6 +59,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 base64 = "0.22"
 mail-builder = "0.4"
+mailparse = "0.16"
 rand = "0.8"
 hmac = "0.12"
 md-5 = "0.10"

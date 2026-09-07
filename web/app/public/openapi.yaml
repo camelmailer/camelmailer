@@ -401,7 +401,8 @@ paths:
       description: >
         Each bounce carries its classification in `bounce_category`
         (`hard` = permanent 5xx failure, `soft` = exhausted 4xx retries,
-        `undetermined` = unclassifiable).
+        `undetermined` = unclassifiable). Correlated inbound DSNs also carry
+        `bounce_for_id`, the original outgoing message id.
       security: [{ ServerApiKey: [] }]
       responses:
         "200": { $ref: "#/components/responses/Success" }
@@ -1974,7 +1975,7 @@ paths:
               properties:
                 event:
                   type: string
-                  enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld]
+                  enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld, MessageBounced]
       responses:
         "200": { $ref: "#/components/responses/Success" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2403,6 +2404,19 @@ components:
         tag: { type: string, nullable: true }
         status: { type: string, nullable: true, example: Sent }
         bounce: { type: boolean }
+        bounce_for_id:
+          type: integer
+          nullable: true
+          description: Original outgoing message id for a correlated inbound DSN.
+        bounce_correlated_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            When this DSN was correlated to its original message. Set once,
+            alongside `bounce_for_id`, and retained (unlike `bounce_for_id`)
+            after retention prunes the original, so it keeps bounce
+            statistics from re-counting the DSN.
         bounce_category:
           type: string
           nullable: true
@@ -2483,7 +2497,7 @@ components:
           description: Subscribed event names; empty = all events.
           items:
             type: string
-            enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld]
+            enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld, MessageBounced]
         headers:
           type: object
           description: |

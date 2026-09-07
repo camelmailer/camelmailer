@@ -99,6 +99,11 @@ pub struct MessageRecord {
     pub tag: Option<String>,
     pub status: String,
     pub bounce: bool,
+    /// Original outgoing message for an inbound DSN, once correlated.
+    pub bounce_for_id: Option<i64>,
+    /// Durable correlation marker. Unlike `bounce_for_id`, this survives
+    /// retention pruning the original and keeps statistics de-duplicated.
+    pub bounce_correlated_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `hard` / `soft` / `undetermined` once the message terminally failed
     /// or was processed as a bounce (see [`crate::bounce`]); `None` until
     /// then.

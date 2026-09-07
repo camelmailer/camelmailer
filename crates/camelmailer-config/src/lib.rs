@@ -600,6 +600,8 @@ pub struct Dns {
     pub mx_records: Vec<String>,
     pub spf_include: String,
     pub return_path_domain: String,
+    /// Opt in to rewriting outbound envelope senders; defaults off in 0.7.x.
+    pub return_path_envelope: bool,
     pub route_domain: String,
     pub track_domain: String,
     pub helo_hostname: Option<String>,
@@ -626,6 +628,7 @@ impl Default for Dns {
             ],
             spf_include: "spf.postal.example.com".into(),
             return_path_domain: "rp.postal.example.com".into(),
+            return_path_envelope: false,
             route_domain: "routes.postal.example.com".into(),
             track_domain: "track.postal.example.com".into(),
             helo_hostname: None,
@@ -637,6 +640,64 @@ impl Default for Dns {
             timeout: 5,
             resolv_conf_path: "/etc/resolv.conf".into(),
         }
+    }
+}
+
+/// Convert a DNS name to the canonical ASCII form used for comparisons.
+///
+/// SMTP domain names are case-insensitive. Accept an operator-friendly
+/// trailing root dot and Unicode input, but reject malformed labels.
+pub fn normalize_dns_domain_name(value: &str) -> Option<String> {
+    let domain = value.trim().trim_end_matches('.');
+    let domain = idna::domain_to_ascii(domain).ok()?.to_ascii_lowercase();
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2
+        || domain.len() > 253
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || !label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                || !label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+    {
+        return None;
+    }
+    Some(domain)
+}
+
+impl Dns {
+    /// The shared return-path domain in canonical form, when it can receive
+    /// real mail. Reserved documentation domains deliberately remain unusable
+    /// so an untouched sample configuration cannot change outbound MAIL FROM.
+    pub fn normalized_return_path_domain(&self) -> Option<String> {
+        let domain = normalize_dns_domain_name(&self.return_path_domain)?;
+        for suffix in [
+            "example",
+            "example.com",
+            "example.net",
+            "example.org",
+            "invalid",
+            "localhost",
+            "test",
+        ] {
+            if domain == suffix
+                || domain
+                    .strip_suffix(suffix)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+            {
+                return None;
+            }
+        }
+        Some(domain)
     }
 }
 
@@ -1085,6 +1146,7 @@ mod tests {
             vec!["mx1.postal.example.com", "mx2.postal.example.com"]
         );
         assert_eq!(config.dns.return_path_domain, "rp.postal.example.com");
+        assert!(!config.dns.return_path_envelope);
         assert_eq!(config.dns.route_domain, "routes.postal.example.com");
         assert_eq!(config.dns.custom_return_path_prefix, "psrp");
         assert_eq!(config.dns.dkim_identifier, "postal");
@@ -1092,6 +1154,46 @@ mod tests {
         assert_eq!(config.smtp.port, 25);
         assert_eq!(config.smtp.authentication_type, "login");
         assert!(config.smtp.enable_starttls_auto);
+    }
+
+    #[test]
+    fn return_path_envelope_requires_explicit_opt_in() {
+        for (setting, enabled) in [
+            ("", false),
+            ("  return_path_envelope: false\n", false),
+            ("  return_path_envelope: true\n", true),
+        ] {
+            let config: Config = serde_yaml::from_str(&format!(
+                "dns:\n  return_path_domain: rp.camelmailer.com\n{setting}"
+            ))
+            .unwrap();
+            assert_eq!(config.dns.return_path_envelope, enabled);
+        }
+    }
+
+    #[test]
+    fn dns_domain_names_are_normalized_for_comparison() {
+        assert_eq!(
+            normalize_dns_domain_name("  BÜCHER.CamelMailer.COM.  ").as_deref(),
+            Some("xn--bcher-kva.camelmailer.com")
+        );
+        assert_eq!(normalize_dns_domain_name("bad_label.example"), None);
+        assert_eq!(normalize_dns_domain_name("localhost"), None);
+    }
+
+    #[test]
+    fn return_path_domain_rejects_reserved_values_after_normalizing() {
+        let mut dns = Dns::default();
+        for value in ["", "RP.Example.COM.", "foo.test", "localhost"] {
+            dns.return_path_domain = value.into();
+            assert_eq!(dns.normalized_return_path_domain(), None, "{value}");
+        }
+
+        dns.return_path_domain = "RP.CamelMailer.COM.".into();
+        assert_eq!(
+            dns.normalized_return_path_domain().as_deref(),
+            Some("rp.camelmailer.com")
+        );
     }
 
     #[test]

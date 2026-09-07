@@ -56,7 +56,15 @@ impl From<&camelmailer_config::Config> for SessionConfig {
             smtp_hostname: config.camelmailer.smtp_hostname.clone(),
             tls_enabled: config.smtp_server.tls_enabled,
             max_message_size: config.smtp_server.max_message_size,
-            return_path_domain: config.dns.return_path_domain.clone(),
+            // Unlike the outbound envelope sender, the intake must keep
+            // accepting return-path mail even when the configured domain is
+            // an unedited placeholder — `normalized_return_path_domain`'s
+            // reserved-suffix filter is a send-side-only fallback rule, not
+            // a reason to reject inbound mail.
+            return_path_domain: camelmailer_config::normalize_dns_domain_name(
+                &config.dns.return_path_domain,
+            )
+            .unwrap_or_default(),
             custom_return_path_prefix: config.dns.custom_return_path_prefix.clone(),
             route_domain: config.dns.route_domain.clone(),
         }
@@ -149,11 +157,17 @@ pub struct Session {
 
 impl Session {
     pub fn new(
-        config: SessionConfig,
+        mut config: SessionConfig,
         store: Arc<dyn Store>,
         sink: Arc<dyn MessageSink>,
         ip_address: Option<String>,
     ) -> Self {
+        // Keep direct SessionConfig callers on the same canonical comparison
+        // form as Config-derived production sessions.
+        config.return_path_domain =
+            camelmailer_config::normalize_dns_domain_name(&config.return_path_domain)
+                .unwrap_or_default();
+        config.custom_return_path_prefix = config.custom_return_path_prefix.to_ascii_lowercase();
         let state = if ip_address.is_some() {
             State::Welcome
         } else {
@@ -584,8 +598,13 @@ impl Session {
             None => (uname, None),
         };
 
+        let normalized_domain = camelmailer_config::normalize_dns_domain_name(domain);
         let return_path_prefix = format!("{}.", self.config.custom_return_path_prefix);
-        if domain == self.config.return_path_domain || domain.starts_with(&return_path_prefix) {
+        let is_return_path = normalized_domain.as_deref().is_some_and(|domain| {
+            (!self.config.return_path_domain.is_empty() && domain == self.config.return_path_domain)
+                || domain.starts_with(&return_path_prefix)
+        });
+        if is_return_path {
             // This is a return path
             self.state = State::RcptToReceived;
             match self.store.find_server_by_token(uname) {

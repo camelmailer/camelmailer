@@ -9,7 +9,7 @@ use camelmailer_core::{
 use camelmailer_db::{PgMessageSink, PgQueue, PgStore};
 use camelmailer_worker::{ProcessOutcome, Worker};
 use rand::Rng;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -30,7 +30,7 @@ macro_rules! require_db {
     };
 }
 
-async fn test_pool(base: &str) -> PgPool {
+async fn test_pool_with_connections(base: &str, max_connections: u32) -> PgPool {
     let name: String = {
         let mut rng = rand::thread_rng();
         (0..12)
@@ -45,11 +45,89 @@ async fn test_pool(base: &str) -> PgPool {
         .unwrap();
     admin_pool.close().await;
     let position = base.rfind('/').unwrap();
-    let pool = camelmailer_db::connect(&format!("{}/{}", &base[..position], db_name), 2)
-        .await
-        .unwrap();
+    let pool = camelmailer_db::connect(
+        &format!("{}/{}", &base[..position], db_name),
+        max_connections,
+    )
+    .await
+    .unwrap();
     camelmailer_db::migrate(&pool).await.unwrap();
     pool
+}
+
+async fn test_pool(base: &str) -> PgPool {
+    test_pool_with_connections(base, 2).await
+}
+
+const WEBHOOK_INSERT_BARRIER_CLASS: i32 = 61_703;
+const WEBHOOK_INSERT_BARRIER_KEY: i32 = 7;
+
+async fn install_webhook_insert_barrier(pool: &PgPool) -> sqlx::pool::PoolConnection<Postgres> {
+    sqlx::query(
+        "CREATE FUNCTION pause_webhook_request_insert() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock(61703, 7);
+             RETURN NEW;
+         END
+         $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER pause_webhook_request_insert
+         BEFORE INSERT ON webhook_requests
+         FOR EACH ROW EXECUTE FUNCTION pause_webhook_request_insert()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1, $2)")
+        .bind(WEBHOOK_INSERT_BARRIER_CLASS)
+        .bind(WEBHOOK_INSERT_BARRIER_KEY)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    connection
+}
+
+async fn wait_for_locked_query(pool: &PgPool, query_prefix: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND query LIKE $1
+                       AND wait_event_type = 'Lock'
+                 )",
+            )
+            .bind(format!("{query_prefix}%"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("query did not reach lock barrier: {query_prefix}"));
+}
+
+async fn release_webhook_insert_barrier(connection: &mut sqlx::pool::PoolConnection<Postgres>) {
+    let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1, $2)")
+        .bind(WEBHOOK_INSERT_BARRIER_CLASS)
+        .bind(WEBHOOK_INSERT_BARRIER_KEY)
+        .fetch_one(&mut **connection)
+        .await
+        .unwrap();
+    assert!(released);
 }
 
 /// A single-shot mock SMTP server. Replies to the transaction with the
@@ -57,6 +135,13 @@ async fn test_pool(base: &str) -> PgPool {
 struct MockSmtp {
     port: u16,
     received: Arc<Mutex<Vec<String>>>,
+}
+
+struct PausedMockSmtp {
+    port: u16,
+    received: Arc<Mutex<Vec<String>>>,
+    final_response_ready: Arc<tokio::sync::Notify>,
+    final_response_release: Arc<tokio::sync::Notify>,
 }
 
 async fn mock_smtp(final_reply: &'static str) -> MockSmtp {
@@ -113,6 +198,78 @@ async fn mock_smtp(final_reply: &'static str) -> MockSmtp {
         }
     });
     MockSmtp { port, received }
+}
+
+/// A mock SMTP server that pauses after receiving the DATA terminator. Tests
+/// use the pause to commit a DSN correlation before the SMTP outcome reaches
+/// the outbound worker.
+async fn paused_mock_smtp(final_reply: &'static str) -> PausedMockSmtp {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    let final_response_ready = Arc::new(tokio::sync::Notify::new());
+    let ready = final_response_ready.clone();
+    let final_response_release = Arc::new(tokio::sync::Notify::new());
+    let release = final_response_release.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let captured = captured.clone();
+            let ready = ready.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                write_half.write_all(b"220 mock ESMTP\r\n").await.ok();
+                let mut in_data = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let trimmed = line.trim_end().to_string();
+                    captured.lock().unwrap().push(trimmed.clone());
+                    if in_data {
+                        if trimmed == "." {
+                            in_data = false;
+                            ready.notify_one();
+                            release.notified().await;
+                            write_half
+                                .write_all(format!("{final_reply}\r\n").as_bytes())
+                                .await
+                                .ok();
+                        }
+                        continue;
+                    }
+                    let upper = trimmed.to_ascii_uppercase();
+                    let reply: &str = if upper.starts_with("EHLO") {
+                        "250-mock\r\n250 OK"
+                    } else if upper.starts_with("DATA") {
+                        in_data = true;
+                        "354 Go ahead"
+                    } else if upper.starts_with("QUIT") {
+                        write_half.write_all(b"221 Bye\r\n").await.ok();
+                        return;
+                    } else {
+                        "250 OK"
+                    };
+                    write_half
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await
+                        .ok();
+                }
+            });
+        }
+    });
+    PausedMockSmtp {
+        port,
+        received,
+        final_response_ready,
+        final_response_release,
+    }
 }
 
 /// A mock HTTP server capturing POSTed JSON bodies.
@@ -187,6 +344,8 @@ fn worker_config(relay_port: u16) -> camelmailer_config::Config {
     let mut config = camelmailer_config::Config::default();
     config.camelmailer.smtp_relays = vec![format!("smtp://127.0.0.1:{relay_port}")];
     config.camelmailer.default_maximum_delivery_attempts = 3;
+    config.dns.return_path_domain = "rp.camelmailer.com".into();
+    config.dns.return_path_envelope = true;
     config.smtp_client.open_timeout = 5;
     // The webhook / route-endpoint mock servers in these tests bind to
     // 127.0.0.1, which the SSRF guard blocks by default. Allowlist loopback so
@@ -239,9 +398,16 @@ async fn outgoing_messages_are_delivered_via_the_relay_and_webhooked() {
         .await
         .unwrap();
 
-    s.sink
+    let message_id = s
+        .sink
         .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
         .await
+        .unwrap();
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
         .unwrap();
 
     let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
@@ -252,9 +418,14 @@ async fn outgoing_messages_are_delivered_via_the_relay_and_webhooked() {
 
     // the mock SMTP saw the right envelope and body
     let seen = smtp.received.lock().unwrap().clone();
-    assert!(seen.iter().any(|l| l == "MAIL FROM:<sender@org.example>"));
+    assert!(seen
+        .iter()
+        .any(|l| { l == &format!("MAIL FROM:<{}@rp.camelmailer.com>", s.server.token) }));
     assert!(seen.iter().any(|l| l == "RCPT TO:<user@dest.example>"));
     assert!(seen.iter().any(|l| l == "Subject: Pipeline"));
+    assert!(seen
+        .iter()
+        .any(|l| l == &format!("X-CamelMailer-MsgID: {}", stored.token)));
 
     // the webhook fired with a MessageSent event
     let hooks = hook.requests.lock().unwrap().clone();
@@ -264,6 +435,163 @@ async fn outgoing_messages_are_delivered_via_the_relay_and_webhooked() {
         hooks[0]["payload"]["message"]["rcpt_to"],
         "user@dest.example"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_webhook_during_sent_fanout_cannot_requeue_accepted_mail() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 4).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let webhook = s
+        .store
+        .create_webhook(NewWebhook::all(
+            s.server.id,
+            "sent events",
+            "https://hooks.example.test/sent",
+            false,
+        ))
+        .await
+        .unwrap();
+    let message_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    // The trigger stops the request insert after the worker has received 250
+    // and snapshotted the webhook. The delete must wait for that transaction,
+    // then cascade the committed request without undoing Sent or queue
+    // completion.
+    let mut barrier = install_webhook_insert_barrier(&pool).await;
+    let send_config = worker_config(smtp.port);
+    let send_worker = Worker::new(&send_config, s.store.clone());
+    let send_task = tokio::spawn(async move { send_worker.process_next().await });
+    wait_for_locked_query(&pool, "INSERT INTO webhook_requests").await;
+
+    let delete_store = s.store.clone();
+    let delete_task = tokio::spawn(async move { delete_store.delete_webhook(webhook.id).await });
+    wait_for_locked_query(&pool, "DELETE FROM webhooks").await;
+
+    release_webhook_insert_barrier(&mut barrier).await;
+    let outcome = send_task.await.unwrap().unwrap().unwrap();
+    assert!(matches!(outcome, ProcessOutcome::Delivered { .. }));
+    assert!(delete_task.await.unwrap().unwrap());
+
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Sent");
+    let deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, message_id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, "Sent");
+    let webhook_requests: i64 = sqlx::query_scalar("SELECT count(*) FROM webhook_requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(webhook_requests, 0);
+
+    let recovery_worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    assert!(recovery_worker.process_next().await.unwrap().is_none());
+    assert_eq!(
+        smtp.received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.as_str() == ".")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_return_path_envelope_preserves_the_submitted_sender() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let mut config = worker_config(smtp.port);
+    config.dns.return_path_envelope = false;
+    let worker = Worker::new(&config, s.store.clone());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let seen = smtp.received.lock().unwrap().clone();
+    assert!(seen
+        .iter()
+        .any(|line| line == "MAIL FROM:<sender@org.example>"));
+    // Correlation headers remain available independently of envelope rewriting.
+    assert!(seen
+        .iter()
+        .any(|line| line.starts_with("X-CamelMailer-MsgID:")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_return_path_domains_preserve_the_submitted_envelope_sender() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    for return_path_domain in ["", "rp.example.com"] {
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+        let mut config = worker_config(smtp.port);
+        config.dns.return_path_domain = return_path_domain.into();
+        let worker = Worker::new(&config, s.store.clone());
+        assert!(matches!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::Delivered { .. }
+        ));
+    }
+
+    let seen = smtp.received.lock().unwrap().clone();
+    assert_eq!(
+        seen.iter()
+            .filter(|line| *line == "MAIL FROM:<sender@org.example>")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_return_path_domains_are_normalized_before_sending() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let mut config = worker_config(smtp.port);
+    config.dns.return_path_domain = "RP.CamelMailer.COM.".into();
+    let worker = Worker::new(&config, s.store.clone());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+
+    let seen = smtp.received.lock().unwrap().clone();
+    assert!(seen
+        .iter()
+        .any(|line| line == &format!("MAIL FROM:<{}@rp.camelmailer.com>", s.server.token)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -485,35 +813,845 @@ async fn inbound_dsn_bounces_are_classified_from_their_status_fields() {
     };
 
     // Status: 5.1.1 -> hard; Status: 4.4.1 -> soft; a DSN without
-    // Status:/Diagnostic-Code: fields stays undetermined (numbers in the
-    // human-readable text never classify).
-    let cases: [(&[u8], &str); 3] = [
+    // Status:/Diagnostic-Code: fields stays undetermined. With no route or
+    // matching token, each failed DSN is terminally recorded like Postal. A
+    // return-path message without DSN structure keeps the normal fallback.
+    let cases: [(&[u8], Option<&str>); 4] = [
         (
             b"Subject: Delivery Status Notification\r\n\r\n\
+              Reporting-MTA: dns; mx.dest.example\r\n\
               Final-Recipient: rfc822; gone@example.com\r\n\
               Action: failed\r\n\
               Status: 5.1.1\r\n\
               Diagnostic-Code: smtp; 550 5.1.1 user unknown\r\n",
-            "hard",
+            Some("hard"),
         ),
-        (b"Subject: Delayed\r\n\r\nStatus: 4.4.1\r\n", "soft"),
         (
-            b"Subject: bounce\r\n\r\nYour mail from 2026 got 550 problems.\r\n",
-            "undetermined",
+            b"Subject: Delayed\r\n\
+              Content-Type: message/delivery-status\r\n\r\n\
+              Action: failed\r\n\
+              Status: 4.4.1\r\n",
+            Some("soft"),
+        ),
+        (
+            b"Subject: bounce\r\n\
+              Content-Type: multipart/report; report-type=delivery-status; boundary=b\r\n\r\n\
+              --b\r\nContent-Type: message/delivery-status\r\n\r\n\
+              Final-Recipient: rfc822; gone@example.com\r\n\
+              Action: failed\r\n\
+              Your mail from 2026 got 550 problems.\r\n--b--\r\n",
+            Some("undetermined"),
+        ),
+        (
+            b"Subject: Automatic reply\r\n\r\nYour mail from 2026 got 550 problems.\r\n",
+            None,
         ),
     ];
 
     for (raw, expected) in cases {
         let id = s.sink.insert_message(&dsn(raw)).await.unwrap();
         let outcome = worker.process_next().await.unwrap().unwrap();
-        assert_eq!(outcome, ProcessOutcome::NothingToDo);
         let record = camelmailer_core::ServerStore::message(&s.store, s.server.id, id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(record.bounce_category.as_deref(), Some(expected));
+        assert_eq!(record.bounce_category.as_deref(), expected);
+        let deliveries = s
+            .sink
+            .deliveries_for_message(s.server.id, id)
+            .await
+            .unwrap();
+        if expected.is_some() {
+            assert!(matches!(outcome, ProcessOutcome::Failed { .. }));
+            assert_eq!(record.status, "HardFail");
+            assert_eq!(deliveries.len(), 1);
+            assert_eq!(deliveries[0].status, "HardFail");
+            assert!(deliveries[0]
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("couldn't link it")));
+        } else {
+            assert_eq!(outcome, ProcessOutcome::NothingToDo);
+            assert_eq!(record.status, "Pending");
+            assert!(deliveries.is_empty());
+        }
     }
     assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unmatched_failed_dsns_with_a_route_are_posted_to_the_endpoint() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let endpoint = mock_http(axum::http::StatusCode::OK).await;
+    let domain = s
+        .store
+        .create_domain(
+            camelmailer_core::DomainOwner::Server(s.server.id),
+            "org.example",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    let route = s
+        .store
+        .create_route_with_endpoint(
+            s.server.id,
+            Some(domain.id),
+            "bounces",
+            camelmailer_core::RouteMode::Endpoint,
+            Some(endpoint.url.clone()),
+        )
+        .await
+        .unwrap();
+
+    let mut dsn = outgoing_message(s.server.id, "bounces@org.example");
+    dsn.scope = MessageScope::Incoming;
+    dsn.bounce = true;
+    dsn.route_id = Some(route.id);
+    dsn.raw_message = b"Content-Type: message/delivery-status\r\n\r\n\
+        Final-Recipient: rfc822; gone@example.com\r\n\
+        Action: failed\r\nStatus: 5.1.1\r\n"
+        .to_vec();
+    let dsn_id = s.sink.insert_message(&dsn).await.unwrap();
+
+    let worker = Worker::new(&worker_config(1), s.store.clone());
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Routed
+    );
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, dsn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.bounce_category.as_deref(), Some("hard"));
+    assert!(s
+        .sink
+        .deliveries_for_message(s.server.id, dsn_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let posts = endpoint.requests.lock().unwrap().clone();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0]["message"]["id"], dsn_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_dsns_correlate_only_the_first_matching_original_and_fire_one_webhook() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let hook = mock_http(axum::http::StatusCode::OK).await;
+    let rspamd_port = mock_rspamd(0.5, "no action").await;
+    s.store
+        .create_webhook(NewWebhook {
+            server_id: s.server.id,
+            name: "bounces".into(),
+            url: hook.url.clone(),
+            all_events: false,
+            sign: false,
+            events: vec!["MessageBounced".into()],
+            headers: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let domain = s
+        .store
+        .create_server_domain(s.server.id, "org.example", None)
+        .await
+        .unwrap();
+    let mut outgoing = outgoing_message(s.server.id, "gone@dest.example");
+    outgoing.domain_id = Some(domain.id);
+    outgoing.raw_message = b"Message-ID: <original@example.com>\r\n\
+        Subject: =?UTF-8?Q?Ol=C3=A1?=\r\n\r\nHello.\r\n"
+        .to_vec();
+    let original_id = s.sink.insert_message(&outgoing).await.unwrap();
+    let mut second_outgoing = outgoing_message(s.server.id, "second@dest.example");
+    second_outgoing.raw_message = b"Message-ID: <second@example.com>\r\n\
+        Subject: Second message\r\n\r\nHello again.\r\n"
+        .to_vec();
+    let second_original_id = s.sink.insert_message(&second_outgoing).await.unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.rspamd.enabled = true;
+    config.rspamd.host = "127.0.0.1".into();
+    config.rspamd.port = rspamd_port;
+    let worker = Worker::new(&config, s.store.clone());
+    for _ in 0..2 {
+        assert!(matches!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::Delivered { .. }
+        ));
+    }
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let second_original = s
+        .sink
+        .message_by_id(s.server.id, second_original_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut dsn = outgoing_message(
+        s.server.id,
+        &format!("{}@rp.camelmailer.com", s.server.token),
+    );
+    dsn.scope = MessageScope::Incoming;
+    dsn.bounce = true;
+    dsn.mail_from = "mailer-daemon@dest.example".into();
+    dsn.raw_message = format!(
+        "From: Mail Delivery System <mailer-daemon@dest.example>\r\n\
+         Message-ID: <bounce@mx.example.com>\r\n\
+         Subject: =?UTF-8?Q?Delivery_Status_Notification_=28Failure=29?=\r\n\
+         Content-Type: multipart/report; report-type=delivery-status; boundary=b\r\n\r\n\
+         --b\r\nContent-Type: message/delivery-status\r\n\r\n\
+         Final-Recipient: rfc822; gone@dest.example\r\n\
+         Action: failed\r\nStatus: 5.1.1\r\n\
+         Diagnostic-Code: smtp; 550 5.1.1 user unknown\r\n\r\n\
+         --b\r\nContent-Type: message/rfc822\r\n\r\n\
+         X-CamelMailer-MsgID: unknown123\r\n\
+         X-CamelMailer-MsgID: {}\r\n\
+         X-Postal-MsgID: {}\r\n\
+         Message-ID: <original@example.com>\r\n\
+         Subject: Original message\r\n\r\nHello.\r\n--b--\r\n",
+        original.token, second_original.token
+    )
+    .into_bytes();
+    let bounce_id = s.sink.insert_message(&dsn).await.unwrap();
+
+    // Disabling rewriting later must not stop intake/correlation of mail
+    // already sent with the return path.
+    config.dns.return_path_envelope = false;
+    let worker = Worker::new(&config, s.store.clone());
+
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::BounceCorrelated
+    );
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+
+    let bounced_original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bounced_original.status, "Bounced");
+    assert_eq!(bounced_original.bounce_category.as_deref(), Some("hard"));
+    let untouched_original = s
+        .sink
+        .message_by_id(s.server.id, second_original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(untouched_original.status, "Sent");
+    assert_eq!(untouched_original.bounce_category, None);
+
+    let received_dsn = s
+        .sink
+        .message_by_id(s.server.id, bounce_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received_dsn.status, "Processed");
+    assert_eq!(received_dsn.bounce_for_id, Some(original_id));
+    assert!(received_dsn.bounce_correlated_at.is_some());
+    assert_eq!(received_dsn.domain_id, Some(domain.id));
+    assert_eq!(received_dsn.bounce_category.as_deref(), Some("hard"));
+    assert_eq!(received_dsn.spam_status, "NotSpam");
+    assert!((received_dsn.spam_score - 0.5).abs() < 1e-9);
+    let correlated_at = received_dsn.bounce_correlated_at;
+
+    let stats = camelmailer_core::ServerStore::message_stats(
+        &s.store,
+        s.server.id,
+        &camelmailer_core::StatsFilter::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.bounced, 1);
+    assert_eq!(stats.bounces_hard, 1);
+
+    let original_deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, original_id)
+        .await
+        .unwrap();
+    assert_eq!(original_deliveries.last().unwrap().status, "Bounced");
+    assert!(original_deliveries
+        .last()
+        .unwrap()
+        .details
+        .as_deref()
+        .is_some_and(|details| details.contains(&format!("See <msg:{bounce_id}> for details"))));
+    let bounce_deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, bounce_id)
+        .await
+        .unwrap();
+    assert_eq!(bounce_deliveries.len(), 1);
+    assert_eq!(bounce_deliveries[0].status, "Processed");
+    assert!(bounce_deliveries[0]
+        .details
+        .as_deref()
+        .is_some_and(|details| details.contains(&format!("<msg:{original_id}>"))));
+
+    assert_eq!(worker.drain_webhooks().await.unwrap(), 1);
+    let hooks = hook.requests.lock().unwrap().clone();
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks[0]["event"], "MessageBounced");
+    assert_eq!(hooks[0]["payload"]["original_message"]["id"], original_id);
+    assert_eq!(
+        hooks[0]["payload"]["original_message"]["direction"],
+        "outgoing"
+    );
+    assert_eq!(
+        hooks[0]["payload"]["original_message"]["message_id"],
+        "original@example.com"
+    );
+    assert_eq!(hooks[0]["payload"]["original_message"]["subject"], "Olá");
+    assert_eq!(
+        hooks[0]["payload"]["original_message"]["to"],
+        "gone@dest.example"
+    );
+    assert_eq!(hooks[0]["payload"]["bounce"]["id"], bounce_id);
+    assert_eq!(hooks[0]["payload"]["bounce"]["direction"], "incoming");
+    assert_eq!(
+        hooks[0]["payload"]["bounce"]["message_id"],
+        "bounce@mx.example.com"
+    );
+    assert_eq!(
+        hooks[0]["payload"]["bounce"]["subject"],
+        "Delivery Status Notification (Failure)"
+    );
+    assert_eq!(hooks[0]["payload"]["bounce"]["spam_status"], "NotSpam");
+
+    let original_delivery_count = original_deliveries.len();
+    let bounce_delivery_count = bounce_deliveries.len();
+
+    // The API's retry path may requeue an already correlated DSN. Processing
+    // it again restores Processed without duplicating either delivery row or
+    // the MessageBounced webhook.
+    let retried = camelmailer_core::ServerStore::retry_message(&s.store, s.server.id, bounce_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried.status, "Pending");
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::BounceCorrelated
+    );
+
+    // A second queue row models a stale-lock retry after correlation committed
+    // but before the original queue row could be completed.
+    s.queue
+        .enqueue(bounce_id, s.server.id, "rp.camelmailer.com")
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::BounceCorrelated
+    );
+
+    let retried_dsn = s
+        .sink
+        .message_by_id(s.server.id, bounce_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retried_dsn.status, "Processed");
+    assert_eq!(retried_dsn.bounce_correlated_at, correlated_at);
+    assert_eq!(
+        s.sink
+            .deliveries_for_message(s.server.id, original_id)
+            .await
+            .unwrap()
+            .len(),
+        original_delivery_count
+    );
+    assert_eq!(
+        s.sink
+            .deliveries_for_message(s.server.id, bounce_id)
+            .await
+            .unwrap()
+            .len(),
+        bounce_delivery_count
+    );
+    assert_eq!(worker.drain_webhooks().await.unwrap(), 0);
+    assert_eq!(hook.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_already_bounced_queue_row_is_completed_without_another_smtp_send() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let hook = mock_http(axum::http::StatusCode::OK).await;
+    s.store
+        .create_webhook(NewWebhook {
+            server_id: s.server.id,
+            name: "delivery-state".into(),
+            url: hook.url.clone(),
+            all_events: false,
+            sign: false,
+            events: vec!["MessageSent".into(), "MessageBounced".into()],
+            headers: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let original_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "gone@dest.example"))
+        .await
+        .unwrap();
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Model an outbound worker that has claimed the message and is waiting
+    // for its SMTP result. The other worker can then dequeue the later DSN.
+    let claimed = s
+        .queue
+        .dequeue("paused-outbound-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.message_id, original_id);
+
+    let mut dsn = outgoing_message(
+        s.server.id,
+        &format!("{}@rp.camelmailer.com", s.server.token),
+    );
+    dsn.scope = MessageScope::Incoming;
+    dsn.bounce = true;
+    dsn.mail_from = "mailer-daemon@dest.example".into();
+    dsn.raw_message = format!(
+        "Content-Type: multipart/report; report-type=delivery-status; boundary=b\r\n\r\n\
+         --b\r\nContent-Type: message/delivery-status\r\n\r\n\
+         Final-Recipient: rfc822; gone@dest.example\r\n\
+         Action: failed\r\nStatus: 5.1.1\r\n\r\n\
+         --b\r\nContent-Type: message/rfc822\r\n\r\n\
+         X-CamelMailer-MsgID: {}\r\n\r\nBody\r\n--b--\r\n",
+        original.token
+    )
+    .into_bytes();
+    let bounce_id = s.sink.insert_message(&dsn).await.unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::BounceCorrelated
+    );
+
+    // Release the abandoned queue row after the bounce has committed. A new
+    // worker must remove it without suppression checks, tracking, or SMTP.
+    s.queue.clear_backoff().await.unwrap();
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::AlreadyBounced
+    );
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    assert!(smtp.received.lock().unwrap().is_empty());
+
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Bounced");
+    assert_eq!(stored.bounce_category.as_deref(), Some("hard"));
+    let deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, original_id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, "Bounced");
+    let bounce_deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, bounce_id)
+        .await
+        .unwrap();
+    assert_eq!(bounce_deliveries.len(), 1);
+    assert_eq!(bounce_deliveries[0].status, "Processed");
+
+    let stats = camelmailer_core::ServerStore::message_stats(
+        &s.store,
+        s.server.id,
+        &camelmailer_core::StatsFilter::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.sent, 0);
+    assert_eq!(stats.bounced, 1);
+    assert_eq!(stats.bounces_hard, 1);
+
+    assert_eq!(worker.drain_webhooks().await.unwrap(), 1);
+    let requests = hook.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["event"], "MessageBounced");
+}
+
+async fn assert_in_flight_smtp_result_loses_to_bounce(final_reply: &'static str) {
+    let Some(base) = base_url() else {
+        return;
+    };
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = paused_mock_smtp(final_reply).await;
+    let hook = mock_http(axum::http::StatusCode::OK).await;
+    s.store
+        .create_webhook(NewWebhook::all(
+            s.server.id,
+            "delivery-state",
+            &hook.url,
+            false,
+        ))
+        .await
+        .unwrap();
+
+    let original_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "gone@dest.example"))
+        .await
+        .unwrap();
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let send_config = worker_config(smtp.port);
+    let send_worker = Worker::new(&send_config, s.store.clone());
+    let send_task = tokio::spawn(async move { send_worker.process_next().await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        smtp.final_response_ready.notified(),
+    )
+    .await
+    .expect("outbound SMTP reached the final response pause");
+
+    let mut dsn = outgoing_message(
+        s.server.id,
+        &format!("{}@rp.camelmailer.com", s.server.token),
+    );
+    dsn.scope = MessageScope::Incoming;
+    dsn.bounce = true;
+    dsn.mail_from = "mailer-daemon@dest.example".into();
+    dsn.raw_message = format!(
+        "Content-Type: multipart/report; report-type=delivery-status; boundary=b\r\n\r\n\
+         --b\r\nContent-Type: message/delivery-status\r\n\r\n\
+         Final-Recipient: rfc822; gone@dest.example\r\n\
+         Action: failed\r\nStatus: 5.1.1\r\n\r\n\
+         --b\r\nContent-Type: message/rfc822\r\n\r\n\
+         X-CamelMailer-MsgID: {}\r\n\r\nBody\r\n--b--\r\n",
+        original.token
+    )
+    .into_bytes();
+    let bounce_id = s.sink.insert_message(&dsn).await.unwrap();
+
+    let correlation_config = worker_config(smtp.port);
+    let correlation_worker = Worker::new(&correlation_config, s.store.clone());
+    assert_eq!(
+        correlation_worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::BounceCorrelated
+    );
+
+    smtp.final_response_release.notify_one();
+    let outbound_outcome = tokio::time::timeout(std::time::Duration::from_secs(5), send_task)
+        .await
+        .expect("outbound worker completed after SMTP release")
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(outbound_outcome, ProcessOutcome::AlreadyBounced);
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    assert!(smtp.received.lock().unwrap().iter().any(|line| line == "."));
+
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Bounced");
+    assert_eq!(stored.bounce_category.as_deref(), Some("hard"));
+    let deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, original_id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, "Bounced");
+    let bounce_deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, bounce_id)
+        .await
+        .unwrap();
+    assert_eq!(bounce_deliveries.len(), 1);
+    assert_eq!(bounce_deliveries[0].status, "Processed");
+
+    let stats = camelmailer_core::ServerStore::message_stats(
+        &s.store,
+        s.server.id,
+        &camelmailer_core::StatsFilter::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.sent, 0);
+    assert_eq!(stats.bounced, 1);
+    assert_eq!(stats.bounces_hard, 1);
+
+    assert_eq!(correlation_worker.drain_webhooks().await.unwrap(), 1);
+    let requests = hook.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["event"], "MessageBounced");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_flight_soft_failure_cannot_replace_or_requeue_a_correlated_bounce() {
+    assert_in_flight_smtp_result_loses_to_bounce("421 Try again later").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_flight_hard_failure_cannot_replace_a_correlated_bounce() {
+    assert_in_flight_smtp_result_loses_to_bounce("550 No such user").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_failure_dsns_do_not_bounce_the_original_or_emit_webhooks() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let hook = mock_http(axum::http::StatusCode::OK).await;
+    s.store
+        .create_webhook(NewWebhook {
+            server_id: s.server.id,
+            name: "bounces".into(),
+            url: hook.url.clone(),
+            all_events: false,
+            sign: false,
+            events: vec!["MessageBounced".into()],
+            headers: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let original_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    for (action, status) in [
+        ("delayed", "4.4.1"),
+        ("delivered", "2.0.0"),
+        ("relayed", "2.0.0"),
+        ("expanded", "2.0.0"),
+    ] {
+        let mut dsn = outgoing_message(
+            s.server.id,
+            &format!("{}@rp.camelmailer.com", s.server.token),
+        );
+        dsn.scope = MessageScope::Incoming;
+        dsn.bounce = true;
+        dsn.raw_message = format!(
+            "Content-Type: multipart/report; report-type=delivery-status; boundary=b\r\n\r\n\
+             --b\r\nContent-Type: message/delivery-status\r\n\r\n\
+             Final-Recipient: rfc822; user@dest.example\r\n\
+             Action: {action}\r\nStatus: {status}\r\n\r\n\
+             --b\r\nContent-Type: message/rfc822\r\n\r\n\
+             X-CamelMailer-MsgID: {}\r\n\r\nBody\r\n--b--\r\n",
+            original.token
+        )
+        .into_bytes();
+        let dsn_id = s.sink.insert_message(&dsn).await.unwrap();
+
+        assert_eq!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::NothingToDo
+        );
+        let stored_dsn = s
+            .sink
+            .message_by_id(s.server.id, dsn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_dsn.bounce_for_id, None, "Action: {action}");
+        assert_eq!(stored_dsn.bounce_correlated_at, None, "Action: {action}");
+        assert_eq!(stored_dsn.bounce_category, None, "Action: {action}");
+    }
+
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.status, "Sent");
+    assert_eq!(original.bounce_category, None);
+    assert_eq!(worker.drain_webhooks().await.unwrap(), 0);
+    assert!(hook.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn return_path_auto_replies_do_not_bounce_quoted_originals() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let original_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut auto_reply = outgoing_message(
+        s.server.id,
+        &format!("{}@rp.camelmailer.com", s.server.token),
+    );
+    auto_reply.scope = MessageScope::Incoming;
+    auto_reply.bounce = true;
+    auto_reply.raw_message = format!(
+        "From: user@dest.example\r\n\
+         Subject: Automatic reply\r\n\
+         Content-Type: text/plain\r\n\r\n\
+         I am away. Your original message contained:\r\n\
+         X-CamelMailer-MsgID: {}\r\n",
+        original.token
+    )
+    .into_bytes();
+    let reply_id = s.sink.insert_message(&auto_reply).await.unwrap();
+
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::NothingToDo
+    );
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.status, "Sent");
+    assert_eq!(original.bounce_category, None);
+    let stored_reply = s
+        .sink
+        .message_by_id(s.server.id, reply_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_reply.bounce_for_id, None);
+    assert_eq!(stored_reply.bounce_category, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn infected_return_path_dsns_are_held_before_correlation() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let clamd_port = mock_clamd("stream: Eicar-Test-Signature FOUND").await;
+    let original_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let mut config = worker_config(smtp.port);
+    config.clamav.enabled = true;
+    config.clamav.host = "127.0.0.1".into();
+    config.clamav.port = clamd_port;
+    let worker = Worker::new(&config, s.store.clone());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut dsn = outgoing_message(
+        s.server.id,
+        &format!("{}@rp.camelmailer.com", s.server.token),
+    );
+    dsn.scope = MessageScope::Incoming;
+    dsn.bounce = true;
+    dsn.raw_message = format!(
+        "Content-Type: multipart/report; report-type=delivery-status; boundary=b\r\n\r\n\
+         --b\r\nContent-Type: message/delivery-status\r\n\r\n\
+         Final-Recipient: rfc822; user@dest.example\r\n\
+         Action: failed\r\nStatus: 5.1.1\r\n\r\n\
+         --b\r\nContent-Type: message/rfc822\r\n\r\n\
+         X-CamelMailer-MsgID: {}\r\n\r\nEICAR\r\n--b--\r\n",
+        original.token
+    )
+    .into_bytes();
+    let dsn_id = s.sink.insert_message(&dsn).await.unwrap();
+
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Held
+    );
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.status, "Sent");
+    let stored_dsn = s
+        .sink
+        .message_by_id(s.server.id, dsn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored_dsn.threat);
+    assert_eq!(stored_dsn.status, "Held");
+    assert_eq!(stored_dsn.bounce_for_id, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1974,7 +3112,10 @@ async fn unparseable_dmarc_route_messages_are_held_not_fatal() {
 
 /// A raw inbound ARF report whose embedded original carries the given
 /// broadcast `List-Unsubscribe` token.
-fn arf_mail(token: &str) -> Vec<u8> {
+fn arf_mail(token: &str, message_token: Option<&str>) -> Vec<u8> {
+    let message_token_header = message_token
+        .map(|token| format!("X-CamelMailer-MsgID: {token}\r\n"))
+        .unwrap_or_default();
     format!(
         "From: abuse@isp.example\r\n\
          To: fbl@track.example.com\r\n\
@@ -2000,6 +3141,7 @@ fn arf_mail(token: &str) -> Vec<u8> {
          From: <broadcast@org.example>\r\n\
          To: <r@dest.example>\r\n\
          Subject: Newsletter\r\n\
+         {message_token_header}\
          List-Unsubscribe: <http://track.example.com/track/u/{token}>, <mailto:u@org.example>\r\n\
          \r\n\
          Spam spam spam\r\n\
@@ -2009,12 +3151,30 @@ fn arf_mail(token: &str) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inbound_arf_reports_record_a_stream_scoped_complaint() {
+async fn return_path_arf_reports_precede_bounce_correlation() {
     use camelmailer_core::{NewStream, ServerStore};
 
     let base = require_db!();
     let pool = test_pool(&base).await;
     let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    let original_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "r@dest.example"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     // A broadcast stream with an opted-in recipient and a one-click token.
     let stream = ServerStore::create_stream(
@@ -2047,13 +3207,17 @@ async fn inbound_arf_reports_record_a_stream_scoped_complaint() {
     .await
     .unwrap();
 
-    // The ISP feedback loop delivers the ARF report as ordinary inbound mail.
-    let mut message = outgoing_message(s.server.id, "fbl@track.example.com");
+    // The ISP feedback loop delivers the ARF report to the return path and
+    // quotes a valid message token. It must remain a complaint, not a bounce.
+    let mut message = outgoing_message(
+        s.server.id,
+        &format!("{}@rp.camelmailer.com", s.server.token),
+    );
     message.scope = MessageScope::Incoming;
-    message.raw_message = arf_mail(&token);
+    message.bounce = true;
+    message.raw_message = arf_mail(&token, Some(&original.token));
     let message_id = s.sink.insert_message(&message).await.unwrap();
 
-    let worker = Worker::new(&worker_config(1), s.store.clone());
     let outcome = worker.process_next().await.unwrap().unwrap();
     assert_eq!(outcome, ProcessOutcome::FeedbackReportIngested);
     assert_eq!(s.queue.queue_size().await.unwrap(), 0);
@@ -2092,4 +3256,13 @@ async fn inbound_arf_reports_record_a_stream_scoped_complaint() {
         .as_deref()
         .unwrap_or_default()
         .contains("spam complaint recorded"));
+
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.status, "Sent");
+    assert_eq!(stored.bounce_for_id, None);
 }

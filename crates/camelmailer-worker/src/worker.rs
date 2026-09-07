@@ -13,8 +13,11 @@ use crate::smtp_client::SendOutcome;
 use crate::ssrf::SsrfGuard;
 use crate::tracking;
 use base64::Engine;
-use camelmailer_core::{AdminStore, Id, RouteMode};
-use camelmailer_db::{PgMessageSink, PgQueue, PgStore, PgWebhookQueue, StoredMessage};
+use camelmailer_core::{AdminStore, RouteMode};
+use camelmailer_db::{
+    BounceCorrelationOutcome, BounceOriginal, OutboundQueueAction, PgMessageSink, PgQueue, PgStore,
+    PgWebhookQueue, StoredMessage,
+};
 use serde_json::json;
 use std::time::Duration;
 
@@ -27,6 +30,79 @@ const API_REQUEST_RETENTION_DAYS: i64 = 30;
 
 /// How often the worker loop runs housekeeping.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(3600);
+
+const UNMATCHED_BOUNCE_DETAILS: &str = "This message was a bounce but we couldn't link it with any outgoing message and there was no route for it.";
+
+/// Borrowed view of either side of Postal's `MessageBounced` payload. Keeping
+/// the JSON contract here prevents the incoming and original shapes drifting.
+struct BounceWebhookFields<'a> {
+    id: i64,
+    token: &'a str,
+    direction: &'a str,
+    message_id: Option<String>,
+    to: &'a str,
+    from_address: &'a str,
+    subject: String,
+    timestamp: f64,
+    spam_status: &'a str,
+    tag: Option<&'a str>,
+}
+
+fn postal_webhook_message_id(value: Option<&str>) -> Option<String> {
+    value.map(|value| {
+        let after_open = value.rsplit_once('<').map_or(value, |(_, rest)| rest);
+        after_open
+            .split_once('>')
+            .map_or(after_open, |(message_id, _)| message_id)
+            .trim()
+            .to_string()
+    })
+}
+
+fn postal_webhook_subject(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    let raw_header = format!("Subject: {value}");
+    let decoded = mailparse::parse_header(raw_header.as_bytes())
+        .map(|(header, _)| header.get_value())
+        .unwrap_or_else(|_| value.to_string());
+    decoded.chars().take(200).collect()
+}
+
+impl<'a> From<&'a StoredMessage> for BounceWebhookFields<'a> {
+    fn from(message: &'a StoredMessage) -> Self {
+        Self {
+            id: message.id,
+            token: &message.token,
+            direction: &message.scope,
+            message_id: postal_webhook_message_id(message.message_id_header.as_deref()),
+            to: &message.rcpt_to,
+            from_address: &message.mail_from,
+            subject: postal_webhook_subject(message.subject.as_deref()),
+            timestamp: message.created_at.timestamp_millis() as f64 / 1000.0,
+            spam_status: &message.spam_status,
+            tag: message.tag.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a BounceOriginal> for BounceWebhookFields<'a> {
+    fn from(message: &'a BounceOriginal) -> Self {
+        Self {
+            id: message.id,
+            token: &message.token,
+            direction: &message.scope,
+            message_id: postal_webhook_message_id(message.message_id_header.as_deref()),
+            to: &message.rcpt_to,
+            from_address: &message.mail_from,
+            subject: postal_webhook_subject(message.subject.as_deref()),
+            timestamp: message.created_at.timestamp_millis() as f64 / 1000.0,
+            spam_status: &message.spam_status,
+            tag: message.tag.as_deref(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOutcome {
@@ -46,7 +122,12 @@ pub enum ProcessOutcome {
     /// Incoming message recognised as an ARF spam-complaint (feedback loop)
     /// report and turned into a stream-scoped complaint for the recipient.
     FeedbackReportIngested,
-    /// Nothing to deliver (incoming without an endpoint, bounces).
+    /// An inbound DSN was linked to its original outgoing message.
+    BounceCorrelated,
+    /// A terminal DSN already bounced this outgoing message. Its stale queue
+    /// row was removed without another send or delivery event.
+    AlreadyBounced,
+    /// Nothing to deliver (an incoming message without an endpoint).
     NothingToDo,
     /// The queued message no longer exists.
     MessageMissing,
@@ -83,6 +164,9 @@ pub struct Worker {
     /// (keep forever); a positive value prunes messages older than that many
     /// days during housekeeping.
     message_retention_days: i64,
+    /// Validated shared SMTP return-path domain. Invalid placeholders retain
+    /// the submitted envelope sender.
+    return_path_domain: Option<String>,
     worker_id: String,
 }
 
@@ -111,6 +195,17 @@ impl Worker {
             .clamav
             .enabled
             .then(|| ClamavInspector::new(&config.clamav));
+        let return_path_domain = config
+            .dns
+            .return_path_envelope
+            .then(|| config.dns.normalized_return_path_domain())
+            .flatten();
+        if config.dns.return_path_envelope && return_path_domain.is_none() {
+            tracing::warn!(
+                configured = %config.dns.return_path_domain,
+                "dns.return_path_domain is empty, invalid, or reserved; preserving submitted envelope senders"
+            );
+        }
         Self {
             store,
             sink,
@@ -132,6 +227,7 @@ impl Worker {
             ssrf_guard: SsrfGuard::from_config(config),
             max_attempts: config.camelmailer.default_maximum_delivery_attempts as i32,
             message_retention_days: config.camelmailer.message_retention_days as i64,
+            return_path_domain,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
         }
     }
@@ -143,19 +239,27 @@ impl Worker {
             return Ok(None);
         };
 
-        let message = self
-            .sink
-            .message_by_id(queued.server_id, queued.message_id)
-            .await?;
-        let Some(message) = message else {
+        let loaded = if self.return_path_domain.is_some() {
+            self.sink
+                .message_with_server_token(queued.server_id, queued.message_id)
+                .await?
+                .map(|(message, token)| (message, Some(token)))
+        } else {
+            self.sink
+                .message_by_id(queued.server_id, queued.message_id)
+                .await?
+                .map(|message| (message, None))
+        };
+        let Some((mut message, server_token)) = loaded else {
             self.queue.complete(queued.id).await?;
             return Ok(Some(ProcessOutcome::MessageMissing));
         };
 
         let outcome = if message.scope == "outgoing" {
-            self.process_outgoing(&queued, &message).await?
+            self.process_outgoing(&queued, &message, server_token.as_deref())
+                .await?
         } else {
-            self.process_incoming(&queued, &message).await?
+            self.process_incoming(&queued, &mut message).await?
         };
         Ok(Some(outcome))
     }
@@ -164,7 +268,17 @@ impl Worker {
         &self,
         queued: &camelmailer_db::QueuedMessageRow,
         message: &StoredMessage,
+        server_token: Option<&str>,
     ) -> Result<ProcessOutcome, sqlx::Error> {
+        if message.status == "Bounced" {
+            self.queue.complete(queued.id).await?;
+            tracing::info!(
+                message_id = message.id,
+                "completed stale queue row for already bounced message"
+            );
+            return Ok(ProcessOutcome::AlreadyBounced);
+        }
+
         // Suppression list check (tenant-scoped, RLS-protected). Stream-aware:
         // a server-wide (stream_id NULL) or this-stream suppression blocks it,
         // so a broadcast opt-out never holds transactional mail.
@@ -177,25 +291,29 @@ impl Worker {
         .await
         .map_err(|e| sqlx::Error::Protocol(e.to_string()))?
         {
-            self.queue.complete(queued.id).await?;
-            self.sink
-                .record_delivery(
+            let details = "recipient is on the suppression list";
+            let payload = self.message_payload(message, details);
+            let recorded = self
+                .sink
+                .record_outbound_delivery(
                     message.server_id,
                     message.id,
+                    queued.id,
                     "Held",
-                    "recipient is on the suppression list",
+                    details,
                     "",
                     false,
                     None,
+                    OutboundQueueAction::Complete,
+                    "MessageHeld",
+                    &payload,
                 )
                 .await?;
-            self.send_webhooks(
-                message.server_id,
-                "MessageHeld",
-                self.message_payload(message, "recipient is on the suppression list"),
-            )
-            .await;
-            return Ok(ProcessOutcome::Held);
+            return Ok(if recorded.is_some() {
+                ProcessOutcome::Held
+            } else {
+                ProcessOutcome::AlreadyBounced
+            });
         }
 
         // Rewrite HTML links for click tracking and append an open pixel
@@ -206,6 +324,8 @@ impl Worker {
         // authenticated domain: with the domain's own key when it has one,
         // with the installation key otherwise. The stored message stays
         // unsigned, matching the Ruby behaviour.
+        let identified =
+            camelmailer_core::bounce::add_message_token_header(&tracked, &message.token);
         let raw_message = match message.domain_id {
             Some(domain_id) => match self.store.domain_by_id(domain_id).await {
                 Ok(Some(domain)) => match dkim::signer_for_domain(
@@ -213,17 +333,24 @@ impl Worker {
                     self.signer.as_ref(),
                 ) {
                     Some(signer) => dkim::sign_and_prepend(
-                        &tracked,
+                        &identified,
                         &domain.name,
                         &self.dkim_selector,
                         &signer,
                         chrono::Utc::now().timestamp(),
                     ),
-                    None => tracked,
+                    None => identified,
                 },
-                _ => tracked,
+                _ => identified,
             },
-            None => tracked,
+            None => identified,
+        };
+
+        let return_path = if let Some(domain) = &self.return_path_domain {
+            let token = server_token.ok_or(sqlx::Error::RowNotFound)?;
+            format!("{token}@{domain}")
+        } else {
+            message.mail_from.clone()
         };
 
         // Source-address selection: send from the message stream's IP pool if
@@ -243,7 +370,7 @@ impl Worker {
             .sender
             .send(
                 &queued.domain,
-                &message.mail_from,
+                &return_path,
                 &message.rcpt_to,
                 &raw_message,
                 source_ip,
@@ -252,57 +379,68 @@ impl Worker {
 
         match outcome {
             SendOutcome::Sent { response, tls } => {
-                self.queue.complete(queued.id).await?;
-                self.sink
-                    .record_delivery(
+                let payload = self.message_payload(message, &response);
+                let recorded = self
+                    .sink
+                    .record_outbound_delivery(
                         message.server_id,
                         message.id,
+                        queued.id,
                         "Sent",
                         "message accepted by the remote server",
                         &response,
                         tls,
                         None,
+                        OutboundQueueAction::Complete,
+                        "MessageSent",
+                        &payload,
                     )
                     .await?;
-                self.send_webhooks(
-                    message.server_id,
-                    "MessageSent",
-                    self.message_payload(message, &response),
-                )
-                .await;
+                if recorded.is_none() {
+                    tracing::info!(
+                        message_id = message.id,
+                        "preserved newer bounced state after outbound SMTP success"
+                    );
+                    return Ok(ProcessOutcome::AlreadyBounced);
+                }
                 Ok(ProcessOutcome::Delivered { response })
             }
             SendOutcome::SoftFail { response } => {
                 if queued.attempts + 1 >= self.max_attempts {
-                    self.queue.complete(queued.id).await?;
                     // Terminal failure: classify the bounce from the last
                     // SMTP response (5xx -> hard, 4xx -> soft, otherwise
                     // undetermined — see camelmailer_core::bounce).
                     let category = camelmailer_core::bounce::classify_response(&response);
-                    self.sink
-                        .record_delivery(
+                    let payload = self.message_payload(message, &response);
+                    let recorded = self
+                        .sink
+                        .record_outbound_delivery(
                             message.server_id,
                             message.id,
+                            queued.id,
                             "HardFail",
                             "delivery attempts exhausted",
                             &response,
                             false,
                             Some(category.as_str()),
+                            OutboundQueueAction::Complete,
+                            "MessageDeliveryFailed",
+                            &payload,
                         )
                         .await?;
-                    self.send_webhooks(
-                        message.server_id,
-                        "MessageDeliveryFailed",
-                        self.message_payload(message, &response),
-                    )
-                    .await;
-                    Ok(ProcessOutcome::Failed { response })
+                    Ok(if recorded.is_some() {
+                        ProcessOutcome::Failed { response }
+                    } else {
+                        ProcessOutcome::AlreadyBounced
+                    })
                 } else {
-                    self.queue.retry(queued.id, queued.attempts).await?;
-                    self.sink
-                        .record_delivery(
+                    let payload = self.message_payload(message, &response);
+                    let recorded = self
+                        .sink
+                        .record_outbound_delivery(
                             message.server_id,
                             message.id,
+                            queued.id,
                             "SoftFail",
                             "temporary delivery failure",
                             &response,
@@ -310,38 +448,44 @@ impl Worker {
                             // transient — the message may still deliver, so
                             // no bounce category is persisted yet
                             None,
+                            OutboundQueueAction::Retry {
+                                attempts: queued.attempts,
+                            },
+                            "MessageDelayed",
+                            &payload,
                         )
                         .await?;
-                    self.send_webhooks(
-                        message.server_id,
-                        "MessageDelayed",
-                        self.message_payload(message, &response),
-                    )
-                    .await;
-                    Ok(ProcessOutcome::Delayed { response })
+                    Ok(if recorded.is_some() {
+                        ProcessOutcome::Delayed { response }
+                    } else {
+                        ProcessOutcome::AlreadyBounced
+                    })
                 }
             }
             SendOutcome::HardFail { response } => {
-                self.queue.complete(queued.id).await?;
                 let category = camelmailer_core::bounce::classify_response(&response);
-                self.sink
-                    .record_delivery(
+                let payload = self.message_payload(message, &response);
+                let recorded = self
+                    .sink
+                    .record_outbound_delivery(
                         message.server_id,
                         message.id,
+                        queued.id,
                         "HardFail",
                         "message rejected by the remote server",
                         &response,
                         false,
                         Some(category.as_str()),
+                        OutboundQueueAction::Complete,
+                        "MessageDeliveryFailed",
+                        &payload,
                     )
                     .await?;
-                self.send_webhooks(
-                    message.server_id,
-                    "MessageDeliveryFailed",
-                    self.message_payload(message, &response),
-                )
-                .await;
-                Ok(ProcessOutcome::Failed { response })
+                Ok(if recorded.is_some() {
+                    ProcessOutcome::Failed { response }
+                } else {
+                    ProcessOutcome::AlreadyBounced
+                })
             }
         }
     }
@@ -349,7 +493,7 @@ impl Worker {
     /// Inspect an incoming message with rspamd/clamav (when enabled) and
     /// record the verdict. Returns true when the message is a virus threat
     /// or exceeds the spam-failure threshold and should be held.
-    async fn inspect(&self, message: &StoredMessage) -> Result<bool, sqlx::Error> {
+    async fn inspect(&self, message: &mut StoredMessage) -> Result<bool, sqlx::Error> {
         if self.rspamd.is_none() && self.clamav.is_none() {
             return Ok(false);
         }
@@ -401,16 +545,25 @@ impl Worker {
             )
             .await?;
 
+        // Later inbound handlers build payloads from this value. Keep it in
+        // sync with the verdict just persisted instead of using the row that
+        // was loaded before inspection.
+        message.spam_status = spam_status.clone();
+        message.spam_score = spam_score;
+        message.threat = threat;
+        message.threat_details = threat_details;
+        message.inspected = true;
+
         Ok(threat || spam_status == "SpamFailure")
     }
 
     async fn process_incoming(
         &self,
         queued: &camelmailer_db::QueuedMessageRow,
-        message: &StoredMessage,
+        message: &mut StoredMessage,
     ) -> Result<ProcessOutcome, sqlx::Error> {
-        // Inspect incoming mail before routing; a virus or spam-failure
-        // message is held (stored, not delivered).
+        // Inspect every incoming message before any content-specific handler;
+        // a virus or spam-failure message is held (stored, not delivered).
         if self.inspect(message).await? {
             self.sink
                 .record_delivery(
@@ -427,23 +580,19 @@ impl Worker {
             return Ok(ProcessOutcome::Held);
         }
 
-        // Bounce processing: classify arriving DSNs (bounce-flagged
-        // messages) from their Status:/Diagnostic-Code: fields so the
-        // observability API can break bounces down into
-        // hard / soft / undetermined.
-        if message.bounce {
-            let category = camelmailer_core::bounce::classify_dsn(&message.raw_message);
-            self.sink
-                .set_bounce_category(message.server_id, message.id, category.as_str())
-                .await?;
-        }
-
         // Feedback-loop (ARF) reports: an ISP delivers a spam complaint as a
         // multipart/report; report-type=feedback-report. Recognise it by its
         // envelope (content-based, independent of routing) and record a
         // stream-scoped complaint for the recipient who complained.
         if crate::arf::is_feedback_report(&message.raw_message) {
             return self.ingest_feedback_report(queued, message).await;
+        }
+
+        // Correlate only machine-readable delivery-status notifications.
+        // Auto-replies and other messages addressed to the return path retain
+        // the existing route/fallback behaviour below.
+        if let Some(outcome) = self.correlate_bounce(queued, message).await? {
+            return Ok(outcome);
         }
 
         let route = match message.route_id {
@@ -519,6 +668,61 @@ impl Worker {
                 Ok(ProcessOutcome::Delayed { response })
             }
         }
+    }
+
+    async fn correlate_bounce(
+        &self,
+        queued: &camelmailer_db::QueuedMessageRow,
+        message: &StoredMessage,
+    ) -> Result<Option<ProcessOutcome>, sqlx::Error> {
+        if !message.bounce
+            || !camelmailer_core::bounce::is_failed_delivery_status_notification(
+                &message.raw_message,
+            )
+        {
+            return Ok(None);
+        }
+        let category = camelmailer_core::bounce::classify_dsn(&message.raw_message);
+        let tokens = camelmailer_core::bounce::original_message_tokens(&message.raw_message);
+        let correlation = self
+            .sink
+            .correlate_bounce(
+                message.server_id,
+                message.id,
+                &tokens,
+                category.as_str(),
+                |original| {
+                    json!({
+                        "original_message": self.bounce_webhook_payload(original.into()),
+                        "bounce": self.bounce_webhook_payload(message.into()),
+                    })
+                },
+            )
+            .await?;
+        match correlation {
+            BounceCorrelationOutcome::Correlated(_) => {}
+            BounceCorrelationOutcome::AlreadyCorrelated => {
+                self.queue.complete(queued.id).await?;
+                return Ok(Some(ProcessOutcome::BounceCorrelated));
+            }
+            BounceCorrelationOutcome::NotMatched if message.route_id.is_none() => {
+                self.sink
+                    .record_unmatched_bounce(
+                        message.server_id,
+                        message.id,
+                        queued.id,
+                        category.as_str(),
+                        UNMATCHED_BOUNCE_DETAILS,
+                    )
+                    .await?;
+                return Ok(Some(ProcessOutcome::Failed {
+                    response: UNMATCHED_BOUNCE_DETAILS.to_string(),
+                }));
+            }
+            BounceCorrelationOutcome::NotMatched => return Ok(None),
+        }
+        self.queue.complete(queued.id).await?;
+        Ok(Some(ProcessOutcome::BounceCorrelated))
     }
 
     /// Parse an inbound message as a DMARC aggregate report and store it
@@ -787,43 +991,21 @@ impl Worker {
         })
     }
 
-    /// Enqueue an event for every enabled webhook of the server that
-    /// subscribes to it (an empty `events` list subscribes to everything).
-    /// Delivery, signing, retrying and audit logging happen in
-    /// [`Worker::process_next_webhook`].
-    async fn send_webhooks(&self, server_id: Id, event: &str, payload: serde_json::Value) {
-        let webhooks = match self.store.list_webhooks(server_id).await {
-            Ok(webhooks) => webhooks,
-            Err(error) => {
-                tracing::warn!(%error, server_id, "could not load webhooks");
-                return;
-            }
-        };
-        for webhook in webhooks.into_iter().filter(|w| w.subscribes_to(event)) {
-            let uuid = camelmailer_core::token::generate_uuid();
-            let body = json!({
-                "event": event,
-                "timestamp": chrono::Utc::now().timestamp(),
-                "uuid": uuid,
-                "payload": payload,
-            });
-            if let Err(error) = self
-                .webhook_queue
-                .enqueue(
-                    server_id,
-                    webhook.id,
-                    &uuid,
-                    event,
-                    &webhook.url,
-                    &body.to_string(),
-                    webhook.sign,
-                    &webhook.headers,
-                )
-                .await
-            {
-                tracing::warn!(%error, webhook = %webhook.url, "could not enqueue webhook");
-            }
-        }
+    /// Postal's `MessageBounced` contract uses `direction`, `to` and `from`.
+    /// Keep those names so Postal webhook consumers can migrate unchanged.
+    fn bounce_webhook_payload(&self, message: BounceWebhookFields<'_>) -> serde_json::Value {
+        json!({
+            "id": message.id,
+            "token": message.token,
+            "direction": message.direction,
+            "message_id": message.message_id,
+            "to": message.to,
+            "from": message.from_address,
+            "subject": message.subject,
+            "timestamp": message.timestamp,
+            "spam_status": message.spam_status,
+            "tag": message.tag,
+        })
     }
 
     /// Deliver one queued webhook request, if any is ready. Signs the body
@@ -988,5 +1170,28 @@ impl Worker {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{postal_webhook_message_id, postal_webhook_subject};
+
+    #[test]
+    fn postal_webhook_message_ids_drop_angle_brackets_and_surrounding_text() {
+        assert_eq!(
+            postal_webhook_message_id(Some("prefix <original@example.com> suffix")),
+            Some("original@example.com".to_string())
+        );
+        assert_eq!(postal_webhook_message_id(None), None);
+    }
+
+    #[test]
+    fn postal_webhook_subjects_are_decoded_capped_and_never_null() {
+        assert_eq!(postal_webhook_subject(Some("=?UTF-8?Q?Ol=C3=A1?=")), "Olá");
+
+        let long = "x".repeat(201);
+        assert_eq!(postal_webhook_subject(Some(&long)), "x".repeat(200));
+        assert_eq!(postal_webhook_subject(None), "");
     }
 }

@@ -182,6 +182,28 @@ async fn an_http_error_reports_the_status_without_delivery() {
 }
 
 #[tokio::test]
+async fn bounced_test_events_use_the_correlation_payload_shape() {
+    let (base, recorded) = start_mock_endpoint().await;
+    let (app, webhook_id) = build(&format!("{base}/ok"), None).await;
+
+    let (status, body) = post_test(&app, webhook_id, json!({ "event": "MessageBounced" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["result"]["delivered"], true);
+
+    let requests = recorded.requests.lock().unwrap();
+    let (headers, payload) = &requests[0];
+    assert_eq!(headers["x-camelmailer-event"], "MessageBounced");
+    assert_eq!(
+        payload["payload"]["original_message"]["direction"],
+        "outgoing"
+    );
+    assert_eq!(payload["payload"]["original_message"]["id"], 1234);
+    assert_eq!(payload["payload"]["bounce"]["direction"], "incoming");
+    assert_eq!(payload["payload"]["bounce"]["id"], 1235);
+    assert!(payload["payload"].get("message").is_none());
+}
+
+#[tokio::test]
 async fn a_timeout_reports_a_transport_error() {
     let (base, _) = start_mock_endpoint().await;
     let (app, webhook_id) = build(

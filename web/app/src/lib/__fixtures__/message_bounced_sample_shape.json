@@ -1,0 +1,16 @@
+{
+  "top_level": ["event", "payload", "test", "timestamp", "uuid"],
+  "payload": ["bounce", "original_message"],
+  "message": [
+    "direction",
+    "from",
+    "id",
+    "message_id",
+    "spam_status",
+    "subject",
+    "tag",
+    "timestamp",
+    "to",
+    "token"
+  ]
+}

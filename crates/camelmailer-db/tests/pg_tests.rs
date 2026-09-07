@@ -9,12 +9,13 @@
 use camelmailer_core::{
     AdminStore, CredentialType, DomainOwner, ImportClick, ImportDelivery, ImportEvent,
     ImportMessage, MessageFilter, MessageScope, NewOrgEmailDomain, NewOrgSsoConnection,
-    NewOrganization, NewRoute, NewServer, OrgSsoConnectionUpdate, OrgSsoStore, QueuedMessage, Role,
-    RouteMode, ServerMode, ServerStore, SsoKind, Store, TrackingStore, TrackingTarget,
+    NewOrganization, NewRoute, NewServer, NewWebhook, OrgSsoConnectionUpdate, OrgSsoStore,
+    QueuedMessage, Role, RouteMode, ServerMode, ServerStore, SsoKind, Store, TrackingStore,
+    TrackingTarget,
 };
 use camelmailer_db::{PgMessageSink, PgStore};
 use rand::Rng;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row};
 
 fn base_url() -> Option<String> {
     std::env::var("CAMELMAILER_TEST_DATABASE_URL").ok()
@@ -33,7 +34,7 @@ macro_rules! require_db {
 }
 
 /// Create a unique throwaway database and run migrations on it.
-async fn test_pool(base: &str) -> PgPool {
+async fn test_pool_with_connections(base: &str, max_connections: u32) -> PgPool {
     let name: String = {
         let mut rng = rand::thread_rng();
         (0..12)
@@ -53,9 +54,86 @@ async fn test_pool(base: &str) -> PgPool {
         let position = base.rfind('/').unwrap();
         format!("{}/{}", &base[..position], db_name)
     };
-    let pool = camelmailer_db::connect(&db_url, 2).await.unwrap();
+    let pool = camelmailer_db::connect(&db_url, max_connections)
+        .await
+        .unwrap();
     camelmailer_db::migrate(&pool).await.unwrap();
     pool
+}
+
+async fn test_pool(base: &str) -> PgPool {
+    test_pool_with_connections(base, 2).await
+}
+
+const WEBHOOK_INSERT_BARRIER_CLASS: i32 = 61_703;
+const WEBHOOK_INSERT_BARRIER_KEY: i32 = 7;
+
+async fn install_webhook_insert_barrier(pool: &PgPool) -> sqlx::pool::PoolConnection<Postgres> {
+    sqlx::query(
+        "CREATE FUNCTION pause_webhook_request_insert() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_advisory_xact_lock(61703, 7);
+             RETURN NEW;
+         END
+         $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER pause_webhook_request_insert
+         BEFORE INSERT ON webhook_requests
+         FOR EACH ROW EXECUTE FUNCTION pause_webhook_request_insert()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1, $2)")
+        .bind(WEBHOOK_INSERT_BARRIER_CLASS)
+        .bind(WEBHOOK_INSERT_BARRIER_KEY)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    connection
+}
+
+async fn wait_for_locked_query(pool: &PgPool, query_prefix: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND query LIKE $1
+                       AND wait_event_type = 'Lock'
+                 )",
+            )
+            .bind(format!("{query_prefix}%"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("query did not reach lock barrier: {query_prefix}"));
+}
+
+async fn release_webhook_insert_barrier(connection: &mut sqlx::pool::PoolConnection<Postgres>) {
+    let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1, $2)")
+        .bind(WEBHOOK_INSERT_BARRIER_CLASS)
+        .bind(WEBHOOK_INSERT_BARRIER_KEY)
+        .fetch_one(&mut **connection)
+        .await
+        .unwrap();
+    assert!(released);
 }
 
 struct PgFixtures {
@@ -142,6 +220,19 @@ async fn rls_scopes_reads_to_the_tenant_context() {
     let tenant_b = sink.messages_for_server(other_server.id).await.unwrap();
     assert_eq!(tenant_b.len(), 1);
     assert_eq!(tenant_b[0].rcpt_to, "b@tenant-b.example");
+
+    let (loaded, token) = sink
+        .message_with_server_token(f.server.id, tenant_a[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.id, tenant_a[0].id);
+    assert_eq!(token, f.server.token);
+    assert!(sink
+        .message_with_server_token(other_server.id, tenant_a[0].id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3766,7 +3857,7 @@ async fn bounce_categories_are_persisted_and_surfaced() {
         "bounce received",
         "",
         false,
-        None,
+        Some("undetermined"),
     )
     .await
     .unwrap();
@@ -3788,6 +3879,24 @@ async fn bounce_categories_are_persisted_and_surfaced() {
     .await
     .unwrap();
 
+    // A processed return-path message with no correlation remains part of
+    // the category breakdown.
+    let mut uncorrelated = message_for(f.server.id, "return-path@org.example");
+    uncorrelated.scope = MessageScope::Incoming;
+    uncorrelated.bounce = true;
+    let uncorrelated = sink.insert_message(&uncorrelated).await.unwrap();
+    sink.record_delivery(
+        f.server.id,
+        uncorrelated,
+        "Processed",
+        "uncorrelated return-path message processed",
+        "",
+        false,
+        Some("hard"),
+    )
+    .await
+    .unwrap();
+
     let record = f.store.message(f.server.id, hard).await.unwrap().unwrap();
     assert_eq!(record.bounce_category.as_deref(), Some("hard"));
     let record = f
@@ -3798,10 +3907,6 @@ async fn bounce_categories_are_persisted_and_surfaced() {
         .unwrap();
     assert_eq!(record.bounce_category, None);
 
-    // the DSN processing hook classifies after the fact
-    sink.set_bounce_category(f.server.id, dsn, "undetermined")
-        .await
-        .unwrap();
     let record = f.store.message(f.server.id, dsn).await.unwrap().unwrap();
     assert_eq!(record.bounce_category.as_deref(), Some("undetermined"));
 
@@ -3812,7 +3917,7 @@ async fn bounce_categories_are_persisted_and_surfaced() {
         .message_stats(f.server.id, &StatsFilter::default())
         .await
         .unwrap();
-    assert_eq!(stats.bounces_hard, 1);
+    assert_eq!(stats.bounces_hard, 2);
     assert_eq!(stats.bounces_soft, 1);
     assert_eq!(stats.bounces_undetermined, 1);
 
@@ -3822,8 +3927,15 @@ async fn bounce_categories_are_persisted_and_surfaced() {
         .bounces(f.server.id, &MessageFilter::default())
         .await
         .unwrap();
-    assert_eq!(bounces.len(), 1);
-    assert_eq!(bounces[0].bounce_category.as_deref(), Some("undetermined"));
+    assert_eq!(bounces.len(), 2);
+    assert!(bounces
+        .iter()
+        .any(|message| message.id == dsn
+            && message.bounce_category.as_deref() == Some("undetermined")));
+    assert!(bounces
+        .iter()
+        .any(|message| message.id == uncorrelated
+            && message.bounce_category.as_deref() == Some("hard")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4453,6 +4565,575 @@ async fn prune_messages_removes_expired_with_dependents_and_keeps_recent() {
         orphan_deliveries, 1,
         "only the recent message's delivery remains"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pruning_an_original_clears_the_link_without_recounting_its_dsn() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let now = chrono::Utc::now();
+    let original_id = ServerStore::import_message(
+        &f.store,
+        import_for(f.server.id, now - chrono::Duration::days(90)),
+    )
+    .await
+    .unwrap();
+    let original = ServerStore::message(&f.store, f.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut dsn = import_for(f.server.id, now - chrono::Duration::days(1));
+    dsn.scope = MessageScope::Incoming;
+    dsn.bounce = true;
+    dsn.deliveries.clear();
+    dsn.opens.clear();
+    dsn.clicks.clear();
+    let dsn_id = ServerStore::import_message(&f.store, dsn).await.unwrap();
+    let sink = PgMessageSink::new(f.store.clone());
+    assert!(matches!(
+        sink.correlate_bounce(
+            f.server.id,
+            dsn_id,
+            &[original.token],
+            "hard",
+            |_| serde_json::json!({}),
+        )
+        .await
+        .unwrap(),
+        camelmailer_db::BounceCorrelationOutcome::Correlated(_)
+    ));
+
+    let recent = camelmailer_core::StatsFilter {
+        from: Some(now - chrono::Duration::days(30)),
+        ..Default::default()
+    };
+    assert_eq!(
+        ServerStore::message_stats(&f.store, f.server.id, &recent)
+            .await
+            .unwrap()
+            .bounces_hard,
+        0
+    );
+
+    assert_eq!(
+        ServerStore::prune_messages(&f.store, now - chrono::Duration::days(30))
+            .await
+            .unwrap(),
+        1
+    );
+    let retained_dsn = ServerStore::message(&f.store, f.server.id, dsn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained_dsn.bounce_for_id, None);
+    assert!(retained_dsn.bounce_correlated_at.is_some());
+    assert_eq!(retained_dsn.status, "Processed");
+    assert_eq!(
+        ServerStore::message_stats(&f.store, f.server.id, &recent)
+            .await
+            .unwrap()
+            .bounces_hard,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_bounce_correlation_writes_each_delivery_once() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    let mut original = message_for(f.server.id, "user@dest.example");
+    original.scope = MessageScope::Outgoing;
+    let original_id = sink.insert_message(&original).await.unwrap();
+    let original = sink
+        .message_by_id(f.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut dsn = message_for(f.server.id, "server@rp.example.com");
+    dsn.bounce = true;
+    let dsn_id = sink.insert_message(&dsn).await.unwrap();
+    let first_sink = sink.clone();
+    let second_sink = sink.clone();
+    let first_tokens = vec![original.token.clone()];
+    let second_tokens = first_tokens.clone();
+    let (first, second) = tokio::join!(
+        first_sink.correlate_bounce(f.server.id, dsn_id, &first_tokens, "hard", |_| {
+            serde_json::json!({})
+        }),
+        second_sink.correlate_bounce(f.server.id, dsn_id, &second_tokens, "hard", |_| {
+            serde_json::json!({})
+        })
+    );
+    let outcomes = [first.unwrap(), second.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                camelmailer_db::BounceCorrelationOutcome::Correlated(_)
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                camelmailer_db::BounceCorrelationOutcome::AlreadyCorrelated
+            ))
+            .count(),
+        1
+    );
+
+    assert_eq!(
+        sink.deliveries_for_message(f.server.id, original_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        sink.deliveries_for_message(f.server.id, dsn_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let stored_dsn = sink
+        .message_by_id(f.server.id, dsn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_dsn.status, "Processed");
+    assert_eq!(stored_dsn.bounce_for_id, Some(original_id));
+    assert!(stored_dsn.bounce_correlated_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounce_correlation_and_multi_webhook_fanout_commit_atomically() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    let first_webhook = f
+        .store
+        .create_webhook(NewWebhook {
+            server_id: f.server.id,
+            name: "first".into(),
+            url: "https://first.example/hook".into(),
+            all_events: false,
+            sign: false,
+            events: vec!["MessageBounced".into()],
+            headers: Default::default(),
+        })
+        .await
+        .unwrap();
+    let second_webhook = f
+        .store
+        .create_webhook(NewWebhook {
+            server_id: f.server.id,
+            name: "second".into(),
+            url: "https://second.example/hook".into(),
+            all_events: false,
+            sign: false,
+            events: vec!["MessageBounced".into()],
+            headers: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let mut original = message_for(f.server.id, "user@dest.example");
+    original.scope = MessageScope::Outgoing;
+    let original_id = sink.insert_message(&original).await.unwrap();
+    let original = sink
+        .message_by_id(f.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut dsn = message_for(f.server.id, "server@rp.example.com");
+    dsn.bounce = true;
+    let dsn_id = sink.insert_message(&dsn).await.unwrap();
+
+    // Force the second request insert to fail after the first one has run.
+    // The whole correlation transaction must roll back, including the first
+    // request, both message states, and both delivery rows.
+    sqlx::query(&format!(
+        "ALTER TABLE webhook_requests ADD CONSTRAINT reject_second_webhook \
+         CHECK (webhook_id <> {})",
+        second_webhook.id
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(sink
+        .correlate_bounce(
+            f.server.id,
+            dsn_id,
+            std::slice::from_ref(&original.token),
+            "hard",
+            |matched| {
+                serde_json::json!({
+                    "original_message": { "id": matched.id },
+                    "bounce": { "id": dsn_id },
+                })
+            },
+        )
+        .await
+        .is_err());
+
+    let original_after_failure = sink
+        .message_by_id(f.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let dsn_after_failure = sink
+        .message_by_id(f.server.id, dsn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original_after_failure.status, "Pending");
+    assert_eq!(dsn_after_failure.status, "Pending");
+    assert_eq!(dsn_after_failure.bounce_for_id, None);
+    assert_eq!(dsn_after_failure.bounce_correlated_at, None);
+    assert!(sink
+        .deliveries_for_message(f.server.id, original_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(sink
+        .deliveries_for_message(f.server.id, dsn_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let queued_after_failure: i64 = sqlx::query("SELECT count(*) AS c FROM webhook_requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("c");
+    assert_eq!(queued_after_failure, 0);
+
+    sqlx::query("ALTER TABLE webhook_requests DROP CONSTRAINT reject_second_webhook")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        sink.correlate_bounce(f.server.id, dsn_id, &[original.token], "hard", |matched| {
+            serde_json::json!({
+                "original_message": { "id": matched.id },
+                "bounce": { "id": dsn_id },
+            })
+        },)
+            .await
+            .unwrap(),
+        camelmailer_db::BounceCorrelationOutcome::Correlated(_)
+    ));
+
+    let requests = sqlx::query(
+        "SELECT webhook_id, uuid, event, payload FROM webhook_requests ORDER BY webhook_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].get::<i64, _>("webhook_id"),
+        first_webhook.id as i64
+    );
+    assert_eq!(
+        requests[1].get::<i64, _>("webhook_id"),
+        second_webhook.id as i64
+    );
+    for request in &requests {
+        assert_eq!(request.get::<String, _>("event"), "MessageBounced");
+        let uuid = request.get::<String, _>("uuid");
+        let body: serde_json::Value =
+            serde_json::from_str(&request.get::<String, _>("payload")).unwrap();
+        assert_eq!(body["uuid"], uuid);
+        assert_eq!(body["event"], "MessageBounced");
+        assert_eq!(body["payload"]["original_message"]["id"], original_id);
+        assert_eq!(body["payload"]["bounce"]["id"], dsn_id);
+    }
+
+    // Reprocessing the committed DSN does not create a second request for
+    // either subscriber.
+    assert!(matches!(
+        sink.correlate_bounce(f.server.id, dsn_id, &[], "hard", |_| {
+            panic!("an already correlated DSN must not rebuild its event")
+        })
+        .await
+        .unwrap(),
+        camelmailer_db::BounceCorrelationOutcome::AlreadyCorrelated
+    ));
+    let queued_after_replay: i64 = sqlx::query("SELECT count(*) AS c FROM webhook_requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("c");
+    assert_eq!(queued_after_replay, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_delete_during_soft_failure_fanout_preserves_retry_schedule() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 4).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let webhook = f
+        .store
+        .create_webhook(NewWebhook::all(
+            f.server.id,
+            "delivery events",
+            "https://hooks.example.test/delivery",
+            false,
+        ))
+        .await
+        .unwrap();
+
+    let mut message = message_for(f.server.id, "user@dest.example");
+    message.scope = MessageScope::Outgoing;
+    let message_id = sink.insert_message(&message).await.unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    let queued = queue.dequeue("soft-failure-worker").await.unwrap().unwrap();
+    assert_eq!(queued.message_id, message_id);
+    let queued_message_id = queued.id;
+    let attempts = queued.attempts;
+
+    // Pause the request insert after record_outbound_delivery has snapshotted
+    // and key-share locked the webhook. A concurrent delete must then wait
+    // for the outbound state and retry transaction instead of invalidating
+    // the request's foreign key and rolling that transaction back.
+    let mut barrier = install_webhook_insert_barrier(&pool).await;
+    let record_sink = sink.clone();
+    let server_id = f.server.id;
+    let record_task = tokio::spawn(async move {
+        let payload = serde_json::json!({ "message": { "id": message_id } });
+        record_sink
+            .record_outbound_delivery(
+                server_id,
+                message_id,
+                queued_message_id,
+                "SoftFail",
+                "temporary delivery failure",
+                "421 Try again later",
+                false,
+                None,
+                camelmailer_db::OutboundQueueAction::Retry { attempts },
+                "MessageDelayed",
+                &payload,
+            )
+            .await
+    });
+    wait_for_locked_query(&pool, "INSERT INTO webhook_requests").await;
+
+    let delete_store = f.store.clone();
+    let delete_task = tokio::spawn(async move { delete_store.delete_webhook(webhook.id).await });
+    wait_for_locked_query(&pool, "DELETE FROM webhooks").await;
+
+    release_webhook_insert_barrier(&mut barrier).await;
+    assert!(record_task.await.unwrap().unwrap().is_some());
+    assert!(delete_task.await.unwrap().unwrap());
+
+    let stored = sink
+        .message_by_id(f.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "SoftFail");
+    let deliveries = sink
+        .deliveries_for_message(f.server.id, message_id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, "SoftFail");
+
+    let queued = sqlx::query(
+        "SELECT attempts, retry_after, locked_by, locked_at, now() AS database_now
+         FROM queued_messages
+         WHERE id = $1",
+    )
+    .bind(queued_message_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued.get::<i32, _>("attempts"), 1);
+    assert!(queued.get::<Option<String>, _>("locked_by").is_none());
+    assert!(queued
+        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("locked_at")
+        .is_none());
+    let retry_after = queued.get::<chrono::DateTime<chrono::Utc>, _>("retry_after");
+    let database_now = queued.get::<chrono::DateTime<chrono::Utc>, _>("database_now");
+    let remaining = retry_after - database_now;
+    assert!(remaining > chrono::Duration::seconds(45));
+    assert!(remaining <= chrono::Duration::minutes(1));
+
+    let webhook_requests: i64 = sqlx::query_scalar("SELECT count(*) FROM webhook_requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(webhook_requests, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_outbound_results_cannot_overwrite_a_correlated_bounce() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    let mut original = message_for(f.server.id, "user@dest.example");
+    original.scope = MessageScope::Outgoing;
+    let original_id = sink.insert_message(&original).await.unwrap();
+    let original = sink
+        .message_by_id(f.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut dsn = message_for(f.server.id, "server@rp.example.com");
+    dsn.bounce = true;
+    let dsn_id = sink.insert_message(&dsn).await.unwrap();
+
+    assert!(matches!(
+        sink.correlate_bounce(
+            f.server.id,
+            dsn_id,
+            &[original.token],
+            "hard",
+            |_| serde_json::json!({}),
+        )
+        .await
+        .unwrap(),
+        camelmailer_db::BounceCorrelationOutcome::Correlated(_)
+    ));
+    for (status, category) in [
+        ("Sent", None),
+        ("SoftFail", None),
+        ("HardFail", Some("hard")),
+        ("Held", None),
+    ] {
+        assert!(
+            sink.record_delivery(
+                f.server.id,
+                original_id,
+                status,
+                "stale outbound result",
+                "stale SMTP response",
+                status == "Sent",
+                category,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "{status} must lose to the correlated bounce"
+        );
+    }
+
+    f.store
+        .create_webhook(NewWebhook::all(
+            f.server.id,
+            "all delivery events",
+            "https://hooks.example.test/delivery",
+            false,
+        ))
+        .await
+        .unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    for (status, category, action, event) in [
+        (
+            "Sent",
+            None,
+            camelmailer_db::OutboundQueueAction::Complete,
+            "MessageSent",
+        ),
+        (
+            "SoftFail",
+            None,
+            camelmailer_db::OutboundQueueAction::Retry { attempts: 0 },
+            "MessageDelayed",
+        ),
+        (
+            "HardFail",
+            Some("hard"),
+            camelmailer_db::OutboundQueueAction::Complete,
+            "MessageDeliveryFailed",
+        ),
+        (
+            "Held",
+            None,
+            camelmailer_db::OutboundQueueAction::Complete,
+            "MessageHeld",
+        ),
+    ] {
+        let queued_message_id = queue
+            .enqueue(original_id, f.server.id, "dest.example")
+            .await
+            .unwrap();
+        assert!(
+            sink.record_outbound_delivery(
+                f.server.id,
+                original_id,
+                queued_message_id,
+                status,
+                "stale outbound result",
+                "stale SMTP response",
+                status == "Sent",
+                category,
+                action,
+                event,
+                &serde_json::json!({ "message": { "id": original_id } }),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "queued {status} result must lose to the correlated bounce"
+        );
+        let queue_row_exists: bool =
+            sqlx::query("SELECT EXISTS(SELECT 1 FROM queued_messages WHERE id = $1) AS present")
+                .bind(queued_message_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("present");
+        assert!(!queue_row_exists, "stale {status} queue row must complete");
+    }
+    let stale_webhooks: i64 = sqlx::query("SELECT count(*) AS count FROM webhook_requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("count");
+    assert_eq!(stale_webhooks, 0);
+
+    let stored = sink
+        .message_by_id(f.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Bounced");
+    assert_eq!(stored.bounce_category.as_deref(), Some("hard"));
+    let deliveries = sink
+        .deliveries_for_message(f.server.id, original_id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, "Bounced");
+
+    let stats = ServerStore::message_stats(
+        &f.store,
+        f.server.id,
+        &camelmailer_core::StatsFilter::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.sent, 0);
+    assert_eq!(stats.bounced, 1);
+    assert_eq!(stats.bounces_hard, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

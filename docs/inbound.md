@@ -124,8 +124,12 @@ according to the route:
 - **Accept / Hold / Bounce** routes leave the stored message in place with
   nothing to deliver.
 
-Two checks run on inbound mail independently of the route, by inspecting
-the message content:
+Inbound processing is ordered so protective and more specific handlers run
+before bounce correlation. Spam and virus inspection runs first. Clean ARF
+feedback reports are handled next, followed by delivery-status correlation and
+then normal route delivery.
+
+Two checks therefore run on all inbound mail independently of the route:
 
 - **Spam and virus inspection.** When rspamd or ClamAV is configured, a
   message that exceeds the spam-failure threshold or fails a virus scan is
@@ -135,15 +139,49 @@ the message content:
   is recognised by its envelope and turned into a stream-scoped complaint
   for the recipient who complained, then marked `Processed`.
 
-Bounce-flagged messages (mail arriving at a return path) are classified
-into hard, soft, or undetermined so the observability API can break
-bounces down by category.
+Return-path intake and correlation do not depend on `dns.return_path_envelope`.
+That flag only controls outbound envelope rewriting and defaults to `false`
+in 0.7.x; see [Return-Path and bounces](domains.md#return-path-and-bounces).
+
+Mail arriving at a return path is considered for bounce correlation only when
+it has delivery-status structure: a delivery-status MIME report/part or the
+recipient, action, enhanced-status and `Reporting-MTA` fields of a legacy DSN.
+The relevant recipient must have `Action: failed`; `delayed`, `delivered`,
+`relayed` and `expanded` reports do not mark a message as bounced. A failed
+report may still have a 4.x enhanced status and is then classified as a soft
+bounce because the reporting MTA has stopped its own delivery attempts.
+CamelMailer sends one recipient per stored message, so it leaves a report with
+mixed recipient actions uncorrelated rather than guessing which action belongs
+to the returned token. When a failed DSN contains an `X-CamelMailer-MsgID`
+header from an outgoing
+CamelMailer message, the worker sets the inbound message's `bounce_for_id`,
+records it as `Processed`, marks the original outgoing message `Bounced`, and
+queues `MessageBounced` for every subscribed webhook. These state changes,
+delivery rows, and webhook requests commit in one transaction. A failed
+fan-out therefore rolls the correlation back for a later queue attempt.
+Reprocessing a committed DSN is idempotent and does not append deliveries or
+queue the webhook again. A stale outgoing queue row whose message is already
+`Bounced` is removed before suppression checks, tracking, or SMTP. If a DSN
+reaches the original while outbound work is already in flight, its `Bounced`
+state wins over any later `Sent`, `SoftFail`, `HardFail`, or `Held` result.
+CamelMailer then completes the stale queue row without appending a delivery,
+scheduling a retry, or enqueueing the older result's webhook. A matched DSN is
+not sent to a route endpoint. An unmatched failed DSN is sent to its configured
+route when one exists. Without a route it is recorded as `HardFail` and removed
+from the queue, matching Postal. Non-failure DSNs, auto-replies and other
+return-path messages retain the normal route behavior. Postal's legacy
+`X-Postal-MsgID` spelling is accepted as well.
 
 You read inbound messages through the same message endpoints as outbound
 mail. `GET /api/v2/server/messages/{id}` returns the message with its
 delivery attempts, which is where the `Processed`, `Held`, or failure
 entries above show up. See the [Quickstart](quickstart.md) for the
 message-reading calls.
+
+In the dashboard, a correlated bounce notification's message detail page shows
+its category, correlation time, and a link to the original message in the same
+server. Unmatched notifications have no original-message link. The original
+message does not yet list its associated bounce notifications.
 
 ## Managing routes
 

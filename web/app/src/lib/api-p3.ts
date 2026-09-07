@@ -164,6 +164,11 @@ export const WEBHOOK_EVENT_META: Record<
     label: "Held",
     description: "The message was held for manual review before sending.",
   },
+  MessageBounced: {
+    tone: "red",
+    label: "Bounced",
+    description: "A returned DSN was matched to an outgoing message.",
+  },
 }
 
 const SAMPLE_DETAILS: Record<string, string> = {
@@ -173,26 +178,77 @@ const SAMPLE_DETAILS: Record<string, string> = {
   MessageHeld: "Message held for manual review (spam score above threshold)",
 }
 
+function webhookMessageSample(
+  id: number,
+  token: string,
+  direction: "incoming" | "outgoing",
+  messageId: string,
+  to: string,
+  from: string,
+  subject: string,
+  timestamp: number,
+) {
+  return {
+    id,
+    token,
+    direction,
+    message_id: messageId,
+    to,
+    from,
+    subject,
+    timestamp,
+    spam_status: "NotChecked",
+    tag: null,
+  }
+}
+
 /** The example JSON payload for an event — mirrors the backend's
  *  `sample_payload`, so what the editor shows matches what arrives. */
 export function webhookSamplePayload(event: string): string {
+  const messageTimestamp = Date.now() / 1000
+  const timestamp = Math.floor(messageTimestamp)
+  const payload =
+    event === "MessageBounced"
+      ? {
+          original_message: webhookMessageSample(
+            1234,
+            "abc123message",
+            "outgoing",
+            "original@example.com",
+            "recipient@example.com",
+            "sender@yourdomain.com",
+            "Example message",
+            messageTimestamp - 60,
+          ),
+          bounce: webhookMessageSample(
+            1235,
+            "def456bounce",
+            "incoming",
+            "bounce@mx.example.com",
+            "server1@rp.example.com",
+            "mailer-daemon@mx.example.com",
+            "Delivery Status Notification (Failure)",
+            messageTimestamp,
+          ),
+        }
+      : {
+          message: {
+            id: 1234,
+            token: "AbCdEf123456",
+            rcpt_to: "recipient@example.com",
+            mail_from: "sender@yourdomain.com",
+            scope: "outgoing",
+            bounce: false,
+          },
+          details: SAMPLE_DETAILS[event] ?? "Test delivery",
+        }
   return JSON.stringify(
     {
       event,
-      timestamp: Math.floor(Date.now() / 1000),
+      timestamp,
       uuid: "<generated per delivery>",
       test: true,
-      payload: {
-        message: {
-          id: 1234,
-          token: "AbCdEf123456",
-          rcpt_to: "recipient@example.com",
-          mail_from: "sender@yourdomain.com",
-          scope: "outgoing",
-          bounce: false,
-        },
-        details: SAMPLE_DETAILS[event] ?? "Test delivery",
-      },
+      payload,
     },
     null,
     2,
