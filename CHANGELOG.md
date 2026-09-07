@@ -15,6 +15,21 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Security
+
+- **SMTP AUTH now requires a TLS-protected session.** EHLO already withheld
+  the `AUTH` capability until after STARTTLS, but the command handler
+  accepted `AUTH PLAIN`, `AUTH LOGIN` and `AUTH CRAM-MD5` whatever the
+  session state, so a client that sent an unadvertised AUTH (on its own, or
+  because an active attacker stripped the capability from the EHLO reply)
+  handed its credential over in cleartext. All mechanisms now answer
+  `538 5.7.11 Encryption required for requested authentication mechanism`
+  until the session is upgraded, and the session never enters a
+  credential-reading input mode. An unknown mechanism answers
+  `504 5.5.4 Unrecognized authentication type` instead of falling through to
+  the generic `502`. Installations with `smtp_server.tls_enabled` off are
+  unaffected: they advertise AUTH on the plain session as before, since they
+  terminate TLS elsewhere.
 ## [0.7.7] - 2026-09-04
 
 ### Added

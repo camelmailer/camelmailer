@@ -328,12 +328,23 @@ impl Session {
             self.rset()
         } else if upper.starts_with("NOOP") {
             self.noop()
-        } else if upper.starts_with("AUTH PLAIN") {
-            self.auth_plain(data)
-        } else if upper.starts_with("AUTH LOGIN") {
-            self.auth_login(data)
-        } else if upper.starts_with("AUTH CRAM-MD5") {
-            self.auth_cram_md5()
+        } else if upper.starts_with("AUTH ") || upper.trim_end() == "AUTH" {
+            if !self.auth_permitted() {
+                // RFC 4954 section 4: refuse the mechanism rather than let a
+                // credential cross an unprotected connection.
+                return Reply::line(
+                    "538 5.7.11 Encryption required for requested authentication mechanism",
+                );
+            }
+            if upper.starts_with("AUTH PLAIN") {
+                self.auth_plain(data)
+            } else if upper.starts_with("AUTH LOGIN") {
+                self.auth_login(data)
+            } else if upper.starts_with("AUTH CRAM-MD5") {
+                self.auth_cram_md5()
+            } else {
+                Reply::line("504 5.5.4 Unrecognized authentication type")
+            }
         } else if upper.starts_with("MAIL FROM") {
             self.mail_from_command(data)
         } else if upper.starts_with("RCPT TO") {
@@ -343,6 +354,22 @@ impl Session {
         } else {
             Reply::line("502 Invalid/unsupported command")
         }
+    }
+
+    /// Whether an AUTH command may start on this connection.
+    ///
+    /// EHLO only advertises AUTH once the session is TLS-protected, but a
+    /// client can send a command that was never advertised. Enforce the same
+    /// condition here so a credential cannot cross an unprotected connection,
+    /// whether the client skipped STARTTLS on its own or an attacker stripped
+    /// the advertisement from the capability list.
+    ///
+    /// An installation that leaves `smtp_server.tls_enabled` off has no
+    /// STARTTLS to offer, so AUTH stays available there. That deployment
+    /// terminates TLS elsewhere or runs on a trusted network, which is the
+    /// same assumption the capability list already makes.
+    fn auth_permitted(&self) -> bool {
+        self.tls || !self.config.tls_enabled
     }
 
     fn proxy(&mut self, data: &str) -> Reply {
@@ -392,7 +419,7 @@ impl Session {
         // mechanism requires a non-standard "org/server" username and breaks
         // standard clients. PLAIN/LOGIN (password == credential key) is the
         // correct, secure path.
-        if self.tls || !self.config.tls_enabled {
+        if self.auth_permitted() {
             capabilities.push("AUTH PLAIN LOGIN");
         }
 

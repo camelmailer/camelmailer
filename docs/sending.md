@@ -240,9 +240,13 @@ is accepted but not used for these mechanisms. The credential identifies the
 server on its own.
 
 **STARTTLS.** The server advertises `STARTTLS` until the session is
-upgraded, and it advertises `AUTH` only once the session is TLS-protected,
-so submission credentials stay off the wire in cleartext (when TLS is
-disabled entirely, AUTH is advertised on the plain session as a fallback).
+upgraded, and it advertises `AUTH` only once the session is TLS-protected.
+The AUTH command itself is refused on the same condition, with
+`538 5.7.11 Encryption required for requested authentication mechanism`, so a
+client that skips STARTTLS and sends AUTH anyway is turned away before its
+credential reaches the wire. When `smtp_server.tls_enabled` is off the server
+has no STARTTLS to offer, and AUTH stays available on the plain session for
+deployments that terminate TLS elsewhere.
 Port 25 speaks plain SMTP with STARTTLS; a listener on 587 is the usual
 submission port, and a listener on 465 uses implicit TLS from the first byte.
 Ports and certificates are set in `smtp_server` (see
