@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn bounced_sample_matches_the_shared_dashboard_shape() {
         let expected: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/message_bounced_sample_shape.json"
+            "../../../web/app/src/lib/__fixtures__/message_bounced_sample_shape.json"
         ))
         .unwrap();
         let payload = sample_payload("MessageBounced", "uuid-1");

@@ -3797,6 +3797,28 @@ impl PgMessageSink {
         Ok(row.as_ref().map(stored_message_from_row))
     }
 
+    /// Worker load with the current server token in the same query. Message
+    /// content remains protected by the owning server's RLS context.
+    pub async fn message_with_server_token(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<Option<(StoredMessage, String)>, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let row = sqlx::query(
+            "SELECT m.*, s.token AS server_token FROM messages m
+             JOIN servers s ON s.id = m.server_id WHERE m.id = $1",
+        )
+        .bind(message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row
+            .as_ref()
+            .map(|row| (stored_message_from_row(row), row.get("server_token"))))
+    }
+
     /// Record a delivery attempt and update the message's status,
     /// `last_delivery_attempt` and `held` flag (port of
     /// `Postal::MessageDB::Message#create_delivery`). `bounce_category`
@@ -3886,14 +3908,11 @@ impl PgMessageSink {
         .await?;
 
         if updated.rows_affected() == 0 {
-            sqlx::query(
-                "DELETE FROM queued_messages
-                 WHERE id = $1 AND message_id = $2 AND server_id = $3",
+            crate::queue::complete_message(
+                &mut *tx,
+                queued_message_id,
+                Some((message_id, server_id)),
             )
-            .bind(queued_message_id)
-            .bind(message_id)
-            .bind(server_id as i64)
-            .execute(&mut *tx)
             .await?;
             tx.commit().await?;
             return Ok(None);
@@ -3914,30 +3933,20 @@ impl PgMessageSink {
 
         match queue_action {
             OutboundQueueAction::Complete => {
-                sqlx::query(
-                    "DELETE FROM queued_messages
-                     WHERE id = $1 AND message_id = $2 AND server_id = $3",
+                crate::queue::complete_message(
+                    &mut *tx,
+                    queued_message_id,
+                    Some((message_id, server_id)),
                 )
-                .bind(queued_message_id)
-                .bind(message_id)
-                .bind(server_id as i64)
-                .execute(&mut *tx)
                 .await?;
             }
             OutboundQueueAction::Retry { attempts } => {
-                let minutes = 2_i64.pow(attempts.min(10) as u32).min(24 * 60);
-                sqlx::query(
-                    "UPDATE queued_messages
-                     SET locked_by = NULL, locked_at = NULL,
-                         attempts = attempts + 1,
-                         retry_after = now() + make_interval(mins => $2::int)
-                     WHERE id = $1 AND message_id = $3 AND server_id = $4",
+                crate::queue::retry_message(
+                    &mut *tx,
+                    queued_message_id,
+                    attempts,
+                    Some((message_id, server_id)),
                 )
-                .bind(queued_message_id)
-                .bind(minutes as i32)
-                .bind(message_id)
-                .bind(server_id as i64)
-                .execute(&mut *tx)
                 .await?;
             }
         }
@@ -3987,14 +3996,11 @@ impl PgMessageSink {
             None
         };
 
-        sqlx::query(
-            "DELETE FROM queued_messages
-             WHERE id = $1 AND message_id = $2 AND server_id = $3",
+        crate::queue::complete_message(
+            &mut *tx,
+            queued_message_id,
+            Some((bounce_message_id, server_id)),
         )
-        .bind(queued_message_id)
-        .bind(bounce_message_id)
-        .bind(server_id as i64)
-        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(delivery_id)

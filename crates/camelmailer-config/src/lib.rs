@@ -600,6 +600,8 @@ pub struct Dns {
     pub mx_records: Vec<String>,
     pub spf_include: String,
     pub return_path_domain: String,
+    /// Opt in to rewriting outbound envelope senders; defaults off in 0.7.x.
+    pub return_path_envelope: bool,
     pub route_domain: String,
     pub track_domain: String,
     pub helo_hostname: Option<String>,
@@ -626,6 +628,7 @@ impl Default for Dns {
             ],
             spf_include: "spf.postal.example.com".into(),
             return_path_domain: "rp.postal.example.com".into(),
+            return_path_envelope: false,
             route_domain: "routes.postal.example.com".into(),
             track_domain: "track.postal.example.com".into(),
             helo_hostname: None,
@@ -1143,6 +1146,7 @@ mod tests {
             vec!["mx1.postal.example.com", "mx2.postal.example.com"]
         );
         assert_eq!(config.dns.return_path_domain, "rp.postal.example.com");
+        assert!(!config.dns.return_path_envelope);
         assert_eq!(config.dns.route_domain, "routes.postal.example.com");
         assert_eq!(config.dns.custom_return_path_prefix, "psrp");
         assert_eq!(config.dns.dkim_identifier, "postal");
@@ -1150,6 +1154,21 @@ mod tests {
         assert_eq!(config.smtp.port, 25);
         assert_eq!(config.smtp.authentication_type, "login");
         assert!(config.smtp.enable_starttls_auto);
+    }
+
+    #[test]
+    fn return_path_envelope_requires_explicit_opt_in() {
+        for (setting, enabled) in [
+            ("", false),
+            ("  return_path_envelope: false\n", false),
+            ("  return_path_envelope: true\n", true),
+        ] {
+            let config: Config = serde_yaml::from_str(&format!(
+                "dns:\n  return_path_domain: rp.camelmailer.com\n{setting}"
+            ))
+            .unwrap();
+            assert_eq!(config.dns.return_path_envelope, enabled);
+        }
     }
 
     #[test]

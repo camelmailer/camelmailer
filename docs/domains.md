@@ -167,24 +167,27 @@ If the domain already sends through another provider, keep it to one
 record by merging the mechanisms, for example
 `v=spf1 include:spf.example.com include:_spf.google.com ~all`.
 
-This check concerns the sending domain. For mail sent by the built-in worker,
-receivers check the SPF record on `dns.return_path_domain` instead. Publish a
-separate SPF record there as part of the installation setup.
+This check concerns the sending domain. When `dns.return_path_envelope` is
+`true`, mail sent by the built-in worker uses `dns.return_path_domain` for
+SPF checks. Publish a separate SPF record there before enabling rewriting.
 
 ## Return-Path and bounces
 
-When `dns.return_path_domain` names a usable, non-placeholder domain,
-CamelMailer replaces the submitted envelope sender with
-`<server-token>@<dns.return_path_domain>` and adds the stored message token as
-`X-CamelMailer-MsgID`. An empty, malformed or reserved example domain keeps
-the submitted envelope sender, so an untouched sample configuration cannot
-break outbound delivery. Mixed-case, IDNA and trailing-dot forms are
-canonicalized once and shared by outbound mail and SMTP intake matching; the
-reserved-example rejection is a send-side-only fallback, so the SMTP intake
-still accepts return-path mail addressed to a reserved or placeholder
-`dns.return_path_domain` — it just cannot yet correlate bounces, since the
-worker never sent from that domain. A receiving mail server sends its DSN to
-that return path and normally includes the original headers.
+Outbound envelope rewriting is opt-in in 0.7.x. By default,
+`dns.return_path_envelope` is `false`, so upgrades preserve the submitted
+`MAIL FROM` even when a real return-path domain is already configured.
+
+When `dns.return_path_envelope: true` and `dns.return_path_domain` names a
+usable, non-placeholder domain, CamelMailer replaces the submitted envelope
+sender with `<server-token>@<dns.return_path_domain>`. An empty, malformed,
+or reserved example domain preserves the submitted sender and logs a startup
+warning. Mixed-case, IDNA and trailing-dot forms are canonicalized.
+
+The worker adds the stored message token as `X-CamelMailer-MsgID` regardless
+of the envelope flag. SMTP return-path intake also remains enabled independently
+of that flag, including for placeholder domains. A receiving mail server sends
+its delivery status notification to the envelope return path and normally
+includes the original headers.
 CamelMailer's SMTP intake recognizes the server token. After inspection and
 feedback-report handling, the worker correlates only a delivery-status-shaped
 message carrying the returned token whose recipient action is `failed`.
@@ -200,12 +203,14 @@ route it remains stored as an uncorrelated inbound bounce with `HardFail`
 status.
 For migrations, the worker also recognizes Postal's `X-Postal-MsgID` header.
 
-Set up the return-path domain before putting its real name in the config:
+Before enabling envelope rewriting:
 
 1. Route its MX to CamelMailer's SMTP intake.
 2. Publish an SPF TXT record that authorizes the worker's outbound IPs or SMTP
    relay. For example, use `v=spf1 include:<dns.spf_include> ~all` when that
    include covers every sending host.
+3. Set `dns.return_path_domain` to the real domain and
+   `dns.return_path_envelope: true` when DNS is ready.
 
 The API does not generate these installation-wide records. The per-domain
 records above cannot represent them because every sending domain shares the
@@ -214,7 +219,7 @@ same return path.
 The SMTP intake also accepts a custom return-path subdomain beginning with
 `dns.custom_return_path_prefix`, such as `psrp.acme.com`, when its DNS routes
 to CamelMailer. The built-in worker does not select that address; it uses the
-shared return-path domain when configured.
+shared return-path domain when envelope rewriting is enabled.
 
 ## Managing domains
 

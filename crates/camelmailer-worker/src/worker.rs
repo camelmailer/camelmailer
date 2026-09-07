@@ -195,8 +195,12 @@ impl Worker {
             .clamav
             .enabled
             .then(|| ClamavInspector::new(&config.clamav));
-        let return_path_domain = config.dns.normalized_return_path_domain();
-        if return_path_domain.is_none() {
+        let return_path_domain = config
+            .dns
+            .return_path_envelope
+            .then(|| config.dns.normalized_return_path_domain())
+            .flatten();
+        if config.dns.return_path_envelope && return_path_domain.is_none() {
             tracing::warn!(
                 configured = %config.dns.return_path_domain,
                 "dns.return_path_domain is empty, invalid, or reserved; preserving submitted envelope senders"
@@ -235,17 +239,25 @@ impl Worker {
             return Ok(None);
         };
 
-        let message = self
-            .sink
-            .message_by_id(queued.server_id, queued.message_id)
-            .await?;
-        let Some(mut message) = message else {
+        let loaded = if self.return_path_domain.is_some() {
+            self.sink
+                .message_with_server_token(queued.server_id, queued.message_id)
+                .await?
+                .map(|(message, token)| (message, Some(token)))
+        } else {
+            self.sink
+                .message_by_id(queued.server_id, queued.message_id)
+                .await?
+                .map(|message| (message, None))
+        };
+        let Some((mut message, server_token)) = loaded else {
             self.queue.complete(queued.id).await?;
             return Ok(Some(ProcessOutcome::MessageMissing));
         };
 
         let outcome = if message.scope == "outgoing" {
-            self.process_outgoing(&queued, &message).await?
+            self.process_outgoing(&queued, &message, server_token.as_deref())
+                .await?
         } else {
             self.process_incoming(&queued, &mut message).await?
         };
@@ -256,6 +268,7 @@ impl Worker {
         &self,
         queued: &camelmailer_db::QueuedMessageRow,
         message: &StoredMessage,
+        server_token: Option<&str>,
     ) -> Result<ProcessOutcome, sqlx::Error> {
         if message.status == "Bounced" {
             self.queue.complete(queued.id).await?;
@@ -334,13 +347,8 @@ impl Worker {
         };
 
         let return_path = if let Some(domain) = &self.return_path_domain {
-            let server = self
-                .store
-                .server_async(message.server_id)
-                .await
-                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?
-                .ok_or(sqlx::Error::RowNotFound)?;
-            format!("{}@{domain}", server.token)
+            let token = server_token.ok_or(sqlx::Error::RowNotFound)?;
+            format!("{token}@{domain}")
         } else {
             message.mail_from.clone()
         };

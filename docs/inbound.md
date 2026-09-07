@@ -139,6 +139,10 @@ Two checks therefore run on all inbound mail independently of the route:
   is recognised by its envelope and turned into a stream-scoped complaint
   for the recipient who complained, then marked `Processed`.
 
+Return-path intake and correlation do not depend on `dns.return_path_envelope`.
+That flag only controls outbound envelope rewriting and defaults to `false`
+in 0.7.x; see [Return-Path and bounces](domains.md#return-path-and-bounces).
+
 Mail arriving at a return path is considered for bounce correlation only when
 it has delivery-status structure: a delivery-status MIME report/part or the
 recipient, action, enhanced-status and `Reporting-MTA` fields of a legacy DSN.
@@ -173,6 +177,11 @@ mail. `GET /api/v2/server/messages/{id}` returns the message with its
 delivery attempts, which is where the `Processed`, `Held`, or failure
 entries above show up. See the [Quickstart](quickstart.md) for the
 message-reading calls.
+
+In the dashboard, a correlated bounce notification's message detail page shows
+its category, correlation time, and a link to the original message in the same
+server. Unmatched notifications have no original-message link. The original
+message does not yet list its associated bounce notifications.
 
 ## Managing routes
 

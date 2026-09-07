@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest"
-import messageBouncedSampleShape from "../../../../crates/camelmailer-api/tests/fixtures/message_bounced_sample_shape.json"
+import messageBouncedSampleShape from "./__fixtures__/message_bounced_sample_shape.json"
 import type { Domain } from "@/lib/api"
 import { maskKey, deriveSmtpHost, webhookSamplePayload } from "@/lib/api-p3"
 import { relativeTime } from "@/lib/api-p1"

@@ -155,7 +155,7 @@ impl PgWebhookQueue {
 
     /// Reschedule with exponential backoff (`2^attempts` minutes, capped).
     pub async fn retry(&self, id: i64, attempts: i32) -> Result<(), sqlx::Error> {
-        let minutes = 2_i64.pow(attempts.min(10) as u32).min(24 * 60);
+        let minutes = crate::queue::retry_delay_minutes(attempts);
         sqlx::query(
             "UPDATE webhook_requests
              SET locked_by = NULL, locked_at = NULL, attempts = attempts + 1,
@@ -163,7 +163,7 @@ impl PgWebhookQueue {
              WHERE id = $1",
         )
         .bind(id)
-        .bind(minutes as i32)
+        .bind(minutes)
         .execute(&self.pool)
         .await?;
         Ok(())

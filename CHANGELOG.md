@@ -19,26 +19,38 @@ integration tests) is green.
 
 ### Added
 
-- **Return-path bounce correlation.** With a usable return-path domain,
-  outbound SMTP now uses `<server-token>@<dns.return_path_domain>` as its
-  envelope sender and adds `X-CamelMailer-MsgID` before DKIM signing. The
+- **Return-path bounce correlation.** With `dns.return_path_envelope: true`
+  and a usable return-path domain, outbound SMTP uses
+  `<server-token>@<dns.return_path_domain>` as its envelope sender. The worker
+  adds `X-CamelMailer-MsgID` before DKIM signing independently of that flag. The
   worker also accepts Postal's `X-Postal-MsgID` on inbound DSNs. A returned DSN
   carrying that token is linked to the original message through
   `bounce_for_id`; the DSN is recorded as `Processed`, the original as
   `Bounced`, and subscribed webhooks receive `MessageBounced` with
   `original_message` and `bounce` details.
 
+- The dashboard now shows a correlated bounce notification's category,
+  correlation time, and a link to its original message. Browser tests cover
+  navigation, unmatched notifications, and unavailable originals.
+
 ### Changed
 
-- **Return-path upgrade note.** Once `dns.return_path_domain` is set to a real
-  domain, the worker changes outbound `MAIL FROM` from the submitted sender to
-  `<server-token>@<dns.return_path_domain>`. Operators must route that domain's
-  MX to CamelMailer and publish an SPF record authorizing the outbound worker
-  IPs or relay. Empty, malformed and reserved example values preserve the
-  submitted envelope sender.
+- **Return-path upgrade note.** `dns.return_path_envelope` defaults to `false`
+  in 0.7.x, including when omitted from YAML. Existing installations preserve
+  their submitted `MAIL FROM` even with a real return-path domain configured.
+  Before enabling rewriting, route that domain's MX to CamelMailer and publish
+  SPF authorizing the outbound worker IPs or relay. Empty, malformed and
+  reserved example values still preserve the submitted sender. Bounce intake
+  and correlation remain independent of the flag.
+- The worker loads the server token alongside the message when rewriting is
+  enabled, avoiding an additional database round trip. Queue completion and
+  retry operations share helpers while retaining their transaction boundaries
+  and existing backoff schedule.
 
 ### Fixed
 
+- The shared webhook fixture now lives inside the dashboard Docker build
+  context, fixing isolated builds.
 - A DSN containing several returned message tokens now correlates only the
   first token that matches an outgoing message, consistent with the one-to-one
   `bounce_for_id` relationship.

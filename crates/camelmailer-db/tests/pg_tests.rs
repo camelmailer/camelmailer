@@ -220,6 +220,19 @@ async fn rls_scopes_reads_to_the_tenant_context() {
     let tenant_b = sink.messages_for_server(other_server.id).await.unwrap();
     assert_eq!(tenant_b.len(), 1);
     assert_eq!(tenant_b[0].rcpt_to, "b@tenant-b.example");
+
+    let (loaded, token) = sink
+        .message_with_server_token(f.server.id, tenant_a[0].id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.id, tenant_a[0].id);
+    assert_eq!(token, f.server.token);
+    assert!(sink
+        .message_with_server_token(other_server.id, tenant_a[0].id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

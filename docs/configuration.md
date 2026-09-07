@@ -125,6 +125,13 @@ For deliverability you publish, per installation:
 | Return-path | `dns.return_path_domain` | MX to CamelMailer plus an SPF TXT record authorizing its outbound senders |
 | Click/open tracking | `dns.track_domain` | CNAME → the web server |
 
+`dns.return_path_envelope` defaults to `false` in 0.7.x. Setting a
+return-path domain alone configures intake and does not change outbound
+`MAIL FROM`. Publish the return-path MX and SPF records, then explicitly set
+`return_path_envelope: true` to enable envelope rewriting. Empty, invalid,
+or reserved example domains still preserve the submitted sender and produce
+a startup warning when rewriting is enabled.
+
 You don't have to assemble these by hand for sending domains:
 `GET /api/v2/admin/…/domains/{name}` (and the dashboard's *DNS records*
 dialog) returns the exact `verification_record`, `spf_record` and

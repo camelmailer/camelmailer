@@ -8,7 +8,7 @@
 
 use camelmailer_core::Id;
 use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Row};
+use sqlx::{Executor, PgPool, Postgres, Row};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedMessageRow {
@@ -27,6 +27,54 @@ fn queued_from_row(row: &PgRow) -> QueuedMessageRow {
         domain: row.get("domain"),
         attempts: row.get("attempts"),
     }
+}
+
+/// Preserve the existing retry schedule: 1 minute initially, up to 1024 minutes.
+pub(crate) fn retry_delay_minutes(attempts: i32) -> i32 {
+    2_i32.pow(attempts.clamp(0, 10) as u32)
+}
+
+/// Queue mutations accept either a pool or the delivery's open transaction.
+/// Delivery callers additionally constrain the row to its message and tenant.
+pub(crate) async fn complete_message<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
+    id: i64,
+    owner: Option<(i64, Id)>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM queued_messages WHERE id = $1
+         AND ($2::bigint IS NULL OR message_id = $2)
+         AND ($3::bigint IS NULL OR server_id = $3)",
+    )
+    .bind(id)
+    .bind(owner.map(|(message_id, _)| message_id))
+    .bind(owner.map(|(_, server_id)| server_id as i64))
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn retry_message<'e>(
+    executor: impl Executor<'e, Database = Postgres>,
+    id: i64,
+    attempts: i32,
+    owner: Option<(i64, Id)>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE queued_messages
+         SET locked_by = NULL, locked_at = NULL, attempts = attempts + 1,
+             retry_after = now() + make_interval(mins => $2::int)
+         WHERE id = $1
+         AND ($3::bigint IS NULL OR message_id = $3)
+         AND ($4::bigint IS NULL OR server_id = $4)",
+    )
+    .bind(id)
+    .bind(retry_delay_minutes(attempts))
+    .bind(owner.map(|(message_id, _)| message_id))
+    .bind(owner.map(|(_, server_id)| server_id as i64))
+    .execute(executor)
+    .await?;
+    Ok(())
 }
 
 /// Default stale-lock window (days) when a caller does not configure one.
@@ -107,28 +155,12 @@ impl PgQueue {
 
     /// Delivery finished (successfully or terminally) — remove from queue.
     pub async fn complete(&self, id: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM queued_messages WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        complete_message(&self.pool, id, None).await
     }
 
-    /// Soft failure — unlock and reschedule with exponential backoff
-    /// (`2^attempts` minutes, capped at one day).
+    /// Soft failure — unlock and reschedule with exponential backoff.
     pub async fn retry(&self, id: i64, attempts: i32) -> Result<(), sqlx::Error> {
-        let minutes = 2_i64.pow(attempts.min(10) as u32).min(24 * 60);
-        sqlx::query(
-            "UPDATE queued_messages
-             SET locked_by = NULL, locked_at = NULL, attempts = attempts + 1,
-                 retry_after = now() + make_interval(mins => $2::int)
-             WHERE id = $1",
-        )
-        .bind(id)
-        .bind(minutes as i32)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        retry_message(&self.pool, id, attempts, None).await
     }
 
     pub async fn queue_size(&self) -> Result<i64, sqlx::Error> {

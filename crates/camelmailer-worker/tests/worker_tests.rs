@@ -345,6 +345,7 @@ fn worker_config(relay_port: u16) -> camelmailer_config::Config {
     config.camelmailer.smtp_relays = vec![format!("smtp://127.0.0.1:{relay_port}")];
     config.camelmailer.default_maximum_delivery_attempts = 3;
     config.dns.return_path_domain = "rp.camelmailer.com".into();
+    config.dns.return_path_envelope = true;
     config.smtp_client.open_timeout = 5;
     // The webhook / route-endpoint mock servers in these tests bind to
     // 127.0.0.1, which the SSRF guard blocks by default. Allowlist loopback so
@@ -509,6 +510,33 @@ async fn deleting_a_webhook_during_sent_fanout_cannot_requeue_accepted_mail() {
             .count(),
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_return_path_envelope_preserves_the_submitted_sender() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let mut config = worker_config(smtp.port);
+    config.dns.return_path_envelope = false;
+    let worker = Worker::new(&config, s.store.clone());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let seen = smtp.received.lock().unwrap().clone();
+    assert!(seen
+        .iter()
+        .any(|line| line == "MAIL FROM:<sender@org.example>"));
+    // Correlation headers remain available independently of envelope rewriting.
+    assert!(seen
+        .iter()
+        .any(|line| line.starts_with("X-CamelMailer-MsgID:")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1001,6 +1029,11 @@ async fn inbound_dsns_correlate_only_the_first_matching_original_and_fire_one_we
     )
     .into_bytes();
     let bounce_id = s.sink.insert_message(&dsn).await.unwrap();
+
+    // Disabling rewriting later must not stop intake/correlation of mail
+    // already sent with the return path.
+    config.dns.return_path_envelope = false;
+    let worker = Worker::new(&config, s.store.clone());
 
     assert_eq!(
         worker.process_next().await.unwrap().unwrap(),

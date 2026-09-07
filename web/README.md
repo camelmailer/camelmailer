@@ -63,3 +63,17 @@ docker compose exec -e CAMELMAILER_USER_PASSWORD=e2e-test-password-1 \
 pnpm run dev &
 node e2e/smoke.mjs
 ```
+
+## Focused browser tests
+
+From `web/app`, run `pnpm exec playwright install chromium` once, then
+`pnpm test:ui`. The Playwright test runner starts the dashboard at
+`http://127.0.0.1:3217` and mocks API responses in the browser, so these tests
+need no backend or test account. Set `E2E_BASE_URL` to use an already-running
+app instead. Failed tests save screenshots and traces under `test-results/`.
+
+The bounce tests cover the original-message link, keyboard navigation,
+unmatched notifications, and an original message that is no longer available.
+These check UI rendering and routing; the Rust integration tests cover actual
+bounce correlation and tenant isolation. The separate `e2e/smoke.mjs` script
+above exercises the real backend.
