@@ -1,0 +1,14 @@
+# Handler helpers in camelmailer-api return `Result<T, axum::response::Response>`
+# so they can early-return a rendered error straight to axum. That `Response`
+# is exactly 128 bytes, which is clippy's default `large-error-threshold`, so
+# from Rust 1.98 the `result_large_err` lint fires on every one of them and
+# `-D warnings` turns CI red.
+#
+# Boxing the response would satisfy the lint and make the code worse: an
+# allocation on every error path, and `.map_err(Box::new)` at each call site,
+# to shrink a return value that lives for the length of one HTTP request.
+# `Result<T, Response>` is the idiomatic axum shape and it stays.
+#
+# The threshold is raised just past `Response` rather than the lint being
+# switched off, so a genuinely oversized error type still gets caught.
+large-error-threshold = 192
