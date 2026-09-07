@@ -275,6 +275,6 @@ deferred (documented so integrators know what not to expect yet):
 
 ## License
 
-MIT — see [LICENSE](LICENSE). CamelMailer began as a Rust rewrite of
-[Postal](https://github.com/postalserver/postal) (also MIT); portions of the
-design and behaviour derive from it.
+MIT, see [LICENSE](LICENSE). CamelMailer began as a Rust rewrite of
+[Postal](https://github.com/postalserver/postal), which is MIT too. The
+attribution for the portions that derive from it is in [NOTICE](NOTICE).
