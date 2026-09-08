@@ -15,6 +15,19 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Changed
+
+- The Rust toolchain is pinned in `rust-toolchain.toml` (currently `1.98.1`).
+  CI installs `dtolnay/rust-toolchain@stable`, which follows upstream's
+  release schedule; when stable moved to 1.98.1 on 2026-09-01 clippy's
+  `result_large_err` began firing on pre-existing handler helpers and turned
+  `main` red with no code change, while the same command stayed green on a
+  developer machine still running 1.96.0. rustup reads the file and uses the
+  pinned toolchain whatever the workflow installed, so `cargo clippy` now
+  means the same thing locally and in CI. New stable lints arrive when the
+  file is bumped rather than on upstream's schedule, which is the point. This
+  is not an MSRV declaration.
+
 ## [0.7.8] - 2026-09-08
 
 ### Added
