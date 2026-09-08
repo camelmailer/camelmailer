@@ -230,6 +230,27 @@ pub struct UserAuth {
     pub disabled: bool,
 }
 
+/// What a session needs to end the identity provider's session too.
+///
+/// Revoking the local session leaves the provider's own session standing, so
+/// the next sign-in succeeds without a prompt and the user was not really
+/// logged out. OpenID Connect RP-Initiated Logout fixes that by sending the
+/// browser to the provider, which needs the `id_token` as `id_token_hint`
+/// and the endpoint to send it to.
+///
+/// The endpoint is resolved from discovery at **login**, not at logout, so
+/// signing out never waits on the provider being reachable. Present only for
+/// sessions that came from OIDC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcLogout {
+    /// The `id_token` from the token response, passed back as
+    /// `id_token_hint`. Providers such as Keycloak reject an end-session
+    /// request carrying neither this nor a `client_id`.
+    pub id_token: String,
+    /// The provider's `end_session_endpoint` from its discovery document.
+    pub end_session_endpoint: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthSession {
     pub id: Id,
@@ -241,6 +262,10 @@ pub struct AuthSession {
     pub last_used_at: DateTime<Utc>,
     pub ip_address: Option<String>,
     pub user_agent: Option<String>,
+    /// Set when the session came from OIDC, so logout can end the
+    /// provider's session too. `None` for password, 2FA, WebAuthn and SAML
+    /// sessions.
+    pub oidc_logout: Option<OidcLogout>,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +275,8 @@ pub struct NewAuthSession {
     pub expires_at: DateTime<Utc>,
     pub ip_address: Option<String>,
     pub user_agent: Option<String>,
+    /// See [`AuthSession::oidc_logout`]. Only the OIDC sign-in paths set it.
+    pub oidc_logout: Option<OidcLogout>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

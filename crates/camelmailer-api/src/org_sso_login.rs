@@ -35,7 +35,7 @@ use crate::app::{
     render_error, render_store_error, render_success, timing_middleware, ApiResponse, ApiState,
     RequestStart,
 };
-use crate::auth_api::{client_ip, issue_session, user_json};
+use crate::auth_api::{client_ip, issue_session_with_oidc_logout, user_json};
 use crate::oidc::{
     decoding_key_from_jwks, fetch_discovery, provisioned_name, sso_error, urlencode, Discovery,
 };
@@ -304,10 +304,18 @@ pub(crate) async fn org_callback(
         Ok(connection) => connection,
         Err(response) => return response,
     };
-    // Turn the provider's response into (uid, email, name), by protocol.
-    let (uid, email, name): (String, String, String) = match connection.kind {
+    // Turn the provider's response into (uid, email, name) plus, for the
+    // OIDC family, what RP-initiated logout will need. GitHub has no
+    // end-session flow of this shape, so it contributes None.
+    type Identity = (
+        String,
+        String,
+        String,
+        Option<camelmailer_core::auth::OidcLogout>,
+    );
+    let (uid, email, name, oidc_logout): Identity = match connection.kind {
         SsoKind::Github => match github_identity(&state, &connection, code).await {
-            Ok(identity) => identity,
+            Ok((uid, email, name)) => (uid, email, name, None),
             Err(response) => return *response,
         },
         _ => {
@@ -401,7 +409,17 @@ pub(crate) async fn org_callback(
                     .trim()
                     .to_string(),
             };
-            (uid.to_string(), email, name)
+            // The endpoint comes from the discovery document fetched
+            // above, so logging out never waits on the provider. A
+            // connection whose provider advertises none has no
+            // RP-initiated logout and ends locally.
+            let oidc_logout = discovery.end_session_endpoint.as_ref().map(|endpoint| {
+                camelmailer_core::auth::OidcLogout {
+                    id_token: id_token.clone(),
+                    end_session_endpoint: endpoint.clone(),
+                }
+            });
+            (uid.to_string(), email, name, oidc_logout)
         }
     };
 
@@ -420,17 +438,23 @@ pub(crate) async fn org_callback(
         Err(response) => return response.into_response(),
     };
 
-    complete_login(&state, &auth_store, &start, &headers, &user).await
+    complete_login(&state, &auth_store, &start, &headers, &user, oidc_logout).await
 }
 
 /// Record the audit event and issue the session — the shared tail of every
 /// tenant login (OIDC family, GitHub, SAML).
+///
+/// `oidc_logout` is set only by the OIDC branch, and only when the provider
+/// advertises an `end_session_endpoint`. GitHub and SAML logins pass `None`:
+/// neither has an RP-initiated logout of this shape, so their sessions end
+/// locally.
 async fn complete_login(
     state: &Arc<ApiState>,
     auth_store: &Arc<dyn AuthStore>,
     start: &RequestStart,
     headers: &HeaderMap,
     user: &User,
+    oidc_logout: Option<camelmailer_core::auth::OidcLogout>,
 ) -> Response {
     let _ = auth_store
         .record_auth_event(NewAuthEvent {
@@ -442,7 +466,7 @@ async fn complete_login(
         })
         .await;
 
-    match issue_session(auth_store, state, user, headers).await {
+    match issue_session_with_oidc_logout(auth_store, state, user, headers, oidc_logout).await {
         Ok((token, session)) => {
             if let Some(base) = state.config.auth.frontend_url.as_deref() {
                 let url = format!(
@@ -934,7 +958,9 @@ pub(crate) async fn org_acs(
         Err(response) => return response.into_response(),
     };
 
-    complete_login(&state, &auth_store, &start, &headers, &user).await
+    // SAML has its own single-logout profile, which is not this flow; the
+    // session ends locally.
+    complete_login(&state, &auth_store, &start, &headers, &user, None).await
 }
 
 /// Build the public `/api/v2/auth/org-sso` router.

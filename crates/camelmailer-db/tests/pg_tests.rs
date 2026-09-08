@@ -3031,6 +3031,7 @@ async fn pg_auth_sessions_lifecycle() {
             expires_at: expires,
             ip_address: Some("10.1.2.3".into()),
             user_agent: Some("tests".into()),
+            oidc_logout: None,
         })
         .await
         .unwrap();
@@ -3059,6 +3060,7 @@ async fn pg_auth_sessions_lifecycle() {
                 expires_at: expires,
                 ip_address: None,
                 user_agent: None,
+                oidc_logout: None,
             })
             .await
             .unwrap();
@@ -5994,5 +5996,104 @@ async fn idempotency_storage_failure_rolls_back_every_send_artifact() {
             .unwrap()
             .len(),
         2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_round_trips_its_oidc_logout_context() {
+    use camelmailer_core::{AuthStore, NewAuthSession, NewUser};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let user = f
+        .store
+        .create_user(NewUser {
+            email_address: "sso@example.com".into(),
+            first_name: "Ada".into(),
+            last_name: "Lovelace".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+
+    f.store
+        .create_session(NewAuthSession {
+            user_id: user.id,
+            token_hash: "oidc-session".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+            ip_address: None,
+            user_agent: None,
+            oidc_logout: Some(camelmailer_core::auth::OidcLogout {
+                id_token: "header.payload.signature".into(),
+                end_session_endpoint: "https://idp.example/logout".into(),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let (session, _) = f
+        .store
+        .session_with_user("oidc-session")
+        .await
+        .unwrap()
+        .unwrap();
+    let logout = session.oidc_logout.expect("the context should round-trip");
+    assert_eq!(logout.id_token, "header.payload.signature");
+    assert_eq!(logout.end_session_endpoint, "https://idp.example/logout");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_without_oidc_reads_back_as_local_only() {
+    use camelmailer_core::{AuthStore, NewAuthSession, NewUser};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let user = f
+        .store
+        .create_user(NewUser {
+            email_address: "local@example.com".into(),
+            first_name: "Ada".into(),
+            last_name: "Lovelace".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+    f.store
+        .create_session(NewAuthSession {
+            user_id: user.id,
+            token_hash: "local-session".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+            ip_address: None,
+            user_agent: None,
+            oidc_logout: None,
+        })
+        .await
+        .unwrap();
+
+    let (session, _) = f
+        .store
+        .session_with_user("local-session")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(session.oidc_logout.is_none());
+
+    // A row carrying only one of the two columns cannot produce a usable
+    // end-session request, so it reads as a local-only session rather than
+    // half of one. Written directly, since the API never creates this shape.
+    sqlx::query("UPDATE auth_sessions SET oidc_id_token = 'orphan' WHERE token_hash = $1")
+        .bind("local-session")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (session, _) = f
+        .store
+        .session_with_user("local-session")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        session.oidc_logout.is_none(),
+        "a half-populated row must not become a logout request"
     );
 }

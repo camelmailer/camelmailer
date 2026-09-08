@@ -461,6 +461,7 @@ async fn missing_invalid_and_expired_tokens_are_unauthorized() {
             expires_at: chrono::Utc::now() - chrono::Duration::minutes(1),
             ip_address: None,
             user_agent: None,
+            oidc_logout: None,
         })
         .await
         .unwrap();
@@ -749,4 +750,139 @@ async fn auth_endpoints_require_an_auth_store() {
     let (status, body) = login(&app, "a@example.com", "irrelevant").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"]["code"], "AccountsUnavailable");
+}
+
+// ------------------------------- RP-initiated OIDC logout
+//
+// Revoking the local session leaves the provider's session standing, so the
+// next sign-in succeeds with no prompt and the user was not really logged
+// out. Logout therefore hands back the provider's end-session URL for a
+// session that came from OIDC, and the dashboard navigates to it.
+
+/// Create a session for `email` directly, with or without an OIDC logout
+/// context, and return its bearer token. Going through the store rather than
+/// a login flow keeps these tests about logout instead of about a mock IdP.
+async fn session_with_oidc(
+    store: &Arc<MemoryStore>,
+    email: &str,
+    oidc_logout: Option<camelmailer_core::auth::OidcLogout>,
+) -> String {
+    let user = create_user(store, email, false).await;
+    let token = auth::generate_auth_token();
+    store
+        .create_session(NewAuthSession {
+            user_id: user.id,
+            token_hash: auth::hash_token(&token),
+            expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+            ip_address: None,
+            user_agent: None,
+            oidc_logout,
+        })
+        .await
+        .unwrap();
+    token
+}
+
+#[tokio::test]
+async fn logout_of_a_password_session_reports_no_end_session_url() {
+    let (app, store, _) = build_app().await;
+    let token = session_with_oidc(&store, "local@example.com", None).await;
+
+    let (status, body) = request(&app, "POST", "/api/v2/auth/logout", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["logged_out"], true);
+    assert!(
+        body["data"]["end_session_url"].is_null(),
+        "a session that did not come from OIDC has nothing to log out of: {body}"
+    );
+}
+
+#[tokio::test]
+async fn logout_of_an_oidc_session_returns_the_providers_end_session_url() {
+    let (app, store, _) = build_app().await;
+    let token = session_with_oidc(
+        &store,
+        "sso@example.com",
+        Some(camelmailer_core::auth::OidcLogout {
+            id_token: "header.payload.signature".into(),
+            end_session_endpoint: "https://idp.example/protocol/openid-connect/logout".into(),
+        }),
+    )
+    .await;
+
+    let (status, body) = request(&app, "POST", "/api/v2/auth/logout", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let url = body["data"]["end_session_url"].as_str().unwrap();
+    assert!(
+        url.starts_with("https://idp.example/protocol/openid-connect/logout?"),
+        "{url}"
+    );
+    // Keycloak and others refuse an end-session request with neither an
+    // id_token_hint nor a client_id, so the hint has to be there.
+    assert!(
+        url.contains("id_token_hint=header.payload.signature"),
+        "{url}"
+    );
+    // The redirect target is percent-encoded, not pasted in raw: the ://
+    // and the path separators must not survive as literals.
+    assert!(url.contains("post_logout_redirect_uri="), "{url}");
+    assert!(
+        url.contains("%3A%2F%2F"),
+        "expected an encoded scheme: {url}"
+    );
+    assert!(url.ends_with("%2Flogin"), "expected /login encoded: {url}");
+
+    // The local session is gone regardless of what the provider does next.
+    let (status, _) = request(&app, "GET", "/api/v2/auth/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn an_end_session_endpoint_that_already_has_a_query_gets_an_ampersand() {
+    let (app, store, _) = build_app().await;
+    let token = session_with_oidc(
+        &store,
+        "query@example.com",
+        Some(camelmailer_core::auth::OidcLogout {
+            id_token: "a.b.c".into(),
+            end_session_endpoint: "https://idp.example/logout?realm=main".into(),
+        }),
+    )
+    .await;
+
+    let (_, body) = request(&app, "POST", "/api/v2/auth/logout", Some(&token), None).await;
+    let url = body["data"]["end_session_url"].as_str().unwrap();
+    assert!(
+        url.starts_with("https://idp.example/logout?realm=main&"),
+        "{url}"
+    );
+    assert_eq!(
+        url.matches('?').count(),
+        1,
+        "one query separator only: {url}"
+    );
+}
+
+#[tokio::test]
+async fn an_id_token_with_url_unsafe_characters_is_encoded() {
+    let (app, store, _) = build_app().await;
+    let token = session_with_oidc(
+        &store,
+        "encode@example.com",
+        Some(camelmailer_core::auth::OidcLogout {
+            // A real JWT is base64url and safe, but nothing guarantees the
+            // provider sent one, and an unencoded value would break the URL.
+            id_token: "a+b/c=d&e".into(),
+            end_session_endpoint: "https://idp.example/logout".into(),
+        }),
+    )
+    .await;
+
+    let (_, body) = request(&app, "POST", "/api/v2/auth/logout", Some(&token), None).await;
+    let url = body["data"]["end_session_url"].as_str().unwrap();
+    assert!(url.contains("id_token_hint=a%2Bb%2Fc%3Dd%26e"), "{url}");
+    assert!(
+        !url.contains("&e&"),
+        "an unencoded ampersand would inject a parameter: {url}"
+    );
 }
