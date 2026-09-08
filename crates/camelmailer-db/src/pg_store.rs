@@ -8,11 +8,13 @@
 use async_trait::async_trait;
 use camelmailer_core::{
     auth, store, token, ActivityEvent, AdminApiKey, AdminStore, Campaign, CampaignStats,
-    CampaignUpdate, Credential, CredentialType, DeliveryRecord, Domain, DomainOwner, Id, IpAddress,
-    IpPool, MessageFilter, MessageRecord, MessageScope, MessageSink, NewCampaign, NewCredential,
-    NewIpAddress, NewOrganization, NewRoute, NewSenderAddress, NewServer, NewSuppression, NewUser,
-    NewWebhook, Organization, QueuedMessage, ResolvedRoute, Route, RouteMode, SenderAddress,
-    Server, ServerMode, Store, StoreError, Subscription, Suppression, TrackDomain, User, Webhook,
+    CampaignUpdate, Credential, CredentialType, DeliveryRecord, Domain, DomainOwner, Id,
+    IdempotencyLookup, IdempotencyRequest, IpAddress, IpPool, MessageFilter, MessageRecord,
+    MessageScope, MessageSink, NewCampaign, NewCredential, NewIpAddress, NewOrganization, NewRoute,
+    NewSenderAddress, NewServer, NewSuppression, NewUser, NewWebhook, Organization,
+    QueueMessagesOutcome, QueuedMessage, ResolvedRoute, Route, RouteMode, SendOperationItem,
+    SendOperationResult, SendPlanItem, SenderAddress, Server, ServerMode, Store, StoreError,
+    StoreSendOutcome, StoredSendResult, Subscription, Suppression, TrackDomain, User, Webhook,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
@@ -1742,6 +1744,171 @@ impl camelmailer_core::ServerStore for PgStore {
         Ok(camelmailer_core::SentMessage { id, token, rcpt_to })
     }
 
+    async fn idempotency_lookup(
+        &self,
+        server_id: Id,
+        request: &IdempotencyRequest,
+    ) -> Result<IdempotencyLookup, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let row = sqlx::query(
+            "SELECT request_hash, operation, response
+             FROM idempotency_requests
+             WHERE server_id = $1 AND key_hash = $2 AND expires_at > now()",
+        )
+        .bind(server_id as i64)
+        .bind(&request.key_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+
+        let Some(row) = row else {
+            return Ok(IdempotencyLookup::New);
+        };
+        if row.get::<String, _>("request_hash") != request.request_hash
+            || row.get::<String, _>("operation") != request.operation
+        {
+            return Ok(IdempotencyLookup::Conflict);
+        }
+        let response = serde_json::from_value(row.get::<serde_json::Value, _>("response"))
+            .map_err(|error| StoreError::Other(format!("invalid cached send response: {error}")))?;
+        Ok(IdempotencyLookup::Replay(response))
+    }
+
+    async fn store_send_operation(
+        &self,
+        server_id: Id,
+        plan: Vec<SendPlanItem>,
+        idempotency: Option<IdempotencyRequest>,
+    ) -> Result<StoreSendOutcome, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        set_tenant_context(&mut tx, server_id)
+            .await
+            .map_err(Self::sqlx_error)?;
+
+        if let Some(request) = &idempotency {
+            sqlx::query(
+                "DELETE FROM idempotency_requests
+                 WHERE server_id = $1 AND key_hash = $2 AND expires_at <= now()",
+            )
+            .bind(server_id as i64)
+            .bind(&request.key_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+
+            if let Some(row) = sqlx::query(
+                "SELECT request_hash, operation, response
+                 FROM idempotency_requests
+                 WHERE server_id = $1 AND key_hash = $2",
+            )
+            .bind(server_id as i64)
+            .bind(&request.key_hash)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?
+            {
+                tx.rollback().await.map_err(Self::sqlx_error)?;
+                if row.get::<String, _>("request_hash") != request.request_hash
+                    || row.get::<String, _>("operation") != request.operation
+                {
+                    return Ok(StoreSendOutcome::Conflict);
+                }
+                let response = serde_json::from_value(row.get::<serde_json::Value, _>("response"))
+                    .map_err(|error| {
+                        StoreError::Other(format!("invalid cached send response: {error}"))
+                    })?;
+                return Ok(StoreSendOutcome::Replayed(response));
+            }
+        }
+
+        let mut items = Vec::with_capacity(plan.len());
+        for item in plan {
+            match item {
+                SendPlanItem::Messages(messages) => {
+                    let mut recipients = Vec::with_capacity(messages.len());
+                    for planned in messages {
+                        let message = planned.message;
+                        if message.server_id != server_id {
+                            return Err(StoreError::Other(
+                                "send operation crossed server boundary".into(),
+                            ));
+                        }
+                        if let Some(token) = planned.unsubscribe_token {
+                            sqlx::query(
+                                "INSERT INTO unsubscribe_tokens
+                                     (server_id, stream_id, address, token)
+                                 VALUES ($1, $2, $3, $4)",
+                            )
+                            .bind(server_id as i64)
+                            .bind(token.stream_id.map(|id| id as i64))
+                            .bind(&token.address)
+                            .bind(&token.token)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(Self::sqlx_error)?;
+                        }
+                        recipients.push(
+                            insert_message_in_tx(&mut tx, &message)
+                                .await
+                                .map_err(Self::sqlx_error)?,
+                        );
+                    }
+                    items.push(SendOperationItem::Success(StoredSendResult {
+                        message_id: recipients.first().map(|message| message.id),
+                        recipients,
+                    }));
+                }
+                SendPlanItem::Error { code, message } => {
+                    items.push(SendOperationItem::Error { code, message });
+                }
+            }
+        }
+        let response = SendOperationResult { items };
+
+        if let Some(request) = &idempotency {
+            let response_json = serde_json::to_value(&response).map_err(|error| {
+                StoreError::Other(format!("could not cache send response: {error}"))
+            })?;
+            let inserted = sqlx::query(
+                "INSERT INTO idempotency_requests
+                     (server_id, key_hash, request_hash, operation, response, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (server_id, key_hash) DO NOTHING",
+            )
+            .bind(server_id as i64)
+            .bind(&request.key_hash)
+            .bind(&request.request_hash)
+            .bind(&request.operation)
+            .bind(response_json)
+            .bind(request.expires_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+
+            if inserted.rows_affected() == 0 {
+                tx.rollback().await.map_err(Self::sqlx_error)?;
+                return match camelmailer_core::ServerStore::idempotency_lookup(
+                    self, server_id, request,
+                )
+                .await?
+                {
+                    IdempotencyLookup::Replay(response) => Ok(StoreSendOutcome::Replayed(response)),
+                    IdempotencyLookup::Conflict => Ok(StoreSendOutcome::Conflict),
+                    IdempotencyLookup::New => Err(StoreError::Other(
+                        "concurrent idempotency result disappeared".into(),
+                    )),
+                };
+            }
+        }
+
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(StoreSendOutcome::Stored(response))
+    }
+
     async fn import_message(
         &self,
         message: camelmailer_core::ImportMessage,
@@ -3096,6 +3263,38 @@ impl camelmailer_core::ServerStore for PgStore {
             .map_err(Self::sqlx_error)
     }
 
+    async fn prune_idempotency_requests(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StoreError> {
+        let server_ids: Vec<i64> = sqlx::query("SELECT id FROM servers ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?
+            .iter()
+            .map(|row| row.get("id"))
+            .collect();
+        let mut removed = 0;
+        for server_id in server_ids {
+            let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+            set_tenant_context(&mut tx, server_id as Id)
+                .await
+                .map_err(Self::sqlx_error)?;
+            removed += sqlx::query(
+                "DELETE FROM idempotency_requests
+                 WHERE server_id = $1 AND expires_at <= $2",
+            )
+            .bind(server_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?
+            .rows_affected();
+            tx.commit().await.map_err(Self::sqlx_error)?;
+        }
+        Ok(removed)
+    }
+
     async fn prune_messages(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
@@ -3581,6 +3780,82 @@ fn delivery_from_row(row: &PgRow) -> Delivery {
     }
 }
 
+async fn insert_message_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    message: &QueuedMessage,
+) -> Result<camelmailer_core::SentMessage, sqlx::Error> {
+    let subject = camelmailer_core::message::header_value(&message.raw_message, "subject");
+    let message_id_header =
+        camelmailer_core::message::header_value(&message.raw_message, "message-id");
+    let public_token = token::generate_token(12);
+    let row = sqlx::query(
+        "INSERT INTO messages
+             (server_id, token, scope, rcpt_to, mail_from, bounce,
+              received_with_ssl, domain_id, credential_id, route_id, raw_message,
+              subject, message_id_header, size, tag, metadata, stream_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+         RETURNING id",
+    )
+    .bind(message.server_id as i64)
+    .bind(&public_token)
+    .bind(match message.scope {
+        MessageScope::Incoming => "incoming",
+        MessageScope::Outgoing => "outgoing",
+    })
+    .bind(&message.rcpt_to)
+    .bind(&message.mail_from)
+    .bind(message.bounce)
+    .bind(message.received_with_ssl)
+    .bind(message.domain_id.map(|id| id as i64))
+    .bind(message.credential_id.map(|id| id as i64))
+    .bind(message.route_id.map(|id| id as i64))
+    .bind(&message.raw_message)
+    .bind(&subject)
+    .bind(&message_id_header)
+    .bind(message.raw_message.len() as i64)
+    .bind(&message.tag)
+    .bind(&message.metadata)
+    .bind(message.stream_id.map(|id| id as i64))
+    .fetch_one(&mut **tx)
+    .await?;
+    let message_id: i64 = row.get("id");
+
+    let destination_domain = message
+        .rcpt_to
+        .rsplit_once('@')
+        .map(|(_, domain)| domain)
+        .unwrap_or_default();
+    sqlx::query("INSERT INTO queued_messages (message_id, server_id, domain) VALUES ($1, $2, $3)")
+        .bind(message_id)
+        .bind(message.server_id as i64)
+        .bind(destination_domain)
+        .execute(&mut **tx)
+        .await?;
+
+    // Count the message against the server's send limit in the same
+    // transaction, so the counter cannot drift from what was stored. The
+    // bucket outlives the message: `message_retention_days` prunes the
+    // `messages` row, and counting rows there would hand a server its
+    // quota back early.
+    if matches!(message.scope, MessageScope::Outgoing) {
+        sqlx::query(
+            "INSERT INTO server_send_counters (server_id, day, sent)
+                 VALUES ($1, (now() AT TIME ZONE 'UTC')::date, 1)
+                 ON CONFLICT (server_id, day)
+                 DO UPDATE SET sent = server_send_counters.sent + 1",
+        )
+        .bind(message.server_id as i64)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(camelmailer_core::SentMessage {
+        id: message_id,
+        token: public_token,
+        rcpt_to: message.rcpt_to.clone(),
+    })
+}
+
 /// [`MessageSink`] backed by the RLS-protected `messages` table. All access
 /// runs inside a transaction that establishes the tenant context first, so
 /// the RLS policy validates every write.
@@ -3605,82 +3880,11 @@ impl PgMessageSink {
         &self,
         message: &QueuedMessage,
     ) -> Result<(i64, String), sqlx::Error> {
-        // index the interesting headers at insert time, like the Ruby
-        // message DB does on save
-        let subject = camelmailer_core::message::header_value(&message.raw_message, "subject");
-        let message_id_header =
-            camelmailer_core::message::header_value(&message.raw_message, "message-id");
-        let public_token = token::generate_token(12);
-
         let mut tx = self.store.pool.begin().await?;
         set_tenant_context(&mut tx, message.server_id).await?;
-        let row = sqlx::query(
-            "INSERT INTO messages
-                 (server_id, token, scope, rcpt_to, mail_from, bounce,
-                  received_with_ssl, domain_id, credential_id, route_id, raw_message,
-                  subject, message_id_header, size, tag, metadata, stream_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-             RETURNING id",
-        )
-        .bind(message.server_id as i64)
-        .bind(&public_token)
-        .bind(match message.scope {
-            MessageScope::Incoming => "incoming",
-            MessageScope::Outgoing => "outgoing",
-        })
-        .bind(&message.rcpt_to)
-        .bind(&message.mail_from)
-        .bind(message.bounce)
-        .bind(message.received_with_ssl)
-        .bind(message.domain_id.map(|id| id as i64))
-        .bind(message.credential_id.map(|id| id as i64))
-        .bind(message.route_id.map(|id| id as i64))
-        .bind(&message.raw_message)
-        .bind(&subject)
-        .bind(&message_id_header)
-        .bind(message.raw_message.len() as i64)
-        .bind(&message.tag)
-        .bind(&message.metadata)
-        .bind(message.stream_id.map(|id| id as i64))
-        .fetch_one(&mut *tx)
-        .await?;
-        let message_id: i64 = row.get("id");
-
-        // Queue for delivery in the same transaction (the queue table is
-        // cross-tenant and not RLS-protected — see migrations/0004_queue.sql).
-        let destination_domain = message
-            .rcpt_to
-            .rsplit_once('@')
-            .map(|(_, domain)| domain)
-            .unwrap_or_default();
-        sqlx::query(
-            "INSERT INTO queued_messages (message_id, server_id, domain) VALUES ($1, $2, $3)",
-        )
-        .bind(message_id)
-        .bind(message.server_id as i64)
-        .bind(destination_domain)
-        .execute(&mut *tx)
-        .await?;
-
-        // Count the message against the server's send limit in the same
-        // transaction, so the counter cannot drift from what was stored. The
-        // bucket outlives the message: `message_retention_days` prunes the
-        // `messages` row, and counting rows there would hand a server its
-        // quota back early.
-        if matches!(message.scope, MessageScope::Outgoing) {
-            sqlx::query(
-                "INSERT INTO server_send_counters (server_id, day, sent)
-                 VALUES ($1, (now() AT TIME ZONE 'UTC')::date, 1)
-                 ON CONFLICT (server_id, day)
-                 DO UPDATE SET sent = server_send_counters.sent + 1",
-            )
-            .bind(message.server_id as i64)
-            .execute(&mut *tx)
-            .await?;
-        }
-
+        let sent = insert_message_in_tx(&mut tx, message).await?;
         tx.commit().await?;
-        Ok((message_id, public_token))
+        Ok((sent.id, sent.token))
     }
 
     /// Outgoing messages counted against the server's send limit in the
@@ -4828,6 +5032,57 @@ impl MessageSink for PgMessageSink {
                 rcpt_to = %message.rcpt_to,
                 "failed to store accepted message"
             );
+        }
+    }
+
+    fn queue_messages(
+        &self,
+        messages: Vec<QueuedMessage>,
+        idempotency: Option<IdempotencyRequest>,
+        allowance: camelmailer_core::SendAllowance,
+    ) -> QueueMessagesOutcome {
+        let Some(server_id) = messages.first().map(|message| message.server_id) else {
+            return QueueMessagesOutcome::Stored;
+        };
+        // Completed submissions do not consume quota. Check the durable result
+        // before refusing an over-quota request, even on a new SMTP connection.
+        if !allowance.allows(
+            messages
+                .iter()
+                .filter(|m| m.scope == MessageScope::Outgoing)
+                .count() as i64,
+        ) {
+            if let Some(request) = &idempotency {
+                match self
+                    .store
+                    .wait(camelmailer_core::ServerStore::idempotency_lookup(
+                        &self.store,
+                        server_id,
+                        request,
+                    )) {
+                    Ok(IdempotencyLookup::Replay(_)) => return QueueMessagesOutcome::Replayed,
+                    Ok(IdempotencyLookup::Conflict) => return QueueMessagesOutcome::Conflict,
+                    Ok(IdempotencyLookup::New) => {}
+                    Err(error) => return QueueMessagesOutcome::Failed(error.to_string()),
+                }
+            }
+            return QueueMessagesOutcome::LimitExceeded(allowance.rejection_message());
+        }
+        let plan = vec![SendPlanItem::Messages(
+            messages.into_iter().map(Into::into).collect(),
+        )];
+        match self
+            .store
+            .wait(camelmailer_core::ServerStore::store_send_operation(
+                &self.store,
+                server_id,
+                plan,
+                idempotency,
+            )) {
+            Ok(StoreSendOutcome::Stored(_)) => QueueMessagesOutcome::Stored,
+            Ok(StoreSendOutcome::Replayed(_)) => QueueMessagesOutcome::Replayed,
+            Ok(StoreSendOutcome::Conflict) => QueueMessagesOutcome::Conflict,
+            Err(error) => QueueMessagesOutcome::Failed(error.to_string()),
         }
     }
 }

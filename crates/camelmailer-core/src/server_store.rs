@@ -12,6 +12,7 @@ use crate::dmarc::{DmarcFilter, DmarcRecordRow, DmarcReport, NewDmarcReport};
 use crate::message::{MessageRecord, QueuedMessage, SentMessage};
 use crate::model::{Campaign, Id, MessageStream, NewCampaign, Server, Subscription, Template};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// The server a per-server API request is scoped to, injected as a request
 /// extension by the server-token auth middleware.
@@ -341,6 +342,83 @@ pub struct DeliveryStats {
     pub domains: Vec<QueuedDomain>,
 }
 
+/// One optional idempotency claim attached to a send operation. The caller
+/// hashes both values before they cross the storage boundary, so the database
+/// never stores the client key or request body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyRequest {
+    pub key_hash: String,
+    pub request_hash: String,
+    pub operation: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUnsubscribeToken {
+    pub token: String,
+    pub stream_id: Option<Id>,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SendPlanMessage {
+    pub message: QueuedMessage,
+    pub unsubscribe_token: Option<PendingUnsubscribeToken>,
+}
+
+impl From<QueuedMessage> for SendPlanMessage {
+    fn from(message: QueuedMessage) -> Self {
+        Self {
+            message,
+            unsubscribe_token: None,
+        }
+    }
+}
+
+/// One item in a prepared send operation. A normal send has one `Messages`
+/// item. Batch sends have one item per submitted entry and retain validation
+/// errors alongside the entries that are ready to queue.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SendPlanItem {
+    Messages(Vec<SendPlanMessage>),
+    Error { code: String, message: String },
+}
+
+/// The stable response for one accepted send entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSendResult {
+    pub message_id: Option<i64>,
+    pub recipients: Vec<SentMessage>,
+}
+
+/// One stable result in a single or batch send response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendOperationItem {
+    Success(StoredSendResult),
+    Error { code: String, message: String },
+}
+
+/// The data cached for an idempotent send. It contains generated message ids
+/// and tokens, allowing a retry to return the original response verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendOperationResult {
+    pub items: Vec<SendOperationItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyLookup {
+    New,
+    Replay(SendOperationResult),
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreSendOutcome {
+    Stored(SendOperationResult),
+    Replayed(SendOperationResult),
+    Conflict,
+}
+
 /// Storage for the per-server API. Kept separate from [`crate::AdminStore`]
 /// because these endpoints are authenticated by a server token and operate
 /// only within one tenant.
@@ -358,6 +436,26 @@ pub trait ServerStore: Send + Sync {
     /// [`crate::SendAllowance`]. The synchronous [`crate::Store`] trait
     /// carries the same method for the SMTP session.
     async fn send_usage(&self, server_id: Id) -> Result<i64, StoreError>;
+
+    /// Check for a completed, unexpired send before doing template rendering,
+    /// MIME construction, or other preparation. The store method below
+    /// repeats this check atomically to close the concurrency race.
+    async fn idempotency_lookup(
+        &self,
+        server_id: Id,
+        request: &IdempotencyRequest,
+    ) -> Result<IdempotencyLookup, StoreError>;
+
+    /// Store every accepted recipient in one transaction and cache the
+    /// resulting response under the optional idempotency claim. Concurrent
+    /// callers using the same claim either replay the winner or get a payload
+    /// conflict; their speculative message rows are rolled back.
+    async fn store_send_operation(
+        &self,
+        server_id: Id,
+        plan: Vec<SendPlanItem>,
+        idempotency: Option<IdempotencyRequest>,
+    ) -> Result<StoreSendOutcome, StoreError>;
 
     /// Import ONE historical message as a completed record WITHOUT queuing it
     /// for delivery: insert the message (with its original `created_at`, an
@@ -455,6 +553,12 @@ pub trait ServerStore: Send + Sync {
     async fn prune_api_requests(
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StoreError>;
+
+    /// Delete expired send-idempotency responses across all servers.
+    async fn prune_idempotency_requests(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, StoreError>;
 
     /// Delete stored messages (of every server) created before `older_than`,
@@ -791,6 +895,23 @@ impl ServerStore for crate::store::MemoryStore {
         Ok(crate::Store::send_usage(self, server_id))
     }
 
+    async fn idempotency_lookup(
+        &self,
+        server_id: Id,
+        request: &IdempotencyRequest,
+    ) -> Result<IdempotencyLookup, StoreError> {
+        Ok(self.idempotency_result(server_id, request))
+    }
+
+    async fn store_send_operation(
+        &self,
+        server_id: Id,
+        plan: Vec<SendPlanItem>,
+        idempotency: Option<IdempotencyRequest>,
+    ) -> Result<StoreSendOutcome, StoreError> {
+        Ok(self.insert_send_operation(server_id, plan, idempotency))
+    }
+
     async fn import_message(&self, message: ImportMessage) -> Result<i64, StoreError> {
         self.import_message_record(message)
     }
@@ -895,6 +1016,13 @@ impl ServerStore for crate::store::MemoryStore {
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, StoreError> {
         Ok(self.prune_api_requests_before(older_than))
+    }
+
+    async fn prune_idempotency_requests(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, StoreError> {
+        Ok(self.prune_idempotency_requests_at(now))
     }
 
     async fn prune_messages(

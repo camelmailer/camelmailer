@@ -22,6 +22,7 @@ info:
 
     Error codes worth branching on: `Unauthorized`, `Forbidden`, `NotFound`,
     `ValidationError`, `ParameterMissing`, `InvalidCredentials`, `TOTPRequired`,
+    `InvalidIdempotencyKey`, `InvalidIdempotentRequest`,
     `InvalidTOTPCode`, `AccountLocked`, `InvalidToken`, `SSOError`,
     `WebAuthnDisabled`, `WebAuthnError`, `TwoFactorEnforced` (a session
     without an active second factor touched an organization with
@@ -108,13 +109,15 @@ paths:
       summary: Send a message
       description: |
         Queues one message per recipient. The `from` domain must be a
-        verified sending domain of the server.
+        verified sending domain of the server. Supply `Idempotency-Key` for
+        retry-safe submission; completed results are retained for 24 hours.
 
         A server with a `send_limit` answers `429` with the error code
         `SendLimitExceeded` once the trailing 30-day window is full. A
         request naming more recipients than the remainder is refused whole,
         so the response never leaves some recipients queued and others not.
       security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
       requestBody:
         required: true
         content:
@@ -137,7 +140,9 @@ paths:
                   - type: object
                     properties:
                       data: { $ref: "#/components/schemas/SendResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/ValidationError" }
         "429": { $ref: "#/components/responses/SendLimitExceeded" }
     get:
@@ -177,6 +182,7 @@ paths:
       summary: Send a batch of messages
       description: An array of send requests; returns one result per entry.
       security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
       requestBody:
         required: true
         content:
@@ -189,7 +195,9 @@ paths:
                   items: { $ref: "#/components/schemas/SendRequest" }
       responses:
         "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
 
   /api/v2/server/messages/with_template:
     post:
@@ -200,6 +208,7 @@ paths:
         against `template_model`, then sends. Fields set directly
         (e.g. `subject`) override the rendered ones.
       security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
       requestBody:
         required: true
         content:
@@ -219,8 +228,10 @@ paths:
               template_model: { name: "Ada", product: "Acme" }
       responses:
         "201": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
   /api/v2/server/messages/with_template/batch:
@@ -228,9 +239,12 @@ paths:
       tags: [Send]
       summary: Send a template to many recipients (batch)
       security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
       responses:
         "200": { $ref: "#/components/responses/Success" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
 
   /api/v2/server/messages/{id}:
     get:
@@ -2324,6 +2338,16 @@ components:
       required: true
       description: Server permalink
       schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Opaque operation key for retry-safe sending. Must be 1–256 visible
+        ASCII characters. The same key and normalized request replay the
+        original result for 24 hours; reuse for another payload or send
+        endpoint returns `409 InvalidIdempotentRequest`.
+      schema: { type: string, minLength: 1, maxLength: 256 }
 
   responses:
     Success:
@@ -2331,6 +2355,11 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/SuccessEnvelope" }
+    BadRequest:
+      description: Malformed request or invalid idempotency key
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
     Unauthorized:
       description: Missing or invalid credentials
       content:
@@ -2355,6 +2384,11 @@ components:
       description: >
         The server has reached its send limit for the current 30-day window.
         The error code is `SendLimitExceeded`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Conflict:
+      description: The idempotency key was already used for another request
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }

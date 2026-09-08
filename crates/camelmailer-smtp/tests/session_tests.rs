@@ -846,6 +846,25 @@ fn authenticated_setup(mail_from: &str, rcpt_to: &str) -> TestSetup {
     setup
 }
 
+fn finish_submission(session: &mut Session, key: Option<&str>, subject: &str) -> Reply {
+    assert_eq!(line(&session.handle("DATA")), "354 Go ahead");
+    if let Some(key) = key {
+        session.handle(&format!("CamelMailer-Idempotency-Key: {key}"));
+    }
+    session.handle(&format!("Subject: {subject}"));
+    session.handle("From: test@example.com");
+    session.handle("To: recipient@elsewhere.com");
+    session.handle("");
+    session.handle("This is a test message");
+    session.handle("\r");
+    session.handle(".\r")
+}
+
+fn begin_second_authenticated_message(session: &mut Session) {
+    session.handle("MAIL FROM: test@example.com");
+    session.handle("RCPT TO: recipient@elsewhere.com");
+}
+
 #[test]
 fn finish_dot_without_cr_does_nothing() {
     let mut setup = authenticated_setup("test@example.com", "test@example.com");
@@ -992,6 +1011,58 @@ fn finish_stores_an_outgoing_message_and_resets_state() {
     assert!(message.domain_id.is_some());
     assert_eq!(message.route_id, None);
     assert!(!message.raw_message.is_empty());
+}
+
+#[test]
+fn finish_replays_an_idempotent_outgoing_message_without_queueing_it_twice() {
+    let mut setup = authenticated_setup("test@example.com", "recipient@elsewhere.com");
+    setup.fixtures.verified_server_domain("example.com");
+
+    let reply = finish_submission(&mut setup.session, Some("invoice/123"), "Test");
+    assert_eq!(line(&reply), "250 OK");
+    assert_eq!(setup.sink.messages().len(), 1);
+
+    begin_second_authenticated_message(&mut setup.session);
+    let reply = finish_submission(&mut setup.session, Some("invoice/123"), "Test");
+    assert_eq!(line(&reply), "250 OK");
+
+    let messages = setup.sink.messages();
+    assert_eq!(messages.len(), 1);
+    let raw = String::from_utf8_lossy(&messages[0].raw_message);
+    assert!(!raw
+        .to_ascii_lowercase()
+        .contains("camelmailer-idempotency-key"));
+}
+
+#[test]
+fn finish_rejects_an_idempotency_key_reused_for_different_smtp_content() {
+    let mut setup = authenticated_setup("test@example.com", "recipient@elsewhere.com");
+    setup.fixtures.verified_server_domain("example.com");
+    assert_eq!(
+        line(&finish_submission(
+            &mut setup.session,
+            Some("invoice/123"),
+            "First"
+        )),
+        "250 OK"
+    );
+
+    begin_second_authenticated_message(&mut setup.session);
+    let reply = finish_submission(&mut setup.session, Some("invoice/123"), "Changed");
+    assert_eq!(
+        line(&reply),
+        "554 Idempotency key reused with a different request"
+    );
+    assert_eq!(setup.sink.messages().len(), 1);
+}
+
+#[test]
+fn finish_rejects_an_idempotency_key_longer_than_256_characters() {
+    let mut setup = authenticated_setup("test@example.com", "recipient@elsewhere.com");
+    setup.fixtures.verified_server_domain("example.com");
+    let reply = finish_submission(&mut setup.session, Some(&"x".repeat(257)), "Test");
+    assert_eq!(line(&reply), "554 Invalid CamelMailer-Idempotency-Key");
+    assert!(setup.sink.messages().is_empty());
 }
 
 #[test]
@@ -1150,18 +1221,24 @@ fn rcpt_is_accepted_while_the_send_limit_has_room() {
 }
 
 #[test]
-fn rcpt_past_the_send_limit_is_refused_permanently() {
+fn data_past_the_send_limit_is_refused_permanently() {
     let mut setup = TestSetup::new();
     setup.fixtures.set_send_limit(Some(2));
     setup.fixtures.record_sends(2);
     authenticated_session(&mut setup);
 
-    let reply = setup.session.handle("RCPT TO: over@dest.example");
+    setup.fixtures.verified_server_domain("example.com");
+    assert_eq!(
+        line(&setup.session.handle("RCPT TO: over@dest.example")),
+        "250 OK"
+    );
+    let reply = finish_submission(&mut setup.session, None, "Over quota");
     // 5xx, not 4xx: the window is 30 days, so a retry loop would run for
     // weeks. The reply names the limit so the sender knows what happened.
     assert!(line(&reply).starts_with("550 5.7.1 "), "{}", line(&reply));
     assert!(line(&reply).contains("2 messages per 30 days"));
     assert!(setup.session.recipients().is_empty());
+    assert!(setup.sink.messages().is_empty());
 }
 
 #[test]
@@ -1180,9 +1257,14 @@ fn recipients_named_in_one_transaction_count_against_the_limit() {
         line(&setup.session.handle("RCPT TO: b@dest.example")),
         "250 OK"
     );
-    let reply = setup.session.handle("RCPT TO: c@dest.example");
+    assert_eq!(
+        line(&setup.session.handle("RCPT TO: c@dest.example")),
+        "250 OK"
+    );
+    setup.fixtures.verified_server_domain("example.com");
+    let reply = finish_submission(&mut setup.session, None, "Too many recipients");
     assert!(line(&reply).starts_with("550 5.7.1 "), "{}", line(&reply));
-    assert_eq!(setup.session.recipients().len(), 2);
+    assert!(setup.sink.messages().is_empty());
 }
 
 #[test]
@@ -1212,4 +1294,71 @@ fn inbound_route_mail_is_not_held_back_by_the_send_limit() {
 
     let reply = setup.session.handle("RCPT TO: info@example.com");
     assert_eq!(line(&reply), "250 OK");
+}
+
+#[test]
+fn keyed_smtp_replays_on_a_new_connection_at_quota_and_rejects_new_sends() {
+    let mut setup = authenticated_setup("test@example.com", "recipient@elsewhere.com");
+    setup.fixtures.verified_server_domain("example.com");
+    setup.fixtures.set_send_limit(Some(1));
+    assert_eq!(
+        line(&finish_submission(
+            &mut setup.session,
+            Some("quota/original"),
+            "Original"
+        )),
+        "250 OK"
+    );
+    // The test sink and usage store are separate; PostgreSQL counts on commit.
+    setup.fixtures.record_sends(1);
+    setup.session = Session::new(
+        config(),
+        setup.fixtures.store(),
+        setup.sink.clone(),
+        Some("1.2.3.5".into()),
+    );
+    setup.session.handle("HELO retry.example.net");
+    assert!(line(
+        &setup
+            .session
+            .handle(&format!("AUTH PLAIN {}", to_smtp_plain("key123")))
+    )
+    .starts_with("235"));
+    for (key, subject, expected) in [
+        (Some("quota/original"), "Original", "250 OK"),
+        (
+            Some("quota/original"),
+            "Changed",
+            "554 Idempotency key reused with a different request",
+        ),
+        (Some("quota/new"), "New", "550 5.7.1"),
+        (None, "Unkeyed", "550 5.7.1"),
+    ] {
+        setup.session.handle("MAIL FROM: test@example.com");
+        assert_eq!(
+            line(&setup.session.handle("RCPT TO: recipient@elsewhere.com")),
+            "250 OK"
+        );
+        let reply = finish_submission(&mut setup.session, key, subject);
+        assert!(line(&reply).starts_with(expected), "{}", line(&reply));
+        assert_eq!(setup.sink.messages().len(), 1);
+    }
+    // Refusing a new key must not reserve it, and limits are refreshed per DATA.
+    setup.fixtures.set_send_limit(Some(2));
+    begin_second_authenticated_message(&mut setup.session);
+    assert_eq!(
+        line(&finish_submission(
+            &mut setup.session,
+            Some("quota/new"),
+            "New"
+        )),
+        "250 OK"
+    );
+    assert_eq!(setup.sink.messages().len(), 2);
+    setup.fixtures.record_sends(1);
+    begin_second_authenticated_message(&mut setup.session);
+    assert!(
+        line(&finish_submission(&mut setup.session, None, "Over again")).starts_with("550 5.7.1")
+    );
+    assert_eq!(setup.sink.messages().len(), 2);
 }

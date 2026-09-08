@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use serde::Serialize;
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
 
 use crate::model::Id;
 
@@ -43,13 +42,7 @@ pub fn verify_password(password: &str, digest: &str) -> bool {
 /// SHA-256 hex of a bearer token — the only form ever persisted, so a
 /// database leak does not leak live sessions/invitations/reset links.
 pub fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hex(&hasher.finalize())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crate::hashing::sha256_hex(token.as_bytes())
 }
 
 /// A high-entropy bearer token (session / invitation / password reset).

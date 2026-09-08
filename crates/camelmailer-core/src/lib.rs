@@ -10,6 +10,7 @@ pub mod auth_store;
 pub mod bounce;
 pub mod dmarc;
 pub mod dns;
+pub mod hashing;
 pub mod message;
 pub mod mime;
 pub mod model;
@@ -39,7 +40,8 @@ pub use dmarc::{
 };
 pub use dns::{DnsError, DnsResolver, StaticDnsResolver};
 pub use message::{
-    MemorySink, MessageRecord, MessageScope, MessageSink, QueuedMessage, SentMessage,
+    MemorySink, MessageRecord, MessageScope, MessageSink, QueueMessagesOutcome, QueuedMessage,
+    SentMessage,
 };
 pub use model::*;
 pub use org_sso::{
@@ -49,9 +51,11 @@ pub use org_sso::{
 pub use send_limit::SendAllowance;
 pub use server_store::{
     is_valid_delivery_status, ActivityEvent, ApiRequestFilter, ApiRequestRecord, CampaignStats,
-    CampaignUpdate, DeliveryRecord, DeliveryStats, ImportClick, ImportDelivery, ImportEvent,
-    ImportMessage, MessageFilter, MessageShare, MessageStats, NewApiRequest, NewLayout,
-    NewMessageShare, NewStream, NewTemplate, QueuedDomain, ServerContext, ServerStore, StatsFilter,
+    CampaignUpdate, DeliveryRecord, DeliveryStats, IdempotencyLookup, IdempotencyRequest,
+    ImportClick, ImportDelivery, ImportEvent, ImportMessage, MessageFilter, MessageShare,
+    MessageStats, NewApiRequest, NewLayout, NewMessageShare, NewStream, NewTemplate,
+    PendingUnsubscribeToken, QueuedDomain, SendOperationItem, SendOperationResult, SendPlanItem,
+    SendPlanMessage, ServerContext, ServerStore, StatsFilter, StoreSendOutcome, StoredSendResult,
     TagCount, DELIVERY_STATUSES,
 };
 pub use spf::{evaluate as evaluate_spf, received_spf_header, SpfResolver, SpfResult};

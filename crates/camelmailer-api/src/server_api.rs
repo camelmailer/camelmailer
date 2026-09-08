@@ -12,7 +12,7 @@ use crate::app::{
     ApiState, PaginationParams, RequestStart,
 };
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -20,11 +20,12 @@ use axum::{Json, Router};
 use base64::Engine;
 use camelmailer_core::mime::{self, Address, Attachment, BuildParams};
 use camelmailer_core::{
-    ActivityEvent, Campaign, CampaignStats, DeliveryRecord, MessageFilter, MessageRecord,
-    MessageScope, MessageStream, NewCampaign, NewStream, NewTemplate, QueuedMessage, Server,
-    ServerContext, Template,
+    ActivityEvent, Campaign, CampaignStats, DeliveryRecord, IdempotencyLookup, IdempotencyRequest,
+    MessageFilter, MessageRecord, MessageScope, MessageStream, NewCampaign, NewStream, NewTemplate,
+    PendingUnsubscribeToken, QueuedMessage, SendOperationItem, SendOperationResult, SendPlanItem,
+    SendPlanMessage, Server, ServerContext, StoreSendOutcome, StoredSendResult, Template,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -124,7 +125,7 @@ async fn ping(start: axum::Extension<RequestStart>, server: axum::Extension<Serv
 
 // ----------------------------------------------------------------- send
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct AddressInput {
     pub(crate) email: String,
     pub(crate) name: Option<String>,
@@ -140,7 +141,7 @@ impl From<AddressInput> for Address {
 }
 
 /// Accept either `"a@b.c"` or `{email, name}` for an address field.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub(crate) enum AddressOrString {
     String(String),
@@ -156,14 +157,14 @@ impl From<AddressOrString> for Address {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct AttachmentInput {
     name: String,
     content_type: String,
     data_base64: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub(crate) struct SendMessage {
     pub(crate) from: Option<AddressOrString>,
     #[serde(default)]
@@ -187,21 +188,116 @@ pub(crate) struct SendMessage {
     pub(crate) stream: Option<String>,
 }
 
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+const IDEMPOTENCY_KEY_MAX_CHARS: usize = 256;
+const IDEMPOTENCY_RETENTION_HOURS: i64 = 24;
+
+fn idempotency_request<T: Serialize>(
+    headers: &HeaderMap,
+    operation: &str,
+    payload: &T,
+) -> Result<Option<IdempotencyRequest>, ApiError> {
+    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "InvalidIdempotencyKey".into(),
+            "Idempotency-Key must be provided only once".into(),
+        ));
+    }
+    let key = value.as_bytes();
+    if !key.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "InvalidIdempotencyKey".into(),
+            "Idempotency-Key must contain visible ASCII characters".into(),
+        ));
+    }
+    let key_len = key.len();
+    if key_len == 0 || key_len > IDEMPOTENCY_KEY_MAX_CHARS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "InvalidIdempotencyKey".into(),
+            format!("Idempotency-Key must be between 1 and {IDEMPOTENCY_KEY_MAX_CHARS} characters"),
+        ));
+    }
+
+    let normalized = serde_json::to_value(payload).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError".into(),
+            "An internal error occurred".into(),
+        )
+    })?;
+    let normalized = serde_json::to_string(&normalized).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError".into(),
+            "An internal error occurred".into(),
+        )
+    })?;
+    Ok(Some(IdempotencyRequest {
+        key_hash: camelmailer_core::hashing::sha256_hex(key),
+        request_hash: camelmailer_core::hashing::sha256_hex(normalized.as_bytes()),
+        operation: operation.into(),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(IDEMPOTENCY_RETENTION_HOURS),
+    }))
+}
+
+fn idempotency_conflict() -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        "InvalidIdempotentRequest".into(),
+        "The same idempotency key was used with a different request".into(),
+    )
+}
+
+async fn cached_send_operation(
+    state: &ApiState,
+    server_id: camelmailer_core::Id,
+    request: Option<&IdempotencyRequest>,
+) -> Result<Option<SendOperationResult>, ApiError> {
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let store = state.server_store.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError".into(),
+        "message storage is not configured".into(),
+    ))?;
+    let lookup = store.idempotency_lookup(server_id, request).await;
+    #[cfg(test)]
+    let lookup = idempotency_tests::after_lookup(lookup).await;
+    match lookup.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError".into(),
+            "An internal error occurred".into(),
+        )
+    })? {
+        IdempotencyLookup::New => Ok(None),
+        IdempotencyLookup::Replay(response) => Ok(Some(response)),
+        IdempotencyLookup::Conflict => Err(idempotency_conflict()),
+    }
+}
+
 /// The From-address' domain, or an error message.
 fn domain_of(address: &str) -> Option<&str> {
     address.rsplit_once('@').map(|(_, d)| d)
 }
 
-/// Validate + build one message and enqueue it per recipient. Returns the
-/// per-message result object (native shape). Also the internal entry point
-/// for platform mail (`crate::app_mailer`), so app mail takes exactly the
-/// HTTP-send path: From-domain authorization, default stream, MIME build,
-/// `ServerStore::store_outgoing`.
-pub(crate) async fn enqueue_send(
+/// Validate and build one stored message per recipient. Persistence is kept
+/// separate so the full recipient set and its idempotency response can commit
+/// atomically.
+async fn prepare_send(
     state: &ApiState,
     server: &Server,
     body: SendMessage,
-) -> Result<Value, (StatusCode, String, String)> {
+    pending_recipients: i64,
+) -> Result<Vec<SendPlanMessage>, ApiError> {
     let server_store = state.server_store.as_ref().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "InternalServerError".into(),
@@ -237,8 +333,9 @@ pub(crate) async fn enqueue_send(
         )
     };
 
-    // Send limit. Every API send funnels through here, including broadcast
-    // stream sends, campaign expansion and platform mail, so this one check
+    // Include accepted recipients awaiting storage in this batch. Failed
+    // entries never reserve quota. Every API send funnels through here,
+    // including broadcasts, campaigns and platform mail, so this one check
     // covers the whole HTTP surface. It runs before anything is stored, and
     // it counts the whole request: a request for more recipients than the
     // remainder is refused outright rather than half-stored, which would
@@ -251,7 +348,7 @@ pub(crate) async fn enqueue_send(
             .map_err(|_| internal_error())?;
         let allowance = camelmailer_core::SendAllowance {
             limit: Some(limit),
-            used,
+            used: used.saturating_add(pending_recipients),
         };
         if !allowance.allows(recipients) {
             return Err((
@@ -427,16 +524,18 @@ pub(crate) async fn enqueue_send(
         }
     }
 
-    let mut results = Vec::with_capacity(recipients.len());
-    let mut shared_id: Option<i64> = None;
+    let mut messages = Vec::with_capacity(recipients.len());
     for recipient in &recipients {
+        let mut unsubscribe_token = None;
         let raw_message = if is_broadcast {
             // Register a one-click unsubscribe token for this recipient/stream
             // and bake the RFC 8058 headers into the stored raw.
-            let token = server_store
-                .create_unsubscribe_token(server.id, stream_id, &recipient.email)
-                .await
-                .map_err(|_| internal_error())?;
+            let token = camelmailer_core::token::generate_token(32);
+            unsubscribe_token = Some(PendingUnsubscribeToken {
+                token: token.clone(),
+                stream_id,
+                address: recipient.email.clone(),
+            });
             let mut params = params.clone();
             params.headers.push((
                 "List-Unsubscribe".into(),
@@ -481,81 +580,214 @@ pub(crate) async fn enqueue_send(
         } else {
             raw.clone().expect("non-broadcast raw is built once")
         };
-        let queued = QueuedMessage {
-            server_id: server.id,
-            rcpt_to: recipient.email.clone(),
-            mail_from: from.email.clone(),
-            raw_message,
-            received_with_ssl: false,
-            scope: MessageScope::Outgoing,
-            bounce: false,
-            domain_id,
-            credential_id: None,
-            route_id: None,
-            tag: body.tag.clone(),
-            metadata: body.metadata.clone(),
-            stream_id,
-        };
-        match server_store.store_outgoing(queued).await {
-            Ok(sent) => {
-                shared_id.get_or_insert(sent.id);
-                results.push(json!({
-                    "rcpt_to": sent.rcpt_to,
-                    "message_id": sent.id,
-                    "token": sent.token,
-                    "status": "queued",
-                }));
-            }
-            Err(error) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "InternalServerError".into(),
-                    error.to_string(),
-                ))
-            }
-        }
+        messages.push(SendPlanMessage {
+            message: QueuedMessage {
+                server_id: server.id,
+                rcpt_to: recipient.email.clone(),
+                mail_from: from.email.clone(),
+                raw_message,
+                received_with_ssl: false,
+                scope: MessageScope::Outgoing,
+                bounce: false,
+                domain_id,
+                credential_id: None,
+                route_id: None,
+                tag: body.tag.clone(),
+                metadata: body.metadata.clone(),
+                stream_id,
+            },
+            unsubscribe_token,
+        });
     }
 
-    Ok(json!({
-        "message_id": shared_id,
-        "recipients": results,
-    }))
+    Ok(messages)
+}
+
+async fn store_send_plan(
+    state: &ApiState,
+    server_id: camelmailer_core::Id,
+    plan: Vec<SendPlanItem>,
+    idempotency: Option<IdempotencyRequest>,
+) -> Result<SendOperationResult, ApiError> {
+    let store = state.server_store.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError".into(),
+        "message storage is not configured".into(),
+    ))?;
+    match store
+        .store_send_operation(server_id, plan, idempotency)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError".into(),
+                error.to_string(),
+            )
+        })? {
+        StoreSendOutcome::Stored(response) | StoreSendOutcome::Replayed(response) => Ok(response),
+        StoreSendOutcome::Conflict => Err(idempotency_conflict()),
+    }
+}
+
+fn stored_send_json(send: &StoredSendResult) -> Value {
+    json!({
+        "message_id": send.message_id,
+        "recipients": send.recipients.iter().map(|sent| json!({
+            "rcpt_to": sent.rcpt_to,
+            "message_id": sent.id,
+            "token": sent.token,
+            "status": "queued",
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn single_send_json(response: &SendOperationResult) -> Result<Value, ApiError> {
+    match response.items.as_slice() {
+        [SendOperationItem::Success(send)] => Ok(stored_send_json(send)),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError".into(),
+            "invalid stored send response".into(),
+        )),
+    }
+}
+
+fn render_single_send(start: &RequestStart, outcome: Result<Value, ApiError>) -> Response {
+    match outcome {
+        Ok(data) => render_success(Some(start), StatusCode::CREATED, data).into_response(),
+        Err((status, code, message)) => {
+            render_error(Some(start), status, &code, &message).into_response()
+        }
+    }
+}
+
+// Another request may have completed after the first lookup but before
+// preparation observed exhausted quota or a changed template.
+async fn reconcile_single_send_error(
+    state: &ApiState,
+    server_id: camelmailer_core::Id,
+    idempotency: Option<&IdempotencyRequest>,
+    error: ApiError,
+) -> Result<Value, ApiError> {
+    match cached_send_operation(state, server_id, idempotency).await? {
+        Some(response) => single_send_json(&response),
+        None => Err(error),
+    }
+}
+
+fn batch_send_json(response: &SendOperationResult) -> Value {
+    let messages = response
+        .items
+        .iter()
+        .map(|item| match item {
+            SendOperationItem::Success(send) => {
+                json!({ "status": "success", "data": stored_send_json(send) })
+            }
+            SendOperationItem::Error { code, message } => {
+                json!({ "status": "error", "error": { "code": code, "message": message } })
+            }
+        })
+        .collect::<Vec<_>>();
+    json!({ "messages": messages })
+}
+
+/// Internal one-off send entry point used by platform mail and campaign
+/// expansion. Public HTTP handlers add optional idempotency around the same
+/// preparation and storage path.
+pub(crate) async fn enqueue_send(
+    state: &ApiState,
+    server: &Server,
+    body: SendMessage,
+) -> Result<Value, ApiError> {
+    let messages = prepare_send(state, server, body, 0).await?;
+    let response = store_send_plan(
+        state,
+        server.id,
+        vec![SendPlanItem::Messages(messages)],
+        None,
+    )
+    .await?;
+    single_send_json(&response)
 }
 
 async fn messages_send(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
     server: axum::Extension<Server>,
+    headers: HeaderMap,
     Json(body): Json<SendMessage>,
 ) -> Response {
-    match enqueue_send(&state, &server.0, body).await {
-        Ok(data) => render_success(Some(&start.0), StatusCode::CREATED, data).into_response(),
+    let idempotency = match idempotency_request(&headers, "messages.send", &body) {
+        Ok(request) => request,
         Err((status, code, message)) => {
-            render_error(Some(&start.0), status, &code, &message).into_response()
+            return render_error(Some(&start.0), status, &code, &message).into_response()
+        }
+    };
+    match cached_send_operation(&state, server.0.id, idempotency.as_ref()).await {
+        Ok(Some(response)) => return render_single_send(&start.0, single_send_json(&response)),
+        Ok(None) => {}
+        Err((status, code, message)) => {
+            return render_error(Some(&start.0), status, &code, &message).into_response()
         }
     }
+    let outcome = match prepare_send(&state, &server.0, body, 0).await {
+        Ok(messages) => store_send_plan(
+            &state,
+            server.0.id,
+            vec![SendPlanItem::Messages(messages)],
+            idempotency,
+        )
+        .await
+        .and_then(|response| single_send_json(&response)),
+        Err(error) => {
+            reconcile_single_send_error(&state, server.0.id, idempotency.as_ref(), error).await
+        }
+    };
+    render_single_send(&start.0, outcome)
 }
 
 async fn messages_send_batch(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
     server: axum::Extension<Server>,
+    headers: HeaderMap,
     Json(messages): Json<Vec<SendMessage>>,
 ) -> Response {
-    let mut results = Vec::with_capacity(messages.len());
-    for message in messages {
-        match enqueue_send(&state, &server.0, message).await {
-            Ok(data) => results.push(json!({ "status": "success", "data": data })),
-            Err((_, code, message)) => results
-                .push(json!({ "status": "error", "error": { "code": code, "message": message } })),
+    let idempotency = match idempotency_request(&headers, "messages.send_batch", &messages) {
+        Ok(request) => request,
+        Err((status, code, message)) => {
+            return render_error(Some(&start.0), status, &code, &message).into_response()
+        }
+    };
+    match cached_send_operation(&state, server.0.id, idempotency.as_ref()).await {
+        Ok(Some(response)) => {
+            return render_success(Some(&start.0), StatusCode::OK, batch_send_json(&response))
+                .into_response()
+        }
+        Ok(None) => {}
+        Err((status, code, message)) => {
+            return render_error(Some(&start.0), status, &code, &message).into_response()
         }
     }
-    render_success(
-        Some(&start.0),
-        StatusCode::OK,
-        json!({ "messages": results }),
-    )
-    .into_response()
+
+    let mut plan = Vec::with_capacity(messages.len());
+    let mut pending_recipients = 0;
+    for message in messages {
+        match prepare_send(&state, &server.0, message, pending_recipients).await {
+            Ok(messages) => {
+                pending_recipients += messages.len() as i64;
+                plan.push(SendPlanItem::Messages(messages));
+            }
+            Err((_, code, message)) => plan.push(SendPlanItem::Error { code, message }),
+        }
+    }
+    match store_send_plan(&state, server.0.id, plan, idempotency).await {
+        Ok(response) => render_success(Some(&start.0), StatusCode::OK, batch_send_json(&response))
+            .into_response(),
+        Err((status, code, message)) => {
+            render_error(Some(&start.0), status, &code, &message).into_response()
+        }
+    }
 }
 
 // -------------------------------------------------------------- read APIs
@@ -3451,7 +3683,7 @@ async fn template_render(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SendWithTemplate {
     #[serde(flatten)]
     message: SendMessage,
@@ -3506,20 +3738,41 @@ async fn messages_send_with_template(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
     server: axum::Extension<Server>,
+    headers: HeaderMap,
     Json(body): Json<SendWithTemplate>,
 ) -> Response {
-    let message = match build_templated_message(&state, &server.0, body).await {
-        Ok(message) => message,
+    let idempotency = match idempotency_request(&headers, "messages.send_with_template", &body) {
+        Ok(request) => request,
         Err((status, code, message)) => {
             return render_error(Some(&start.0), status, &code, &message).into_response()
         }
     };
-    match enqueue_send(&state, &server.0, message).await {
-        Ok(data) => render_success(Some(&start.0), StatusCode::CREATED, data).into_response(),
+    match cached_send_operation(&state, server.0.id, idempotency.as_ref()).await {
+        Ok(Some(response)) => return render_single_send(&start.0, single_send_json(&response)),
+        Ok(None) => {}
         Err((status, code, message)) => {
-            render_error(Some(&start.0), status, &code, &message).into_response()
+            return render_error(Some(&start.0), status, &code, &message).into_response()
         }
     }
+    let prepared = async {
+        let message = build_templated_message(&state, &server.0, body).await?;
+        prepare_send(&state, &server.0, message, 0).await
+    }
+    .await;
+    let outcome = match prepared {
+        Ok(messages) => store_send_plan(
+            &state,
+            server.0.id,
+            vec![SendPlanItem::Messages(messages)],
+            idempotency,
+        )
+        .await
+        .and_then(|response| single_send_json(&response)),
+        Err(error) => {
+            reconcile_single_send_error(&state, server.0.id, idempotency.as_ref(), error).await
+        }
+    };
+    render_single_send(&start.0, outcome)
 }
 
 /// `POST /api/v2/server/messages/with_template/batch`.
@@ -3527,26 +3780,49 @@ async fn messages_send_with_template_batch(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
     server: axum::Extension<Server>,
+    headers: HeaderMap,
     Json(messages): Json<Vec<SendWithTemplate>>,
 ) -> Response {
-    let mut results = Vec::with_capacity(messages.len());
+    let idempotency =
+        match idempotency_request(&headers, "messages.send_with_template_batch", &messages) {
+            Ok(request) => request,
+            Err((status, code, message)) => {
+                return render_error(Some(&start.0), status, &code, &message).into_response()
+            }
+        };
+    match cached_send_operation(&state, server.0.id, idempotency.as_ref()).await {
+        Ok(Some(response)) => {
+            return render_success(Some(&start.0), StatusCode::OK, batch_send_json(&response))
+                .into_response()
+        }
+        Ok(None) => {}
+        Err((status, code, message)) => {
+            return render_error(Some(&start.0), status, &code, &message).into_response()
+        }
+    }
+
+    let mut plan = Vec::with_capacity(messages.len());
+    let mut pending_recipients = 0;
     for body in messages {
         let outcome = match build_templated_message(&state, &server.0, body).await {
-            Ok(message) => enqueue_send(&state, &server.0, message).await,
+            Ok(message) => prepare_send(&state, &server.0, message, pending_recipients).await,
             Err(error) => Err(error),
         };
         match outcome {
-            Ok(data) => results.push(json!({ "status": "success", "data": data })),
-            Err((_, code, message)) => results
-                .push(json!({ "status": "error", "error": { "code": code, "message": message } })),
+            Ok(messages) => {
+                pending_recipients += messages.len() as i64;
+                plan.push(SendPlanItem::Messages(messages));
+            }
+            Err((_, code, message)) => plan.push(SendPlanItem::Error { code, message }),
         }
     }
-    render_success(
-        Some(&start.0),
-        StatusCode::OK,
-        json!({ "messages": results }),
-    )
-    .into_response()
+    match store_send_plan(&state, server.0.id, plan, idempotency).await {
+        Ok(response) => render_success(Some(&start.0), StatusCode::OK, batch_send_json(&response))
+            .into_response(),
+        Err((status, code, message)) => {
+            render_error(Some(&start.0), status, &code, &message).into_response()
+        }
+    }
 }
 
 // ------------------------------------------------------- DMARC monitoring
@@ -3824,3 +4100,6 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
 
     Router::new().nest("/api/v2/server", server)
 }
+
+#[cfg(test)]
+mod idempotency_tests;

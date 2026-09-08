@@ -52,7 +52,7 @@ pub trait Store: Send + Sync {
     /// Outgoing messages counted against the server's send limit in the
     /// current 30-day window. Combined with `Server::send_limit` this gives
     /// a [`crate::SendAllowance`]. Kept on the synchronous `Store` trait
-    /// because the SMTP session checks it at `RCPT TO`.
+    /// because the SMTP session checks it after `DATA`.
     fn send_usage(&self, server_id: Id) -> i64;
 
     /// Does the server have a `__returnpath__` route?
@@ -202,10 +202,19 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) auth_events: Vec<crate::auth::AuthEvent>,
     /// Per-server API request log (metadata only), in insertion order.
     pub(crate) api_requests: Vec<crate::server_store::ApiRequestRecord>,
+    /// Completed send operations keyed by (server id, SHA-256 key).
+    pub(crate) idempotency_requests: HashMap<(Id, String), MemoryIdempotencyRecord>,
     /// Per-organization SSO connections (tenant OIDC/SAML/social).
     pub(crate) org_sso_connections: HashMap<Id, crate::org_sso::OrgSsoConnection>,
     /// Email domains organizations have claimed for SSO login routing.
     pub(crate) org_email_domains: HashMap<Id, crate::org_sso::OrgEmailDomain>,
+}
+
+pub(crate) struct MemoryIdempotencyRecord {
+    request_hash: String,
+    operation: String,
+    response: crate::server_store::SendOperationResult,
+    expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A thread-safe in-memory [`Store`].
@@ -390,10 +399,24 @@ impl MemoryStore {
         &self,
         message: crate::message::QueuedMessage,
     ) -> crate::message::SentMessage {
+        let (record, sent) = self.build_message_record(message);
+        let mut inner = self.inner.write().unwrap();
+        if record.scope == "outgoing" {
+            *inner
+                .send_counters
+                .entry((record.server_id, record.created_at.date_naive()))
+                .or_insert(0) += 1;
+        }
+        inner.messages.push(record);
+        sent
+    }
+
+    fn build_message_record(
+        &self,
+        message: crate::message::QueuedMessage,
+    ) -> (crate::message::MessageRecord, crate::message::SentMessage) {
         let id = self.next_id() as i64;
         let token = crate::token::generate_token(12);
-        let outgoing = matches!(message.scope, crate::message::MessageScope::Outgoing);
-        let server_id = message.server_id;
         let record = crate::message::MessageRecord {
             id,
             token: token.clone(),
@@ -424,21 +447,120 @@ impl MemoryStore {
             created_at: chrono::Utc::now(),
             raw_message: message.raw_message,
         };
-        {
-            let mut inner = self.inner.write().unwrap();
-            if outgoing {
-                *inner
-                    .send_counters
-                    .entry((server_id, chrono::Utc::now().date_naive()))
-                    .or_insert(0) += 1;
-            }
-            inner.messages.push(record);
-        }
-        crate::message::SentMessage {
+        let sent = crate::message::SentMessage {
             id,
             token,
             rcpt_to: message.rcpt_to,
+        };
+        (record, sent)
+    }
+
+    pub fn idempotency_result(
+        &self,
+        server_id: Id,
+        request: &crate::server_store::IdempotencyRequest,
+    ) -> crate::server_store::IdempotencyLookup {
+        let inner = self.inner.read().unwrap();
+        let Some(record) = inner
+            .idempotency_requests
+            .get(&(server_id, request.key_hash.clone()))
+        else {
+            return crate::server_store::IdempotencyLookup::New;
+        };
+        if record.expires_at <= chrono::Utc::now() {
+            return crate::server_store::IdempotencyLookup::New;
         }
+        if record.request_hash != request.request_hash || record.operation != request.operation {
+            return crate::server_store::IdempotencyLookup::Conflict;
+        }
+        crate::server_store::IdempotencyLookup::Replay(record.response.clone())
+    }
+
+    pub fn insert_send_operation(
+        &self,
+        server_id: Id,
+        plan: Vec<crate::server_store::SendPlanItem>,
+        idempotency: Option<crate::server_store::IdempotencyRequest>,
+    ) -> crate::server_store::StoreSendOutcome {
+        let mut inner = self.inner.write().unwrap();
+
+        if let Some(request) = &idempotency {
+            let cache_key = (server_id, request.key_hash.clone());
+            if let Some(record) = inner.idempotency_requests.get(&cache_key) {
+                if record.expires_at > chrono::Utc::now() {
+                    if record.request_hash == request.request_hash
+                        && record.operation == request.operation
+                    {
+                        return crate::server_store::StoreSendOutcome::Replayed(
+                            record.response.clone(),
+                        );
+                    }
+                    return crate::server_store::StoreSendOutcome::Conflict;
+                }
+            }
+            inner.idempotency_requests.remove(&cache_key);
+        }
+
+        let mut items = Vec::with_capacity(plan.len());
+        for item in plan {
+            match item {
+                crate::server_store::SendPlanItem::Messages(messages) => {
+                    let mut recipients = Vec::with_capacity(messages.len());
+                    for planned in messages {
+                        if let Some(token) = planned.unsubscribe_token {
+                            inner.unsubscribe_tokens.push((
+                                token.token,
+                                server_id,
+                                token.stream_id,
+                                token.address,
+                            ));
+                        }
+                        let message = planned.message;
+                        debug_assert_eq!(message.server_id, server_id);
+                        let (record, sent) = self.build_message_record(message);
+                        if record.scope == "outgoing" {
+                            *inner
+                                .send_counters
+                                .entry((record.server_id, record.created_at.date_naive()))
+                                .or_insert(0) += 1;
+                        }
+                        inner.messages.push(record);
+                        recipients.push(sent);
+                    }
+                    items.push(crate::server_store::SendOperationItem::Success(
+                        crate::server_store::StoredSendResult {
+                            message_id: recipients.first().map(|message| message.id),
+                            recipients,
+                        },
+                    ));
+                }
+                crate::server_store::SendPlanItem::Error { code, message } => {
+                    items.push(crate::server_store::SendOperationItem::Error { code, message });
+                }
+            }
+        }
+        let response = crate::server_store::SendOperationResult { items };
+        if let Some(request) = idempotency {
+            inner.idempotency_requests.insert(
+                (server_id, request.key_hash),
+                MemoryIdempotencyRecord {
+                    request_hash: request.request_hash,
+                    operation: request.operation,
+                    response: response.clone(),
+                    expires_at: request.expires_at,
+                },
+            );
+        }
+        crate::server_store::StoreSendOutcome::Stored(response)
+    }
+
+    pub fn prune_idempotency_requests_at(&self, now: chrono::DateTime<chrono::Utc>) -> u64 {
+        let mut inner = self.inner.write().unwrap();
+        let before = inner.idempotency_requests.len();
+        inner
+            .idempotency_requests
+            .retain(|_, record| record.expires_at > now);
+        (before - inner.idempotency_requests.len()) as u64
     }
 
     /// Import a historical message as a completed record WITHOUT queuing it

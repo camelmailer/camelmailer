@@ -273,17 +273,28 @@ async fn json_request(
     token: &str,
     body: Value,
 ) -> (StatusCode, Value) {
+    json_request_with_headers(app, method, path, token, body, &[]).await
+}
+
+async fn json_request_with_headers(
+    app: &Router,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Value,
+    headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("X-Server-API-Key", token)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(path)
-                .header("X-Server-API-Key", token)
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
     let status = response.status();
@@ -326,6 +337,234 @@ async fn send_stores_one_message_per_recipient() {
     assert!(stored.iter().all(|m| m.tag.as_deref() == Some("welcome")));
     let raw = String::from_utf8_lossy(&stored[0].raw_message);
     assert!(raw.contains("Subject: Hello"));
+}
+
+#[tokio::test]
+async fn idempotent_send_replays_the_original_response_without_queuing_again() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    let body = json!({
+        "from": "news@org.example",
+        "to": ["a@dest.example", "b@dest.example"],
+        "subject": "Only once",
+        "headers": { "X-Event": "signup", "X-Source": "api" }
+    });
+    let headers = [("Idempotency-Key", "welcome/user-42")];
+
+    let (first_status, first) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages",
+        &token,
+        body.clone(),
+        &headers,
+    )
+    .await;
+    let (second_status, second) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages",
+        &token,
+        body,
+        &headers,
+    )
+    .await;
+
+    assert_eq!(first_status, StatusCode::CREATED);
+    assert_eq!(second_status, StatusCode::CREATED);
+    assert_eq!(first["data"], second["data"]);
+    assert_eq!(store.messages_for(server_id).len(), 2);
+}
+
+#[tokio::test]
+async fn idempotency_key_reuse_with_a_changed_payload_is_a_conflict() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    let headers = [("Idempotency-Key", "receipt/order-7")];
+    let body = |subject: &str| {
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example"],
+            "subject": subject
+        })
+    };
+
+    let (first_status, _) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages",
+        &token,
+        body("First"),
+        &headers,
+    )
+    .await;
+    let (second_status, second) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages",
+        &token,
+        body("Changed"),
+        &headers,
+    )
+    .await;
+
+    assert_eq!(first_status, StatusCode::CREATED);
+    assert_eq!(second_status, StatusCode::CONFLICT);
+    assert_eq!(second["error"]["code"], "InvalidIdempotentRequest");
+    assert_eq!(store.messages_for(server_id).len(), 1);
+}
+
+#[tokio::test]
+async fn idempotency_keys_cannot_be_reused_across_send_endpoints() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    let headers = [("Idempotency-Key", "send/operation-7")];
+    let body = json!({
+        "from": "news@org.example",
+        "to": ["a@dest.example"],
+        "subject": "One operation"
+    });
+
+    let (first_status, _) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages",
+        &token,
+        body.clone(),
+        &headers,
+    )
+    .await;
+    let (second_status, second) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages/batch",
+        &token,
+        json!([body]),
+        &headers,
+    )
+    .await;
+
+    assert_eq!(first_status, StatusCode::CREATED);
+    assert_eq!(second_status, StatusCode::CONFLICT);
+    assert_eq!(second["error"]["code"], "InvalidIdempotentRequest");
+    assert_eq!(store.messages_for(server_id).len(), 1);
+}
+
+#[tokio::test]
+async fn idempotency_key_length_is_bounded() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    let valid_key: String = (0x20u8..=0x7e).cycle().take(256).map(char::from).collect();
+    for key in [" ", "~", valid_key.as_str()] {
+        let (status, _) = json_request_with_headers(
+            &app,
+            "POST",
+            "/api/v2/server/messages",
+            &token,
+            json!({"from": "news@org.example", "to": ["recipient@example.net"]}),
+            &[("Idempotency-Key", key)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let key = "k".repeat(257);
+    let headers = [("Idempotency-Key", key.as_str())];
+    let (status, body) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example"],
+            "subject": "Too long"
+        }),
+        &headers,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidIdempotencyKey");
+    assert_eq!(store.messages_for(server_id).len(), 3);
+
+    for invalid_key in ["", "tab\tkey", "\t", "non-ascii-\u{0080}"] {
+        let (status, body) = json_request_with_headers(
+            &app,
+            "POST",
+            "/api/v2/server/messages",
+            &token,
+            json!({"from": "news@org.example", "to": ["recipient@example.net"]}),
+            &[("Idempotency-Key", invalid_key)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "key {invalid_key:?}");
+        assert_eq!(body["error"]["code"], "InvalidIdempotencyKey");
+        assert_eq!(store.messages_for(server_id).len(), 3);
+    }
+
+    let duplicate_headers = [
+        ("Idempotency-Key", "duplicate/key"),
+        ("Idempotency-Key", "duplicate/key"),
+    ];
+    let (status, body) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example"]
+        }),
+        &duplicate_headers,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "InvalidIdempotencyKey");
+    assert_eq!(store.messages_for(server_id).len(), 3);
+}
+
+#[tokio::test]
+async fn idempotent_batch_replays_successes_and_entry_errors() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    let body = json!([
+        {
+            "from": "news@org.example",
+            "to": ["a@dest.example"],
+            "subject": "One"
+        },
+        {
+            "from": "news@org.example",
+            "subject": "Missing recipient"
+        },
+        {
+            "from": "news@org.example",
+            "to": ["b@dest.example"],
+            "subject": "Two"
+        }
+    ]);
+    let headers = [("Idempotency-Key", "batch/import-9")];
+
+    let (first_status, first) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages/batch",
+        &token,
+        body.clone(),
+        &headers,
+    )
+    .await;
+    let (second_status, second) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages/batch",
+        &token,
+        body,
+        &headers,
+    )
+    .await;
+
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(first["data"], second["data"]);
+    assert_eq!(first["data"]["messages"][1]["status"], "error");
+    assert_eq!(store.messages_for(server_id).len(), 2);
 }
 
 #[tokio::test]
@@ -1281,6 +1520,68 @@ async fn send_with_template_renders_and_enqueues() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn idempotent_template_send_replays_without_rendering_the_changed_template() {
+    let (app, token, _, store) = build_two_with_domains().await;
+    post_json(
+        &app,
+        "/api/v2/server/templates",
+        &token,
+        json!({
+            "name": "Receipt",
+            "subject": "Original {{ order }}",
+            "text_body": "Thanks"
+        }),
+    )
+    .await;
+    let request = json!({
+        "from": "news@alpha.example",
+        "to": ["buyer@dest.example"],
+        "template": "receipt",
+        "template_model": { "order": 42 }
+    });
+    let headers = [("Idempotency-Key", "template/order-42")];
+
+    let (first_status, first) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages/with_template",
+        &token,
+        request.clone(),
+        &headers,
+    )
+    .await;
+    patch_json(
+        &app,
+        "/api/v2/server/templates/receipt",
+        &token,
+        json!({ "subject": "Changed {{ order }}" }),
+    )
+    .await;
+    let (second_status, second) = json_request_with_headers(
+        &app,
+        "POST",
+        "/api/v2/server/messages/with_template",
+        &token,
+        request,
+        &headers,
+    )
+    .await;
+
+    assert_eq!(first_status, StatusCode::CREATED);
+    assert_eq!(second_status, StatusCode::CREATED);
+    assert_eq!(first["data"], second["data"]);
+    let server_id = store
+        .server_for_api_token(&token)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let messages = store.messages_for(server_id);
+    assert_eq!(messages.len(), 1);
+    assert!(String::from_utf8_lossy(&messages[0].raw_message).contains("Subject: Original 42"));
 }
 
 #[tokio::test]
@@ -3029,4 +3330,72 @@ async fn inbound_messages_do_not_consume_the_send_limit() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn batches_reserve_quota_per_accepted_entry_and_replay_at_the_limit() {
+    for templated in [false, true] {
+        for keyed in [false, true] {
+            let (app, token, store, server_id) = build_with_verified_domain().await;
+            set_send_limit(&store, server_id, Some(3)).await;
+            if templated {
+                let (status, _) = post_json(
+                    &app,
+                    "/api/v2/server/templates",
+                    &token,
+                    json!({"name":"Receipt", "subject":"Hi", "text_body":"Thanks"}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED);
+            }
+            let message = |recipients: Value| {
+                let mut value = json!({"from":"news@org.example", "to":recipients, "subject":"Hi", "text_body":"Thanks"});
+                if templated {
+                    value["template"] = json!("receipt");
+                }
+                value
+            };
+            let mut invalid = message(json!(["invalid@example.net"]));
+            invalid["from"] = json!("sender@unverified.example");
+            let body = json!([
+                message(json!(["a@example.net", "b@example.net"])),
+                message(json!(["c@example.net", "d@example.net"])),
+                invalid,
+                message(json!(["e@example.net"]))
+            ]);
+            let endpoint = if templated {
+                "/api/v2/server/messages/with_template/batch"
+            } else {
+                "/api/v2/server/messages/batch"
+            };
+            let headers = if keyed {
+                vec![("Idempotency-Key", "batch/quota")]
+            } else {
+                vec![]
+            };
+            let (status, response) =
+                json_request_with_headers(&app, "POST", endpoint, &token, body.clone(), &headers)
+                    .await;
+            assert_eq!(status, StatusCode::OK);
+            let items = &response["data"]["messages"];
+            assert_eq!(items[0]["status"], "success");
+            assert_eq!(items[1]["error"]["code"], "SendLimitExceeded");
+            assert_eq!(items[2]["status"], "error");
+            assert_ne!(items[2]["error"]["code"], "SendLimitExceeded");
+            assert_eq!(items[3]["status"], "success");
+            assert_eq!(store.messages_for(server_id).len(), 3);
+            let (status, retry) =
+                json_request_with_headers(&app, "POST", endpoint, &token, body, &headers).await;
+            assert_eq!(status, StatusCode::OK);
+            if keyed {
+                assert_eq!(retry["data"], response["data"]);
+            } else {
+                assert_eq!(
+                    retry["data"]["messages"][0]["error"]["code"],
+                    "SendLimitExceeded"
+                );
+            }
+            assert_eq!(store.messages_for(server_id).len(), 3);
+        }
+    }
 }
