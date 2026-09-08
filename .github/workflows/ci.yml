@@ -84,7 +84,13 @@ jobs:
         working-directory: web/app
     steps:
       - uses: actions/checkout@v4
+      # `defaults.run.working-directory` applies to `run:` steps only, not to
+      # action inputs, so the version has to be pointed at explicitly: the
+      # `packageManager` field lives in web/app, and the repository root has
+      # no package.json for the action to read.
       - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: web/app/package.json
       - uses: actions/setup-node@v4
         with:
           node-version: 22
