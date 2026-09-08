@@ -66,7 +66,21 @@ pub struct CamelMailer {
     pub default_dkim_key_size: u32,
     /// Path to the private key used for signing
     pub signing_key_path: String,
-    /// SMTP relays in the format smtp://host:port
+    /// Smarthosts to deliver every message through, tried in order, instead
+    /// of looking up each recipient domain's MX records. Empty means
+    /// direct-to-MX.
+    ///
+    /// `smtp://[user:password@]host[:port]` for plaintext with opportunistic
+    /// STARTTLS, `smtps://…` for implicit TLS. The port defaults to 25
+    /// (`smtp`) or 465 (`smtps`), and port 587 makes STARTTLS mandatory
+    /// rather than opportunistic. The credentials are optional and go out as
+    /// AUTH PLAIN once the connection is protected, never before;
+    /// percent-encode any `@` or `:` inside them (`%40`, `%3A`). Certificate
+    /// verification for relays follows `smtp.openssl_verify_mode`.
+    ///
+    /// An entry that does not parse is skipped, so a typo leaves that relay
+    /// unused. See `docs/configuration.md` and `camelmailer-worker`'s
+    /// `sender::parse_relay`.
     pub smtp_relays: Vec<String>,
     /// IP addresses to trust for proxying requests (in addition to localhost)
     pub trusted_proxies: Vec<String>,
