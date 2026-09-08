@@ -1362,3 +1362,102 @@ fn keyed_smtp_replays_on_a_new_connection_at_quota_and_rejects_new_sends() {
     );
     assert_eq!(setup.sink.messages().len(), 2);
 }
+
+// ------------------------------- send limits across SMTP transactions
+//
+// These drive a Session against StoreBackedSink rather than MemorySink,
+// because storing a message has to move the per-server send counters for the
+// limit to be observable at all. With MemorySink the store never sees the
+// messages and `send_usage` reads 0 forever, which is why the bypass fixed in
+// v0.7.8 was invisible to the five single-transaction tests above.
+
+/// A session authenticated as the fixture server's SMTP credential, wired to
+/// a sink that stores through to the fixture store.
+fn store_backed_session(fixtures: &Fixtures) -> Session {
+    let credential = fixtures.credential(CredentialType::Smtp, "key123");
+    let sink = Arc::new(camelmailer_core::testing::StoreBackedSink::new(
+        fixtures.store(),
+    ));
+    let mut session = Session::new(config(), fixtures.store(), sink, Some("1.2.3.4".into()));
+    session.handle("HELO test.example.com");
+    let reply = session.handle(&format!("AUTH PLAIN {}", to_smtp_plain(&credential.key)));
+    assert!(
+        line(&reply).starts_with("235 Granted for"),
+        "{}",
+        line(&reply)
+    );
+    session
+}
+
+/// Send one authorized single-recipient message and return the final reply.
+fn send_one(session: &mut Session, index: usize) -> Reply {
+    session.handle("MAIL FROM: sender@example.com");
+    session.handle(&format!("RCPT TO: r{index}@dest.example"));
+    session.handle("DATA");
+    session.handle("Subject: Test");
+    session.handle("From: sender@example.com");
+    session.handle(&format!("To: r{index}@dest.example"));
+    session.handle("");
+    session.handle("body");
+    session.handle("\r");
+    session.handle(".\r")
+}
+
+#[test]
+fn the_send_limit_holds_across_transactions_on_one_connection() {
+    // Regression test for the v0.7.7 bypass: usage was cached for the life of
+    // the session, so each transaction after the first measured a stale
+    // figure and the limit never bit.
+    let fixtures = Fixtures::new();
+    fixtures.verified_server_domain("example.com");
+    fixtures.set_send_limit(Some(2));
+    let mut session = store_backed_session(&fixtures);
+
+    assert_eq!(line(&send_one(&mut session, 0)), "250 OK");
+    assert_eq!(line(&send_one(&mut session, 1)), "250 OK");
+
+    let reply = send_one(&mut session, 2);
+    assert!(line(&reply).starts_with("550 5.7.1 "), "{}", line(&reply));
+    assert!(line(&reply).contains("2 messages per 30 days"));
+
+    assert_eq!(
+        camelmailer_core::Store::send_usage(fixtures.store().as_ref(), fixtures.server_id()),
+        2,
+        "a third message was stored past the limit"
+    );
+}
+
+#[test]
+fn an_unlimited_server_keeps_accepting_across_transactions() {
+    let fixtures = Fixtures::new();
+    fixtures.verified_server_domain("example.com");
+    let mut session = store_backed_session(&fixtures);
+    for index in 0..5 {
+        assert_eq!(
+            line(&send_one(&mut session, index)),
+            "250 OK",
+            "message {index}"
+        );
+    }
+    assert_eq!(
+        camelmailer_core::Store::send_usage(fixtures.store().as_ref(), fixtures.server_id()),
+        5
+    );
+}
+
+#[test]
+fn usage_seeded_before_the_connection_counts_against_the_limit() {
+    // The first transaction must see existing usage, not start from zero.
+    let fixtures = Fixtures::new();
+    fixtures.verified_server_domain("example.com");
+    fixtures.set_send_limit(Some(3));
+    fixtures.record_sends(3);
+    let mut session = store_backed_session(&fixtures);
+
+    let reply = send_one(&mut session, 0);
+    assert!(line(&reply).starts_with("550 5.7.1 "), "{}", line(&reply));
+    assert_eq!(
+        camelmailer_core::Store::send_usage(fixtures.store().as_ref(), fixtures.server_id()),
+        3
+    );
+}
