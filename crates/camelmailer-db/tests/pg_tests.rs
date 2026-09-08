@@ -33,15 +33,87 @@ macro_rules! require_db {
     };
 }
 
+/// How old a `cm_test_*` database must be before the sweep drops it. Long
+/// enough that a suite running concurrently is never touched.
+const STALE_TEST_DATABASE_SECS: u64 = 3600;
+
+/// Seconds since the epoch, used to stamp throwaway database names.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Drop `cm_test_*` databases left behind by earlier runs, once per process.
+///
+/// No test drops its own database: a panicking test would skip the cleanup
+/// and `Drop` cannot await. Sweeping at the start is the one place that runs
+/// regardless of how the previous run ended. CI never saw the leak because
+/// every run gets a fresh container, but repeating the suite locally
+/// accumulates one database per test per run until the disk fills and
+/// PostgreSQL answers `53100: No space left on device`.
+///
+/// The age comes from the name rather than the catalog, because
+/// `pg_database` has no creation timestamp and `pg_stat_file` needs
+/// privileges the test role deliberately lacks (it is NOSUPERUSER so the
+/// row-level-security tests are meaningful). A name without a parseable
+/// stamp predates this scheme and counts as stale. Failures are ignored:
+/// another process may hold a connection, which is not this run's problem.
+async fn sweep_stale_test_databases(base: &str) {
+    static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if SWEPT.set(()).is_err() {
+        return;
+    }
+    let Ok(admin_pool) = camelmailer_db::connect(base, 1).await else {
+        return;
+    };
+    let cutoff = now_secs().saturating_sub(STALE_TEST_DATABASE_SECS);
+    let names: Vec<String> = sqlx::query(
+        "SELECT datname FROM pg_database
+         WHERE datname LIKE 'cm\\_test\\_%' AND NOT datistemplate",
+    )
+    .fetch_all(&admin_pool)
+    .await
+    .map(|rows| rows.iter().map(|row| row.get("datname")).collect())
+    .unwrap_or_default();
+
+    let mut dropped = 0;
+    for name in names {
+        let stamp = name
+            .strip_prefix("cm_test_")
+            .and_then(|rest| rest.split('_').next())
+            .and_then(|stamp| stamp.parse::<u64>().ok());
+        // None = pre-dates the stamped naming, so definitionally old.
+        if stamp.is_some_and(|created| created > cutoff) {
+            continue;
+        }
+        if sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\""))
+            .execute(&admin_pool)
+            .await
+            .is_ok()
+        {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        eprintln!("swept {dropped} stale cm_test_* database(s)");
+    }
+    admin_pool.close().await;
+}
+
 /// Create a unique throwaway database and run migrations on it.
 async fn test_pool_with_connections(base: &str, max_connections: u32) -> PgPool {
+    sweep_stale_test_databases(base).await;
     let name: String = {
         let mut rng = rand::thread_rng();
         (0..12)
             .map(|_| char::from(b'a' + rng.gen_range(0..26)))
             .collect()
     };
-    let db_name = format!("cm_test_{name}");
+    // The creation time is part of the name so the sweep above can judge age
+    // without catalog privileges.
+    let db_name = format!("cm_test_{}_{name}", now_secs());
 
     let admin_pool = camelmailer_db::connect(base, 1).await.unwrap();
     sqlx::query(&format!("CREATE DATABASE {db_name}"))

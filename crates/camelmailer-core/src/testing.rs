@@ -1,6 +1,7 @@
 //! Test fixtures shared across crates (the Rust counterpart of the
 //! FactoryBot factories in `spec/factories`).
 
+use crate::message::{MessageScope, MessageSink, QueueMessagesOutcome, QueuedMessage};
 use crate::model::*;
 use crate::store::MemoryStore;
 use crate::token;
@@ -205,5 +206,65 @@ impl Fixtures {
             mode: RouteMode::Endpoint,
             endpoint_url: Some(endpoint_url.into()),
         })
+    }
+}
+
+/// A [`MessageSink`] that stores through to a [`MemoryStore`], the way
+/// `PgMessageSink` stores through to PostgreSQL.
+///
+/// [`crate::MemorySink`] collects messages in its own `Vec` and never touches
+/// the store, so anything the real sink does *as part of storing* does not
+/// happen: today that is incrementing the per-server send counters. A test
+/// driving an SMTP `Session` against `MemorySink` therefore reads
+/// `Store::send_usage` as 0 no matter how many messages it just accepted,
+/// which made a send-limit bypass across transactions unobservable (the
+/// limit was cached for the session while the per-transaction reset cleared
+/// the recipient count, so a client holding one connection open could send
+/// past its `send_limit` without bound; shipped in v0.7.7, fixed in v0.7.8).
+///
+/// Use this sink whenever a test asserts on state that storing a message
+/// produces, rather than on the messages themselves.
+///
+/// Idempotency claims are deliberately unsupported: replay and conflict
+/// semantics are transactional and are covered against real PostgreSQL in
+/// `pg_tests.rs`. Passing a claim here panics rather than quietly behaving
+/// differently from production.
+pub struct StoreBackedSink {
+    store: Arc<MemoryStore>,
+}
+
+impl StoreBackedSink {
+    pub fn new(store: Arc<MemoryStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl MessageSink for StoreBackedSink {
+    fn queue_message(&self, message: QueuedMessage) {
+        self.store.insert_message_record(message);
+    }
+
+    fn queue_messages(
+        &self,
+        messages: Vec<QueuedMessage>,
+        idempotency: Option<crate::server_store::IdempotencyRequest>,
+        allowance: crate::SendAllowance,
+    ) -> QueueMessagesOutcome {
+        assert!(
+            idempotency.is_none(),
+            "StoreBackedSink does not implement idempotent replay; \
+             test that against PostgreSQL in pg_tests.rs"
+        );
+        let outgoing = messages
+            .iter()
+            .filter(|message| message.scope == MessageScope::Outgoing)
+            .count() as i64;
+        if !allowance.allows(outgoing) {
+            return QueueMessagesOutcome::LimitExceeded(allowance.rejection_message());
+        }
+        for message in messages {
+            self.store.insert_message_record(message);
+        }
+        QueueMessagesOutcome::Stored
     }
 }
