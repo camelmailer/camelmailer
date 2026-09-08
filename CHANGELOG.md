@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-09-08
+
 ### Added
 
 - Optional idempotent submission through `Idempotency-Key` on all four HTTP
@@ -36,6 +38,18 @@ integration tests) is green.
 - Custom Rust storage implementations must implement the new idempotency
   methods on `ServerStore` and `MessageSink::queue_messages`. Sends without
   a key continue to queue a new message for each submission.
+
+### Fixed
+
+- **Send limits were bypassable on a persistent SMTP connection.** 0.7.7
+  cached a server's 30-day usage for the lifetime of the session, and the
+  per-transaction reset cleared the accepted recipients without clearing that
+  cache. Every transaction after the first on one connection therefore
+  measured a stale usage figure against a zeroed recipient count, so a client
+  that kept a single connection open could send past its `send_limit` without
+  bound. Usage is now read fresh for each DATA transaction. Installations that
+  never set a `send_limit` were unaffected, since no limit was enforced for
+  them either way.
 
 ## [0.7.7] - 2026-09-07
 
@@ -853,7 +867,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.7.7...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.7.8...HEAD
+[0.7.8]: https://github.com/camelmailer/camelmailer/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/camelmailer/camelmailer/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/camelmailer/camelmailer/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/camelmailer/camelmailer/compare/v0.7.4...v0.7.5
