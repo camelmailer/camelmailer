@@ -437,6 +437,22 @@ pub(crate) async fn issue_session(
     user: &User,
     headers: &axum::http::HeaderMap,
 ) -> Result<(String, AuthSession), StoreError> {
+    issue_session_with_oidc_logout(store, state, user, headers, None).await
+}
+
+/// [`issue_session`] for a sign-in that came from OIDC, carrying what logout
+/// needs to end the provider's session as well.
+///
+/// Kept separate so the password, 2FA, WebAuthn and SAML paths keep calling
+/// [`issue_session`] unchanged; only the OIDC paths have a logout context to
+/// pass.
+pub(crate) async fn issue_session_with_oidc_logout(
+    store: &Arc<dyn AuthStore>,
+    state: &ApiState,
+    user: &User,
+    headers: &axum::http::HeaderMap,
+    oidc_logout: Option<camelmailer_core::auth::OidcLogout>,
+) -> Result<(String, AuthSession), StoreError> {
     let token = auth::generate_auth_token();
     let expires_at = Utc::now() + Duration::days(state.config.auth.session_timeout_days as i64);
     let session = store
@@ -446,6 +462,7 @@ pub(crate) async fn issue_session(
             expires_at,
             ip_address: client_ip(headers),
             user_agent: user_agent(headers),
+            oidc_logout,
         })
         .await?;
     Ok((token, session))
@@ -512,13 +529,51 @@ pub(crate) async fn session_middleware(
 
 // ------------------------------------------------------- authenticated
 
-// Logout is local session revocation only. RP-initiated OIDC single-logout
-// (redirecting to the IdP `end_session_endpoint` with an `id_token_hint`) is
-// deliberately out of scope: this is a JSON API the dashboard calls via fetch,
-// not a browser navigation, and sessions do not retain the originating
-// id_token or issuer — a correct SLO flow would need a session-schema change,
-// a discovery `end_session_endpoint` lookup, and a redirecting GET endpoint.
-// Killing the local session already blocks all further access here.
+/// Where the provider should return the browser after ending its session.
+///
+/// Registered with the provider as a post-logout redirect URI, so it has to
+/// be a stable, absolute URL built the same way as the login redirect.
+fn post_logout_redirect_uri(state: &ApiState) -> String {
+    format!(
+        "{}://{}/login",
+        state.config.camelmailer.web_protocol, state.config.camelmailer.web_hostname
+    )
+}
+
+/// Build the provider's end-session URL for a session that came from OIDC.
+///
+/// `id_token_hint` tells the provider whose session to end (Keycloak and
+/// others refuse a request without it), and `post_logout_redirect_uri`
+/// brings the browser back. Returns `None` when the session did not come
+/// from OIDC or the provider advertised no `end_session_endpoint`, in which
+/// case revoking locally is all there is to do.
+fn oidc_end_session_url(state: &ApiState, session: &AuthSession) -> Option<String> {
+    let logout = session.oidc_logout.as_ref()?;
+    let redirect = post_logout_redirect_uri(state);
+    let separator = if logout.end_session_endpoint.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    Some(format!(
+        "{}{separator}id_token_hint={}&post_logout_redirect_uri={}",
+        logout.end_session_endpoint,
+        crate::oidc::urlencode(&logout.id_token),
+        crate::oidc::urlencode(&redirect),
+    ))
+}
+
+// Logout revokes the local session and, for a session that came from OIDC,
+// hands back the provider's end-session URL for the caller to navigate to.
+//
+// The local revocation happens first and unconditionally: whatever the
+// provider does next, the token stops working here. The URL is returned
+// rather than answered as a redirect because this is a JSON API called with
+// fetch, and because a 302 to a third party from an XHR is not something a
+// browser will follow usefully. The dashboard navigates when the field is
+// present, which is what makes the provider's session end too; without that
+// step the next sign-in succeeds silently and the user was never really
+// logged out.
 async fn logout(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
@@ -527,6 +582,14 @@ async fn logout(
 ) -> ApiResponse {
     let Some(store) = auth_store(&state) else {
         return unavailable(Some(&start.0));
+    };
+    // Read the session before revoking it: the provider's end-session URL is
+    // built from what the row carries, and after the delete it is gone.
+    // A lookup failure is not a reason to refuse the logout, so it degrades
+    // to a local-only sign-out rather than an error.
+    let end_session_url = match store.session_with_user(&current.token_hash).await {
+        Ok(Some((session, _))) => oidc_end_session_url(&state, &session),
+        _ => None,
     };
     if let Err(error) = store.delete_session(&current.token_hash).await {
         return render_store_error(Some(&start.0), error);
@@ -542,7 +605,11 @@ async fn logout(
     render_success(
         Some(&start.0),
         StatusCode::OK,
-        json!({ "logged_out": true }),
+        // `end_session_url` is present only for a session that came from a
+        // provider advertising RP-initiated logout. The caller navigates to
+        // it to end that session too; the local one is already gone either
+        // way.
+        json!({ "logged_out": true, "end_session_url": end_session_url }),
     )
 }
 

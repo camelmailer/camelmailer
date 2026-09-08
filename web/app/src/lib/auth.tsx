@@ -69,14 +69,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   )
 
   const logout = useCallback(async () => {
+    // For a session that came from OIDC the API answers with the provider's
+    // end-session URL. Revoking our session alone leaves the provider's
+    // standing, so the next sign-in would succeed with no prompt and the
+    // user was never really logged out. Navigating there ends it, and the
+    // provider returns the browser to /login afterwards.
+    let endSessionUrl: string | null = null
     try {
-      await authApi.logout()
+      const result = await authApi.logout()
+      endSessionUrl = result.end_session_url ?? null
     } catch {
       // the session may already be gone — that's fine
     }
     setToken(null)
     setTokenState(null)
     setMe(null)
+    if (endSessionUrl) {
+      window.location.assign(endSessionUrl)
+    }
   }, [])
 
   return (

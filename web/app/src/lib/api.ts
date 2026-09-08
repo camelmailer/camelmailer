@@ -609,7 +609,13 @@ export const authApi = {
       user: User
       workspace?: { organization: string; server: string; api_key: string }
     }>("/api/v2/auth/register", fields),
-  logout: () => api.post<{ logged_out: boolean }>("/api/v2/auth/logout"),
+  // `end_session_url` is present only for a session that came from an OIDC
+  // provider advertising RP-initiated logout; the caller navigates to it so
+  // the provider's session ends too.
+  logout: () =>
+    api.post<{ logged_out: boolean; end_session_url: string | null }>(
+      "/api/v2/auth/logout",
+    ),
   me: () => api.get<MeResponse>("/api/v2/auth/me"),
   updateMe: (fields: { first_name?: string; last_name?: string }) =>
     api.patch<{ user: User }>("/api/v2/auth/me", fields),

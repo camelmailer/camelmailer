@@ -57,6 +57,22 @@ fn session_from_row(row: &PgRow) -> AuthSession {
         created_at: row.get("created_at"),
         expires_at: row.get("expires_at"),
         last_used_at: row.get("last_used_at"),
+        // Both columns are set together by the OIDC sign-in paths, so a row
+        // carrying only one of them is a session that cannot be logged out
+        // at the provider; treat it as a non-OIDC session rather than
+        // building a half-formed request.
+        oidc_logout: match (
+            row.get::<Option<String>, _>("oidc_id_token"),
+            row.get::<Option<String>, _>("oidc_end_session_endpoint"),
+        ) {
+            (Some(id_token), Some(end_session_endpoint)) => {
+                Some(camelmailer_core::auth::OidcLogout {
+                    id_token,
+                    end_session_endpoint,
+                })
+            }
+            _ => None,
+        },
         ip_address: row.get("ip_address"),
         user_agent: row.get("user_agent"),
     }
@@ -223,14 +239,22 @@ impl AuthStore for PgStore {
 
     async fn create_session(&self, new: NewAuthSession) -> Result<AuthSession, StoreError> {
         sqlx::query(
-            "INSERT INTO auth_sessions (user_id, token_hash, expires_at, ip_address, user_agent)
-             VALUES ($1, $2, $3, $4, $5) RETURNING *",
+            "INSERT INTO auth_sessions
+                 (user_id, token_hash, expires_at, ip_address, user_agent,
+                  oidc_id_token, oidc_end_session_endpoint)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
         )
         .bind(new.user_id as i64)
         .bind(&new.token_hash)
         .bind(new.expires_at)
         .bind(&new.ip_address)
         .bind(&new.user_agent)
+        .bind(new.oidc_logout.as_ref().map(|l| l.id_token.clone()))
+        .bind(
+            new.oidc_logout
+                .as_ref()
+                .map(|l| l.end_session_endpoint.clone()),
+        )
         .fetch_one(self.pool())
         .await
         .map(|row| session_from_row(&row))
@@ -244,6 +268,7 @@ impl AuthStore for PgStore {
         let row = sqlx::query(
             "SELECT s.id, s.user_id, s.token_hash, s.created_at, s.expires_at,
                     s.last_used_at, s.ip_address, s.user_agent,
+                    s.oidc_id_token, s.oidc_end_session_endpoint,
                     u.id AS u_id, u.uuid AS u_uuid, u.email_address AS u_email,
                     u.first_name AS u_first, u.last_name AS u_last, u.admin AS u_admin
              FROM auth_sessions s JOIN users u ON u.id = s.user_id

@@ -42,6 +42,44 @@ Sessions are opaque bearer tokens (stored hashed, SHA-256) with a sliding
 expiry of `auth.session_timeout_days` (default 14). `POST /api/v2/auth/logout`
 revokes the current session.
 
+### Signing out of an OIDC session
+
+Revoking the local session does not end the identity provider's session. The
+next sign-in then succeeds without a prompt, which looks to the user as
+though logout did nothing.
+
+For a session created through OIDC, logout therefore answers with the
+provider's end-session URL, and the caller navigates to it. This is OpenID
+Connect RP-Initiated Logout:
+
+```json
+{
+  "logged_out": true,
+  "end_session_url": "https://idp.example/protocol/openid-connect/logout?id_token_hint=…&post_logout_redirect_uri=…"
+}
+```
+
+The field is `null` for a session that came from a password, 2FA, WebAuthn,
+GitHub or SAML login, and for an OIDC provider that advertises no
+`end_session_endpoint` in its discovery document. In those cases revoking
+locally is all there is to do.
+
+Two consequences worth knowing before enabling SSO:
+
+- **Logout becomes a browser navigation.** The dashboard leaves the app, the
+  provider ends its session, and the user comes back to `/login`. Register
+  `{web_protocol}://{web_hostname}/login` as a post-logout redirect URI with
+  the provider, or it will refuse the redirect and leave the user on its own
+  page.
+- **The local session is revoked first, unconditionally.** Whatever the
+  provider does next, and whether or not the user completes the navigation,
+  the token stops working here.
+
+The `id_token` is passed back as `id_token_hint` because providers such as
+Keycloak reject an end-session request carrying neither that nor a
+`client_id`. It is kept on the session row for exactly that purpose and
+disappears with the row when the session ends.
+
 Error codes a frontend can branch on at login: `InvalidCredentials`,
 `AccountLocked` (after `auth.max_login_attempts` failures, for
 `auth.lockout_minutes`), `AccountDisabled` (deactivated, e.g. via SCIM),

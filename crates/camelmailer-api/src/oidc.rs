@@ -31,7 +31,7 @@ use std::sync::Arc;
 use crate::app::{
     render_error, render_success, timing_middleware, ApiResponse, ApiState, RequestStart,
 };
-use crate::auth_api::{client_ip, issue_session, user_json};
+use crate::auth_api::{client_ip, issue_session_with_oidc_logout, user_json};
 
 const STATE_TTL_MINUTES: i64 = 10;
 
@@ -55,6 +55,12 @@ pub(crate) struct Discovery {
     pub(crate) token_endpoint: String,
     pub(crate) jwks_uri: String,
     pub(crate) issuer: String,
+    /// Where to send the browser to end the provider's own session
+    /// (OpenID Connect RP-Initiated Logout). Optional: a provider that does
+    /// not advertise one does not support RP-initiated logout, and sessions
+    /// from it simply end locally.
+    #[serde(default)]
+    pub(crate) end_session_endpoint: Option<String>,
 }
 
 pub(crate) async fn fetch_discovery(issuer: &str) -> Result<Discovery, String> {
@@ -395,7 +401,18 @@ async fn oidc_callback(
         })
         .await;
 
-    match issue_session(&store, &state, &user, &headers).await {
+    // Keep what RP-initiated logout needs. The endpoint is taken from the
+    // discovery document fetched above, so signing out later never waits on
+    // the provider; a provider advertising none simply has no RP-initiated
+    // logout and the session ends locally.
+    let oidc_logout = discovery.end_session_endpoint.as_ref().map(|endpoint| {
+        camelmailer_core::auth::OidcLogout {
+            id_token: id_token.clone(),
+            end_session_endpoint: endpoint.clone(),
+        }
+    });
+
+    match issue_session_with_oidc_logout(&store, &state, &user, &headers, oidc_logout).await {
         Ok((token, session)) => {
             // With a frontend configured, hand the token over in the URL
             // fragment (fragments never reach server logs).

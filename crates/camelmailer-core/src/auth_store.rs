@@ -332,6 +332,7 @@ impl AuthStore for MemoryStore {
             last_used_at: now,
             ip_address: new.ip_address,
             user_agent: new.user_agent,
+            oidc_logout: new.oidc_logout,
         };
         self.inner
             .write()
@@ -1042,6 +1043,7 @@ mod tests {
                 expires_at: expires,
                 ip_address: Some("10.0.0.1".into()),
                 user_agent: Some("test".into()),
+                oidc_logout: None,
             })
             .await
             .unwrap();
@@ -1073,6 +1075,7 @@ mod tests {
                     expires_at: Utc::now() + Duration::days(1),
                     ip_address: None,
                     user_agent: None,
+                    oidc_logout: None,
                 })
                 .await
                 .unwrap();
