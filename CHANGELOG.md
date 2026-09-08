@@ -33,6 +33,24 @@ integration tests) is green.
   release workflow uses. Previously nothing in CI touched `web/app` and the
   image was built only when a tag was pushed, so a break there surfaced at
   release time rather than in the pull request.
+- **The domain SPF health check evaluates the policy instead of comparing
+  text.** It asked whether the record contained this installation's
+  mechanism, which warns on a domain that authorizes us through an
+  `include:` chain and cannot see a hosted SPF service at all. When the
+  installation pins its source addresses with an IP pool, the check now
+  evaluates the domain's policy against those addresses the way a receiver
+  does, following `include:` and `redirect=` inside the RFC 7208 ten-lookup
+  budget, and grades `ok` when each one passes. A record using macros
+  (`include:%{ir}...`, as hosted SPF services publish), `exists:` or `ptr`
+  reports that it could not be verified, naming the term and the record that
+  carried it, rather than proposing an edit that may be unnecessary. A failed
+  DNS lookup during evaluation reports as retryable. Without an IP pool the
+  source address is not knowable from the API, and the check falls back to
+  the previous text comparison.
+- `camelmailer-core::spf` gained `evaluate_verifiable`, which reports whether
+  its answer can be trusted. `evaluate` is unchanged, so the inbound
+  `Received-SPF` verdict is exactly what it was; a test pins that for a macro
+  record. `DnsError` is now `Clone` so a caller can memoize lookups.
 
 ## [0.7.8] - 2026-09-08
 

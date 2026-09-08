@@ -245,6 +245,12 @@ async fn web_server() -> std::io::Result<()> {
         None
     };
 
+    // Shared by both branches: the domain health check evaluates a sending
+    // domain's SPF against this installation's sending addresses, which needs
+    // TXT, A/AAAA and MX rather than the TXT-only verification resolver.
+    let spf_resolver: Arc<dyn camelmailer_core::SpfResolver> =
+        Arc::new(camelmailer_api::dns::HickorySpfResolver::new());
+
     let (state, tracking) = if postgres_enabled(&config) {
         // One Postgres store, shared as the admin store, the tenant-scoped
         // server store, the account store, and the tracking store.
@@ -257,7 +263,8 @@ async fn web_server() -> std::io::Result<()> {
             config.clone(),
             billing,
         )
-        .with_org_sso_store(pg.clone());
+        .with_org_sso_store(pg.clone())
+        .with_spf_resolver(spf_resolver.clone());
         let tracking: Arc<dyn TrackingStore> = pg;
         (state, Some(tracking))
     } else {
@@ -271,7 +278,8 @@ async fn web_server() -> std::io::Result<()> {
             config.clone(),
             billing,
         )
-        .with_org_sso_store(memory);
+        .with_org_sso_store(memory)
+        .with_spf_resolver(spf_resolver.clone());
         (state, None)
     };
 

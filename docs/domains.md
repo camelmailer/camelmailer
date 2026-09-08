@@ -157,11 +157,39 @@ config:
   hostname: `v=spf1 a:<camelmailer.smtp_hostname> ~all`.
 
 Publish exactly **one** `v=spf1` record on the domain and keep the `all`
-qualifier at `~all` (softfail) or `-all` (hardfail). The health check
-grades SPF `ok` when a single `v=spf1` record exists, includes this
-installation, and ends in `~all` or `-all`. It warns on a soft `?all`,
-an open `+all`, a missing mechanism, or more than one SPF record
-(receivers treat multiple `v=spf1` records as a permanent error).
+qualifier at `~all` (softfail) or `-all` (hardfail). The health check warns
+on a soft `?all`, an open `+all`, or more than one SPF record (receivers
+treat multiple `v=spf1` records as a permanent error).
+
+### How the check decides the record authorizes this installation
+
+When the installation pins its source addresses with an IP pool, the check
+**evaluates** the domain's published policy against those addresses, the way
+a receiver does, following `include:` and `redirect=` within the RFC 7208
+ten-lookup budget. It grades `ok` when every one of them evaluates to `pass`.
+
+That matters because a record does not have to name this installation's
+mechanism to authorize it. A domain whose record is
+`v=spf1 include:reseller.example -all`, where the reseller in turn includes
+us, authorizes us perfectly well, and an earlier version of this check
+reported that as a problem.
+
+Two cases the check refuses to guess about, reporting that it could not
+verify rather than proposing an edit:
+
+- **Hosted SPF with macros.** Services like Proofpoint publish
+  `include:%{ir}.%{v}.%{d}.spf.has.pphosted.com`; the target name only exists
+  once expanded against a specific sending address, so it cannot be resolved
+  from a record alone. `exists:` and the deprecated `ptr` are the same class.
+- **A DNS lookup that failed** during evaluation, which is a reason to retry
+  rather than a verdict about the record.
+
+Without an IP pool the source address is whatever the host uses for outbound
+connections, which the API cannot know. The check then falls back to looking
+for this installation's mechanism in the record text and suggesting it if
+absent, which is the older, weaker behaviour.
+
+The check reads `ignored` for a domain with `check_spf` set to `false`.
 
 If the domain already sends through another provider, keep it to one
 record by merging the mechanisms, for example

@@ -2045,3 +2045,192 @@ async fn domain_spf_check_can_be_disabled_and_reads_ignored() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let _ = resolver;
 }
+
+// ------------------------------------- SPF health: real evaluation
+//
+// The check used to ask "does this record's text contain our mechanism?",
+// which warns on a domain that authorizes us through an include chain and
+// cannot see a hosted SPF service at all. These drive the endpoint with a
+// full SPF resolver and a configured sending address, so the question becomes
+// "would a receiver accept our mail for this domain?".
+
+/// An app whose SPF resolver and sending address are both configured, plus a
+/// domain to check. Returns the app and the SPF resolver to publish records on.
+async fn build_app_for_spf_evaluation(
+    domain: &str,
+) -> (
+    Router,
+    Arc<StaticDnsResolver>,
+    Arc<camelmailer_core::StaticSpfResolver>,
+) {
+    let dns = Arc::new(StaticDnsResolver::new());
+    let spf = Arc::new(camelmailer_core::StaticSpfResolver::new());
+    let store = Arc::new(MemoryStore::new());
+    let state = ApiState::new_with_resolver(store, Some(GLOBAL_KEY.to_string()), dns.clone())
+        .with_spf_resolver(spf.clone());
+    let app = build_router(state);
+
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Acme", "permalink": "acme" })),
+    )
+    .await;
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations/acme/servers",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Mail", "permalink": "mail" })),
+    )
+    .await;
+
+    // A pool with one address, assigned to the server: this is what makes the
+    // installation's sending address knowable, and therefore evaluable.
+    let (_, pool) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/ip_pools",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Pool", "default": true })),
+    )
+    .await;
+    let pool_id = pool["data"]["ip_pool"]["id"].as_u64().unwrap();
+    request(
+        &app,
+        "POST",
+        &format!("/api/v2/admin/ip_pools/{pool_id}/ip_addresses"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "ipv4": "203.0.113.10", "hostname": "mx.camelmailer.test" })),
+    )
+    .await;
+    request(
+        &app,
+        "POST",
+        &format!("{BASE}/ip_pool"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "ip_pool_id": pool_id })),
+    )
+    .await;
+
+    request(
+        &app,
+        "POST",
+        &format!("{BASE}/domains"),
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": domain })),
+    )
+    .await;
+    (app, dns, spf)
+}
+
+async fn spf_check(app: &Router, domain: &str) -> Value {
+    let (_, health) = request(
+        app,
+        "GET",
+        &format!("{BASE}/domains/{domain}/health"),
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    health["data"]["health"]["checks"]["spf"].clone()
+}
+
+#[tokio::test]
+async fn spf_passes_when_an_include_chain_authorizes_the_sending_address() {
+    // The domain never names our mechanism. A text comparison warns here;
+    // evaluation follows the chain and finds the address authorized.
+    let (app, dns, spf) = build_app_for_spf_evaluation("chained.example").await;
+    let record = "v=spf1 include:reseller.example -all";
+    dns.add_txt("chained.example", record);
+    spf.add_txt("chained.example", record);
+    spf.add_txt("reseller.example", "v=spf1 include:spf.provider.test ~all");
+    spf.add_txt("spf.provider.test", "v=spf1 ip4:203.0.113.0/24 -all");
+
+    let check = spf_check(&app, "chained.example").await;
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(check["problems"].as_array().unwrap().is_empty(), "{check}");
+}
+
+#[tokio::test]
+async fn spf_is_unverifiable_rather_than_wrong_for_a_hosted_macro_record() {
+    // Proofpoint's shape. The old check told the operator to add an include
+    // they may not need; this says it cannot tell, and why.
+    let (app, dns, spf) = build_app_for_spf_evaluation("hosted.example").await;
+    let record = "v=spf1 include:%{ir}.%{v}.%{d}.spf.has.pphosted.com ~all";
+    dns.add_txt("hosted.example", record);
+    spf.add_txt("hosted.example", record);
+
+    let check = spf_check(&app, "hosted.example").await;
+    assert_eq!(check["status"], "warning", "{check}");
+    let problems = check["problems"].as_array().unwrap();
+    let text = problems[0].as_str().unwrap();
+    assert!(
+        text.contains("cannot be verified automatically"),
+        "expected an honest 'cannot verify', got: {text}"
+    );
+    assert!(text.contains("macro"), "{text}");
+    assert!(
+        !text.contains("add include:"),
+        "must not instruct an edit it cannot justify: {text}"
+    );
+}
+
+#[tokio::test]
+async fn spf_warns_with_the_address_when_the_record_really_does_not_authorize_us() {
+    let (app, dns, spf) = build_app_for_spf_evaluation("elsewhere.example").await;
+    let record = "v=spf1 ip4:198.51.100.0/24 -all";
+    dns.add_txt("elsewhere.example", record);
+    spf.add_txt("elsewhere.example", record);
+
+    let check = spf_check(&app, "elsewhere.example").await;
+    assert_eq!(check["status"], "warning", "{check}");
+    let text = check["problems"].as_array().unwrap()[0].as_str().unwrap();
+    assert!(text.contains("does not authorize"), "{text}");
+    assert!(
+        text.contains("203.0.113.10"),
+        "the message should name the address that failed: {text}"
+    );
+}
+
+#[tokio::test]
+async fn spf_falls_back_to_the_text_check_without_a_configured_sending_address() {
+    // No IP pool: the host's egress address is not knowable here, so the
+    // endpoint keeps the behaviour it always had rather than guessing.
+    let dns = Arc::new(StaticDnsResolver::new());
+    let spf = Arc::new(camelmailer_core::StaticSpfResolver::new());
+    let store = Arc::new(MemoryStore::new());
+    let state = ApiState::new_with_resolver(store, Some(GLOBAL_KEY.to_string()), dns.clone())
+        .with_spf_resolver(spf.clone());
+    let app = build_router(state);
+    for (method, path, body) in [
+        (
+            "POST",
+            "/api/v2/admin/organizations".to_string(),
+            json!({ "name": "Acme", "permalink": "acme" }),
+        ),
+        (
+            "POST",
+            "/api/v2/admin/organizations/acme/servers".to_string(),
+            json!({ "name": "Mail", "permalink": "mail" }),
+        ),
+        (
+            "POST",
+            format!("{BASE}/domains"),
+            json!({ "name": "nopool.example" }),
+        ),
+    ] {
+        request(&app, method, &path, Some(GLOBAL_KEY), Some(body)).await;
+    }
+    dns.add_txt("nopool.example", "v=spf1 include:_spf.google.com ~all");
+
+    let check = spf_check(&app, "nopool.example").await;
+    assert_eq!(check["status"], "warning", "{check}");
+    let text = check["problems"].as_array().unwrap()[0].as_str().unwrap();
+    assert!(
+        text.starts_with("add "),
+        "expected the text-comparison advice: {text}"
+    );
+}
