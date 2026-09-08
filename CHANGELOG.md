@@ -27,6 +27,12 @@ integration tests) is green.
   means the same thing locally and in CI. New stable lints arrive when the
   file is bumped rather than on upstream's schedule, which is the point. This
   is not an MSRV declaration.
+- CI now covers the dashboard. `ci.yml` gained a `web` job (`tsc --noEmit`,
+  vitest, and eslint surfaced without gating) and a `web-image` job that
+  builds the dashboard image with `context: web/app`, the same isolation the
+  release workflow uses. Previously nothing in CI touched `web/app` and the
+  image was built only when a tag was pushed, so a break there surfaced at
+  release time rather than in the pull request.
 
 ## [0.7.8] - 2026-09-08
 
