@@ -4,6 +4,7 @@
 //! and the sink it is queued into.
 
 use crate::model::Id;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// Parse the header block of a raw message (up to the first empty line),
@@ -77,7 +78,7 @@ pub struct QueuedMessage {
 }
 
 /// The public identity of a message accepted via the HTTP send API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SentMessage {
     pub id: i64,
     pub token: String,
@@ -124,15 +125,39 @@ pub struct MessageRecord {
 }
 
 /// Where accepted messages go. The production implementation writes to the
-/// per-server MariaDB message database; [`MemorySink`] collects them for
+/// PostgreSQL message database; [`MemorySink`] collects them for
 /// tests.
 pub trait MessageSink: Send + Sync {
     fn queue_message(&self, message: QueuedMessage);
+
+    /// Replay a completed claim before applying the current allowance to a
+    /// new submission. A quota rejection must not reserve the key.
+    fn queue_messages(
+        &self,
+        messages: Vec<QueuedMessage>,
+        idempotency: Option<crate::server_store::IdempotencyRequest>,
+        allowance: crate::SendAllowance,
+    ) -> QueueMessagesOutcome;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueMessagesOutcome {
+    Stored,
+    Replayed,
+    Conflict,
+    LimitExceeded(String),
+    Failed(String),
+}
+
+#[derive(Default)]
+struct MemorySinkInner {
+    messages: Vec<QueuedMessage>,
+    idempotency_requests: HashMap<(Id, String), (String, String, chrono::DateTime<chrono::Utc>)>,
 }
 
 #[derive(Default)]
 pub struct MemorySink {
-    messages: Mutex<Vec<QueuedMessage>>,
+    inner: Mutex<MemorySinkInner>,
 }
 
 impl MemorySink {
@@ -141,13 +166,63 @@ impl MemorySink {
     }
 
     pub fn messages(&self) -> Vec<QueuedMessage> {
-        self.messages.lock().unwrap().clone()
+        self.inner.lock().unwrap().messages.clone()
     }
 }
 
 impl MessageSink for MemorySink {
     fn queue_message(&self, message: QueuedMessage) {
-        self.messages.lock().unwrap().push(message);
+        self.inner.lock().unwrap().messages.push(message);
+    }
+
+    fn queue_messages(
+        &self,
+        messages: Vec<QueuedMessage>,
+        idempotency: Option<crate::server_store::IdempotencyRequest>,
+        allowance: crate::SendAllowance,
+    ) -> QueueMessagesOutcome {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(request) = &idempotency {
+            let cache_key = (
+                messages.first().map(|m| m.server_id).unwrap_or(0),
+                request.key_hash.clone(),
+            );
+            if let Some((request_hash, operation, expires_at)) =
+                inner.idempotency_requests.get(&cache_key)
+            {
+                if *expires_at > chrono::Utc::now() {
+                    if request_hash == &request.request_hash && operation == &request.operation {
+                        return QueueMessagesOutcome::Replayed;
+                    }
+                    return QueueMessagesOutcome::Conflict;
+                }
+            }
+        }
+        if !allowance.allows(
+            messages
+                .iter()
+                .filter(|m| m.scope == MessageScope::Outgoing)
+                .count() as i64,
+        ) {
+            return QueueMessagesOutcome::LimitExceeded(allowance.rejection_message());
+        }
+        if let Some(request) = &idempotency {
+            let cache_key = (
+                messages.first().map(|m| m.server_id).unwrap_or(0),
+                request.key_hash.clone(),
+            );
+            inner.idempotency_requests.remove(&cache_key);
+            inner.idempotency_requests.insert(
+                cache_key,
+                (
+                    request.request_hash.clone(),
+                    request.operation.clone(),
+                    request.expires_at,
+                ),
+            );
+        }
+        inner.messages.extend(messages);
+        QueueMessagesOutcome::Stored
     }
 }
 

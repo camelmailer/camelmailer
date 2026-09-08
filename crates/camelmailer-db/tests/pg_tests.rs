@@ -7,11 +7,11 @@
 //! parallel without interfering.
 
 use camelmailer_core::{
-    AdminStore, CredentialType, DomainOwner, ImportClick, ImportDelivery, ImportEvent,
-    ImportMessage, MessageFilter, MessageScope, NewOrgEmailDomain, NewOrgSsoConnection,
-    NewOrganization, NewRoute, NewServer, NewWebhook, OrgSsoConnectionUpdate, OrgSsoStore,
-    QueuedMessage, Role, RouteMode, ServerMode, ServerStore, SsoKind, Store, TrackingStore,
-    TrackingTarget,
+    AdminStore, CredentialType, DomainOwner, IdempotencyRequest, ImportClick, ImportDelivery,
+    ImportEvent, ImportMessage, MessageFilter, MessageScope, NewOrgEmailDomain,
+    NewOrgSsoConnection, NewOrganization, NewRoute, NewServer, NewWebhook, OrgSsoConnectionUpdate,
+    OrgSsoStore, QueuedMessage, Role, RouteMode, SendPlanItem, ServerMode, ServerStore, SsoKind,
+    Store, StoreSendOutcome, TrackingStore, TrackingTarget,
 };
 use camelmailer_db::{PgMessageSink, PgStore};
 use rand::Rng;
@@ -185,7 +185,204 @@ fn message_for(server_id: camelmailer_core::Id, rcpt_to: &str) -> QueuedMessage 
     }
 }
 
+fn idempotency_request(
+    key: &str,
+    request: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> IdempotencyRequest {
+    IdempotencyRequest {
+        key_hash: camelmailer_core::hashing::sha256_hex(key.as_bytes()),
+        request_hash: camelmailer_core::hashing::sha256_hex(request.as_bytes()),
+        operation: "messages.send".into(),
+        expires_at,
+    }
+}
+
 // ------------------------------------------------------------ RLS isolation
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idempotent_send_replays_atomically_in_postgres() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let messages = || {
+        vec![
+            QueuedMessage {
+                scope: MessageScope::Outgoing,
+                ..message_for(f.server.id, "a@dest.example")
+            }
+            .into(),
+            QueuedMessage {
+                scope: MessageScope::Outgoing,
+                ..message_for(f.server.id, "b@dest.example")
+            }
+            .into(),
+        ]
+    };
+    let request = idempotency_request(
+        "welcome/user-42",
+        "normalized-request",
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    );
+
+    let first = f
+        .store
+        .store_send_operation(
+            f.server.id,
+            vec![SendPlanItem::Messages(messages())],
+            Some(request.clone()),
+        )
+        .await
+        .unwrap();
+    let second = f
+        .store
+        .store_send_operation(
+            f.server.id,
+            vec![SendPlanItem::Messages(messages())],
+            Some(request),
+        )
+        .await
+        .unwrap();
+
+    let StoreSendOutcome::Stored(first) = first else {
+        panic!("first send was not stored");
+    };
+    let StoreSendOutcome::Replayed(second) = second else {
+        panic!("second send was not replayed");
+    };
+    assert_eq!(first, second);
+    assert_eq!(
+        f.store
+            .messages(f.server.id, &MessageFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let queued: i64 = sqlx::query("SELECT count(*) AS c FROM queued_messages")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("c");
+    assert_eq!(queued, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_postgres_sends_with_one_key_create_one_recipient_set() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let request = idempotency_request(
+        "concurrent/send-1",
+        "normalized-request",
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    );
+    let plan = || {
+        vec![SendPlanItem::Messages(vec![QueuedMessage {
+            scope: MessageScope::Outgoing,
+            ..message_for(f.server.id, "a@dest.example")
+        }
+        .into()])]
+    };
+
+    let first = f
+        .store
+        .store_send_operation(f.server.id, plan(), Some(request.clone()));
+    let second = f
+        .store
+        .store_send_operation(f.server.id, plan(), Some(request));
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert!(matches!(
+        (&first, &second),
+        (StoreSendOutcome::Stored(_), StoreSendOutcome::Replayed(_))
+            | (StoreSendOutcome::Replayed(_), StoreSendOutcome::Stored(_))
+    ));
+    let first_response = match first {
+        StoreSendOutcome::Stored(response) | StoreSendOutcome::Replayed(response) => response,
+        StoreSendOutcome::Conflict => unreachable!(),
+    };
+    let second_response = match second {
+        StoreSendOutcome::Stored(response) | StoreSendOutcome::Replayed(response) => response,
+        StoreSendOutcome::Conflict => unreachable!(),
+    };
+    assert_eq!(first_response, second_response);
+
+    assert_eq!(
+        f.store
+            .messages(f.server.id, &MessageFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let queued: i64 = sqlx::query("SELECT count(*) AS c FROM queued_messages")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("c");
+    assert_eq!(queued, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_payload_conflicts_and_expired_key_can_be_reused() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let plan = || {
+        vec![SendPlanItem::Messages(vec![QueuedMessage {
+            scope: MessageScope::Outgoing,
+            ..message_for(f.server.id, "a@dest.example")
+        }
+        .into()])]
+    };
+    let expired = idempotency_request(
+        "receipt/order-7",
+        "original",
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+    );
+    assert!(matches!(
+        f.store
+            .store_send_operation(f.server.id, plan(), Some(expired))
+            .await
+            .unwrap(),
+        StoreSendOutcome::Stored(_)
+    ));
+
+    let fresh = idempotency_request(
+        "receipt/order-7",
+        "new-after-expiry",
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    );
+    assert!(matches!(
+        f.store
+            .store_send_operation(f.server.id, plan(), Some(fresh.clone()))
+            .await
+            .unwrap(),
+        StoreSendOutcome::Stored(_)
+    ));
+
+    let changed = IdempotencyRequest {
+        request_hash: camelmailer_core::hashing::sha256_hex(b"changed-again"),
+        ..fresh
+    };
+    assert!(matches!(
+        f.store
+            .store_send_operation(f.server.id, plan(), Some(changed))
+            .await
+            .unwrap(),
+        StoreSendOutcome::Conflict
+    ));
+    assert_eq!(
+        f.store
+            .messages(f.server.id, &MessageFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rls_scopes_reads_to_the_tenant_context() {
@@ -5475,4 +5672,255 @@ async fn a_send_limit_round_trips_through_the_server_row() {
     .unwrap()
     .unwrap();
     assert_eq!(reloaded.send_limit, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtp_idempotency_replays_before_quota_rejection_in_postgres() {
+    use camelmailer_core::{MessageSink, QueueMessagesOutcome, SendAllowance};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let messages = || {
+        vec![QueuedMessage {
+            scope: MessageScope::Outgoing,
+            ..message_for(f.server.id, "recipient@example.net")
+        }]
+    };
+    let mut request = idempotency_request(
+        "smtp/quota",
+        "original",
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    );
+    request.operation = "smtp.send".into();
+    let available = SendAllowance {
+        limit: Some(1),
+        used: 0,
+    };
+    let exhausted = SendAllowance {
+        limit: Some(1),
+        used: 1,
+    };
+    assert_eq!(
+        sink.queue_messages(messages(), Some(request.clone()), available),
+        QueueMessagesOutcome::Stored
+    );
+    assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 1);
+    // A fresh sink uses the durable response from the first submission.
+    let retry_sink = PgMessageSink::new(f.store.clone());
+    assert_eq!(
+        retry_sink.queue_messages(messages(), Some(request.clone()), exhausted),
+        QueueMessagesOutcome::Replayed
+    );
+    let changed = IdempotencyRequest {
+        request_hash: "changed".into(),
+        ..request.clone()
+    };
+    assert_eq!(
+        retry_sink.queue_messages(messages(), Some(changed), exhausted),
+        QueueMessagesOutcome::Conflict
+    );
+    let new = IdempotencyRequest {
+        key_hash: "new-key-hash".into(),
+        ..request
+    };
+    assert!(matches!(
+        retry_sink.queue_messages(messages(), Some(new.clone()), exhausted),
+        QueueMessagesOutcome::LimitExceeded(_)
+    ));
+    assert!(matches!(
+        retry_sink.queue_messages(messages(), None, exhausted),
+        QueueMessagesOutcome::LimitExceeded(_)
+    ));
+    assert!(matches!(
+        f.store.idempotency_lookup(f.server.id, &new).await.unwrap(),
+        camelmailer_core::IdempotencyLookup::New
+    ));
+    assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 1);
+    assert_eq!(
+        sink.messages_for_server(f.server.id).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        retry_sink.queue_messages(
+            messages(),
+            Some(new),
+            SendAllowance {
+                limit: Some(2),
+                used: 1
+            }
+        ),
+        QueueMessagesOutcome::Stored
+    );
+    assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idempotency_rows_are_tenant_isolated_and_pruned_across_servers() {
+    use camelmailer_core::IdempotencyLookup;
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let expired = idempotency_request("expired", "body", now - chrono::Duration::seconds(1));
+    let fresh = idempotency_request("fresh", "body", now + chrono::Duration::hours(24));
+    for server in [f.server.id, other.id] {
+        for request in [&expired, &fresh] {
+            assert!(matches!(
+                f.store
+                    .store_send_operation(server, vec![], Some(request.clone()))
+                    .await
+                    .unwrap(),
+                StoreSendOutcome::Stored(_)
+            ));
+        }
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+            .bind(server.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT server_id FROM idempotency_requests")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![server as i64; 2]);
+        tx.commit().await.unwrap();
+    }
+    let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM idempotency_requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(visible, 0);
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+        .bind(f.server.id.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let error = sqlx::query("INSERT INTO idempotency_requests (server_id, key_hash, request_hash, operation, response, expires_at) VALUES ($1, 'foreign-key', 'body', 'smtp.send', '{}', now())")
+        .bind(other.id as i64).execute(&mut *tx).await.unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("42501")
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(f.store.prune_idempotency_requests(now).await.unwrap(), 2);
+    for server in [f.server.id, other.id] {
+        assert!(matches!(
+            f.store.idempotency_lookup(server, &expired).await.unwrap(),
+            IdempotencyLookup::New
+        ));
+        assert!(matches!(
+            f.store.idempotency_lookup(server, &fresh).await.unwrap(),
+            IdempotencyLookup::Replay(_)
+        ));
+    }
+    assert_eq!(f.store.prune_idempotency_requests(now).await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idempotency_storage_failure_rolls_back_every_send_artifact() {
+    use camelmailer_core::{IdempotencyLookup, PendingUnsubscribeToken, SendPlanMessage};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let request = idempotency_request(
+        "atomic/send",
+        "body",
+        chrono::Utc::now() + chrono::Duration::hours(24),
+    );
+    let plan = |second_token: &str| {
+        vec![SendPlanItem::Messages(
+            ["first-token", second_token]
+                .into_iter()
+                .enumerate()
+                .map(|(index, token)| {
+                    let address = format!("recipient{index}@example.net");
+                    SendPlanMessage {
+                        message: QueuedMessage {
+                            scope: MessageScope::Outgoing,
+                            ..message_for(f.server.id, &address)
+                        },
+                        unsubscribe_token: Some(PendingUnsubscribeToken {
+                            token: token.into(),
+                            stream_id: None,
+                            address,
+                        }),
+                    }
+                })
+                .collect(),
+        )]
+    };
+    // The duplicate token fails on the second recipient, after the first
+    // recipient's message, queue row, counter and unsubscribe token exist.
+    assert!(f
+        .store
+        .store_send_operation(f.server.id, plan("first-token"), Some(request.clone()))
+        .await
+        .is_err());
+    assert!(matches!(
+        f.store
+            .idempotency_lookup(f.server.id, &request)
+            .await
+            .unwrap(),
+        IdempotencyLookup::New
+    ));
+    assert_eq!(
+        ServerStore::send_usage(&f.store, f.server.id)
+            .await
+            .unwrap(),
+        0
+    );
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+        .bind(f.server.id.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    for table in [
+        "messages",
+        "queued_messages",
+        "unsubscribe_tokens",
+        "server_send_counters",
+        "idempotency_requests",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table} must roll back");
+    }
+    tx.commit().await.unwrap();
+    assert!(matches!(
+        f.store
+            .store_send_operation(f.server.id, plan("second-token"), Some(request))
+            .await
+            .unwrap(),
+        StoreSendOutcome::Stored(_)
+    ));
+    assert_eq!(
+        ServerStore::send_usage(&f.store, f.server.id)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        f.store
+            .messages(f.server.id, &MessageFilter::default())
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }

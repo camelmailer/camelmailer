@@ -15,8 +15,7 @@
 //!
 //! - the HTTP send path (`enqueue_send`), which every API send funnels
 //!   through, including broadcasts and campaigns,
-//! - SMTP `RCPT TO`, so an over-quota submission is refused before its body
-//!   crosses the wire.
+//! - SMTP end of DATA, after a completed idempotent retry can be recognized.
 //!
 //! Both consult [`SendAllowance`], so the two surfaces cannot disagree about
 //! what the limit means.

@@ -15,6 +15,28 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- Optional idempotent submission through `Idempotency-Key` on all four HTTP
+  send endpoints and `CamelMailer-Idempotency-Key` on authenticated SMTP
+  messages. Server-scoped keys retain completed results for 24 hours, so
+  retries return the original result without queuing duplicate recipients.
+  Reusing a key for different content or another send operation is rejected.
+- Migration `0045` adds tenant-isolated idempotency records. Recipient messages,
+  queue entries, unsubscribe tokens and the saved response commit together;
+  worker housekeeping removes expired records. Apply migrations before running
+  the updated API, SMTP server or worker.
+
+### Changed
+
+- SMTP evaluates send limits after DATA so completed keyed submissions can
+  replay even when the server's quota is full. New submissions exceeding the
+  allowance receive `550 5.7.1` before storage. HTTP batches count recipients
+  already accepted into the batch when evaluating later entries.
+- Custom Rust storage implementations must implement the new idempotency
+  methods on `ServerStore` and `MessageSink::queue_messages`. Sends without
+  a key continue to queue a new message for each submission.
+
 ## [0.7.7] - 2026-09-07
 
 ### Added

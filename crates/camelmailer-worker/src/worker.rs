@@ -1118,6 +1118,14 @@ impl Worker {
         let api_cutoff = now - chrono::Duration::days(API_REQUEST_RETENTION_DAYS);
         let removed =
             camelmailer_core::ServerStore::prune_api_requests(&self.store, api_cutoff).await?;
+        let expired_idempotency =
+            camelmailer_core::ServerStore::prune_idempotency_requests(&self.store, now).await?;
+        if expired_idempotency > 0 {
+            tracing::info!(
+                pruned = expired_idempotency,
+                "pruned expired send-idempotency responses"
+            );
+        }
 
         if self.message_retention_days > 0 {
             let message_cutoff = now - chrono::Duration::days(self.message_retention_days);

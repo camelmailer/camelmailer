@@ -3,8 +3,8 @@
 Sending is the core of CamelMailer. You hand a message to the platform,
 it stores and queues it, and the delivery worker takes it from there. There
 are two front doors into that same pipeline: an HTTP send API and SMTP
-submission. Both authenticate with a server API credential, both apply the
-same From-address rules, and both end in one stored, queued message per
+submission. Both authenticate with a server-scoped credential, both apply
+the same From-address rules, and both end in one stored, queued message per
 recipient.
 
 This page covers both doors, the request and response shapes, attachments
@@ -126,6 +126,40 @@ while the others still queue:
 }
 ```
 
+### Idempotent retries
+
+Add an `Idempotency-Key` header when a send may be retried after a timeout or
+lost response:
+
+```bash
+-H "Idempotency-Key: receipt/order-10432"
+```
+
+The key must be 1–256 characters and is scoped to the authenticated server.
+CamelMailer retains a completed result for 24 hours:
+
+- retrying the same endpoint and normalized request with the same key returns
+  the original success response, including the original message ids and
+  tokens, without queueing another message;
+- reusing the key for another payload or send endpoint returns
+  `409 InvalidIdempotentRequest`;
+- an empty, repeated, or overlong header returns
+  `400 InvalidIdempotencyKey`;
+- a batch key covers the whole batch, including its per-item success and error
+  results.
+
+The 256-character limit applies to the caller-provided key before it is
+hashed. CamelMailer stores only SHA-256 hashes of the key and normalized
+request, but validating the external value first keeps the public protocol
+bounded and predictable. Key length therefore does not affect the database
+index size.
+
+Generate a key for the application operation you are protecting—for example,
+`receipt/order-10432`. Do not use the email's RFC `Message-ID` as the
+idempotency key. `Message-ID` identifies a MIME message; an idempotency key
+identifies a send API operation and must be available before CamelMailer
+creates and queues that message.
+
 ### How message IDs work
 
 Three separate identifiers travel with a message, and it helps to keep them
@@ -148,7 +182,9 @@ the body.
 
 ```bash
 curl -s -X POST "$API/api/v2/server/messages" \
-  -H "X-Server-API-Key: $SERVER_KEY" -H "Content-Type: application/json" \
+  -H "X-Server-API-Key: $SERVER_KEY" \
+  -H "Idempotency-Key: receipt/order-10432" \
+  -H "Content-Type: application/json" \
   -d '{
     "from": { "email": "billing@acme.example", "name": "Acme Billing" },
     "to": ["ada@example.com"],
@@ -259,6 +295,7 @@ swaks --server mx.example.com --port 587 --tls \
   --auth PLAIN --auth-user ignored --auth-password "$SMTP_KEY" \
   --from billing@acme.example \
   --to ada@example.com \
+  --header "CamelMailer-Idempotency-Key: receipt/order-10432" \
   --header "Subject: Your receipt" \
   --body "Thanks for your purchase."
 ```
@@ -266,6 +303,15 @@ swaks --server mx.example.com --port 587 --tls \
 A successful `AUTH` is acknowledged with `235 Granted for <org>/<server>`.
 As with the HTTP API, each `RCPT TO` recipient becomes its own stored,
 queued message.
+
+For retry-safe authenticated submission, add exactly one
+`CamelMailer-Idempotency-Key` message header. It follows the same 1–256
+character and 24-hour rules as the HTTP header. The request fingerprint covers
+the envelope sender, the ordered envelope recipients and the client-supplied
+message data. A replay receives `250 OK` without another queued message; reuse
+with different content or recipients receives `554`. CamelMailer removes this
+operational header before storing and delivering the message. It is not
+accepted on unauthenticated inbound mail.
 
 **Managing credentials in the dashboard.** A server's **Credentials** tab
 lists every credential with its name, type and status. Opening one shows a
@@ -310,7 +356,11 @@ consumes nothing:
 | Path | Response |
 |---|---|
 | HTTP send API | `429` with the error code `SendLimitExceeded` |
-| SMTP `RCPT TO` | `550 5.7.1` naming the limit and the window |
+| SMTP end of `DATA` | `550 5.7.1` naming the limit and the window |
+
+SMTP accepts the envelope so it can read the idempotency key in DATA. A
+completed keyed retry returns `250 OK` even when the quota is full. New
+submissions are checked against current usage after DATA, before storage.
 
 SMTP answers `5xx` rather than `4xx` on purpose. The window is 30 days, so a
 transient code would have the sending client retrying for weeks.
@@ -347,9 +397,9 @@ Accepting a message and delivering it are two steps:
    attempts and their outcomes are recorded against the message and readable
    via `GET /api/v2/server/messages/{id}/deliveries`.
 
-Sending is **not idempotent**: there is no idempotency key, so a repeated
-request queues the message again. Deduplicate on your side if a retry must
-not resend.
+Sends without an idempotency header retain the normal behavior: submitting the
+same request again queues another message. Use a unique operation key whenever
+the caller may retry an uncertain result.
 
 ### Local development without a worker
 
