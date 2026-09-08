@@ -63,6 +63,82 @@ impl SpfResult {
     }
 }
 
+/// A term this bounded evaluator cannot resolve, and therefore the reason a
+/// verdict is not trustworthy. Named so a caller can tell an operator what
+/// stood in the way rather than reporting a misleading result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedTerm {
+    /// The term as published, e.g. `include:%{ir}.%{v}.%{d}.spf.has.pphosted.com`.
+    pub term: String,
+    /// The record that carried it, which may be a nested `include` target
+    /// rather than the domain that was asked about.
+    pub domain: String,
+    /// Which unsupported construct it is.
+    pub kind: UnsupportedKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedKind {
+    /// RFC 7208 §7 macro expansion (`%{i}`, `%{ir}`, `%{d}`, …). Hosted SPF
+    /// services build per-sender includes this way (Proofpoint's
+    /// `%{ir}.%{v}.%{d}.spf.has.pphosted.com`), so the target name only
+    /// exists once expanded against a specific sending IP.
+    Macro,
+    /// `exists:` — matches on the existence of a name that is almost always
+    /// macro-derived.
+    Exists,
+    /// `ptr` — deprecated by RFC 7208 §5.5 and requires reverse DNS.
+    Ptr,
+}
+
+impl UnsupportedKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Macro => "macro",
+            Self::Exists => "exists",
+            Self::Ptr => "ptr",
+        }
+    }
+}
+
+/// The outcome of an evaluation that reports its own trustworthiness.
+///
+/// [`evaluate`] answers with a bare [`SpfResult`] because the receive path
+/// only needs something to stamp into a header. A caller that turns the
+/// answer into advice ("your DNS does not authorize us") needs to know when
+/// the evaluator was unable to decide, because a confidently wrong
+/// instruction is worse than none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpfVerdict {
+    /// The record was fully evaluated with the mechanisms this evaluator
+    /// supports; the result is the answer a receiver would reach.
+    Determined(SpfResult),
+    /// Evaluation reached a term it cannot resolve and the outcome depends on
+    /// it, so no result is reported. Verify by other means.
+    Unverifiable(UnsupportedTerm),
+}
+
+/// Does `term` use RFC 7208 macro expansion?
+fn term_uses_macro(term: &str) -> bool {
+    term.contains("%{")
+}
+
+/// Classify a term this evaluator cannot resolve, if it is one. Checked
+/// before any DNS is spent, so a macro-built name is never queried literally.
+fn unsupported_kind(term: &str) -> Option<UnsupportedKind> {
+    if term_uses_macro(term) {
+        return Some(UnsupportedKind::Macro);
+    }
+    let lower = term.to_ascii_lowercase();
+    if lower.starts_with("exists:") {
+        return Some(UnsupportedKind::Exists);
+    }
+    if lower == "ptr" || lower.starts_with("ptr:") {
+        return Some(UnsupportedKind::Ptr);
+    }
+    None
+}
+
 /// The DNS a full SPF evaluation needs: TXT (the record itself, `include`,
 /// `redirect`), plus A/AAAA (`a`) and MX (`mx`). Errors mean *lookup failed*
 /// (→ temperror), distinct from "no records" (`Ok(vec![])`).
@@ -89,8 +165,49 @@ pub async fn evaluate(resolver: &dyn SpfResolver, domain: &str, client_ip: IpAdd
     let evaluator = Evaluator {
         resolver,
         budget: AtomicU32::new(MAX_DNS_LOOKUPS),
+        macro_mode: MacroMode::Lenient,
+        blocked: std::sync::Mutex::new(None),
     };
     evaluator.check_host(domain.to_string(), client_ip).await
+}
+
+/// Evaluate `domain`'s SPF against `client_ip` and say whether the answer can
+/// be trusted.
+///
+/// Same walk as [`evaluate`], with one difference: a term this evaluator
+/// cannot resolve (a macro, `exists:`, `ptr`) is recorded instead of being
+/// silently treated as a non-match. If nothing matched and such a term was
+/// consulted, the outcome depends on it and the verdict is
+/// [`SpfVerdict::Unverifiable`] rather than a `fail` or `neutral` that would
+/// be reported to an operator as fact.
+///
+/// A `pass` is always [`SpfVerdict::Determined`]: the match came from a term
+/// that was resolved, so an unresolvable term later in the record cannot
+/// change it.
+///
+/// Use this wherever a result becomes advice. [`evaluate`] remains the entry
+/// point for the receive path, whose behaviour this does not alter.
+pub async fn evaluate_verifiable(
+    resolver: &dyn SpfResolver,
+    domain: &str,
+    client_ip: IpAddr,
+) -> SpfVerdict {
+    if domain.trim().is_empty() {
+        return SpfVerdict::Determined(SpfResult::None);
+    }
+    let evaluator = Evaluator {
+        resolver,
+        budget: AtomicU32::new(MAX_DNS_LOOKUPS),
+        macro_mode: MacroMode::Report,
+        blocked: std::sync::Mutex::new(None),
+    };
+    let result = evaluator.check_host(domain.to_string(), client_ip).await;
+    let blocked = evaluator.blocked.lock().unwrap().clone();
+    match (result, blocked) {
+        (SpfResult::Pass, _) => SpfVerdict::Determined(SpfResult::Pass),
+        (_, Some(term)) => SpfVerdict::Unverifiable(term),
+        (result, None) => SpfVerdict::Determined(result),
+    }
 }
 
 /// Build the value of a `Received-SPF:` header (without the field name, to
@@ -125,9 +242,28 @@ pub fn received_spf_header(
     header
 }
 
+/// Whether the walk reports terms it cannot resolve, or keeps the receive
+/// path's lenient behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacroMode {
+    /// [`evaluate`]: unsupported terms take the paths they always took, so
+    /// the inbound verdict is unchanged. A macro `include:` still resolves
+    /// its literal name, finds no record and yields the permerror it does
+    /// today.
+    Lenient,
+    /// [`evaluate_verifiable`]: an unsupported term is recorded and skipped
+    /// without spending DNS, so the caller can say "not verifiable" instead
+    /// of reporting a result that depends on a term nobody evaluated.
+    Report,
+}
+
 struct Evaluator<'a> {
     resolver: &'a dyn SpfResolver,
     budget: AtomicU32,
+    macro_mode: MacroMode,
+    /// The first unresolvable term actually consulted during the walk. Only
+    /// set in [`MacroMode::Report`].
+    blocked: std::sync::Mutex<Option<UnsupportedTerm>>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -158,6 +294,10 @@ impl<'a> Evaluator<'a> {
             for term in record.split_whitespace().skip(1) {
                 // modifiers (name=value)
                 if let Some(target) = term.strip_prefix("redirect=") {
+                    if self.macro_mode == MacroMode::Report && term_uses_macro(target) {
+                        self.note_unsupported(term, &domain, UnsupportedKind::Macro);
+                        continue;
+                    }
                     redirect = Some(target.to_string());
                     continue;
                 }
@@ -215,12 +355,36 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// Record the first unresolvable term consulted, so the verdict can say
+    /// what stood in the way. Only the first is kept: it is the one that
+    /// explains the outcome, and a list would just be noise.
+    fn note_unsupported(&self, term: &str, domain: &str, kind: UnsupportedKind) {
+        let mut blocked = self.blocked.lock().unwrap();
+        if blocked.is_none() {
+            *blocked = Some(UnsupportedTerm {
+                term: term.to_string(),
+                domain: domain.to_string(),
+                kind,
+            });
+        }
+    }
+
     async fn match_mechanism(
         &self,
         mechanism: &str,
         current_domain: &str,
         ip: IpAddr,
     ) -> MechanismOutcome {
+        // In reporting mode an unresolvable term is noted and skipped before
+        // any DNS is spent, so a macro-built name is never queried literally.
+        // Lenient mode falls through to the paths it always took, leaving the
+        // receive path's verdict untouched.
+        if self.macro_mode == MacroMode::Report {
+            if let Some(kind) = unsupported_kind(mechanism) {
+                self.note_unsupported(mechanism, current_domain, kind);
+                return MechanismOutcome::NoMatch;
+            }
+        }
         let lower = mechanism.to_ascii_lowercase();
         if lower == "all" {
             return MechanismOutcome::Matched;
@@ -609,5 +773,169 @@ mod tests {
         );
         assert!(fail.starts_with("fail ("));
         assert!(!fail.contains("helo="));
+    }
+}
+
+#[cfg(test)]
+mod verifiable_tests {
+    use super::*;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    /// Proofpoint's hosted SPF, the shape that made a literal-match health
+    /// check tell operators to add an include they may not need.
+    const HOSTED: &str = "v=spf1 include:%{ir}.%{v}.%{d}.spf.has.pphosted.com ~all";
+
+    #[tokio::test]
+    async fn a_resolvable_record_is_determined() {
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt("acme.com", "v=spf1 ip4:192.0.2.0/24 -all");
+
+        assert_eq!(
+            evaluate_verifiable(&resolver, "acme.com", ip("192.0.2.15")).await,
+            SpfVerdict::Determined(SpfResult::Pass)
+        );
+        assert_eq!(
+            evaluate_verifiable(&resolver, "acme.com", ip("198.51.100.1")).await,
+            SpfVerdict::Determined(SpfResult::Fail)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_macro_include_is_unverifiable_rather_than_a_fail() {
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt("hosted.example", HOSTED);
+
+        match evaluate_verifiable(&resolver, "hosted.example", ip("192.0.2.1")).await {
+            SpfVerdict::Unverifiable(term) => {
+                assert_eq!(term.kind, UnsupportedKind::Macro);
+                assert_eq!(term.domain, "hosted.example");
+                assert!(term.term.contains("%{ir}"), "{}", term.term);
+            }
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_keeps_its_receive_path_behaviour_for_the_same_record() {
+        // The bare entry point must not change: a macro include still
+        // resolves its literal name, finds no record, and permerrors exactly
+        // as it did before evaluate_verifiable existed.
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt("hosted.example", HOSTED);
+        assert_eq!(
+            evaluate(&resolver, "hosted.example", ip("192.0.2.1")).await,
+            SpfResult::PermError
+        );
+    }
+
+    #[tokio::test]
+    async fn a_macro_nested_in_an_include_is_reported_with_that_domain() {
+        // The domain asked about is clean; the provider it delegates to is
+        // the one using macros. The report names the nested record.
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt("clean.example", "v=spf1 include:provider.example -all");
+        resolver.add_txt("provider.example", HOSTED);
+
+        match evaluate_verifiable(&resolver, "clean.example", ip("192.0.2.1")).await {
+            SpfVerdict::Unverifiable(term) => {
+                assert_eq!(term.kind, UnsupportedKind::Macro);
+                assert_eq!(term.domain, "provider.example");
+            }
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pass_before_the_macro_stays_determined() {
+        // The match came from a term that was resolved, so an unresolvable
+        // term further along cannot change the answer.
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt(
+            "mixed.example",
+            "v=spf1 ip4:192.0.2.0/24 include:%{ir}.spf.example ~all",
+        );
+        assert_eq!(
+            evaluate_verifiable(&resolver, "mixed.example", ip("192.0.2.9")).await,
+            SpfVerdict::Determined(SpfResult::Pass)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_record_is_unverifiable_for_an_ip_that_reaches_the_macro() {
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt(
+            "mixed.example",
+            "v=spf1 ip4:192.0.2.0/24 include:%{ir}.spf.example ~all",
+        );
+        assert!(matches!(
+            evaluate_verifiable(&resolver, "mixed.example", ip("198.51.100.7")).await,
+            SpfVerdict::Unverifiable(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn exists_and_ptr_are_reported_too() {
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt("e.example", "v=spf1 exists:%{i}._spf.e.example -all");
+        resolver.add_txt("p.example", "v=spf1 ptr -all");
+
+        match evaluate_verifiable(&resolver, "e.example", ip("192.0.2.1")).await {
+            // The macro check runs first, which is the honest label here:
+            // the name is macro-derived.
+            SpfVerdict::Unverifiable(term) => assert_eq!(term.kind, UnsupportedKind::Macro),
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+        match evaluate_verifiable(&resolver, "p.example", ip("192.0.2.1")).await {
+            SpfVerdict::Unverifiable(term) => assert_eq!(term.kind, UnsupportedKind::Ptr),
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_with_a_macro_target_is_reported() {
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt("r.example", "v=spf1 redirect=%{d}.spf.example");
+        match evaluate_verifiable(&resolver, "r.example", ip("192.0.2.1")).await {
+            SpfVerdict::Unverifiable(term) => {
+                assert_eq!(term.kind, UnsupportedKind::Macro);
+                assert!(term.term.starts_with("redirect="), "{}", term.term);
+            }
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_nested_include_chain_resolves_without_a_literal_match() {
+        // The point of using the evaluator at all: our mechanism is not in
+        // the domain's record, it is two includes deep, and the answer is
+        // still pass.
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt("tenant.example", "v=spf1 include:reseller.example -all");
+        resolver.add_txt(
+            "reseller.example",
+            "v=spf1 include:spf.camelmailer.test ~all",
+        );
+        resolver.add_txt("spf.camelmailer.test", "v=spf1 ip4:203.0.113.0/24 -all");
+
+        assert_eq!(
+            evaluate_verifiable(&resolver, "tenant.example", ip("203.0.113.10")).await,
+            SpfVerdict::Determined(SpfResult::Pass)
+        );
+        assert_eq!(
+            evaluate_verifiable(&resolver, "tenant.example", ip("198.51.100.1")).await,
+            SpfVerdict::Determined(SpfResult::Fail)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_record_is_determined_none() {
+        let resolver = StaticSpfResolver::new();
+        assert_eq!(
+            evaluate_verifiable(&resolver, "nothing.example", ip("192.0.2.1")).await,
+            SpfVerdict::Determined(SpfResult::None)
+        );
     }
 }

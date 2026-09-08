@@ -43,6 +43,12 @@ pub struct ApiState {
     /// Billing backend (hosted cloud only). `None` on self-hosted
     /// installations: billing endpoints then report disabled.
     pub billing: Option<Arc<dyn crate::billing::BillingProvider>>,
+    /// Full SPF resolution (TXT + A/AAAA + MX) for the domain health check,
+    /// which evaluates a sending domain's SPF against this installation's
+    /// sending addresses instead of matching the record text. `None` (the
+    /// default, and what a bare test state gets) falls back to the literal
+    /// mechanism check, so the endpoint still answers without it.
+    pub spf_resolver: Option<Arc<dyn camelmailer_core::SpfResolver>>,
     /// Live TXT lookups for `POST …/domains/{name}/verify` — hickory in
     /// production, a static mock in tests.
     pub dns_resolver: Arc<dyn camelmailer_core::DnsResolver>,
@@ -93,6 +99,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            spf_resolver: None,
         })
     }
 
@@ -115,6 +122,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            spf_resolver: None,
         })
     }
 
@@ -282,7 +290,21 @@ impl ApiState {
             webhook_sender,
             installation_signing_key_pem,
             org_sso_store: None,
+            spf_resolver: None,
         })
+    }
+
+    /// Attach a full SPF resolver so the domain health check can evaluate a
+    /// sending domain's policy rather than compare its text. Same shape as
+    /// [`ApiState::with_org_sso_store`]: the state is immutable behind an
+    /// `Arc`, so this returns a fresh one.
+    pub fn with_spf_resolver(
+        self: Arc<Self>,
+        spf_resolver: Arc<dyn camelmailer_core::SpfResolver>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.spf_resolver = Some(spf_resolver);
+        Arc::new(state)
     }
 
     /// Attach per-organization SSO storage (production and SSO-aware

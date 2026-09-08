@@ -601,6 +601,164 @@ fn health_check_json(
     })
 }
 
+/// What the SPF check could establish about this installation.
+enum SpfAuthorization {
+    /// Every sending address we know of evaluates to `pass`.
+    Authorized,
+    /// At least one sending address does not. Carries the ones that failed.
+    NotAuthorized { addresses: Vec<std::net::IpAddr> },
+    /// The record (or something it delegates to) uses a construct the
+    /// evaluator cannot resolve, so no claim is made. Carries the message.
+    Unverifiable { reason: String },
+    /// Evaluation was not possible at all: no SPF resolver is configured, or
+    /// this installation does not pin its source addresses. The caller
+    /// compares the record text instead, as it always did.
+    TextFallback,
+}
+
+/// Render an address list for an operator-facing message.
+fn describe_addresses(addresses: &[std::net::IpAddr]) -> String {
+    match addresses {
+        [] => "this installation".to_string(),
+        [one] => format!("this installation's sending address {one}"),
+        many => format!(
+            "this installation's sending addresses {}",
+            many.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Evaluate `domain`'s published SPF against the addresses this installation
+/// sends from, and report what that establishes.
+///
+/// A `pass` for every address is the only answer that clears the check. One
+/// unresolvable term anywhere in the record's delegation chain makes the
+/// whole thing unverifiable rather than a failure: telling an operator their
+/// DNS is wrong when we simply could not read it is worse than saying so.
+async fn spf_authorization(
+    state: &ApiState,
+    server: &camelmailer_core::Server,
+    domain: &str,
+) -> SpfAuthorization {
+    let Some(resolver) = state.spf_resolver.as_ref() else {
+        return SpfAuthorization::TextFallback;
+    };
+    let (addresses, truncated) = sending_addresses(state, server).await;
+    if addresses.is_empty() {
+        return SpfAuthorization::TextFallback;
+    }
+
+    // One memoizing wrapper for the whole batch: every address walks the
+    // same record tree, so the queries are issued once between them.
+    let memoizing = crate::dns::MemoizingSpfResolver::new(resolver.as_ref());
+    let mut unauthorized: Vec<std::net::IpAddr> = Vec::new();
+    for address in &addresses {
+        match camelmailer_core::spf::evaluate_verifiable(&memoizing, domain, *address).await {
+            camelmailer_core::SpfVerdict::Determined(camelmailer_core::SpfResult::Pass) => {}
+            camelmailer_core::SpfVerdict::Determined(camelmailer_core::SpfResult::TempError) => {
+                return SpfAuthorization::Unverifiable {
+                    reason: format!(
+                        "a DNS lookup while evaluating this record failed, so whether it authorizes {} could not be determined — retry the check",
+                        describe_addresses(&addresses)
+                    ),
+                };
+            }
+            camelmailer_core::SpfVerdict::Determined(_) => unauthorized.push(*address),
+            camelmailer_core::SpfVerdict::Unverifiable(term) => {
+                return SpfAuthorization::Unverifiable {
+                    reason: format!(
+                        "this record cannot be verified automatically: {} uses \"{}\" ({}), which only resolves against a specific sending address. Confirm with the domain's administrator that {} is authorized",
+                        term.domain,
+                        term.term,
+                        term.kind.as_str(),
+                        describe_addresses(&addresses)
+                    ),
+                };
+            }
+        }
+    }
+
+    if !unauthorized.is_empty() {
+        return SpfAuthorization::NotAuthorized {
+            addresses: unauthorized,
+        };
+    }
+    if truncated {
+        // Every address we looked at passed, but we did not look at all of
+        // them. Say so rather than implying full coverage.
+        return SpfAuthorization::Unverifiable {
+            reason: format!(
+                "the first {MAX_SPF_CHECK_ADDRESSES} sending addresses are authorized; the pool holds more than this check evaluates"
+            ),
+        };
+    }
+    SpfAuthorization::Authorized
+}
+
+/// Most sending addresses a health check will evaluate SPF against.
+///
+/// Each address costs one full evaluation, and an evaluation is capped at the
+/// RFC's ten DNS queries. Memoization means the queries are shared across
+/// addresses, so the real cost is far lower, but a pool with hundreds of
+/// addresses should not be able to turn one request into a long walk.
+const MAX_SPF_CHECK_ADDRESSES: usize = 12;
+
+/// The addresses this installation would send `server`'s mail from.
+///
+/// The worker picks a source address from the message stream's IP pool, or
+/// the server's pool when the stream sets none, so both are relevant: a
+/// broadcast stream on its own pool sends from addresses the server's pool
+/// never uses. Pools are deduplicated, then addresses, then the list is
+/// capped.
+///
+/// An empty result means this installation does not pin its source address
+/// (no pool configured, the common self-hosted shape). The host's default
+/// egress address is not knowable from here, so the caller falls back to
+/// checking the record text instead of guessing.
+async fn sending_addresses(
+    state: &ApiState,
+    server: &camelmailer_core::Server,
+) -> (Vec<std::net::IpAddr>, bool) {
+    let mut pool_ids: Vec<camelmailer_core::Id> = server.ip_pool_id.into_iter().collect();
+    if let Some(store) = state.server_store.as_ref() {
+        if let Ok(streams) = store.list_streams(server.id).await {
+            for stream in streams.iter().filter(|stream| !stream.archived) {
+                if let Some(pool_id) = stream.ip_pool_id {
+                    if !pool_ids.contains(&pool_id) {
+                        pool_ids.push(pool_id);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut addresses: Vec<std::net::IpAddr> = Vec::new();
+    for pool_id in pool_ids {
+        let Ok(entries) = state.store.list_ip_addresses(pool_id).await else {
+            continue;
+        };
+        for entry in entries {
+            for text in [Some(entry.ipv4), entry.ipv6].into_iter().flatten() {
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                if let Ok(address) = text.parse::<std::net::IpAddr>() {
+                    if !addresses.contains(&address) {
+                        addresses.push(address);
+                    }
+                }
+            }
+        }
+    }
+    let truncated = addresses.len() > MAX_SPF_CHECK_ADDRESSES;
+    addresses.truncate(MAX_SPF_CHECK_ADDRESSES);
+    (addresses, truncated)
+}
+
 /// Escalation heuristics for the recommended next step: with at least
 /// this many reported messages and this pass rate, the next-stricter
 /// DMARC policy is suggested (documented in docs/dmarc.md).
@@ -662,13 +820,40 @@ pub(crate) async fn domains_health(
                 }
                 1 => {
                     let record = &spf_found[0];
-                    if !dmarc_rules::spf_contains_mechanism(record, &spf_mechanism) {
-                        // Propose the domain's own record extended with our
-                        // mechanism, not a fresh standalone one.
-                        expected_spf = dmarc_rules::spf_with_mechanism(record, &spf_mechanism);
-                        spf_problems.push(format!(
-                            "add {spf_mechanism} to the existing record — publish \"{expected_spf}\" (keep it to one v=spf1 record)"
-                        ));
+                    // Whether this installation is authorized is a question
+                    // about evaluation, not about text. A domain may
+                    // legitimately never name our mechanism and still
+                    // authorize us through an include chain, and a hosted
+                    // SPF service builds its include with macros so the
+                    // mechanism cannot appear literally at all. Evaluate the
+                    // policy against the addresses we would send from when
+                    // we know them, and only fall back to comparing text
+                    // when we do not.
+                    let authorized = spf_authorization(&state, &server, &domain.name).await;
+                    match authorized {
+                        SpfAuthorization::Authorized => {}
+                        SpfAuthorization::NotAuthorized { addresses } => {
+                            expected_spf = dmarc_rules::spf_with_mechanism(record, &spf_mechanism);
+                            spf_problems.push(format!(
+                                "this record does not authorize {} — publish \"{expected_spf}\" (keep it to one v=spf1 record)",
+                                describe_addresses(&addresses)
+                            ));
+                        }
+                        SpfAuthorization::Unverifiable { reason } => {
+                            spf_problems.push(reason);
+                        }
+                        SpfAuthorization::TextFallback => {
+                            if !dmarc_rules::spf_contains_mechanism(record, &spf_mechanism) {
+                                // Propose the domain's own record extended
+                                // with our mechanism, not a fresh standalone
+                                // one.
+                                expected_spf =
+                                    dmarc_rules::spf_with_mechanism(record, &spf_mechanism);
+                                spf_problems.push(format!(
+                                    "add {spf_mechanism} to the existing record — publish \"{expected_spf}\" (keep it to one v=spf1 record)"
+                                ));
+                            }
+                        }
                     }
                     match dmarc_rules::spf_all_qualifier(record) {
                         Some('-') | Some('~') => {}

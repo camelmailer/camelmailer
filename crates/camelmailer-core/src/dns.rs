@@ -7,7 +7,11 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-#[derive(Debug, thiserror::Error)]
+// Clone so a caller may memoize a lookup outcome (see the domain health
+// check, which evaluates one SPF record once per sending address and would
+// otherwise repeat every query). The variant holds only a message, so
+// cloning copies a String and nothing else.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum DnsError {
     /// The lookup itself failed (network, resolver configuration, …) —
     /// distinct from "the name has no TXT records", which is `Ok(vec![])`.
