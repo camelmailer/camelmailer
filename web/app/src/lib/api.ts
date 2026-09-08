@@ -11,6 +11,22 @@ const BASE_URL: string = process.env.NEXT_PUBLIC_API_URL ?? ""
 
 const TOKEN_KEY = "camelmailer.session_token"
 
+// The token lives in localStorage, which makes it an external store: React
+// reads it through useSyncExternalStore (see AuthProvider), so every writer
+// has to announce itself. `storage` events cover the other tabs; the
+// listener set covers this one, because a tab gets no event for its own
+// write.
+const tokenListeners = new Set<() => void>()
+
+export function subscribeToken(listener: () => void): () => void {
+  tokenListeners.add(listener)
+  window.addEventListener("storage", listener)
+  return () => {
+    tokenListeners.delete(listener)
+    window.removeEventListener("storage", listener)
+  }
+}
+
 export function getToken(): string | null {
   if (typeof window === "undefined") return null
   return localStorage.getItem(TOKEN_KEY)
@@ -19,6 +35,7 @@ export function setToken(token: string | null) {
   if (typeof window === "undefined") return
   if (token === null) localStorage.removeItem(TOKEN_KEY)
   else localStorage.setItem(TOKEN_KEY, token)
+  for (const listener of tokenListeners) listener()
 }
 
 export class ApiError extends Error {

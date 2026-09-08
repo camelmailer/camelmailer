@@ -3,7 +3,7 @@
 // The admin-API resource tabs of a mail server: domains, credentials,
 // routes, webhooks, suppressions.
 
-import { useEffect, useState } from "react"
+import { useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
@@ -1583,8 +1583,11 @@ export function WebhookDetail({ org, server, id }: Scope & { id: number }) {
   const [testing, setTesting] = useState(false)
 
   // Seed the editor from the webhook once it arrives (or the id changes).
-  useEffect(() => {
-    if (!webhook) return
+  // Keyed on the id, not the object, so a background refetch of the same
+  // webhook leaves unsaved edits alone.
+  const [seededId, setSeededId] = useState<number | null>(null)
+  if (webhook && seededId !== webhook.id) {
+    setSeededId(webhook.id)
     setName(webhook.name)
     setUrl(webhook.url)
     setSign(webhook.sign)
@@ -1592,8 +1595,7 @@ export function WebhookDetail({ org, server, id }: Scope & { id: number }) {
     setHeaderRows(
       Object.entries(webhook.headers ?? {}).map(([name, value]) => ({ name, value })),
     )
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [webhook?.id])
+  }
 
   const toggleEvent = (event: string, checked: boolean) =>
     setEvents((current) =>

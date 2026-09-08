@@ -14,6 +14,7 @@ import {
   type ColumnDef,
   type ColumnFiltersState,
   type Header,
+  type RowData,
   type SortingState,
   flexRender,
   getCoreRowModel,
@@ -55,8 +56,10 @@ import {
 // meta.align is retained for column defs but no longer drives layout:
 // alignment is derived from the column id (only "actions" is right-aligned).
 declare module "@tanstack/react-table" {
+  // The type parameters have to repeat the library's own signature for the
+  // declaration to merge, even though neither is used here.
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  interface ColumnMeta<TData extends unknown, TValue> {
+  interface ColumnMeta<TData extends RowData, TValue> {
     align?: "left" | "right"
   }
 }

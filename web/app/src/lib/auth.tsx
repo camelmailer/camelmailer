@@ -9,9 +9,10 @@ import {
   useContext,
   useEffect,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react"
-import { authApi, getToken, setToken, type MeResponse } from "./api"
+import { authApi, getToken, setToken, subscribeToken, type MeResponse } from "./api"
 
 type AuthContextValue = {
   token: string | null
@@ -27,42 +28,42 @@ type AuthContextValue = {
 const AuthContext = createContext<AuthContextValue | null>(null)
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  // Initialized in an effect (not from localStorage directly) so server
-  // rendering and hydration agree on the initial markup.
-  const [token, setTokenState] = useState<string | null>(null)
+  // Read straight out of localStorage rather than mirrored into state: the
+  // server snapshot is null, so server rendering and hydration agree on the
+  // initial markup, and every setToken anywhere in the app lands here (a
+  // password change issues a fresh session token outside this provider).
+  const token = useSyncExternalStore(subscribeToken, getToken, () => null)
   const [me, setMe] = useState<MeResponse | null>(null)
   const [loading, setLoading] = useState<boolean>(true)
 
-  const refresh = useCallback(async () => {
-    if (!getToken()) {
-      setMe(null)
-      return
-    }
+  // Fetches /me without touching React state, so the mount effect below can
+  // write the result asynchronously instead of synchronously.
+  const loadMe = useCallback(async (): Promise<MeResponse | null> => {
+    if (!getToken()) return null
     try {
-      setMe(await authApi.me())
+      return await authApi.me()
     } catch {
       // token invalid/expired — drop it
       setToken(null)
-      setTokenState(null)
-      setMe(null)
+      return null
     }
   }, [])
 
+  const refresh = useCallback(async () => {
+    setMe(await loadMe())
+  }, [loadMe])
+
+  // One /me on mount; loadMe answers null when there is no stored token, so
+  // both paths clear `loading` the same way.
   useEffect(() => {
-    const stored = getToken()
-    setTokenState(stored)
-    if (stored) {
-      refresh().finally(() => setLoading(false))
-    } else {
-      setLoading(false)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    loadMe()
+      .then(setMe)
+      .finally(() => setLoading(false))
+  }, [loadMe])
 
   const adopt = useCallback(
     async (newToken: string) => {
       setToken(newToken)
-      setTokenState(newToken)
       await refresh()
     },
     [refresh],
@@ -82,7 +83,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // the session may already be gone — that's fine
     }
     setToken(null)
-    setTokenState(null)
     setMe(null)
     if (endSessionUrl) {
       window.location.assign(endSessionUrl)
