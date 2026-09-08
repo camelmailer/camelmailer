@@ -1,5 +1,6 @@
 # CamelMailer CI — lint + full test suite (including the PostgreSQL
-# integration tests) + a Docker image build.
+# integration tests) + Docker image builds for the engine and the dashboard,
+# plus the dashboard's own type check and unit tests.
 #
 # NOTE: this workflow becomes active once the camelmailer directory is its
 # own repository root (the planned split-out); GitHub only reads workflows
@@ -71,3 +72,49 @@ jobs:
           tags: camelmailer:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # The dashboard had no CI at all: nothing here ran tsc, eslint, vitest or
+  # next build, and the only place web/app was built was the *release*
+  # workflow. A break in web/app therefore surfaced at the tag rather than in
+  # the pull request.
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/app/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: npx tsc --noEmit
+      - run: pnpm test
+      # Not a gate yet: `src` currently has 6 pre-existing eslint errors (one
+      # no-unnecessary-type-constraint, five react-hooks/set-state-in-effect).
+      # Surfaced here so they are visible and shrinking, rather than silently
+      # absent. Fixing them belongs in its own change; drop
+      # continue-on-error once it is clean.
+      - run: pnpm run lint
+        continue-on-error: true
+
+  # Builds the dashboard image the way the release workflow does, with
+  # `context: web/app`. That isolation is the point: anything reaching outside
+  # that directory resolves fine in a repo checkout and fails only here. It is
+  # how a cross-boundary test fixture import in an early contribution would
+  # have escaped to the tag.
+  web-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: web/app
+          push: false
+          tags: camelmailer-web:ci
+          cache-from: type=gha,scope=ci-web
+          cache-to: type=gha,mode=max,scope=ci-web
