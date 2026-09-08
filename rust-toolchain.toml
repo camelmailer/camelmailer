@@ -1,0 +1,28 @@
+# Pin the toolchain so a local build and CI agree.
+#
+# The workflows install `dtolnay/rust-toolchain@stable`, which follows
+# upstream's release schedule. That bit us on 2026-09-01: stable moved to
+# 1.98.1, clippy's `result_large_err` began firing on six pre-existing
+# `Result<T, axum::response::Response>` handler helpers, and `-D warnings`
+# turned `main` red with no code change. Locally the same command stayed
+# green because the developer's stable was still 1.96.0, so the failure was
+# only visible in CI.
+#
+# rustup reads this file and uses the pinned toolchain regardless of what the
+# workflow installed, so `cargo clippy` means the same thing everywhere. The
+# action does not read this file (it has no such input), so it still installs
+# current stable; rustup then fetches the pinned toolchain on first use.
+#
+# The trade: new stable lints arrive when someone bumps this file, not on
+# upstream's schedule. That is deliberate. A release here is gated on a green
+# suite, so a compiler update should be a decision rather than a surprise.
+#
+# To move: bump `channel`, run `cargo fmt --all` and
+# `cargo clippy --workspace --all-targets -- -D warnings`, fix what the new
+# release flags, and ship it as its own change.
+#
+# This is not an MSRV. Nothing here promises the crates build on older
+# compilers; `[workspace.package] rust-version` would be the place for that.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
