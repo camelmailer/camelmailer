@@ -15,6 +15,25 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-08
+
+### Added
+
+- **RP-initiated OIDC logout.** Revoking the local session left the identity
+  provider's session standing, so the next sign-in succeeded without a prompt
+  and the user was not really logged out. `POST /api/v2/auth/logout` now
+  answers with `end_session_url` for a session created through OIDC, and the
+  dashboard navigates there so the provider ends its session too, returning
+  the browser to `/login`. The field is `null` for password, 2FA, WebAuthn,
+  GitHub and SAML sessions, and for a provider advertising no
+  `end_session_endpoint`. Migration `0046` keeps the `id_token` (passed back
+  as `id_token_hint`, which Keycloak and others require) and the resolved
+  endpoint on the session row; the endpoint is taken from discovery at login,
+  so signing out never waits on the provider. The local session is revoked
+  first and unconditionally, whatever happens next. Register
+  `{web_protocol}://{web_hostname}/login` as a post-logout redirect URI with
+  the provider before enabling this.
+
 ### Changed
 
 - The Rust toolchain is pinned in `rust-toolchain.toml` (currently `1.98.1`).
@@ -51,22 +70,6 @@ integration tests) is green.
   its answer can be trusted. `evaluate` is unchanged, so the inbound
   `Received-SPF` verdict is exactly what it was; a test pins that for a macro
   record. `DnsError` is now `Clone` so a caller can memoize lookups.
-### Added
-
-- **RP-initiated OIDC logout.** Revoking the local session left the identity
-  provider's session standing, so the next sign-in succeeded without a prompt
-  and the user was not really logged out. `POST /api/v2/auth/logout` now
-  answers with `end_session_url` for a session created through OIDC, and the
-  dashboard navigates there so the provider ends its session too, returning
-  the browser to `/login`. The field is `null` for password, 2FA, WebAuthn,
-  GitHub and SAML sessions, and for a provider advertising no
-  `end_session_endpoint`. Migration `0046` keeps the `id_token` (passed back
-  as `id_token_hint`, which Keycloak and others require) and the resolved
-  endpoint on the session row; the endpoint is taken from discovery at login,
-  so signing out never waits on the provider. The local session is revoked
-  first and unconditionally, whatever happens next. Register
-  `{web_protocol}://{web_hostname}/login` as a post-logout redirect URI with
-  the provider before enabling this.
 
 ## [0.7.8] - 2026-09-08
 
@@ -920,7 +923,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.7.8...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/camelmailer/camelmailer/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/camelmailer/camelmailer/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/camelmailer/camelmailer/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/camelmailer/camelmailer/compare/v0.7.5...v0.7.6
