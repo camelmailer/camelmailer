@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-10
+
 ### Added
 
 - **`smtp_server.auth_requires_tls`** (default `true`), the migration window
