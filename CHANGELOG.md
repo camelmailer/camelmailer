@@ -15,6 +15,32 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **`smtp_server.auth_requires_tls`** (default `true`), the migration window
+  for turning `tls_enabled` on. AUTH is offered and accepted only over TLS,
+  and an installation with TLS off is the exception: it has no STARTTLS to
+  offer, so AUTH stays available. That makes the switch sharper than it
+  looks, because the moment TLS becomes available AUTH starts requiring it,
+  and a client configured without STARTTLS fails at that instant. Setting
+  this to `false` offers STARTTLS while still accepting an unprotected AUTH,
+  so clients upgrade on their own schedule. Every such AUTH is logged at warn
+  level with the credential, its server and the client address, and the
+  server repeats a warning at startup for as long as the window is open, so
+  the state is closed on evidence rather than forgotten.
+
+### Fixed
+
+- **The SMTP TLS certificate is re-read when it changes on disk.** The
+  acceptor was built once, when the listeners were bound, so it quietly
+  outlived the certificate: an ACME certificate is replaced roughly every 60
+  days and the running process kept presenting the expired one until somebody
+  restarted the service. Nothing in the process noticed. The certificate and
+  key are now stated before each handshake and the acceptor is rebuilt when a
+  modification time moves, which is one `stat` per connection that negotiates
+  TLS. A file caught mid-write keeps the previous certificate in service and
+  is retried on the next handshake, so a renewal can never drop TLS.
+
 ## [0.8.1] - 2026-09-10
 
 ### Changed

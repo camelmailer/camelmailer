@@ -65,10 +65,17 @@ smtp_server:
   default_port: 25
   default_bind_address: "::"
   max_message_size: 14              # MB
-  # STARTTLS termination:
+  # STARTTLS termination. The certificate is re-read when the file on disk
+  # changes, so an ACME renewal needs no restart.
   # tls_enabled: true
   # tls_certificate_path: $config-file-root/smtp.cert
   # tls_private_key_path: $config-file-root/smtp.key
+  # Turning tls_enabled on also makes AUTH require TLS, which breaks a client
+  # that authenticates without STARTTLS today. Set this to false for a
+  # migration window: STARTTLS is offered, an unprotected AUTH is still
+  # accepted, and each one is logged at warn level with the credential and
+  # the client address. Turn it back on once the log stays quiet.
+  # auth_requires_tls: false
   # proxy_protocol: true            # behind HAProxy etc.
   # Additional listeners besides default_port (which always speaks plain
   # SMTP with optional STARTTLS). mode "smtp" behaves like default_port;

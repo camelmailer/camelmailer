@@ -13,6 +13,7 @@ use camelmailer_config::SmtpListenerMode;
 use camelmailer_core::{MessageSink, Store};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -101,6 +102,86 @@ fn load_tls_acceptor(
         .with_single_cert(certificates, private_key)
         .map_err(std::io::Error::other)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Modification times of the certificate and key, the signal that a renewal
+/// has landed. `None` for a file that cannot be stated right now, which
+/// compares unequal to a real timestamp and so asks for a reload attempt.
+type CertificateStamp = (Option<SystemTime>, Option<SystemTime>);
+
+/// Hands out the current TLS acceptor, rebuilding it after the certificate on
+/// disk changes.
+///
+/// The acceptor used to be built once, when the listeners were bound. That
+/// quietly outlived the certificate: an ACME certificate is replaced every
+/// ~60 days and the running process kept presenting the expired one until
+/// somebody restarted the service. Nothing in the process noticed, and
+/// neither did anything else until a client refused the handshake.
+///
+/// So the certificate is stated before each handshake and reloaded when its
+/// modification time moves. That is one `stat` per connection that actually
+/// negotiates TLS, against a page the kernel has cached.
+struct TlsReloader {
+    certificate_path: String,
+    private_key_path: String,
+    current: tokio::sync::RwLock<(TlsAcceptor, CertificateStamp)>,
+}
+
+impl TlsReloader {
+    fn load(certificate_path: &str, private_key_path: &str) -> std::io::Result<Self> {
+        let acceptor = load_tls_acceptor(certificate_path, private_key_path)?;
+        let stamp = Self::stamp(certificate_path, private_key_path);
+        Ok(Self {
+            certificate_path: certificate_path.to_string(),
+            private_key_path: private_key_path.to_string(),
+            current: tokio::sync::RwLock::new((acceptor, stamp)),
+        })
+    }
+
+    /// Stats both files synchronously. The workspace keeps tokio's feature
+    /// list short and does not enable `fs`, and a `stat` of a path the kernel
+    /// has cached costs about as much as the atomic loads around it. The
+    /// reload below reads the files synchronously too, exactly as the startup
+    /// path always has.
+    fn stamp(certificate_path: &str, private_key_path: &str) -> CertificateStamp {
+        fn modified(path: &str) -> Option<SystemTime> {
+            std::fs::metadata(path).ok()?.modified().ok()
+        }
+        (modified(certificate_path), modified(private_key_path))
+    }
+
+    async fn acceptor(&self) -> TlsAcceptor {
+        let on_disk = Self::stamp(&self.certificate_path, &self.private_key_path);
+        {
+            let current = self.current.read().await;
+            if current.1 == on_disk {
+                return current.0.clone();
+            }
+        }
+        match load_tls_acceptor(&self.certificate_path, &self.private_key_path) {
+            Ok(acceptor) => {
+                let mut current = self.current.write().await;
+                *current = (acceptor.clone(), on_disk);
+                tracing::info!(
+                    certificate = %self.certificate_path,
+                    "reloaded the SMTP TLS certificate"
+                );
+                acceptor
+            }
+            Err(error) => {
+                // A renewal caught mid-write, or a file that has gone bad.
+                // Keep serving the certificate already loaded rather than
+                // dropping TLS, and try again on the next handshake: the
+                // stamp stays unrecorded, so this stays a retry.
+                tracing::warn!(
+                    %error,
+                    certificate = %self.certificate_path,
+                    "could not load the SMTP TLS certificate, keeping the previous one"
+                );
+                self.current.read().await.0.clone()
+            }
+        }
+    }
 }
 
 pub struct SmtpServer {
@@ -192,10 +273,10 @@ impl SmtpServer {
         listeners: Vec<(TcpListener, SmtpListenerMode)>,
     ) -> std::io::Result<()> {
         let tls_acceptor = if self.config.smtp_server.tls_enabled {
-            Some(load_tls_acceptor(
+            Some(Arc::new(TlsReloader::load(
                 &self.config.smtp_server.tls_certificate_path,
                 &self.config.smtp_server.tls_private_key_path,
-            )?)
+            )?))
         } else {
             None
         };
@@ -244,7 +325,7 @@ impl SmtpServer {
         &self,
         stream: TcpStream,
         peer: SocketAddr,
-        tls_acceptor: Option<TlsAcceptor>,
+        tls_acceptor: Option<Arc<TlsReloader>>,
         mode: SmtpListenerMode,
     ) -> std::io::Result<()> {
         let session_config = SessionConfig::from(&self.config);
@@ -281,7 +362,7 @@ impl SmtpServer {
                 // is unreachable, kept as a defensive close.
                 return Ok(());
             };
-            let tls_stream = tls_acceptor.accept(stream).await?;
+            let tls_stream = tls_acceptor.acceptor().await.accept(stream).await?;
             session.set_tls(true);
             let mut lines = LineStream::new(tls_stream);
             if send_banner {
@@ -313,7 +394,11 @@ impl SmtpServer {
 
         // TLS phase: handshake on the raw socket, then continue the same
         // session over the encrypted stream.
-        let tls_stream = tls_acceptor.accept(lines.into_inner()).await?;
+        let tls_stream = tls_acceptor
+            .acceptor()
+            .await
+            .accept(lines.into_inner())
+            .await?;
         session.set_tls(true);
         let mut tls_lines = LineStream::new(tls_stream);
         drive_session(&mut session, &mut tls_lines, spf.as_ref()).await?;

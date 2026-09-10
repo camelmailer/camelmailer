@@ -344,6 +344,15 @@ async fn smtp_server() -> std::io::Result<()> {
         tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
         (Arc::new(MemoryStore::new()), Arc::new(MemorySink::new()))
     };
+    if config.smtp_server.tls_enabled && !config.smtp_server.auth_requires_tls {
+        // Say it on every boot. The setting is a migration window, and a
+        // window nobody is reminded of stays open.
+        tracing::warn!(
+            "smtp_server.auth_requires_tls is off: SMTP AUTH is accepted on \
+             unencrypted sessions. Intended only while clients move to \
+             STARTTLS; each such AUTH is logged"
+        );
+    }
     SmtpServer::new(config, store, sink).run().await
 }
 

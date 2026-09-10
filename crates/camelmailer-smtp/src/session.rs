@@ -52,6 +52,9 @@ fn encode64(input: &[u8]) -> String {
 pub struct SessionConfig {
     pub smtp_hostname: String,
     pub tls_enabled: bool,
+    /// See `smtp_server.auth_requires_tls`. Only consulted when
+    /// `tls_enabled`, and meant to be temporary.
+    pub auth_requires_tls: bool,
     /// in megabytes
     pub max_message_size: u64,
     pub return_path_domain: String,
@@ -64,6 +67,7 @@ impl From<&camelmailer_config::Config> for SessionConfig {
         Self {
             smtp_hostname: config.camelmailer.smtp_hostname.clone(),
             tls_enabled: config.smtp_server.tls_enabled,
+            auth_requires_tls: config.smtp_server.auth_requires_tls,
             max_message_size: config.smtp_server.max_message_size,
             // Unlike the outbound envelope sender, the intake must keep
             // accepting return-path mail even when the configured domain is
@@ -383,8 +387,14 @@ impl Session {
     /// STARTTLS to offer, so AUTH stays available there. That deployment
     /// terminates TLS elsewhere or runs on a trusted network, which is the
     /// same assumption the capability list already makes.
+    ///
+    /// `smtp_server.auth_requires_tls: false` keeps AUTH available even once
+    /// TLS is on, which is how an installation switches TLS on without
+    /// breaking clients that authenticate in the clear today. Those AUTHs are
+    /// logged in [`Self::authenticate`], so the window can be closed on
+    /// evidence.
     fn auth_permitted(&self) -> bool {
-        self.tls || !self.config.tls_enabled
+        self.tls || !self.config.tls_enabled || !self.config.auth_requires_tls
     }
 
     fn proxy(&mut self, data: &str) -> Reply {
@@ -528,6 +538,19 @@ impl Session {
     fn authenticate(&mut self, password: &str) -> Reply {
         match self.store.find_smtp_credential_by_key(password) {
             Some(credential) => {
+                if !self.tls {
+                    // The credential just crossed an unprotected connection.
+                    // Either the installation runs no TLS at all, or it is
+                    // mid-migration with `auth_requires_tls` off. Both want
+                    // this visible: it names who still has to move before the
+                    // requirement can be turned on.
+                    tracing::warn!(
+                        credential = %credential.name,
+                        server_id = credential.server_id,
+                        client = self.ip_address.as_deref().unwrap_or("unknown"),
+                        "SMTP AUTH accepted on an unencrypted session"
+                    );
+                }
                 self.store.record_credential_use(credential.id);
                 let grant = self.grant_message(&credential);
                 self.credential = Some(credential);
