@@ -16,6 +16,11 @@ export default function OidcCallback() {
     const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""))
     const token = fragment.get("session_token")
     if (!token) {
+      // The fragment is the one part of the URL the server never receives,
+      // so it can only be read after hydration: rendering from it directly
+      // would make the server and the client disagree. That leaves the
+      // effect as the only place this message can come from.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setError("No session token in the callback URL.")
       return
     }

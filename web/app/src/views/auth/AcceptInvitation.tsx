@@ -30,7 +30,10 @@ export default function AcceptInvitation() {
   const { adopt } = useAuth()
 
   const [preview, setPreview] = useState<Preview | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [requestError, setRequestError] = useState<string | null>(null)
+  // A link without a token is wrong on sight, so it needs no request and no
+  // state of its own.
+  const error = token ? requestError : "This invitation link is missing its token."
   const [firstName, setFirstName] = useState("")
   const [lastName, setLastName] = useState("")
   const [password, setPassword] = useState("")
@@ -38,22 +41,19 @@ export default function AcceptInvitation() {
   const [done, setDone] = useState(false)
 
   useEffect(() => {
-    if (!token) {
-      setError("This invitation link is missing its token.")
-      return
-    }
+    if (!token) return
     authApi
       .invitationPreview(token)
       .then((data) => setPreview(data.invitation as Preview))
       .catch((err) =>
-        setError(err instanceof ApiError ? err.message : "Could not load the invitation."),
+        setRequestError(err instanceof ApiError ? err.message : "Could not load the invitation."),
       )
   }, [token])
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
     setBusy(true)
-    setError(null)
+    setRequestError(null)
     try {
       const result = await authApi.invitationAccept({
         token,
@@ -68,7 +68,9 @@ export default function AcceptInvitation() {
         setDone(true)
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Accepting the invitation failed.")
+      setRequestError(
+        err instanceof ApiError ? err.message : "Accepting the invitation failed.",
+      )
     } finally {
       setBusy(false)
     }

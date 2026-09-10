@@ -15,6 +15,27 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Changed
+
+- eslint is a CI gate for the dashboard. The `web` job ran it with
+  `continue-on-error` because `web/app/src` carried six errors; those are
+  fixed, so the step gates like the others. Five were
+  `react-hooks/set-state-in-effect`, and each was addressed on its own terms
+  rather than suppressed: a missing invitation token is derived during render,
+  a template reset moved into the event handler that causes it, the webhook
+  editor seeds itself during render (still keyed on the id, so a background
+  refetch leaves unsaved edits alone), and the session token is read through
+  `useSyncExternalStore` instead of being mirrored into provider state. The
+  one remaining suppression is the SSO callback reading the URL fragment: the
+  server never receives it, so rendering from it directly would make server
+  and client disagree.
+- Signing out now reaches the app's other tabs. The session token was mirrored
+  into `AuthProvider` state at mount, so a second tab kept showing a signed-in
+  shell until it was reloaded, and a password change (which rotates every
+  session and writes the fresh token straight to storage) left the provider
+  holding the revoked one. Reading storage through `useSyncExternalStore`
+  keeps every writer visible to React, in this tab and in the others.
+
 ## [0.8.0] - 2026-09-08
 
 ### Added

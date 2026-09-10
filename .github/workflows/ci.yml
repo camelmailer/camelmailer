@@ -99,13 +99,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: npx tsc --noEmit
       - run: pnpm test
-      # Not a gate yet: `src` currently has 6 pre-existing eslint errors (one
-      # no-unnecessary-type-constraint, five react-hooks/set-state-in-effect).
-      # Surfaced here so they are visible and shrinking, rather than silently
-      # absent. Fixing them belongs in its own change; drop
-      # continue-on-error once it is clean.
       - run: pnpm run lint
-        continue-on-error: true
 
   # Builds the dashboard image the way the release workflow does, with
   # `context: web/app`. That isolation is the point: anything reaching outside

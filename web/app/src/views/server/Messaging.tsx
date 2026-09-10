@@ -467,12 +467,14 @@ export function Send({
   const [expertModel, setExpertModel] = useState(false)
   const [modelJson, setModelJson] = useState("{}")
 
-  // Start from a clean model whenever the selected template changes.
-  useEffect(() => {
+  // Picking a template starts from a clean model. Both callers go through
+  // here, so the reset lives with the event that causes it.
+  function chooseTemplate(permalink: string) {
+    setTemplatePermalink(permalink)
     setModelFields({})
     setExpertModel(false)
     setModelJson("{}")
-  }, [templatePermalink])
+  }
 
   // Toggling expert mode carries the values across: fields → JSON on the
   // way in, best-effort JSON → fields on the way out.
@@ -566,7 +568,7 @@ export function Send({
           setTextBody("")
           setHtmlBody("")
           setHtmlMode(false)
-          setTemplatePermalink("none")
+          chooseTemplate("none")
         }}
       />
     )
@@ -637,7 +639,7 @@ export function Send({
 
       <div className="grid gap-2">
         <Label>Template</Label>
-        <Select value={templatePermalink} onValueChange={setTemplatePermalink}>
+        <Select value={templatePermalink} onValueChange={chooseTemplate}>
           <SelectTrigger>
             <SelectValue />
           </SelectTrigger>
