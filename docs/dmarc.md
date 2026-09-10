@@ -1,6 +1,6 @@
 # DMARC monitoring
 
-CamelMailer can watch a sending domain's authentication health and act
+Camelmailer can watch a sending domain's authentication health and act
 as the destination for the domain's DMARC **aggregate reports** (RUA) —
 the loop that tells you whether your mail passes SPF/DKIM alignment and
 who else is sending as your domain. Three pieces work together:

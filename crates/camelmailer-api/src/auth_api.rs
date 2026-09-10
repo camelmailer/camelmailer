@@ -971,7 +971,7 @@ async fn totp_enroll(
     if let Err(error) = store.set_totp(current.user.id, Some(&secret), false).await {
         return render_store_error(Some(&start.0), error);
     }
-    let issuer = format!("CamelMailer ({})", state.config.camelmailer.web_hostname);
+    let issuer = format!("Camelmailer ({})", state.config.camelmailer.web_hostname);
     render_success(
         Some(&start.0),
         StatusCode::OK,

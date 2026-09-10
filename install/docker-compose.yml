@@ -1,4 +1,4 @@
-# CamelMailer — full stack from the prebuilt GHCR image. No repo clone
+# Camelmailer — full stack from the prebuilt GHCR image. No repo clone
 # needed; this single file is the whole installation:
 #
 #   mkdir camelmailer && cd camelmailer

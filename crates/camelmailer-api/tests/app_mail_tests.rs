@@ -36,7 +36,7 @@ fn app_mail_config(enabled: bool) -> camelmailer_config::Config {
     config.app_mail.enabled = enabled;
     config.app_mail.server_api_key = Some(APP_MAIL_KEY.into());
     config.app_mail.from_address = Some(FROM_ADDRESS.into());
-    config.app_mail.from_name = "CamelMailer".into();
+    config.app_mail.from_name = "Camelmailer".into();
     config
 }
 
@@ -235,8 +235,8 @@ async fn password_reset_emails_the_link_and_keeps_the_token_out_of_the_response(
     assert_eq!(stored[0].scope, "outgoing");
 
     let raw = decoded_raw(&stored[0].raw_message);
-    assert!(raw.contains("Subject: Reset your CamelMailer password"));
-    assert!(raw.contains("CamelMailer"), "From display name");
+    assert!(raw.contains("Subject: Reset your Camelmailer password"));
+    assert!(raw.contains("Camelmailer"), "From display name");
     assert!(raw.contains(&format!("{FRONTEND_URL}/reset-password?token=")));
 
     // the emailed link actually completes the reset (end to end)
@@ -297,7 +297,7 @@ async fn invitation_emails_the_accept_link_and_still_returns_the_token() {
     assert_eq!(stored[0].mail_from, FROM_ADDRESS);
 
     let raw = decoded_raw(&stored[0].raw_message);
-    assert!(raw.contains("Subject: You have been invited to Platform on CamelMailer"));
+    assert!(raw.contains("Subject: You have been invited to Platform on Camelmailer"));
     assert!(raw.contains(&format!("{FRONTEND_URL}/invitations/accept?token=")));
     // the emailed link carries the same token the admin was shown
     assert_eq!(
@@ -334,7 +334,7 @@ async fn registration_sends_a_welcome_mail_without_any_token() {
     assert_eq!(stored[0].mail_from, FROM_ADDRESS);
 
     let raw = decoded_raw(&stored[0].raw_message);
-    assert!(raw.contains("Subject: Welcome to CamelMailer"));
+    assert!(raw.contains("Subject: Welcome to Camelmailer"));
     assert!(raw.contains("Hello Grace"));
     assert!(raw.contains(FRONTEND_URL), "sign-in link");
     assert!(!raw.contains("?token="), "welcome mail carries no token");

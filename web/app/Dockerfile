@@ -1,4 +1,4 @@
-# The CamelMailer web dashboard (Next.js), published as
+# The Camelmailer web dashboard (Next.js), published as
 # ghcr.io/camelmailer/camelmailer-web alongside the engine image.
 #
 # The Next server proxies /api and /health to the backend, and Next bakes

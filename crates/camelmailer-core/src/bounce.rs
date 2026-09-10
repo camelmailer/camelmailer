@@ -16,9 +16,15 @@
 
 /// Header added to outbound messages so a returned DSN can
 /// be tied to the stored message that produced it.
+///
+/// The `CamelMailer` spelling is deliberate and frozen. The product is
+/// written `Camelmailer`, but this name went out on the wire, so it stays
+/// as shipped, the same way [`POSTAL_MESSAGE_TOKEN_HEADER`] does.
+/// `is_message_token_header` compares case-insensitively, so a DSN
+/// carrying either spelling still correlates.
 pub const MESSAGE_TOKEN_HEADER: &str = "X-CamelMailer-MsgID";
 
-/// Postal's equivalent header. Recognising it lets CamelMailer correlate
+/// Postal's equivalent header. Recognising it lets Camelmailer correlate
 /// bounces for messages imported from, or originally delivered by, Postal.
 pub const POSTAL_MESSAGE_TOKEN_HEADER: &str = "X-Postal-MsgID";
 
@@ -275,10 +281,10 @@ fn has_content_type_part(raw_message: &[u8], expected: &str) -> bool {
     })
 }
 
-/// Add CamelMailer's correlation header to an outbound message.
+/// Add Camelmailer's correlation header to an outbound message.
 ///
 /// A submitter may supply arbitrary message headers. Remove existing
-/// CamelMailer or Postal message-token headers from the top-level
+/// Camelmailer or Postal message-token headers from the top-level
 /// header block before adding the trusted value, otherwise one outbound
 /// message could make a later DSN mark unrelated messages as bounced.
 pub fn add_message_token_header(raw_message: &[u8], token: &str) -> Vec<u8> {

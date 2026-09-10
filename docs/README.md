@@ -1,6 +1,6 @@
-# CamelMailer documentation
+# Camelmailer documentation
 
-CamelMailer is a self-hosted or EU-cloud transactional email platform: a
+Camelmailer is a self-hosted or EU-cloud transactional email platform: a
 Rust backend (HTTP API, SMTP server, delivery worker) with a Next.js
 dashboard. These pages document how the product behaves so you can
 integrate against it and run it in production.

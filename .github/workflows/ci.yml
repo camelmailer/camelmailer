@@ -1,4 +1,4 @@
-# CamelMailer CI — lint + full test suite (including the PostgreSQL
+# Camelmailer CI — lint + full test suite (including the PostgreSQL
 # integration tests) + Docker image builds for the engine and the dashboard,
 # plus the dashboard's own type check and unit tests.
 #

@@ -581,7 +581,7 @@ async fn valid_return_path_domains_are_normalized_before_sending() {
         .await
         .unwrap();
     let mut config = worker_config(smtp.port);
-    config.dns.return_path_domain = "RP.CamelMailer.COM.".into();
+    config.dns.return_path_domain = "RP.Camelmailer.COM.".into();
     let worker = Worker::new(&config, s.store.clone());
     assert!(matches!(
         worker.process_next().await.unwrap().unwrap(),

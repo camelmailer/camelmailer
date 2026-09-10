@@ -1,6 +1,6 @@
 # Quickstart — zero to first mail
 
-This walkthrough boots the full CamelMailer stack with Docker Compose and
+This walkthrough boots the full Camelmailer stack with Docker Compose and
 sends a message over the HTTP API. Total time: about five minutes, most of
 it the first image build.
 
@@ -13,7 +13,7 @@ docker compose up -d --build
 ```
 
 This starts PostgreSQL, runs the schema migrations, and launches the three
-CamelMailer processes:
+Camelmailer processes:
 
 | Service | Role | Port |
 |---|---|---|
@@ -92,7 +92,7 @@ curl -s -X POST "$API/api/v2/server/messages" \
   -d '{
     "from": "hello@acme.example",
     "to": ["you@example.com"],
-    "subject": "Hello from CamelMailer",
+    "subject": "Hello from Camelmailer",
     "html_body": "<p>It works 🐫</p>",
     "text_body": "It works"
   }'
@@ -173,7 +173,7 @@ OIDC single sign-on and CORS.
 
 ## Running without Docker
 
-CamelMailer is a single static-ish Rust binary; all you need is PostgreSQL:
+Camelmailer is a single static-ish Rust binary; all you need is PostgreSQL:
 
 ```bash
 cargo build --release -p camelmailer

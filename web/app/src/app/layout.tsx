@@ -3,7 +3,7 @@ import "./globals.css"
 import Providers from "./providers"
 
 export const metadata: Metadata = {
-  title: { default: "CamelMailer", template: "%s — CamelMailer" },
+  title: { default: "Camelmailer", template: "%s — Camelmailer" },
   description:
     "Transactional email, nothing else. Self-hosted or EU cloud. Open source, MIT.",
   icons: {

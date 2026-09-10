@@ -1,6 +1,6 @@
 # Accounts, RBAC & SSO
 
-CamelMailer's HTTP APIs accept three kinds of credentials:
+Camelmailer's HTTP APIs accept three kinds of credentials:
 
 | Credential | Header | Scope |
 |---|---|---|
@@ -270,7 +270,7 @@ auth:
     enabled: true
     rp_id: app.camelmailer.com          # the domain passkeys are scoped to
     rp_origin: https://app.camelmailer.com   # the exact browser origin
-    rp_name: CamelMailer                # shown by the browser (optional)
+    rp_name: Camelmailer                # shown by the browser (optional)
 ```
 
 `enabled` requires `rp_id` and `rp_origin`. Choose `rp_id` carefully:
@@ -316,7 +316,7 @@ curl http://localhost:5000/api/v2/auth/features
 
 ## Platform email delivery
 
-CamelMailer can send its own account mail through its own sending
+Camelmailer can send its own account mail through its own sending
 pipeline (dogfooding). Create a mail server on **this** installation with
 a verified sending domain and an API credential, then configure:
 
@@ -325,7 +325,7 @@ app_mail:
   enabled: true
   server_api_key: "<API credential of a mail server of this installation>"
   from_address: no-reply@example.com   # domain must be verified on that server
-  from_name: CamelMailer               # optional display name
+  from_name: Camelmailer               # optional display name
 auth:
   frontend_url: https://mail-admin.example.com   # needed for the links
 ```
@@ -350,7 +350,7 @@ back to logging the link for the operator.
 ## Single sign-on (OIDC)
 
 Any spec-compliant OpenID Connect provider works: Okta, Microsoft Entra
-ID, Google Workspace, Keycloak, Authentik, … CamelMailer runs the
+ID, Google Workspace, Keycloak, Authentik, … Camelmailer runs the
 authorization-code flow with PKCE and validates ID tokens against the
 provider's JWKS (`iss`, `aud`, `exp`, `nonce`).
 
@@ -474,7 +474,7 @@ audit events). One account can hold links to several providers at once
 ## SAML
 
 For identity providers that only speak SAML 2.0 (or where the SAML app
-catalog entry is the paved path), CamelMailer acts as a SAML service
+catalog entry is the paved path), Camelmailer acts as a SAML service
 provider: HTTP-Redirect binding for the `AuthnRequest`, HTTP-POST
 binding for the response.
 
@@ -492,7 +492,7 @@ saml:
   # allowed_email_domains: [acme.com]
 ```
 
-Register CamelMailer with the IdP using the SP metadata:
+Register Camelmailer with the IdP using the SP metadata:
 
 ```text
 GET  {web}/api/v2/auth/saml/metadata   SP metadata XML (entity id + ACS)
@@ -539,7 +539,7 @@ log as `saml.login` / `saml.provision`.
 ## SCIM provisioning
 
 SCIM 2.0 (RFC 7643/7644, Users core) lets Okta, Entra ID & co. create,
-update and deactivate CamelMailer accounts automatically:
+update and deactivate Camelmailer accounts automatically:
 
 ```yaml
 scim:
@@ -624,13 +624,13 @@ auth:
     enabled: false
     rp_id: null                   # required when enabled
     rp_origin: null               # required when enabled
-    rp_name: CamelMailer
+    rp_name: Camelmailer
 
 app_mail:                         # platform email delivery (see above)
   enabled: false
   server_api_key: null            # required when enabled
   from_address: null              # required when enabled
-  from_name: CamelMailer
+  from_name: Camelmailer
 
 saml:                             # SAML 2.0 SSO (see above)
   enabled: false

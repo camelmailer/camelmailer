@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Import the transactional template library into a CamelMailer server.
+# Import the transactional template library into a Camelmailer server.
 #
 #   ./templates/import.sh https://mail.yourdomain.com $SERVER_API_KEY [name…]
 #

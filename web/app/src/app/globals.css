@@ -6,7 +6,7 @@
    that is never applied (rather than reacting to the OS colour scheme). */
 @custom-variant dark (&:is(.dark *));
 
-/* CamelMailer theme — the brand palette (see camelmailer.com/BRANDING.md):
+/* Camelmailer theme — the brand palette (see camelmailer.com/BRANDING.md):
    Cashmere White paper (#FFFDF1), Butterscotch Bloom highlight (#FFCE99),
    Whiskey Barrel ink and primary (#562F00). Light mode is brown ink on
    cream with a whiskey primary; dark mode inverts to a warm dark-brown

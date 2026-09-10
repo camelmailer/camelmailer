@@ -1,4 +1,4 @@
-# CamelMailer web
+# Camelmailer web
 
 One **Next.js** application (App Router) serves both faces of the product:
 

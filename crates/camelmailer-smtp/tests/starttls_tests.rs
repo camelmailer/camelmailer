@@ -183,7 +183,7 @@ async fn starttls_upgrades_the_session_and_delivers_authenticated_mail() {
     let mut client = SmtpTestClient::new(stream);
 
     let banner = client.read_line().await;
-    assert!(banner.starts_with("220 postal.example.com ESMTP CamelMailer/"));
+    assert!(banner.starts_with("220 postal.example.com ESMTP Camelmailer/"));
 
     // Before the upgrade: STARTTLS offered, AUTH withheld
     let reply = client.command("EHLO client.example").await;
@@ -251,7 +251,7 @@ async fn smtps_listener_speaks_tls_from_the_first_byte() {
     let mut client = SmtpTestClient::new(tls_stream);
 
     let banner = client.read_line().await;
-    assert!(banner.starts_with("220 postal.example.com ESMTP CamelMailer/"));
+    assert!(banner.starts_with("220 postal.example.com ESMTP Camelmailer/"));
 
     // The session starts in the TLS state: AUTH is advertised right away
     // and STARTTLS is not offered (exactly as after a STARTTLS upgrade).

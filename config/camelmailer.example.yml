@@ -1,4 +1,4 @@
-# CamelMailer configuration — copy to camelmailer.yml and point
+# Camelmailer configuration — copy to camelmailer.yml and point
 # CAMELMAILER_CONFIG_FILE_PATH at it. Every key is optional; anything you
 # omit falls back to the built-in default. An existing Postal `postal.yml`
 # loads unchanged (the `postal:` group is accepted as an alias for
@@ -167,7 +167,7 @@ auth:
     enabled: false
     # rp_id: app.camelmailer.com
     # rp_origin: https://app.camelmailer.com
-    # rp_name: CamelMailer
+    # rp_name: Camelmailer
 
 # Platform email delivery — the installation sends its own account mail
 # (password resets, invitations, welcome mail) through its own sending
@@ -181,7 +181,7 @@ app_mail:
   # through which platform mail is sent:
   # server_api_key: …
   # from_address: no-reply@example.com   # domain must be verified on that server
-  # from_name: CamelMailer
+  # from_name: Camelmailer
 
 # Stripe billing — for the hosted cloud offering only. Self-hosted
 # installations leave this off (the default): no billing endpoints, no

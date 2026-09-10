@@ -1,6 +1,6 @@
 {
-  "name": "CamelMailer",
-  "short_name": "CamelMailer",
+  "name": "Camelmailer",
+  "short_name": "Camelmailer",
   "description": "Transactional email, nothing else.",
   "start_url": "/",
   "display": "standalone",

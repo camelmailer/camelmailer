@@ -104,7 +104,7 @@ delivery note, so a held send is easy to explain.
 Large mailbox providers offer feedback loops: when a recipient marks your
 mail as spam, the provider sends you a complaint report in the ARF format
 (RFC 5965), an ordinary email whose body is a `multipart/report` with
-`report-type=feedback-report`. CamelMailer ingests these automatically.
+`report-type=feedback-report`. Camelmailer ingests these automatically.
 
 The worker recognises an ARF report by its envelope, independent of how
 it was routed, and hands it to the complaint path instead of delivering

@@ -433,10 +433,10 @@ mod tests {
 
     #[test]
     fn otpauth_url_escapes_issuer_and_account() {
-        let url = otpauth_url("SECRET32", "ada@example.com", "CamelMailer Test");
+        let url = otpauth_url("SECRET32", "ada@example.com", "Camelmailer Test");
         assert_eq!(
             url,
-            "otpauth://totp/CamelMailer%20Test:ada%40example.com?secret=SECRET32&issuer=CamelMailer%20Test&algorithm=SHA1&digits=6&period=30"
+            "otpauth://totp/Camelmailer%20Test:ada%40example.com?secret=SECRET32&issuer=Camelmailer%20Test&algorithm=SHA1&digits=6&period=30"
         );
     }
 

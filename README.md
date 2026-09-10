@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="web/app/public/camelmailer-logo.png" alt="CamelMailer" width="420">
+  <img src="web/app/public/camelmailer-logo.png" alt="Camelmailer" width="420">
 </p>
 
 <p align="center">
@@ -8,7 +8,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT licensed"></a>
 </p>
 
-# CamelMailer
+# Camelmailer
 
 **A headless, API-first mail delivery platform in Rust.** SMTP in and out,
 HTTP APIs for everything — sending, templates, message streams, statistics,
@@ -35,7 +35,7 @@ Three equivalent ways to run the full stack — pick one:
 |---|---|---|
 | **[Prebuilt Docker](#prebuilt-docker-image-ghcr)** | fastest start, no toolchain | Docker only |
 | **[Debian / Ubuntu](#debian--ubuntu-deb)** | bare-metal / VM, systemd | a PostgreSQL |
-| **[From source](#from-source)** | hacking on CamelMailer | Docker (or Rust) |
+| **[From source](#from-source)** | hacking on Camelmailer | Docker (or Rust) |
 
 ### Prebuilt Docker image (GHCR)
 
@@ -121,7 +121,7 @@ refuse to publish unless everything is green (see
 
 ## Storage: single PostgreSQL database with row-level security
 
-CamelMailer uses a **single PostgreSQL database**; tenant (mail-server)
+Camelmailer uses a **single PostgreSQL database**; tenant (mail-server)
 isolation on the shared `messages` table is enforced by the database
 itself via row-level security:
 
@@ -232,7 +232,7 @@ unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
 ## Headless API: Account + Server scopes
 
-CamelMailer is API-first — the whole platform is drivable over HTTP so a
+Camelmailer is API-first — the whole platform is drivable over HTTP so a
 frontend (e.g. React) can be built on top. There are two token scopes, both
 returning the native `{ status, time, data | error }` envelope with
 snake_case fields and `{ page, per_page, total, total_pages }` pagination:
@@ -292,6 +292,6 @@ where they stay searchable.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). CamelMailer began as a Rust rewrite of
+MIT, see [LICENSE](LICENSE). Camelmailer began as a Rust rewrite of
 [Postal](https://github.com/postalserver/postal), which is MIT too. The
 attribution for the portions that derive from it is in [NOTICE](NOTICE).

@@ -463,7 +463,7 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src="/camelmailer-logo.png"
-            alt="CamelMailer"
+            alt="Camelmailer"
             className="block h-auto w-44 dark:brightness-0 dark:invert"
           />
         </Link>

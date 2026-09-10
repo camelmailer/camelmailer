@@ -1,6 +1,6 @@
 # Inbound mail and routing
 
-CamelMailer receives mail as well as sends it. An **inbound stream**
+Camelmailer receives mail as well as sends it. An **inbound stream**
 groups the mail that arrives at a server, and a **route** decides what
 happens to each incoming message: hand it to an HTTP endpoint, keep it
 for later inspection, or ingest it internally (for example DMARC
@@ -77,7 +77,7 @@ kinds exist, and route validation accepts exactly these shapes (any other
 
 | `endpoint_url` | Target kind | What the worker does |
 |---|---|---|
-| `https://…` or `http://…` | **HTTP endpoint** | POSTs a JSON envelope carrying the raw message (base64) to the URL. This is the webhook-style delivery of inbound mail; see [Webhooks](webhooks.md) for the signing and retry model shared across CamelMailer's HTTP deliveries. |
+| `https://…` or `http://…` | **HTTP endpoint** | POSTs a JSON envelope carrying the raw message (base64) to the URL. This is the webhook-style delivery of inbound mail; see [Webhooks](webhooks.md) for the signing and retry model shared across Camelmailer's HTTP deliveries. |
 | `internal://dmarc-reports` | **Internal DMARC ingestion** | Parses the message as an RFC 7489 aggregate report and stores it in the tenant's report tables. Documented in full under [DMARC monitoring](dmarc.md). |
 
 The HTTP POST body is:
@@ -102,7 +102,7 @@ worker's attempt limit, after which the delivery is marked failed.
 
 The endpoint target is an HTTP(S) URL or the internal DMARC target.
 Forwarding an inbound message to another mailbox is a Postal feature that
-CamelMailer's route model leaves out for now; to relay inbound mail
+Camelmailer's route model leaves out for now; to relay inbound mail
 onward, point a route at an HTTP endpoint that re-injects it through the
 send API.
 
@@ -150,11 +150,11 @@ The relevant recipient must have `Action: failed`; `delayed`, `delivered`,
 `relayed` and `expanded` reports do not mark a message as bounced. A failed
 report may still have a 4.x enhanced status and is then classified as a soft
 bounce because the reporting MTA has stopped its own delivery attempts.
-CamelMailer sends one recipient per stored message, so it leaves a report with
+Camelmailer sends one recipient per stored message, so it leaves a report with
 mixed recipient actions uncorrelated rather than guessing which action belongs
 to the returned token. When a failed DSN contains an `X-CamelMailer-MsgID`
 header from an outgoing
-CamelMailer message, the worker sets the inbound message's `bounce_for_id`,
+Camelmailer message, the worker sets the inbound message's `bounce_for_id`,
 records it as `Processed`, marks the original outgoing message `Bounced`, and
 queues `MessageBounced` for every subscribed webhook. These state changes,
 delivery rows, and webhook requests commit in one transaction. A failed
@@ -164,7 +164,7 @@ queue the webhook again. A stale outgoing queue row whose message is already
 `Bounced` is removed before suppression checks, tracking, or SMTP. If a DSN
 reaches the original while outbound work is already in flight, its `Bounced`
 state wins over any later `Sent`, `SoftFail`, `HardFail`, or `Held` result.
-CamelMailer then completes the stale queue row without appending a delivery,
+Camelmailer then completes the stale queue row without appending a delivery,
 scheduling a retry, or enqueueing the older result's webhook. A matched DSN is
 not sent to a route endpoint. An unmatched failed DSN is sent to its configured
 route when one exists. Without a route it is recorded as `HardFail` and removed
@@ -244,7 +244,7 @@ curl -s -X POST \
   }'
 ```
 
-Point the MX record for `acme.example` at your CamelMailer `smtp` host and
+Point the MX record for `acme.example` at your Camelmailer `smtp` host and
 mail to `support@acme.example` starts flowing to the endpoint.
 
 **Hold mail for manual review.** A route that stores everything addressed

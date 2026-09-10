@@ -41,7 +41,7 @@ function curlSnippet(origin: string): string {
   -d '{
     "from": "you@yourdomain.com",
     "to": ["you@example.com"],
-    "subject": "Hello from CamelMailer",
+    "subject": "Hello from Camelmailer",
     "text_body": "It works!"
   }'`
 }

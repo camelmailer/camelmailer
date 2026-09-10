@@ -1,9 +1,9 @@
 openapi: 3.0.3
 info:
-  title: CamelMailer API
+  title: Camelmailer API
   version: "2"
   description: |
-    The CamelMailer HTTP API — transactional email, nothing else.
+    The Camelmailer HTTP API — transactional email, nothing else.
 
     Three surfaces, three credentials:
 
@@ -45,7 +45,7 @@ servers:
     variables:
       host:
         default: mail.example.com
-        description: Your CamelMailer instance (self-hosted or cloud)
+        description: Your Camelmailer instance (self-hosted or cloud)
 tags:
   - name: Send
   - name: Messages

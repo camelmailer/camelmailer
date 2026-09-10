@@ -3,7 +3,7 @@
 A **campaign** is a first-class record of one broadcast: a single piece
 of content sent to the subscribers of a [broadcast stream](broadcast.md).
 You compose it once (subject, From address, HTML and text body), point it
-at a broadcast stream, and CamelMailer expands it into one message per
+at a broadcast stream, and Camelmailer expands it into one message per
 subscriber. Each of those messages carries the campaign's `campaign_id`,
 so the per-campaign analytics roll up over exactly the mail that campaign
 produced.
@@ -203,7 +203,7 @@ marked `failed`.
 ## Async expansion
 
 When a campaign starts sending (send-now, or the scheduler claiming it),
-CamelMailer **expands** it into individual messages. The expansion runs in
+Camelmailer **expands** it into individual messages. The expansion runs in
 the background and returns the campaign to the caller right away, so a
 create-and-send responds in milliseconds while delivery proceeds behind
 it.
@@ -267,7 +267,7 @@ curl -s "$API/api/v2/server/campaigns/42" -H "X-Server-API-Key: $SERVER_KEY"
 | `clicked` | Distinct attributed messages with at least one link click. |
 | `unsubscribed` | Stream-scoped `unsubscribe`/`complaint` suppressions created at or after the campaign's `created_at`. |
 
-`opened` and `clicked` come from CamelMailer's open and click tracking, so
+`opened` and `clicked` come from Camelmailer's open and click tracking, so
 they populate only for streams and messages where tracking is enabled. See
 [Tracking](tracking.md) for how opens and clicks are recorded, and
 [Suppressions](suppressions.md) for how unsubscribes and complaints feed

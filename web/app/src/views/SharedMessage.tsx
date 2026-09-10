@@ -189,7 +189,7 @@ export default function SharedMessage({ token }: { token: string }) {
       </Card>
 
       <footer className="text-center text-xs text-muted-foreground">
-        Shared via CamelMailer
+        Shared via Camelmailer
       </footer>
     </main>
   )

@@ -1,5 +1,5 @@
 [Unit]
-Description=CamelMailer web server (Admin + Server + Auth HTTP APIs)
+Description=Camelmailer web server (Admin + Server + Auth HTTP APIs)
 Documentation=https://github.com/camelmailer/camelmailer
 After=network-online.target postgresql.service
 Wants=network-online.target

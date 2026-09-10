@@ -1,4 +1,4 @@
-//! CamelMailer core domain model and storage abstractions.
+//! Camelmailer core domain model and storage abstractions.
 //!
 //! This crate is the Rust counterpart of the ActiveRecord models plus the
 //! shared helpers (`app/models`, `app/lib/received_header.rb`,

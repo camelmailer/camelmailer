@@ -1,4 +1,4 @@
-# CamelMailer — full stack: PostgreSQL + migrations + web (HTTP APIs) +
+# Camelmailer — full stack: PostgreSQL + migrations + web (HTTP APIs) +
 # SMTP server + delivery worker, all from one image.
 #
 #   cp .env.example .env      # set POSTGRES_PASSWORD

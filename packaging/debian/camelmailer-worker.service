@@ -1,5 +1,5 @@
 [Unit]
-Description=CamelMailer delivery worker (queue, DKIM, tracking, webhooks)
+Description=Camelmailer delivery worker (queue, DKIM, tracking, webhooks)
 Documentation=https://github.com/camelmailer/camelmailer
 After=network-online.target postgresql.service
 Wants=network-online.target

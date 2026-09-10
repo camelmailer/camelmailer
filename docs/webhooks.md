@@ -1,11 +1,11 @@
 # Webhooks
 
-A webhook is an HTTP callback CamelMailer sends to your application when
+A webhook is an HTTP callback Camelmailer sends to your application when
 something happens to a message: it was accepted by the recipient's mail
 server, it was deferred, it failed permanently, it was held before
 sending, or a later DSN reported that it bounced. You register a URL per
 mail server, choose which events it
-receives, and CamelMailer POSTs a small JSON body to that URL every time
+receives, and Camelmailer POSTs a small JSON body to that URL every time
 a matching event fires. Each request carries an RSA signature so your
 receiver can confirm the payload really came from your installation.
 
@@ -16,7 +16,7 @@ click and open data, see [Tracking](tracking.md).
 
 ## Event types
 
-CamelMailer fires five events about the fate of outgoing messages. These
+Camelmailer fires five events about the fate of outgoing messages. These
 names are the single source of truth (`WEBHOOK_EVENTS` in
 `camelmailer-core`); the API rejects any other value at registration
 time.
@@ -76,7 +76,7 @@ The envelope fields:
 The first four events use the common `message` and `details` payload above.
 `MessageBounced` carries both correlated messages:
 
-CamelMailer inspects the inbound DSN before building this payload, so the
+Camelmailer inspects the inbound DSN before building this payload, so the
 `bounce.spam_status` value is the stored inspection verdict. Reprocessing an
 already correlated DSN does not emit another `MessageBounced` event. For
 Postal compatibility, `message_id` omits surrounding angle brackets and
@@ -122,7 +122,7 @@ Test deliveries add one extra top-level field, `"test": true` (see
 
 ## Signing
 
-When a webhook has signing enabled (the default), CamelMailer signs the
+When a webhook has signing enabled (the default), Camelmailer signs the
 exact request body and sends the signature in a header.
 
 | Property | Value |
@@ -133,7 +133,7 @@ exact request body and sends the signature in a header.
 | Signed content | The complete request body, byte for byte |
 | Key | The installation signing key (`camelmailer.signing_key_path`) |
 
-The signing key is the installation's RSA key, the same key CamelMailer
+The signing key is the installation's RSA key, the same key Camelmailer
 uses for DKIM. Its public half is therefore the value published as your
 DKIM `p=` DNS record. To get a PEM copy for your receiver, export the
 public half of the signing key once:
@@ -193,7 +193,7 @@ Each event is fanned out to every enabled webhook that subscribes to it,
 and each delivery becomes a row in a per-server queue that the worker
 drains.
 
-For `MessageBounced`, CamelMailer inserts every subscribed queue row in the
+For `MessageBounced`, Camelmailer inserts every subscribed queue row in the
 same database transaction that links the DSN and marks the original message
 `Bounced`. If any request insert fails, the full correlation rolls back and a
 later message-queue attempt can retry it. A repeated attempt after that
@@ -203,7 +203,7 @@ in-flight outbound result to the message row, the later result cannot enqueue
 Each outbound delivery-state transition commits its delivery row, queue
 completion or retry, and subscribed webhook requests together. This ordering
 also prevents a retry or event from escaping after correlation has recorded
-the newer bounce. Subscriber rows stay locked while CamelMailer inserts their
+the newer bounce. Subscriber rows stay locked while Camelmailer inserts their
 requests. Deleting a webhook during fan-out waits for this transaction to
 commit, then removes the newly queued request through the existing cascade
 without rolling back the message state or queue action.
@@ -239,6 +239,12 @@ Every delivery carries these headers:
 | `X-CamelMailer-Event` | The event name, matching `event` in the body. |
 | `X-CamelMailer-UUID` | The delivery uuid, matching `uuid` in the body. |
 | `X-CamelMailer-Signature` | The base64 RSA signature (present only when signing is enabled and a key exists). |
+
+These three header names keep the `CamelMailer` spelling the product
+shipped with, while the product itself is written Camelmailer. They are
+frozen so that a receiver matching on them keeps working. Header field
+names are case-insensitive (RFC 9110), so a client library that
+normalizes them, as Go and Node do, may hand you a different casing.
 
 Any custom `headers` you set on the webhook are added first, and the
 platform `X-CamelMailer-*` headers are applied last, so a custom header
