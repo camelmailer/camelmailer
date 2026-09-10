@@ -31,6 +31,7 @@ import {
   ACTIVITY_STATES,
   activity,
   bounceRate,
+  bounceShare,
   count,
   FLAG_LABELS,
   flags,
@@ -210,7 +211,7 @@ export default function Organizations() {
       accessorFn: (r) => r.servers,
       meta: { align: "right" },
       cell: ({ row }) => (
-        <span className="tabular-nums">
+        <span className="inline-block min-w-16 tabular-nums">
           {row.original.servers}
           {row.original.suspended_servers > 0 && (
             <span className="ml-1.5 text-xs text-red-600">
@@ -234,11 +235,11 @@ export default function Organizations() {
     {
       id: "bounces",
       header: "Bounces",
-      accessorFn: (r) => (r[range].total > 0 ? r[range].bounced / r[range].total : -1),
+      accessorFn: (r) => bounceShare(r[range]) ?? -1,
       meta: { align: "right" },
       cell: ({ row }) => {
         const counters = row.original[range]
-        const rate = counters.total > 0 ? counters.bounced / counters.total : 0
+        const rate = bounceShare(counters) ?? 0
         return (
           <span
             className={

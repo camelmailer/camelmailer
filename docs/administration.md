@@ -41,9 +41,8 @@ Each row carries:
 | Status | `Sending` (mail in the last 24 hours), `Quiet` (mail in the last 30 days, none today), `Idle` (nothing in 30 days), `Suspended` (every server suspended). |
 | Flags | Zero or more signals worth attention, described below. |
 | Servers | How many mail servers the tenant has, with a note when some are suspended. |
-| Members | How many accounts have access. |
 | Outgoing | Messages sent in the selected window. |
-| Bounces | Bounced share of the window's messages, red above 10%. |
+| Bounces | Bounced share of the window's outgoing messages, red above 10%. A bounce is an outgoing-mail outcome, so inbound mail stays out of the denominator. |
 | Held | Messages held in the selected window. |
 | Last message | When the tenant last sent or received anything. |
 | 2FA | Whether the organization enforces two-factor authentication. |
@@ -54,14 +53,14 @@ worth looking at leads the list.
 
 ### The flags
 
-Flags are judged over the last 30 days and compose, so a brand-new sender
-with a bounce problem carries both. When any tenant is flagged, a strip
+Flags are judged over the last 30 days and compose, so a newly active
+tenant with a bounce problem carries both. When any tenant is flagged, a strip
 above the table names them with the reason.
 
 | Flag | When it appears | Why it matters |
 |---|---|---|
-| **New sender** | The tenant's first message inside the window arrived in the last 24 hours, and it is sending now. | A fresh signup sending immediately at volume is the shape most abuse takes. |
-| **Check bounces** | More than 10% of at least 20 messages bounced. | A bounce share that high usually means a list the sender did not collect themselves. |
+| **Newly active** | The oldest message inside the 30-day window arrived in the last 24 hours, and the tenant is sending now. | Covers both shapes worth a look: a fresh signup sending immediately at volume, and an account dormant for a month that suddenly starts. The counters cannot tell those apart, because the window bounds what they can see, so the label claims only what is known. |
+| **Check bounces** | More than 10% of at least 20 outgoing messages bounced. | A bounce share that high usually means a list the sender did not collect themselves. The floor of 20 keeps a two-message sample from raising it. |
 | **Held mail** | Any message was held in the window. | Outbound spam scoring holds mail above the server's threshold, so held mail is the spam filter's own verdict. |
 | **Failing** | Any message ended in `HardFail` or `SoftFail`. | Repeated failures point at a misconfigured domain or a receiving side that is refusing this sender. |
 

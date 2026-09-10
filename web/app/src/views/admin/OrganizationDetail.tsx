@@ -31,6 +31,7 @@ import {
 import {
   activity,
   bounceRate,
+  bounceShare,
   count,
   flags,
   plural,
@@ -210,7 +211,7 @@ export default function OrganizationDetail({ org }: { org: string }) {
     {
       id: "bounces",
       header: "Bounces 30d",
-      accessorFn: (r) => (r.month.total > 0 ? r.month.bounced / r.month.total : -1),
+      accessorFn: (r) => bounceShare(r.month) ?? -1,
       meta: { align: "right" },
       cell: ({ row }) => <span className="tabular-nums">{bounceRate(row.original.month)}</span>,
     },

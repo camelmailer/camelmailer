@@ -27,15 +27,17 @@ integration tests) is green.
   recognition: a shared sending reputation means one tenant blasting a
   purchased list costs every other tenant inbox placement, and that shape
   is visible here before anyone complains.
-- **Flags, on counters rather than verdicts.** A tenant is flagged as a
-  **New sender** (first message inside the window arrived in the last 24
-  hours while it is sending now), **Check bounces** (over 10% of at least
-  20 messages bounced), **Held mail** (outbound spam scoring held
-  something, which is the spam filter's own verdict) or **Failing**
-  (deliveries ended in HardFail or SoftFail). Flags compose, and a strip
-  above the table names every flagged tenant with the reason. They decide
-  nothing: the drill-down and the message logs are where a judgment gets
-  made.
+- **Flags, on counters rather than verdicts.** A tenant is flagged as
+  **Newly active** (the oldest message inside the 30-day window arrived in
+  the last 24 hours while it is sending now, which covers both a fresh
+  signup and an account dormant for a month), **Check bounces** (over 10%
+  of at least 20 outgoing messages bounced), **Held mail** (outbound spam
+  scoring held something, which is the spam filter's own verdict) or
+  **Failing** (deliveries ended in HardFail or SoftFail). Flags compose,
+  and a strip above the table names every flagged tenant with the reason.
+  They decide nothing: the drill-down and the message logs are where a
+  judgment gets made. Bounce shares divide by outgoing mail, so a busy
+  inbound stream cannot dilute them.
 - **An organization detail page** at `/admin/organizations/{permalink}`:
   the three windows as a traffic matrix, every server with its own
   volume, bounce rate, held count, send limit and last message, who has
