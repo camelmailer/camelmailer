@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-10
+
 ### Changed
 
 - The product is written **Camelmailer**. The camel-case spelling was
