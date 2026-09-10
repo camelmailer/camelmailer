@@ -8,6 +8,8 @@ import { CheckIcon, CopyIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import {
   Dialog,
   DialogContent,
@@ -112,6 +114,7 @@ export function ConfirmDialog({
   title,
   description,
   confirmLabel = "Delete",
+  confirmWord,
   onConfirm,
 }: {
   open: boolean
@@ -119,33 +122,62 @@ export function ConfirmDialog({
   title: string
   description: string
   confirmLabel?: string
+  /// When set, the exact word has to be typed before the action unlocks.
+  /// Reserved for deletions reaching data the caller cannot see from
+  /// where they stand, such as an organization deleted from the admin
+  /// list rather than from inside it.
+  confirmWord?: string
   onConfirm: () => void | Promise<void>
 }) {
   const [busy, setBusy] = useState(false)
+  const [typed, setTyped] = useState("")
+  const unlocked = !confirmWord || typed.trim() === confirmWord
+
+  const run = async () => {
+    if (!unlocked) return
+    setBusy(true)
+    try {
+      await onConfirm()
+      onOpenChange(false)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) setTyped("")
+        onOpenChange(next)
+      }}
+    >
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
+        {confirmWord && (
+          <div className="grid gap-2">
+            <Label htmlFor="confirm-word">
+              Type <span className="font-mono font-medium">{confirmWord}</span> to confirm
+            </Label>
+            <Input
+              id="confirm-word"
+              value={typed}
+              autoComplete="off"
+              onChange={(event) => setTyped(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") void run()
+              }}
+            />
+          </div>
+        )}
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button
-            variant="destructive"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true)
-              try {
-                await onConfirm()
-                onOpenChange(false)
-              } finally {
-                setBusy(false)
-              }
-            }}
-          >
+          <Button variant="destructive" disabled={busy || !unlocked} onClick={run}>
             {confirmLabel}
           </Button>
         </DialogFooter>

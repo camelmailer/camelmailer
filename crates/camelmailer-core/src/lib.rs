@@ -53,10 +53,10 @@ pub use server_store::{
     is_valid_delivery_status, ActivityEvent, ApiRequestFilter, ApiRequestRecord, CampaignStats,
     CampaignUpdate, DeliveryRecord, DeliveryStats, IdempotencyLookup, IdempotencyRequest,
     ImportClick, ImportDelivery, ImportEvent, ImportMessage, MessageFilter, MessageShare,
-    MessageStats, NewApiRequest, NewLayout, NewMessageShare, NewStream, NewTemplate,
+    MessageStats, MessageVolume, NewApiRequest, NewLayout, NewMessageShare, NewStream, NewTemplate,
     PendingUnsubscribeToken, QueuedDomain, SendOperationItem, SendOperationResult, SendPlanItem,
     SendPlanMessage, ServerContext, ServerStore, StatsFilter, StoreSendOutcome, StoredSendResult,
-    TagCount, DELIVERY_STATUSES,
+    TagCount, VolumeCounters, VolumeWindows, DELIVERY_STATUSES,
 };
 pub use spf::{
     evaluate as evaluate_spf, evaluate_verifiable as evaluate_spf_verifiable, received_spf_header,

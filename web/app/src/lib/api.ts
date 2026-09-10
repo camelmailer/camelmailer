@@ -206,6 +206,73 @@ export type ServerStat = {
   bounced: number
 }
 
+/// One window of traffic counters from the administration overview
+/// endpoints. Deliberately smaller than `WindowStats`: enough to see how
+/// much a tenant sends and whether that traffic is healthy.
+export type VolumeCounters = {
+  total: number
+  outgoing: number
+  incoming: number
+  sent: number
+  held: number
+  failed: number
+  bounced: number
+}
+
+/// The three windows every overview row carries, plus the edges of the
+/// activity inside the widest one (null when nothing was sent).
+export type VolumeRow = {
+  day: VolumeCounters
+  week: VolumeCounters
+  month: VolumeCounters
+  first_message_at: string | null
+  last_message_at: string | null
+}
+
+/// Which window an overview column reads.
+export type VolumeWindow = "day" | "week" | "month"
+
+export type OrganizationVolume = VolumeRow & {
+  name: string
+  permalink: string
+  require_two_factor: boolean
+  servers: number
+  suspended_servers: number
+  members: number
+}
+
+export type ServerVolume = VolumeRow & {
+  name: string
+  permalink: string
+  mode: "Live" | "Development"
+  suspended: boolean
+  suspension_reason: string | null
+  send_limit: number | null
+}
+
+/// GET /api/v2/admin/overview — the whole installation, organizations
+/// busiest first. Administrators only.
+export type AdminOverview = {
+  generated_at: string
+  windows: Record<VolumeWindow, string>
+  instance: VolumeRow & {
+    organizations: number
+    servers: number
+    suspended_servers: number
+    users: number
+  }
+  organizations: OrganizationVolume[]
+}
+
+/// GET /api/v2/admin/organizations/{permalink}/overview — one tenant,
+/// broken down by server.
+export type OrganizationOverview = {
+  generated_at: string
+  windows: Record<VolumeWindow, string>
+  organization: OrganizationVolume
+  servers: ServerVolume[]
+}
+
 /// Full windowed message counters (GET .../servers/{server}/stats and the
 /// per-server /api/v2/server/stats). `bounces` breaks the bounced total
 /// into hard/soft/undetermined.
@@ -747,10 +814,19 @@ export function ssoStartUrl(providerId: string): string {
 // ------------------------------------------------------------- admin API
 
 export const adminApi = {
+  // Instance-wide oversight: every organization with its traffic over the
+  // last 24 hours, 7 days and 30 days. 403 for a non-admin session.
+  overview: () => api.get<{ overview: AdminOverview }>("/api/v2/admin/overview"),
   organizations: {
     list: () =>
       api.get<{ organizations: Organization[]; pagination: Pagination }>(
         "/api/v2/admin/organizations?per_page=100",
+      ),
+    // The same rollup for one organization, with its servers broken out.
+    // Readable by the organization's own members too.
+    overview: (permalink: string) =>
+      api.get<{ overview: OrganizationOverview }>(
+        `/api/v2/admin/organizations/${permalink}/overview`,
       ),
     create: (name: string) =>
       api.post<{ organization: Organization }>("/api/v2/admin/organizations", { name }),

@@ -1986,6 +1986,17 @@ impl camelmailer_core::ServerStore for PgStore {
             .map_err(|e| StoreError::Other(e.to_string()))
     }
 
+    async fn message_volume(
+        &self,
+        server_id: Id,
+        windows: camelmailer_core::VolumeWindows,
+    ) -> Result<camelmailer_core::MessageVolume, StoreError> {
+        PgMessageSink::new(self.clone())
+            .message_volume(server_id, windows)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
     async fn delivery_stats(
         &self,
         server_id: Id,
@@ -4876,6 +4887,80 @@ impl PgMessageSink {
             bounces_hard: counts.get("bounces_hard"),
             bounces_soft: counts.get("bounces_soft"),
             bounces_undetermined: counts.get("bounces_undetermined"),
+        })
+    }
+
+    /// Traffic counters over three nested windows plus the first and last
+    /// message inside the widest one, tenant-scoped (RLS).
+    ///
+    /// All three windows are counted in a single pass with `FILTER`
+    /// predicates, and only the widest window is scanned. The column list
+    /// is generated from one table of counters so a window and its
+    /// counters cannot drift apart; nothing in it comes from a caller.
+    pub async fn message_volume(
+        &self,
+        server_id: Id,
+        windows: camelmailer_core::VolumeWindows,
+    ) -> Result<camelmailer_core::MessageVolume, sqlx::Error> {
+        /// Every counter, as a predicate evaluated within each window.
+        const COUNTERS: [(&str, &str); 7] = [
+            ("total", "TRUE"),
+            ("outgoing", "scope = 'outgoing'"),
+            ("incoming", "scope = 'incoming'"),
+            ("sent", "status = 'Sent'"),
+            ("held", "status = 'Held'"),
+            ("failed", "status IN ('HardFail', 'SoftFail')"),
+            ("bounced", "status = 'Bounced'"),
+        ];
+        /// The windows, narrowest first, with the bind parameter holding
+        /// each one's start.
+        const WINDOWS: [(&str, &str); 3] = [("day", "$1"), ("week", "$2"), ("month", "$3")];
+
+        let columns = WINDOWS
+            .iter()
+            .flat_map(|(window, param)| {
+                COUNTERS.iter().map(move |(counter, predicate)| {
+                    format!(
+                        "count(*) FILTER (WHERE created_at >= {param} AND {predicate}) \
+                         AS {window}_{counter}"
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(",\n                 ");
+        let sql = format!(
+            "SELECT {columns},
+                 min(created_at) AS first_message_at,
+                 max(created_at) AS last_message_at
+             FROM messages
+             WHERE created_at >= $3"
+        );
+
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let row = sqlx::query(&sql)
+            .bind(windows.day)
+            .bind(windows.week)
+            .bind(windows.month)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        let counters = |window: &str| camelmailer_core::VolumeCounters {
+            total: row.get(format!("{window}_total").as_str()),
+            outgoing: row.get(format!("{window}_outgoing").as_str()),
+            incoming: row.get(format!("{window}_incoming").as_str()),
+            sent: row.get(format!("{window}_sent").as_str()),
+            held: row.get(format!("{window}_held").as_str()),
+            failed: row.get(format!("{window}_failed").as_str()),
+            bounced: row.get(format!("{window}_bounced").as_str()),
+        };
+        Ok(camelmailer_core::MessageVolume {
+            day: counters("day"),
+            week: counters("week"),
+            month: counters("month"),
+            first_message_at: row.get("first_message_at"),
+            last_message_at: row.get("last_message_at"),
         })
     }
 

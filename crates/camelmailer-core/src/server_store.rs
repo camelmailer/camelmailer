@@ -174,6 +174,48 @@ pub struct StatsFilter {
     pub tag: Option<String>,
 }
 
+/// The start instants of three nested windows, narrowest first. What they
+/// stand for is the caller's choice (the admin overview uses 24 hours,
+/// 7 days and 30 days); the store only requires `day >= week >= month`, and
+/// aggregates all three in one pass over the widest.
+#[derive(Debug, Clone, Copy)]
+pub struct VolumeWindows {
+    pub day: chrono::DateTime<chrono::Utc>,
+    pub week: chrono::DateTime<chrono::Utc>,
+    pub month: chrono::DateTime<chrono::Utc>,
+}
+
+/// Message counters for one window. A deliberately small set: enough to
+/// see how much a tenant sends and whether that traffic is healthy, which
+/// is what an instance operator watches. Per-message detail stays behind
+/// [`MessageStats`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VolumeCounters {
+    pub total: i64,
+    pub outgoing: i64,
+    pub incoming: i64,
+    pub sent: i64,
+    pub held: i64,
+    /// `HardFail` + `SoftFail`.
+    pub failed: i64,
+    pub bounced: i64,
+}
+
+/// One tenant's traffic across three windows plus the edges of its
+/// activity, gathered in a single query for the instance-wide admin
+/// overview (which reads every server on the installation).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageVolume {
+    pub day: VolumeCounters,
+    pub week: VolumeCounters,
+    pub month: VolumeCounters,
+    /// Oldest and newest message inside the widest window, so a brand-new
+    /// sender and a dormant one are both recognizable. `None` when the
+    /// window holds no messages.
+    pub first_message_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_message_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Aggregate message/engagement counters for a server (a time window).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MessageStats {
@@ -507,6 +549,16 @@ pub trait ServerStore: Send + Sync {
         server_id: Id,
         filter: &StatsFilter,
     ) -> Result<MessageStats, StoreError>;
+
+    /// Traffic counters for three nested windows at once, for the
+    /// instance-wide admin overview. One query per tenant: the overview
+    /// reads every server on the installation, so three calls to
+    /// [`ServerStore::message_stats`] per server would multiply by nine.
+    async fn message_volume(
+        &self,
+        server_id: Id,
+        windows: VolumeWindows,
+    ) -> Result<MessageVolume, StoreError>;
 
     /// Pending outbound queue depth (total + per destination domain).
     async fn delivery_stats(&self, server_id: Id) -> Result<DeliveryStats, StoreError>;
@@ -962,6 +1014,14 @@ impl ServerStore for crate::store::MemoryStore {
         filter: &StatsFilter,
     ) -> Result<MessageStats, StoreError> {
         Ok(self.message_stats_for(server_id, filter))
+    }
+
+    async fn message_volume(
+        &self,
+        server_id: Id,
+        windows: VolumeWindows,
+    ) -> Result<MessageVolume, StoreError> {
+        Ok(self.message_volume_for(server_id, windows))
     }
 
     async fn delivery_stats(&self, server_id: Id) -> Result<DeliveryStats, StoreError> {

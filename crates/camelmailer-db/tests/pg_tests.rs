@@ -6098,3 +6098,79 @@ async fn a_session_without_oidc_reads_back_as_local_only() {
         "a half-populated row must not become a logout request"
     );
 }
+
+/// The instance-wide admin overview reads three nested windows per tenant
+/// in a single aggregate. Counters must match the in-memory store, stay
+/// inside their window, and never cross a tenant boundary (RLS).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn message_volume_counts_three_nested_windows_per_tenant() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+    let now = chrono::Utc::now();
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+
+    let imported = |server_id, hours_ago: i64, status: &str, scope| {
+        let at = now - chrono::Duration::hours(hours_ago);
+        let mut message = import_for(server_id, at);
+        message.scope = scope;
+        message.deliveries[0].status = status.to_string();
+        message
+    };
+    for message in [
+        imported(f.server.id, 1, "Sent", MessageScope::Outgoing),
+        imported(f.server.id, 2, "Sent", MessageScope::Incoming),
+        imported(f.server.id, 72, "Bounced", MessageScope::Outgoing),
+        imported(f.server.id, 480, "Held", MessageScope::Outgoing),
+        imported(f.server.id, 24 * 45, "Sent", MessageScope::Outgoing),
+        imported(other.id, 1, "HardFail", MessageScope::Outgoing),
+    ] {
+        ServerStore::import_message(&f.store, message)
+            .await
+            .unwrap();
+    }
+
+    let windows = camelmailer_core::VolumeWindows {
+        day: now - chrono::Duration::hours(24),
+        week: now - chrono::Duration::days(7),
+        month: now - chrono::Duration::days(30),
+    };
+    let volume = ServerStore::message_volume(&f.store, f.server.id, windows)
+        .await
+        .unwrap();
+
+    assert_eq!(volume.day.total, 2);
+    assert_eq!(volume.day.outgoing, 1);
+    assert_eq!(volume.day.incoming, 1);
+    assert_eq!(volume.week.total, 3, "the three-day bounce joins");
+    assert_eq!(volume.week.bounced, 1);
+    assert_eq!(volume.month.total, 4, "the 45-day message stays out");
+    assert_eq!(volume.month.held, 1);
+    assert_eq!(volume.month.sent, 2);
+    assert_eq!(volume.month.failed, 0);
+    // The activity span covers the widest window only.
+    let first = volume.first_message_at.expect("first message");
+    let last = volume.last_message_at.expect("last message");
+    assert!(
+        first >= windows.month,
+        "{first} is outside the month window"
+    );
+    assert!(last > windows.day, "{last} should be the newest message");
+
+    // The other tenant's failure belongs to the other tenant.
+    let other_volume = ServerStore::message_volume(&f.store, other.id, windows)
+        .await
+        .unwrap();
+    assert_eq!(other_volume.month.total, 1);
+    assert_eq!(other_volume.month.failed, 1);
+    assert_eq!(other_volume.day.total, 1);
+}

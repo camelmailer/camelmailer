@@ -255,7 +255,16 @@ function AppBreadcrumbs() {
     crumbs.push({ label: "My Account" })
   } else if (segments[0] === "admin") {
     crumbs.push({ label: "Administration" })
-    if (segments[1]) crumbs.push({ label: segmentLabel(segments[1]) })
+    if (segments[1]) {
+      crumbs.push({
+        label: segmentLabel(segments[1]),
+        // An admin detail page keeps its index reachable.
+        href: segments[2] ? `/admin/${segments[1]}` : undefined,
+      })
+    }
+    // A tenant permalink is shown verbatim: capitalizing it would
+    // misrepresent an identifier the operator matches against the API.
+    if (segments[2]) crumbs.push({ label: decodeURIComponent(segments[2]) })
   }
 
   return (
@@ -647,7 +656,13 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
                   ] as const
                 ).map(([href, label, Icon]) => (
                   <SidebarMenuItem key={href}>
-                    <SidebarMenuButton asChild isActive={pathname === href} tooltip={label}>
+                    <SidebarMenuButton
+                      asChild
+                      // Detail pages hang below their index, so the entry
+                      // stays active while one is open.
+                      isActive={pathname === href || pathname.startsWith(`${href}/`)}
+                      tooltip={label}
+                    >
                       <Link href={href}>
                         <Icon />
                         <span>{label}</span>

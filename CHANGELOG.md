@@ -15,6 +15,48 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Instance-wide oversight in the administration area.** The
+  Organizations page used to list names, permalinks and the 2FA flag,
+  which said nothing about what a tenant was doing. It now opens with the
+  installation's own numbers (organizations, servers, users, outgoing
+  volume, bounce rate, held mail) over a switchable window of 24 hours,
+  7 days or 30 days, and every tenant carries its traffic, its bounce
+  share, its held mail and when it last sent. The point is early
+  recognition: a shared sending reputation means one tenant blasting a
+  purchased list costs every other tenant inbox placement, and that shape
+  is visible here before anyone complains.
+- **Flags, on counters rather than verdicts.** A tenant is flagged as a
+  **New sender** (first message inside the window arrived in the last 24
+  hours while it is sending now), **Check bounces** (over 10% of at least
+  20 messages bounced), **Held mail** (outbound spam scoring held
+  something, which is the spam filter's own verdict) or **Failing**
+  (deliveries ended in HardFail or SoftFail). Flags compose, and a strip
+  above the table names every flagged tenant with the reason. They decide
+  nothing: the drill-down and the message logs are where a judgment gets
+  made.
+- **An organization detail page** at `/admin/organizations/{permalink}`:
+  the three windows as a traffic matrix, every server with its own
+  volume, bounce rate, held count, send limit and last message, who has
+  access with their role, and suspend or unsuspend per server. Deleting a
+  tenant is reachable from here and from the list, and the confirmation
+  asks for the permalink to be typed out, because the deletion cascades
+  through every server, domain, credential, message and membership and is
+  triggered from a list where a mistaken row is easy to hit.
+- **`GET /api/v2/admin/overview`** and **`GET
+  /api/v2/admin/organizations/{permalink}/overview`**, the endpoints
+  behind those pages, so the same oversight can be scripted or fed into
+  monitoring. Both report counters over the three fixed windows plus each
+  tenant's first and last message; the instance endpoint is reserved for
+  administrators (403 for a plain session, 404 for a scoped key) and the
+  per-organization one is a read its own members may perform. Both answer
+  `503 StorageUnavailable` on an installation without message storage,
+  since zeros would read as real numbers. New: `docs/administration.md`.
+- **`ServerStore::message_volume`**, one query per tenant covering three
+  nested windows. The overview reads every server on the installation, so
+  three calls to `message_stats` per server would have multiplied by nine.
+
 ## [0.8.2] - 2026-09-10
 
 ### Added
