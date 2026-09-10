@@ -97,6 +97,7 @@ smtp_server:
   default_port: 25
   max_message_size: 14        # MB
   tls_enabled: true           # STARTTLS termination
+  auth_requires_tls: true     # default; see "Turning TLS on" below
   tls_certificate_path: $config-file-root/smtp.cert
   tls_private_key_path: $config-file-root/smtp.key
   proxy_protocol: false       # enable behind HAProxy/NLB
@@ -112,6 +113,39 @@ first byte — the classic port 465, requires `tls_enabled` and a
 certificate). Ports must be distinct; the session behaves identically on
 every listener — on `smtps` it simply starts in the TLS state (AUTH
 available immediately, messages marked as received over TLS).
+
+**The certificate is re-read when it changes on disk.** The server stats the
+certificate and key before each handshake and rebuilds its TLS acceptor when
+a modification time moves, so an ACME renewal reaches a running server
+without a restart. A file caught mid-write keeps the previous certificate in
+service and is retried on the next handshake.
+
+#### Turning TLS on for an installation that already authenticates
+
+AUTH is advertised, and accepted, only on a TLS-protected session. An
+installation with `tls_enabled: false` is the exception: there is no STARTTLS
+to offer, so AUTH stays available, on the assumption that TLS terminates
+elsewhere or the network is trusted.
+
+That makes the switch sharper than it looks. The moment `tls_enabled` becomes
+true, AUTH starts requiring TLS, and any client configured without STARTTLS
+fails at that instant. Most client libraries upgrade on their own once
+STARTTLS is advertised, so the ones at risk are those with TLS explicitly
+disabled.
+
+`auth_requires_tls: false` is the window for that transition:
+
+1. Deploy the certificate with `tls_enabled: true` and
+   `auth_requires_tls: false`. STARTTLS is now offered, and clients that
+   handle it upgrade by themselves.
+2. Watch the log. Every AUTH accepted on an unencrypted session is a warn
+   line naming the credential, its server and the client address:
+   `SMTP AUTH accepted on an unencrypted session`.
+3. Move the clients the log names.
+4. Remove `auth_requires_tls` (or set it to `true`) once the log stays quiet.
+
+The server logs a warning at startup for as long as the window is open, so an
+installation cannot forget it is in this state.
 
 ### `dns:` — the records you publish
 
@@ -216,7 +250,8 @@ billing portal. Stripe outages surface as the stable error code
 - [ ] `POSTGRES_PASSWORD` strong; database backed up (it holds config *and* mail)
 - [ ] `signing.key` generated, mounted, DKIM TXT record published
 - [ ] SPF include published for every sending domain
-- [ ] `smtp_server.tls_enabled` with a real certificate
+- [ ] `smtp_server.tls_enabled` with a real certificate, and
+      `auth_requires_tls` left at its default
 - [ ] Reverse proxy (TLS) in front of port 5000; `/health` as the LB probe
 - [ ] Port 25 egress open (many clouds block it — or use `smtp_relays`)
 - [ ] `RUST_LOG=info`, logs shipped somewhere

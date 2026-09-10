@@ -12,7 +12,14 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::{TcpListener, TcpStream};
 
 fn write_self_signed_cert(directory: &std::path::Path) -> (String, String) {
-    let certified = rcgen::generate_simple_self_signed(vec!["postal.example.com".into()]).unwrap();
+    let (cert_path, key_path, _) = write_cert_for(directory, "postal.example.com");
+    (cert_path, key_path)
+}
+
+/// Writes `smtp.cert` / `smtp.key` for one DNS name and hands back the DER of
+/// the certificate, so a test can tell which one a handshake presented.
+fn write_cert_for(directory: &std::path::Path, dns_name: &str) -> (String, String, Vec<u8>) {
+    let certified = rcgen::generate_simple_self_signed(vec![dns_name.into()]).unwrap();
     let cert_path = directory.join("smtp.cert");
     let key_path = directory.join("smtp.key");
     std::fs::write(&cert_path, certified.cert.pem()).unwrap();
@@ -20,22 +27,44 @@ fn write_self_signed_cert(directory: &std::path::Path) -> (String, String) {
     (
         cert_path.to_string_lossy().into_owned(),
         key_path.to_string_lossy().into_owned(),
+        certified.cert.der().to_vec(),
     )
 }
 
-/// A rustls client verifier that accepts any certificate (tests only).
+/// Pushes both files' modification times forward. Writing a file twice in
+/// quick succession can leave the timestamp unchanged, and the reload keys on
+/// exactly that, so the test states the renewal rather than hoping for it.
+fn stamp_renewed(cert_path: &str, key_path: &str) {
+    let times = std::fs::FileTimes::new()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2));
+    for path in [cert_path, key_path] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+    }
+}
+
+/// A rustls client verifier that accepts any certificate (tests only) and
+/// records what the server presented, in handshake order.
 #[derive(Debug)]
-struct AcceptAnyCert(rustls::crypto::CryptoProvider);
+struct AcceptAnyCert {
+    provider: rustls::crypto::CryptoProvider,
+    presented: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
 
 impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.presented.lock().unwrap().push(end_entity.to_vec());
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -49,7 +78,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
@@ -63,12 +92,14 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
             message,
             cert,
             dss,
-            &self.0.signature_verification_algorithms,
+            &self.provider.signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -160,15 +191,28 @@ async fn start_server_with_mode(
 }
 
 fn tls_connector() -> tokio_rustls::TlsConnector {
+    recording_tls_connector().0
+}
+
+/// A connector plus the list it records the server's certificate into.
+fn recording_tls_connector() -> (
+    tokio_rustls::TlsConnector,
+    Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+) {
     let provider = rustls::crypto::ring::default_provider();
     let _ = provider.clone().install_default();
+    let presented = Arc::new(std::sync::Mutex::new(Vec::new()));
     let client_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(
-            rustls::crypto::ring::default_provider(),
-        )))
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert {
+            provider: rustls::crypto::ring::default_provider(),
+            presented: presented.clone(),
+        }))
         .with_no_client_auth();
-    tokio_rustls::TlsConnector::from(Arc::new(client_config))
+    (
+        tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+        presented,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -298,4 +342,122 @@ async fn plaintext_sessions_still_work_when_tls_is_enabled() {
     assert_eq!(reply, vec!["250 OK"]);
     let reply = client.command("QUIT").await;
     assert_eq!(reply, vec!["221 Closing Connection"]);
+}
+
+/// Starts an smtps listener whose certificate the caller can replace on disk,
+/// handing back the directory the pair lives in.
+async fn start_server_with_replaceable_cert(
+    fixtures: &Fixtures,
+    sink: Arc<MemorySink>,
+) -> (u16, std::path::PathBuf, Vec<u8>) {
+    let directory = std::env::temp_dir().join(format!("cm-cert-reload-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let (cert_path, key_path, der) = write_cert_for(&directory, "postal.example.com");
+
+    let mut config = camelmailer_config::Config::default();
+    config.camelmailer.smtp_hostname = "postal.example.com".into();
+    config.smtp_server.tls_enabled = true;
+    config.smtp_server.tls_certificate_path = cert_path;
+    config.smtp_server.tls_private_key_path = key_path;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = SmtpServer::new(config, fixtures.store(), sink);
+    tokio::spawn(async move {
+        server
+            .serve_listeners(vec![(listener, SmtpListenerMode::Smtps)])
+            .await
+            .ok();
+    });
+    (port, directory, der)
+}
+
+/// A certificate renewal has to reach a running server. The acceptor used to
+/// be built once when the listeners were bound, so an ACME renewal every ~60
+/// days left the process presenting the expired certificate until somebody
+/// restarted it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewed_certificate_is_served_without_a_restart() {
+    let fixtures = Fixtures::new();
+    let sink = Arc::new(MemorySink::new());
+    let (port, directory, first) = start_server_with_replaceable_cert(&fixtures, sink).await;
+    let (connector, presented) = recording_tls_connector();
+
+    let handshake = |connector: tokio_rustls::TlsConnector| async move {
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("postal.example.com").unwrap();
+        connector.connect(name, tcp).await.unwrap();
+    };
+
+    handshake(connector.clone()).await;
+    assert_eq!(
+        presented.lock().unwrap().clone(),
+        vec![first.clone()],
+        "the first handshake presents the certificate on disk"
+    );
+
+    let (cert_path, key_path, renewed) = write_cert_for(&directory, "renewed.example.com");
+    stamp_renewed(&cert_path, &key_path);
+    assert_ne!(first, renewed, "the renewal has to be a different cert");
+
+    handshake(connector).await;
+    assert_eq!(
+        presented.lock().unwrap().clone(),
+        vec![first, renewed],
+        "the second handshake has to present the renewed certificate"
+    );
+}
+
+/// Turning `tls_enabled` on makes AUTH require TLS, which breaks a client
+/// that authenticates in the clear today. `auth_requires_tls: false` is the
+/// window that lets such an installation offer STARTTLS first and move its
+/// clients afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_stays_available_in_the_clear_while_auth_requires_tls_is_off() {
+    let fixtures = Fixtures::new();
+    fixtures.verified_server_domain("org.example");
+    let credential = fixtures.credential(CredentialType::Smtp, "migration-window-key");
+    let sink = Arc::new(MemorySink::new());
+
+    let directory = std::env::temp_dir().join(format!("cm-authtls-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let (cert_path, key_path) = write_self_signed_cert(&directory);
+    let mut config = camelmailer_config::Config::default();
+    config.camelmailer.smtp_hostname = "postal.example.com".into();
+    config.smtp_server.tls_enabled = true;
+    config.smtp_server.auth_requires_tls = false;
+    config.smtp_server.tls_certificate_path = cert_path;
+    config.smtp_server.tls_private_key_path = key_path;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = SmtpServer::new(config, fixtures.store(), sink);
+    tokio::spawn(async move {
+        server
+            .serve_listeners(vec![(listener, SmtpListenerMode::Smtp)])
+            .await
+            .ok();
+    });
+
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut client = SmtpTestClient::new(stream);
+    client.read_line().await;
+
+    // Both are offered: STARTTLS so a client can upgrade on its own, AUTH so
+    // one that has not yet keeps working.
+    let reply = client.command("EHLO client.example").await;
+    assert!(reply
+        .iter()
+        .any(|l| l == "250-STARTTLS" || l == "250 STARTTLS"));
+    assert!(reply.iter().any(|l| l.contains("AUTH PLAIN LOGIN")));
+
+    use base64::Engine;
+    let auth =
+        base64::engine::general_purpose::STANDARD.encode(format!("\0XX\0{}", credential.key));
+    let reply = client.command(&format!("AUTH PLAIN {auth}")).await;
+    assert!(
+        reply[0].starts_with("235 Granted for"),
+        "unprotected AUTH must still be accepted, got {:?}",
+        reply
+    );
 }

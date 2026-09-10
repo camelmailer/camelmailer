@@ -944,6 +944,7 @@ async fn a_full_smtp_session_stores_the_message_in_postgres() {
     let config = SessionConfig {
         smtp_hostname: "postal.example.com".into(),
         tls_enabled: false,
+        auth_requires_tls: true,
         max_message_size: 14,
         return_path_domain: "rp.postal.example.com".into(),
         custom_return_path_prefix: "psrp".into(),

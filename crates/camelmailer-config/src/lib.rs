@@ -572,6 +572,20 @@ pub struct SmtpServer {
     pub default_health_server_port: u16,
     pub default_health_server_bind_address: String,
     pub tls_enabled: bool,
+    /// Whether AUTH requires a TLS-protected session. Leave this on.
+    ///
+    /// It exists for one situation: turning `tls_enabled` on for an
+    /// installation whose clients already authenticate in the clear. The
+    /// moment TLS becomes available, AUTH starts requiring it, and a client
+    /// configured without STARTTLS fails at that instant. Setting this to
+    /// `false` offers STARTTLS while still accepting an unprotected AUTH, so
+    /// clients can upgrade on their own schedule. Every such AUTH is logged
+    /// at warn level with the credential and the client address, so the
+    /// window can be closed once the log falls quiet.
+    ///
+    /// Has no effect while `tls_enabled` is off, because there is no TLS to
+    /// require.
+    pub auth_requires_tls: bool,
     pub tls_certificate_path: String,
     pub tls_private_key_path: String,
     pub tls_ciphers: Option<String>,
@@ -595,6 +609,7 @@ impl Default for SmtpServer {
             default_health_server_port: 9091,
             default_health_server_bind_address: "127.0.0.1".into(),
             tls_enabled: false,
+            auth_requires_tls: true,
             tls_certificate_path: "$config-file-root/smtp.cert".into(),
             tls_private_key_path: "$config-file-root/smtp.key".into(),
             tls_ciphers: None,
@@ -1153,6 +1168,8 @@ mod tests {
         assert_eq!(config.smtp_server.default_port, 25);
         assert_eq!(config.smtp_server.default_bind_address, "::");
         assert!(!config.smtp_server.tls_enabled);
+        // Secure by default: the migration window has to be asked for.
+        assert!(config.smtp_server.auth_requires_tls);
         assert_eq!(config.smtp_server.max_message_size, 14);
 
         assert_eq!(
@@ -1680,6 +1697,19 @@ auth:
             "auth:\n  webauthn:\n    enabled: true\n    rp_id: app.camelmailer.com\n    rp_origin: https://app.camelmailer.com\n",
         )
         .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn auth_requires_tls_parses_from_yaml() {
+        let config = Config::from_yaml(
+            "camelmailer:\n  web_hostname: mail.example.com\n\
+             smtp_server:\n  tls_enabled: true\n  auth_requires_tls: false\n",
+        )
+        .unwrap();
+        assert!(config.smtp_server.tls_enabled);
+        assert!(!config.smtp_server.auth_requires_tls);
+        // A migration window is a valid configuration, not a config error.
         config.validate().unwrap();
     }
 

@@ -16,6 +16,7 @@ fn config() -> SessionConfig {
     SessionConfig {
         smtp_hostname: SMTP_HOSTNAME.into(),
         tls_enabled: false,
+        auth_requires_tls: true,
         max_message_size: 14,
         return_path_domain: RETURN_PATH_DOMAIN.into(),
         custom_return_path_prefix: "psrp".into(),
