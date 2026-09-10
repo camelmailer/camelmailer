@@ -1,6 +1,6 @@
 import type { NextConfig } from "next"
 
-// The CamelMailer backend the Next server proxies API calls to. In
+// The Camelmailer backend the Next server proxies API calls to. In
 // development this is the local Docker stack; in production point it at
 // your instance (the proxy makes the app same-origin — no CORS needed).
 const API_URL = process.env.API_PROXY_URL ?? "http://localhost:5000"

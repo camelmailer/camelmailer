@@ -180,7 +180,7 @@ export function BillingView({ org }: { org: string }) {
             </AlertTitle>
             <AlertDescription>
               <p>
-                Sending is free while CamelMailer is in public beta, up to{" "}
+                Sending is free while Camelmailer is in public beta, up to{" "}
                 {BETA_MONTHLY_CAP.toLocaleString()} emails per calendar month.
                 Paid plans launch soon, and you will be able to review them here
                 before anything is charged.

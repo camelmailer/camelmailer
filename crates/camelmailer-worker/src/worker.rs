@@ -1057,6 +1057,8 @@ impl Worker {
                 _ => tracing::warn!(header = %name, "skipping invalid webhook header"),
             }
         }
+        // `CamelMailer` here is frozen wire vocabulary, see the note in
+        // `camelmailer_api::webhook_send`.
         http_request = http_request
             .header("X-CamelMailer-Event", &request.event)
             .header("X-CamelMailer-UUID", &request.uuid);

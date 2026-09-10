@@ -1,4 +1,4 @@
-# CamelMailer — single image for every process role.
+# Camelmailer — single image for every process role.
 #
 # The same image runs each component depending on the command:
 #   docker run camelmailer web-server | smtp-server | worker | initialize

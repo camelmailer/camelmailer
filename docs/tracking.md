@@ -1,6 +1,6 @@
 # Open and click tracking
 
-CamelMailer can measure engagement on the mail it sends: whether a
+Camelmailer can measure engagement on the mail it sends: whether a
 message was opened, and which of its links a recipient followed. Two
 techniques do the work, and both are applied by the delivery worker at
 send time so the numbers roll up into message detail, per-server
@@ -8,9 +8,9 @@ send time so the numbers roll up into message detail, per-server
 
 1. **Open tracking** appends an invisible 1×1 GIF (a *pixel*) before
    `</body>`. When the recipient's mail client loads that image, it hits
-   a CamelMailer endpoint and an open is recorded.
+   a Camelmailer endpoint and an open is recorded.
 2. **Click tracking** rewrites every `http(s)` link in the HTML body to
-   point at CamelMailer. The endpoint records the click and then
+   point at Camelmailer. The endpoint records the click and then
    302-redirects the recipient to the original URL, which is preserved
    exactly.
 
@@ -62,7 +62,7 @@ There is one granularity here: the mail server. Individual messages and
 
 ## The tracking domain
 
-Both public endpoints are served by the CamelMailer **web** process (the
+Both public endpoints are served by the Camelmailer **web** process (the
 same one that answers the API, port 5000 in the [quickstart](quickstart.md)
 stack). Recipients reach them through a dedicated hostname, the
 **tracking domain**, set by `dns.track_domain`:

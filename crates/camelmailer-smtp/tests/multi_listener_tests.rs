@@ -61,7 +61,7 @@ impl LineClient {
 async fn deliver_one(port: u16, credential_key: &str, subject: &str) {
     let mut client = LineClient::connect(port).await;
     let banner = client.read_line().await;
-    assert!(banner.starts_with("220 postal.example.com ESMTP CamelMailer/"));
+    assert!(banner.starts_with("220 postal.example.com ESMTP Camelmailer/"));
 
     let reply = client.command("EHLO client.example").await;
     assert!(reply.iter().any(|l| l == "250 AUTH PLAIN LOGIN"));

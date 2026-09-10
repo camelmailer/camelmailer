@@ -73,7 +73,7 @@ function stringify(value: unknown): string {
   return String(value)
 }
 
-/** Render the CamelMailer Mustache subset — `{{ var }}` (dotted paths),
+/** Render the Camelmailer Mustache subset — `{{ var }}` (dotted paths),
  *  `{{{ var }}}` (kept raw), `{{#section}}…{{/section}}` (truthy / list
  *  iteration) and `{{^section}}…{{/section}}` (inverted) — entirely in the
  *  browser, so the split editor previews *unsaved* edits live. Unknown
@@ -342,7 +342,7 @@ export type SnippetContext = {
   smtpUser: string
 }
 
-const SUBJECT = "Hello from CamelMailer"
+const SUBJECT = "Hello from Camelmailer"
 const HTMLBODY = "<h1>It works!</h1><p>Your first message is on its way.</p>"
 
 /** A copy-paste-ready send snippet in the given language, with the real

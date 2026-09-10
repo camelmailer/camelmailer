@@ -1,6 +1,6 @@
 # Sending email
 
-Sending is the core of CamelMailer. You hand a message to the platform,
+Sending is the core of Camelmailer. You hand a message to the platform,
 it stores and queues it, and the delivery worker takes it from there. There
 are two front doors into that same pipeline: an HTTP send API and SMTP
 submission. Both authenticate with a server-scoped credential, both apply
@@ -136,7 +136,7 @@ lost response:
 ```
 
 The key must be 1–256 characters and is scoped to the authenticated server.
-CamelMailer retains a completed result for 24 hours:
+Camelmailer retains a completed result for 24 hours:
 
 - retrying the same endpoint and normalized request with the same key returns
   the original success response, including the original message ids and
@@ -149,7 +149,7 @@ CamelMailer retains a completed result for 24 hours:
   results.
 
 The 256-character limit applies to the caller-provided key before it is
-hashed. CamelMailer stores only SHA-256 hashes of the key and normalized
+hashed. Camelmailer stores only SHA-256 hashes of the key and normalized
 request, but validating the external value first keeps the public protocol
 bounded and predictable. Key length therefore does not affect the database
 index size.
@@ -157,7 +157,7 @@ index size.
 Generate a key for the application operation you are protecting—for example,
 `receipt/order-10432`. Do not use the email's RFC `Message-ID` as the
 idempotency key. `Message-ID` identifies a MIME message; an idempotency key
-identifies a send API operation and must be available before CamelMailer
+identifies a send API operation and must be available before Camelmailer
 creates and queues that message.
 
 ### How message IDs work
@@ -245,7 +245,7 @@ they get their own tracking, stats and configuration.
   `422 ValidationError`.
 
 **Broadcast streams add behavior on send.** When the target stream is a
-broadcast stream, CamelMailer requires every recipient to have opted in to
+broadcast stream, Camelmailer requires every recipient to have opted in to
 that stream and rejects the whole request naming the first address that has
 not. It also gives each recipient a unique one-click unsubscribe: per-recipient
 `List-Unsubscribe` and `List-Unsubscribe-Post` headers (RFC 8058) plus a
@@ -309,7 +309,7 @@ For retry-safe authenticated submission, add exactly one
 character and 24-hour rules as the HTTP header. The request fingerprint covers
 the envelope sender, the ordered envelope recipients and the client-supplied
 message data. A replay receives `250 OK` without another queued message; reuse
-with different content or recipients receives `554`. CamelMailer removes this
+with different content or recipients receives `554`. Camelmailer removes this
 operational header before storing and delivering the message. It is not
 accepted on unauthenticated inbound mail.
 

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to CamelMailer are documented in this file.
+All notable changes to Camelmailer are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/):
@@ -17,6 +17,22 @@ integration tests) is green.
 
 ### Changed
 
+- The product is written **Camelmailer**. The camel-case spelling was
+  inconsistent with the brand, and this corrects it across the README, the
+  docs, the code comments, the packaging metadata and the dashboard. Visible
+  where a name is displayed: the dashboard title and web manifest, the
+  systemd unit descriptions and the `.deb` description, the WebAuthn
+  `auth.webauthn.rp_name` default, the `app_mail.from_name` default, and the
+  TOTP issuer shown when enrolling an authenticator app. Existing TOTP and
+  passkey enrolments keep working, because the issuer and `rp_name` are
+  labels while `rp_id` and the shared secret carry the identity.
+- The header names on the wire keep the spelling they shipped with:
+  `X-CamelMailer-MsgID`, `X-CamelMailer-Event`, `X-CamelMailer-UUID`,
+  `X-CamelMailer-Signature` and `CamelMailer-Idempotency-Key`. Receivers
+  match on those names, and a signature check comparing the string exactly
+  would start rejecting every delivery. They are frozen the way
+  `X-Postal-MsgID` is, and the code that reads them compares
+  case-insensitively, as RFC 9110 allows.
 - eslint is a CI gate for the dashboard. The `web` job ran it with
   `continue-on-error` because `web/app/src` carried six errors; those are
   fixed, so the step gates like the others. Five were
@@ -173,7 +189,7 @@ integration tests) is green.
 - **Return-path upgrade note.** `dns.return_path_envelope` defaults to `false`
   in 0.7.x, including when omitted from YAML. Existing installations preserve
   their submitted `MAIL FROM` even with a real return-path domain configured.
-  Before enabling rewriting, route that domain's MX to CamelMailer and publish
+  Before enabling rewriting, route that domain's MX to Camelmailer and publish
   SPF authorizing the outbound worker IPs or relay. Empty, malformed and
   reserved example values still preserve the submitted sender. Bounce intake
   and correlation remain independent of the flag.
@@ -854,7 +870,7 @@ integration tests) is green.
 - **`GET /api/v2/auth/features`** — public discovery of the optional
   sign-in features (`webauthn`, `registration`, `oidc {enabled, name}`);
   the login page uses it to decide which buttons/links to render.
-- **SAML 2.0 single sign-on** — CamelMailer can act as a SAML service
+- **SAML 2.0 single sign-on** — Camelmailer can act as a SAML service
   provider (`saml` config group: `enabled`, `name`, `idp_sso_url`,
   `idp_certificate`, `sp_entity_id`, `auto_provision`,
   `allowed_email_domains`). HTTP-Redirect binding for the AuthnRequest,
@@ -898,8 +914,8 @@ integration tests) is green.
 
 ## [0.1.0] - 2026-07-11
 
-The first CamelMailer release — a transactional email platform in one
-Rust binary and one PostgreSQL database. CamelMailer began as a
+The first Camelmailer release — a transactional email platform in one
+Rust binary and one PostgreSQL database. Camelmailer began as a
 ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 (MIT) and is an independent project.
 

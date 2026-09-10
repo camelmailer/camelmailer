@@ -87,7 +87,7 @@ export function AuthShell({
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
             src="/camelmailer-logo.png"
-            alt="CamelMailer"
+            alt="Camelmailer"
             className="h-8 w-auto dark:brightness-0 dark:invert"
           />
         </Link>

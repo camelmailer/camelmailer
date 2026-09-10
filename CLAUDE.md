@@ -1,10 +1,10 @@
 # CLAUDE.md
 
-Guidance for AI agents working in this repository (CamelMailer).
+Guidance for AI agents working in this repository (Camelmailer).
 
 ## What this is
 
-**CamelMailer** — a self-hosted / cloud transactional-email platform:
+**Camelmailer** — a self-hosted / cloud transactional-email platform:
 a Cargo workspace (Rust) for the backend, a Next.js app for web, plus a
 transactional template library. Positioning: the self-hosted or EU-cloud
 alternative to the big US email providers, focused exclusively on simple

@@ -40,10 +40,10 @@ fn escape_html(value: &str) -> String {
 pub(crate) fn password_reset_mail(to: &str, link: &str, expiry_hours: u32) -> AppMail {
     AppMail {
         to: to.to_string(),
-        subject: "Reset your CamelMailer password".into(),
+        subject: "Reset your Camelmailer password".into(),
         text_body: format!(
             "Hello,\n\n\
-             A password reset was requested for your CamelMailer account.\n\
+             A password reset was requested for your Camelmailer account.\n\
              Choose a new password using this link:\n\n\
              {link}\n\n\
              The link expires in {expiry_hours} hours. If you did not request \
@@ -51,7 +51,7 @@ pub(crate) fn password_reset_mail(to: &str, link: &str, expiry_hours: u32) -> Ap
         ),
         html_body: format!(
             "<p>Hello,</p>\
-             <p>A password reset was requested for your CamelMailer account. \
+             <p>A password reset was requested for your Camelmailer account. \
              Choose a new password using this link:</p>\
              <p><a href=\"{link}\">{link}</a></p>\
              <p>The link expires in {expiry_hours} hours. If you did not \
@@ -71,10 +71,10 @@ pub(crate) fn invitation_mail(
 ) -> AppMail {
     AppMail {
         to: to.to_string(),
-        subject: format!("You have been invited to {organization_name} on CamelMailer"),
+        subject: format!("You have been invited to {organization_name} on Camelmailer"),
         text_body: format!(
             "Hello,\n\n\
-             You have been invited to join {organization_name} on CamelMailer.\n\
+             You have been invited to join {organization_name} on Camelmailer.\n\
              Accept the invitation using this link:\n\n\
              {link}\n\n\
              The invitation expires in {expiry_days} days.\n"
@@ -82,7 +82,7 @@ pub(crate) fn invitation_mail(
         html_body: format!(
             "<p>Hello,</p>\
              <p>You have been invited to join <strong>{organization_name}</strong> \
-             on CamelMailer. Accept the invitation using this link:</p>\
+             on Camelmailer. Accept the invitation using this link:</p>\
              <p><a href=\"{link}\">{link}</a></p>\
              <p>The invitation expires in {expiry_days} days.</p>",
             organization_name = escape_html(organization_name),
@@ -97,11 +97,11 @@ pub(crate) fn invitation_mail(
 pub(crate) fn sender_address_confirmation_mail(to: &str, link: &str) -> AppMail {
     AppMail {
         to: to.to_string(),
-        subject: "Confirm your sender address on CamelMailer".into(),
+        subject: "Confirm your sender address on Camelmailer".into(),
         text_body: format!(
             "Hello,\n\n\
              This email address was added as a sender address on a \
-             CamelMailer mail server. Confirm that you own it using this \
+             Camelmailer mail server. Confirm that you own it using this \
              link:\n\n\
              {link}\n\n\
              If you did not expect this email, you can ignore it — the \
@@ -110,7 +110,7 @@ pub(crate) fn sender_address_confirmation_mail(to: &str, link: &str) -> AppMail 
         html_body: format!(
             "<p>Hello,</p>\
              <p>This email address was added as a sender address on a \
-             CamelMailer mail server. Confirm that you own it using this \
+             Camelmailer mail server. Confirm that you own it using this \
              link:</p>\
              <p><a href=\"{link}\">{link}</a></p>\
              <p>If you did not expect this email, you can ignore it — the \
@@ -138,16 +138,16 @@ pub(crate) fn welcome_mail(to: &str, first_name: &str, frontend_url: Option<&str
         .unwrap_or_default();
     AppMail {
         to: to.to_string(),
-        subject: "Welcome to CamelMailer".into(),
+        subject: "Welcome to Camelmailer".into(),
         text_body: format!(
             "{greeting},\n\n\
-             Your CamelMailer account has been created.\n\
+             Your Camelmailer account has been created.\n\
              {sign_in_text}\n\
              Happy sending!\n"
         ),
         html_body: format!(
             "<p>{greeting},</p>\
-             <p>Your CamelMailer account has been created.</p>\
+             <p>Your Camelmailer account has been created.</p>\
              {sign_in_html}\
              <p>Happy sending!</p>",
             greeting = escape_html(&greeting),

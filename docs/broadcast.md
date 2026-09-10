@@ -7,7 +7,7 @@ receipt or a password reset to someone who is expecting it, a broadcast
 stream ships promotional mail to a list, so it has to answer to a stricter
 set of rules.
 
-CamelMailer enforces four of them, and it enforces them **only** for
+Camelmailer enforces four of them, and it enforces them **only** for
 `broadcast` streams. A `transactional` or `inbound` stream behaves exactly
 as it always has; every broadcast rule below is gated on
 `stream_type == "broadcast"`.
@@ -174,7 +174,7 @@ and per-pool reputation fit together, see
 ## 3. CAN-SPAM compliance footer
 
 CAN-SPAM requires marketing mail to carry a visible way to opt out and the
-sender's physical postal address. CamelMailer appends both to every broadcast
+sender's physical postal address. Camelmailer appends both to every broadcast
 message, in **both** the HTML and the plain-text body, before the raw message
 is built. The footer travels with the stored message exactly like the
 `List-Unsubscribe` header.

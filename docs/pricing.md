@@ -1,6 +1,6 @@
 # Cloud pricing and the public beta
 
-CamelMailer runs in public beta on its EU cloud. Sending is free during the
+Camelmailer runs in public beta on its EU cloud. Sending is free during the
 beta, and paid plans launch soon. This page covers what the beta includes,
 the plan that is coming, and where all of it lives in the dashboard.
 
@@ -9,7 +9,7 @@ keeps billing disabled and is never charged; see the note at the end.
 
 ## Public beta
 
-While CamelMailer is in public beta, sending is free up to **5,000 emails
+While Camelmailer is in public beta, sending is free up to **5,000 emails
 per calendar month**. There is nothing to pay and nothing to set up. Paid
 plans launch after the beta, and you will be able to review them in the
 dashboard before anything is charged.

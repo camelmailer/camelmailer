@@ -84,7 +84,7 @@ fn proxy_sets_the_ip_address_when_the_header_is_valid() {
     assert_eq!(
         line(&reply),
         format!(
-            "220 {SMTP_HOSTNAME} ESMTP CamelMailer/{}",
+            "220 {SMTP_HOSTNAME} ESMTP Camelmailer/{}",
             setup.session.trace_id()
         )
     );
@@ -288,7 +288,7 @@ fn return_path_rcpt_adds_a_bounce_recipient() {
 #[test]
 fn return_path_rcpt_matches_the_normalized_config_domain() {
     let mut full_config = camelmailer_config::Config::default();
-    full_config.dns.return_path_domain = "RP.CamelMailer.COM.".into();
+    full_config.dns.return_path_domain = "RP.Camelmailer.COM.".into();
     let session_config = SessionConfig::from(&full_config);
     assert_eq!(session_config.return_path_domain, "rp.camelmailer.com");
 

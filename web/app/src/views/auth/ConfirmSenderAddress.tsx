@@ -50,7 +50,7 @@ export default function ConfirmSenderAddress() {
         <CardHeader>
           <CardTitle className="text-xl">Confirm sender address</CardTitle>
           <CardDescription>
-            Confirming authorizes a CamelMailer mail server to send email from
+            Confirming authorizes a Camelmailer mail server to send email from
             your address.
           </CardDescription>
         </CardHeader>

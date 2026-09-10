@@ -1,14 +1,14 @@
 # Sending domains and authentication
 
-Before a mail server may send as `you@acme.com`, CamelMailer needs to
+Before a mail server may send as `you@acme.com`, Camelmailer needs to
 know that you control `acme.com` and needs the DNS in place so receivers
 can authenticate the mail. A **sending domain** ties those together: you
-add the domain to a mail server, CamelMailer hands you the DNS records to
+add the domain to a mail server, Camelmailer hands you the DNS records to
 publish, and you verify ownership. The worker DKIM-signs mail when it has
 a valid domain or installation key. SPF is evaluated against the shared
 return-path domain described below.
 
-This page covers adding a domain, the records CamelMailer expects, how
+This page covers adding a domain, the records Camelmailer expects, how
 DKIM keys and the verification challenge work, and where to manage all
 of it. For the report side of authentication (aggregate reports, the
 policy journey from `p=none` to `p=reject`) see
@@ -31,7 +31,7 @@ publish. Each record is `{ name, type, value }`:
 | Record | Name | Value | Purpose |
 |---|---|---|---|
 | Verification | `_camelmailer-challenge.acme.com` | `camelmailer-verification=<token>` | Proves you control the domain |
-| SPF | `acme.com` | `v=spf1 include:spf.example.com ~all` | Sending-domain SPF record checked by CamelMailer's domain health tools |
+| SPF | `acme.com` | `v=spf1 include:spf.example.com ~all` | Sending-domain SPF record checked by Camelmailer's domain health tools |
 | DKIM | `camelmailer._domainkey.acme.com` | `v=DKIM1; k=rsa; p=<base64 public key>` | Lets receivers verify the signature the worker adds |
 
 All three are TXT records. The SPF mechanism and the DKIM selector come
@@ -46,7 +46,7 @@ does not provide SPF alignment for those messages. It remains part of the
 domain health response for compatibility and for deployments that use the
 sending domain as an envelope sender outside the built-in worker.
 
-Two records CamelMailer does **not** generate for you, on purpose:
+Two records Camelmailer does **not** generate for you, on purpose:
 
 - **DMARC.** You publish `_dmarc.acme.com` yourself. The health check and the
   [DMARC monitoring](dmarc.md) flow walk you through DKIM alignment, the
@@ -67,7 +67,7 @@ ever show the public half.
 ### The public record
 
 The `p=` value in the DKIM TXT record is `base64(SubjectPublicKeyInfo
-DER)` of the domain's key. CamelMailer derives it on the fly from the
+DER)` of the domain's key. Camelmailer derives it on the fly from the
 stored private key each time it renders the record, so the value you see
 in the API and dashboard is always the current key. The record name uses
 the selector from `dns.dkim_identifier` (default `postal`; set it to
@@ -118,7 +118,7 @@ DNS by looking for the challenge token:
 POST /api/v2/admin/organizations/{org}/servers/{server}/domains/{name}/verify
 ```
 
-CamelMailer resolves the TXT records at `_camelmailer-challenge.<domain>`
+Camelmailer resolves the TXT records at `_camelmailer-challenge.<domain>`
 and marks the domain verified when one of them equals
 `camelmailer-verification=<token>`. When the record is missing or the
 lookup fails, the call returns `422 ValidationError` whose message names
@@ -147,7 +147,7 @@ turn what triggers DKIM signing for it.
 
 ## SPF
 
-CamelMailer's domain health tools build a sending-domain SPF record from
+Camelmailer's domain health tools build a sending-domain SPF record from
 config:
 
 - With `dns.spf_include` set (the usual case), the mechanism is
@@ -206,7 +206,7 @@ Outbound envelope rewriting is opt-in in 0.7.x. By default,
 `MAIL FROM` even when a real return-path domain is already configured.
 
 When `dns.return_path_envelope: true` and `dns.return_path_domain` names a
-usable, non-placeholder domain, CamelMailer replaces the submitted envelope
+usable, non-placeholder domain, Camelmailer replaces the submitted envelope
 sender with `<server-token>@<dns.return_path_domain>`. An empty, malformed,
 or reserved example domain preserves the submitted sender and logs a startup
 warning. Mixed-case, IDNA and trailing-dot forms are canonicalized.
@@ -216,7 +216,7 @@ of the envelope flag. SMTP return-path intake also remains enabled independently
 of that flag, including for placeholder domains. A receiving mail server sends
 its delivery status notification to the envelope return path and normally
 includes the original headers.
-CamelMailer's SMTP intake recognizes the server token. After inspection and
+Camelmailer's SMTP intake recognizes the server token. After inspection and
 feedback-report handling, the worker correlates only a delivery-status-shaped
 message carrying the returned token whose recipient action is `failed`.
 Delay and successful-delivery notifications do not mark the original
@@ -233,7 +233,7 @@ For migrations, the worker also recognizes Postal's `X-Postal-MsgID` header.
 
 Before enabling envelope rewriting:
 
-1. Route its MX to CamelMailer's SMTP intake.
+1. Route its MX to Camelmailer's SMTP intake.
 2. Publish an SPF TXT record that authorizes the worker's outbound IPs or SMTP
    relay. For example, use `v=spf1 include:<dns.spf_include> ~all` when that
    include covers every sending host.
@@ -246,7 +246,7 @@ same return path.
 
 The SMTP intake also accepts a custom return-path subdomain beginning with
 `dns.custom_return_path_prefix`, such as `psrp.acme.com`, when its DNS routes
-to CamelMailer. The built-in worker does not select that address; it uses the
+to Camelmailer. The built-in worker does not select that address; it uses the
 shared return-path domain when envelope rewriting is enabled.
 
 ## Managing domains

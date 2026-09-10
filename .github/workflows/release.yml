@@ -1,4 +1,4 @@
-# CamelMailer release pipeline.
+# Camelmailer release pipeline.
 #
 # Push to main      -> image tags :edge and :sha-<shortsha> (moving, unstable)
 # Tag vX.Y.Z        -> full gated release:
@@ -359,7 +359,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          name: CamelMailer ${{ github.ref_name }}
+          name: Camelmailer ${{ github.ref_name }}
           body_path: /tmp/notes.md
           files: /tmp/debs/*.deb
           fail_on_unmatched_files: true

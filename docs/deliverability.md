@@ -2,7 +2,7 @@
 
 Deliverability is the question of whether the mail you send reaches the
 inbox. Most of the answer lives at the receiving end, in the reputation
-that mailbox providers attach to your sending IPs and domains. CamelMailer
+that mailbox providers attach to your sending IPs and domains. Camelmailer
 gives you one direct lever over that reputation: **IP pools**, a way to
 choose which source address a message leaves from, so you can keep
 critical transactional mail on IPs that broadcast campaigns never touch.
@@ -81,7 +81,7 @@ directly with the stream model: transactional streams stay on trusted
 IPs, while [Broadcast streams](broadcast.md) send from a pool you can
 afford to expose to the volatility of marketing volume. Assigning a
 distinct pool to a broadcast stream is the single most effective isolation
-step CamelMailer offers.
+step Camelmailer offers.
 
 ## Managing IP pools (admin)
 
@@ -151,7 +151,7 @@ rest are operational.
 ### Authenticate every sending domain
 
 SPF, DKIM, and DMARC are what let a receiver tie your mail to your domain
-and trust it. CamelMailer signs outbound mail with DKIM at delivery time
+and trust it. Camelmailer signs outbound mail with DKIM at delivery time
 (the domain's own key when it has one, the installation key otherwise) and
 can verify your published records. Set each domain up and keep it green:
 see [Sending domains](domains.md) for SPF/DKIM/DMARC publication and
@@ -163,7 +163,7 @@ IP it sends from.
 ### Keep the recipient list clean
 
 Sending to addresses that bounce or complain is the fastest way to lose
-reputation. CamelMailer holds any message to a suppressed recipient before
+reputation. Camelmailer holds any message to a suppressed recipient before
 it ever reaches the wire, and it grows the suppression list automatically
 from hard bounces and complaints. Review it and keep bad addresses out of
 your sends: see [Suppressions](suppressions.md).
@@ -171,7 +171,7 @@ your sends: see [Suppressions](suppressions.md).
 ### Require opt-in and honor unsubscribes for broadcast
 
 Broadcast mail carries obligations that transactional mail does not.
-CamelMailer gates broadcast sends on a per-stream opt-in and wires up
+Camelmailer gates broadcast sends on a per-stream opt-in and wires up
 one-click unsubscribe: an unsubscribe or a spam complaint creates a
 stream-scoped suppression and flips the recipient's subscription closed,
 so the next campaign skips them. Lean on this rather than sending to
@@ -184,7 +184,7 @@ A brand-new sending IP has no reputation, and providers throttle unknown
 senders that suddenly push high volume. Warm a new pool by starting with a
 low daily volume of your most engaged recipients and increasing it
 gradually over days to weeks, watching your DMARC pass rate and bounce and
-complaint figures as you go. CamelMailer does not pace this for you; it is
+complaint figures as you go. Camelmailer does not pace this for you; it is
 a schedule you run by controlling how much you send through the new pool.
 
 ### Publish matching reverse DNS
@@ -197,7 +197,7 @@ explicit `smtp_server` HELO override; see [Configuration](configuration.md)).
 The `hostname` field on a pool address records the name you intend an IP to
 present, which keeps your operational intent next to the address.
 
-## What CamelMailer enforces versus operational best practice
+## What Camelmailer enforces versus operational best practice
 
 Being honest about the line between the two matters, because a green
 dashboard does not by itself guarantee inbox placement.
@@ -209,14 +209,14 @@ dashboard does not by itself guarantee inbox placement.
 | DKIM signing of authenticated domains at delivery | Enforced |
 | Suppression gate before send; auto-suppress on bounce/complaint | Enforced |
 | Broadcast opt-in gate and one-click unsubscribe handling | Enforced |
-| SPF / DMARC record publication and alignment | Your DNS; CamelMailer checks and monitors |
+| SPF / DMARC record publication and alignment | Your DNS; Camelmailer checks and monitors |
 | Reverse DNS (PTR) for each pool IP | Your network provider; not verified by the product |
 | EHLO / HELO hostname | A single installation-level config value, not the per-address `hostname` field |
 | IPv6 source sending | The `ipv6` field is stored but source binding uses the `ipv4` value |
 | Pool `default` flag | A label in the admin UI; source resolution reads a server's or stream's assigned pool, so assign a pool explicitly for it to take effect |
 | IP warmup pacing | Operational; you control volume ramp, the product does not throttle |
 
-Read that last column as the work that stays with you. CamelMailer places
+Read that last column as the work that stays with you. Camelmailer places
 mail on the IPs and with the signatures you configure, and it keeps your
 lists clean; earning and holding the reputation on those IPs is the
 ongoing operational job that pools are built to protect.

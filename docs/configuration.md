@@ -1,6 +1,6 @@
 # Configuration
 
-CamelMailer reads a single YAML file. Everything has a sensible default —
+Camelmailer reads a single YAML file. Everything has a sensible default —
 an empty (or missing) file is a valid configuration; the two most common
 deployments need only environment variables.
 
@@ -86,7 +86,7 @@ Or just set `DATABASE_URL`. Without either, the servers fall back to
 **non-persistent in-memory storage** (fine for kicking the tires, useless
 for production — a warning is logged).
 
-CamelMailer uses one PostgreSQL database for everything; tenant isolation
+Camelmailer uses one PostgreSQL database for everything; tenant isolation
 on message data is enforced *by the database* via row-level security, not
 by application code. No per-tenant databases to manage.
 
@@ -122,7 +122,7 @@ For deliverability you publish, per installation:
 | MX for inbound | `dns.mx_records` | `mx.example.com` |
 | SPF include | `dns.spf_include` | `v=spf1 include:spf.example.com ~all` on sender domains |
 | DKIM selector | `dns.dkim_identifier` | `camelmailer._domainkey.<domain>` TXT with the domain key's public part (installation key for pre-existing domains) |
-| Return-path | `dns.return_path_domain` | MX to CamelMailer plus an SPF TXT record authorizing its outbound senders |
+| Return-path | `dns.return_path_domain` | MX to Camelmailer plus an SPF TXT record authorizing its outbound senders |
 | Click/open tracking | `dns.track_domain` | CNAME → the web server |
 
 `dns.return_path_envelope` defaults to `false` in 0.7.x. Setting a
@@ -143,14 +143,14 @@ the TXT record `_camelmailer-challenge.<domain>` with the value
 
 The return-path domain is installation-wide, so the domain API does not
 publish its records. Replace the sample `rp.example.com`, route the real
-domain's MX to CamelMailer, and add an SPF TXT record for every IP or relay
+domain's MX to Camelmailer, and add an SPF TXT record for every IP or relay
 used by the worker. Until the value is a usable non-placeholder domain, the
 worker preserves each message's submitted envelope sender and cannot
 correlate returned DSNs through the shared return path. The SMTP intake still
 accepts return-path mail addressed to a syntactically valid configured
 placeholder domain, since the reserved-name check applies only to the outbound
 send-side fallback. Empty or malformed values cannot match an inbound domain.
-CamelMailer canonicalizes a configured value to lowercase ASCII, including
+Camelmailer canonicalizes a configured value to lowercase ASCII, including
 IDNA conversion and removal of a trailing root dot, and uses that same form for
 sending and SMTP intake.
 

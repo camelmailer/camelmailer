@@ -1,4 +1,4 @@
-//! PostgreSQL persistence for CamelMailer.
+//! PostgreSQL persistence for Camelmailer.
 //!
 //! One database for all tenants: configuration tables (organizations,
 //! servers, domains, routes, credentials, admin API keys) plus a single

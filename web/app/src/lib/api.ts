@@ -1,4 +1,4 @@
-// Typed client for the CamelMailer HTTP APIs.
+// Typed client for the Camelmailer HTTP APIs.
 //
 // Every response uses the `{ status, time, data | error }` envelope; this
 // client unwraps `data` and throws `ApiError` (carrying the backend error

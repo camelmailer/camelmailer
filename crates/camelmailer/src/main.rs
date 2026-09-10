@@ -33,7 +33,7 @@ fn main() -> ExitCode {
         Some("make-admin-api-key") => run_async(make_admin_api_key(args[2..].to_vec())),
         Some("make-user") => run_async(make_user(args[2..].to_vec())),
         Some("version") => {
-            println!("CamelMailer v{VERSION}");
+            println!("Camelmailer v{VERSION}");
             ExitCode::SUCCESS
         }
         _ => {
@@ -364,5 +364,5 @@ fn print_usage() {
     println!();
     println!("Other tools:");
     println!();
-    println!(" * version - show the current CamelMailer version");
+    println!(" * version - show the current Camelmailer version");
 }

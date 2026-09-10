@@ -184,6 +184,11 @@ pub fn build_test_request(
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
+    // `CamelMailer` here is frozen wire vocabulary, not a typo for the
+    // product name (`Camelmailer`): receivers match on these names, and a
+    // signature check comparing the string exactly would start rejecting
+    // every delivery. Field names are case-insensitive per RFC 9110, so
+    // this is safe to read either way.
     headers.push(("X-CamelMailer-Event".into(), event.to_string()));
     headers.push(("X-CamelMailer-UUID".into(), uuid));
     if webhook.sign {

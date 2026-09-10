@@ -1,4 +1,4 @@
-//! Configuration for CamelMailer.
+//! Configuration for Camelmailer.
 //!
 //! This is the Rust port of `lib/postal/config_schema.rb` + `lib/postal/config.rb`.
 //! Configuration is loaded from a YAML file (path taken from
@@ -39,12 +39,12 @@ fn default_true() -> bool {
 /// The `camelmailer` group (formerly `postal`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CamelMailer {
-    /// The hostname that the CamelMailer web interface runs on
+pub struct Camelmailer {
+    /// The hostname that the Camelmailer web interface runs on
     pub web_hostname: String,
-    /// The HTTP protocol to use for the CamelMailer web interface
+    /// The HTTP protocol to use for the Camelmailer web interface
     pub web_protocol: String,
-    /// The hostname that the CamelMailer SMTP server runs on
+    /// The hostname that the Camelmailer SMTP server runs on
     pub smtp_hostname: String,
     /// Should IP pools be enabled for this installation?
     pub use_ip_pools: bool,
@@ -111,7 +111,7 @@ pub struct CamelMailer {
     pub message_retention_days: u32,
 }
 
-impl Default for CamelMailer {
+impl Default for Camelmailer {
     fn default() -> Self {
         Self {
             web_hostname: "postal.example.com".into(),
@@ -284,7 +284,7 @@ impl Default for WebAuthn {
             enabled: false,
             rp_id: String::new(),
             rp_origin: String::new(),
-            rp_name: "CamelMailer".into(),
+            rp_name: "Camelmailer".into(),
         }
     }
 }
@@ -312,7 +312,7 @@ impl Default for AppMail {
             enabled: false,
             server_api_key: None,
             from_address: None,
-            from_name: "CamelMailer".into(),
+            from_name: "Camelmailer".into(),
         }
     }
 }
@@ -404,7 +404,7 @@ impl Default for Oidc {
     }
 }
 
-/// SAML 2.0 single sign-on (service-provider role). CamelMailer speaks
+/// SAML 2.0 single sign-on (service-provider role). Camelmailer speaks
 /// the HTTP-Redirect binding for the AuthnRequest and the HTTP-POST
 /// binding for the response; assertions must be signed with the
 /// configured IdP certificate.
@@ -857,7 +857,7 @@ impl Postgres {
     }
 }
 
-/// The complete CamelMailer configuration.
+/// The complete Camelmailer configuration.
 ///
 /// Unknown top-level groups (e.g. `rails`, `rspamd`, `oidc` from a legacy
 /// `postal.yml`) are ignored so a legacy file loads without modification;
@@ -867,7 +867,7 @@ impl Postgres {
 #[serde(default)]
 pub struct Config {
     #[serde(alias = "postal")]
-    pub camelmailer: CamelMailer,
+    pub camelmailer: Camelmailer,
     pub web_server: WebServer,
     pub auth: Auth,
     pub app_mail: AppMail,
@@ -1188,7 +1188,7 @@ mod tests {
     #[test]
     fn dns_domain_names_are_normalized_for_comparison() {
         assert_eq!(
-            normalize_dns_domain_name("  BÜCHER.CamelMailer.COM.  ").as_deref(),
+            normalize_dns_domain_name("  BÜCHER.Camelmailer.COM.  ").as_deref(),
             Some("xn--bcher-kva.camelmailer.com")
         );
         assert_eq!(normalize_dns_domain_name("bad_label.example"), None);
@@ -1203,7 +1203,7 @@ mod tests {
             assert_eq!(dns.normalized_return_path_domain(), None, "{value}");
         }
 
-        dns.return_path_domain = "RP.CamelMailer.COM.".into();
+        dns.return_path_domain = "RP.Camelmailer.COM.".into();
         assert_eq!(
             dns.normalized_return_path_domain().as_deref(),
             Some("rp.camelmailer.com")
@@ -1370,7 +1370,7 @@ rspamd:
         assert!(!config.auth.webauthn.enabled);
         assert_eq!(config.auth.webauthn.rp_id, "");
         assert_eq!(config.auth.webauthn.rp_origin, "");
-        assert_eq!(config.auth.webauthn.rp_name, "CamelMailer");
+        assert_eq!(config.auth.webauthn.rp_name, "Camelmailer");
         assert!(!config.oidc.enabled);
         assert_eq!(config.oidc.scopes, vec!["openid", "email", "profile"]);
         assert_eq!(config.oidc.uid_field, "sub");
@@ -1559,7 +1559,7 @@ auth:
         assert!(!config.app_mail.enabled);
         assert_eq!(config.app_mail.server_api_key, None);
         assert_eq!(config.app_mail.from_address, None);
-        assert_eq!(config.app_mail.from_name, "CamelMailer");
+        assert_eq!(config.app_mail.from_name, "Camelmailer");
         config.validate().unwrap();
     }
 

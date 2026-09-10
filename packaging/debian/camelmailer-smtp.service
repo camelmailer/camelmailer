@@ -1,5 +1,5 @@
 [Unit]
-Description=CamelMailer SMTP server (submission + inbound MX)
+Description=Camelmailer SMTP server (submission + inbound MX)
 Documentation=https://github.com/camelmailer/camelmailer
 After=network-online.target postgresql.service
 Wants=network-online.target

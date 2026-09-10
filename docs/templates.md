@@ -4,7 +4,7 @@ A template is a reusable email body you store once and render with fresh
 data on every send. Instead of assembling `subject`, `html_body` and
 `text_body` in your application for each message, you save them as a named
 template with `{{ variable }}` placeholders and pass a small JSON model at
-send time. CamelMailer renders the model into the template and delivers the
+send time. Camelmailer renders the model into the template and delivers the
 result. See [Sending email](sending.md) for the send call itself.
 
 Templates live on one mail server and are reached through the Server API
@@ -248,7 +248,7 @@ create and update; the stored template keeps the resolved `layout_id`.
 
 ## The template library
 
-CamelMailer bundles **20 production-ready transactional templates** in the
+Camelmailer bundles **20 production-ready transactional templates** in the
 repository's [`templates/library/`](../templates/library/) directory, one
 JSON file each. They cover the mail that most products send, grouped into
 four areas:

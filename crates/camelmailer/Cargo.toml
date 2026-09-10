@@ -14,12 +14,12 @@ path = "src/main.rs"
 [package.metadata.deb]
 name = "camelmailer"
 maintainer = "Michael Döhler <michaeldoehler@me.com>"
-copyright = "CamelMailer contributors. MIT licensed."
+copyright = "Camelmailer contributors. MIT licensed."
 license-file = ["../../LICENSE", "0"]
 section = "mail"
 priority = "optional"
 extended-description = """\
-CamelMailer is a self-hosted transactional email platform written in Rust: \
+Camelmailer is a self-hosted transactional email platform written in Rust: \
 an SMTP server, HTTP APIs (sending, templates, streams, statistics, \
 webhooks, tracking) and a delivery worker, all in one binary, backed by a \
 single PostgreSQL database with row-level-security tenant isolation. \
