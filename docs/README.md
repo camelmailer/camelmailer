@@ -50,6 +50,12 @@ send your first message in about five minutes, then read
 | [Webhooks](webhooks.md) | Event types, the payload envelope, RSA signature verification, and retry semantics |
 | [Accounts, RBAC and SSO](authentication.md) | User accounts, two-factor authentication, organization roles, invitations, OIDC and SAML, and SCIM |
 
+## Running the installation
+
+| Page | What it covers |
+|---|---|
+| [Administration and abuse monitoring](administration.md) | The instance overview, per-organization traffic, the flags worth watching, suspending a server, and deleting a tenant |
+
 ## Account and cloud
 
 | Page | What it covers |

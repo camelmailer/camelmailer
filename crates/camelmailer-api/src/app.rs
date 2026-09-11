@@ -1672,6 +1672,7 @@ pub(crate) fn permalink_from(name: &str) -> String {
 /// Build the `/api/v2/admin` router.
 pub fn build_router(state: Arc<ApiState>) -> Router {
     let admin = Router::new()
+        .route("/overview", get(crate::admin_overview::overview_show))
         .route(
             "/organizations",
             get(organizations_index).post(organizations_create),
@@ -1681,6 +1682,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             get(organizations_show)
                 .patch(organizations_update)
                 .delete(organizations_destroy),
+        )
+        .route(
+            "/organizations/{permalink}/overview",
+            get(crate::admin_overview::organization_overview_show),
         )
         .route(
             "/organizations/{permalink}/servers",

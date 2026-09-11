@@ -25,8 +25,8 @@ attribution, but is an independent project — there is no upstream to track.
 | `crates/camelmailer` | The single binary/CLI: `web-server`, `smtp-server`, `worker`, `initialize`, `make-user`, `make-admin-api-key`, `version` |
 | `web/app` | Next.js (App Router) dashboard (`(app)` group, shadcn/ui + TanStack Query); `/` redirects to `/login`; Next proxies `/api` to the backend (`API_PROXY_URL`) |
 | `templates/` | 20 ready-to-clone transactional email templates (JSON) + `import.sh` |
-| `docs/` | quickstart, configuration, authentication (accounts/RBAC/SSO) |
-| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (all 138 endpoints; the SCIM 2.0 surface under `/scim/v2` is separate and documented in docs/authentication.md) |
+| `docs/` | quickstart, configuration, authentication (accounts/RBAC/SSO), administration |
+| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (every endpoint of the three surfaces below; the SCIM 2.0 surface under `/scim/v2` is separate and documented in docs/authentication.md) |
 
 ## The API surfaces
 

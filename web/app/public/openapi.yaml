@@ -1150,6 +1150,54 @@ paths:
         "404": { description: SAMLDisabled }
 
   # ------------------------------------------------------------- admin
+  /api/v2/admin/overview:
+    get:
+      tags: [Organizations]
+      summary: Instance-wide traffic per organization (administrators)
+      description: |
+        Every organization on the installation with its message counters
+        over the last 24 hours, 7 days and 30 days, plus the installation
+        totals and each tenant's first and last message inside the widest
+        window. Organizations come back busiest first (30-day volume, then
+        name).
+
+        Reserved for administrators of the installation: a session without
+        the global admin flag gets `403 Forbidden`, and an organization- or
+        server-scoped admin key gets `404`. Answers
+        `503 StorageUnavailable` when the installation runs without
+        message storage, rather than reporting zeros.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403":
+          description: Forbidden (not a global administrator)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "503":
+          description: StorageUnavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /api/v2/admin/organizations/{org}/overview:
+    get:
+      tags: [Organizations]
+      summary: One organization's traffic, broken down by server
+      description: |
+        The same rollup as `/api/v2/admin/overview` for a single
+        organization, plus one row per server with its own counters, mode,
+        suspension state and send limit. A read any member of the
+        organization may perform; a non-member gets `404`.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { description: NotFound }
+        "503":
+          description: StorageUnavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
   /api/v2/admin/organizations:
     get:
       tags: [Organizations]

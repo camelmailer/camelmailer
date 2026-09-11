@@ -969,6 +969,53 @@ impl MemoryStore {
         stats
     }
 
+    /// Traffic counters over three nested windows (test read model, the
+    /// analogue of the single Postgres aggregate).
+    pub fn message_volume_for(
+        &self,
+        server_id: Id,
+        windows: crate::server_store::VolumeWindows,
+    ) -> crate::server_store::MessageVolume {
+        let inner = self.inner.read().unwrap();
+        let mut volume = crate::server_store::MessageVolume::default();
+        for message in inner
+            .messages
+            .iter()
+            .filter(|m| m.server_id == server_id && m.created_at >= windows.month)
+        {
+            for counters in [
+                Some(&mut volume.month),
+                (message.created_at >= windows.week).then_some(&mut volume.week),
+                (message.created_at >= windows.day).then_some(&mut volume.day),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                counters.total += 1;
+                match message.scope.as_str() {
+                    "incoming" => counters.incoming += 1,
+                    _ => counters.outgoing += 1,
+                }
+                match message.status.as_str() {
+                    "Sent" => counters.sent += 1,
+                    "Held" => counters.held += 1,
+                    "HardFail" | "SoftFail" => counters.failed += 1,
+                    "Bounced" => counters.bounced += 1,
+                    _ => {}
+                }
+            }
+            volume.first_message_at = Some(match volume.first_message_at {
+                Some(first) => first.min(message.created_at),
+                None => message.created_at,
+            });
+            volume.last_message_at = Some(match volume.last_message_at {
+                Some(last) => last.max(message.created_at),
+                None => message.created_at,
+            });
+        }
+        volume
+    }
+
     /// Pending-outbound queue depth per destination domain (test read model,
     /// derived from `Pending` outgoing messages as the queue proxy).
     pub fn delivery_stats_for(&self, server_id: Id) -> crate::server_store::DeliveryStats {
