@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-11
+
 ### Added
 
 - **Instance-wide oversight in the administration area.** The
