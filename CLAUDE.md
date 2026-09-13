@@ -26,7 +26,7 @@ attribution, but is an independent project — there is no upstream to track.
 | `web/app` | Next.js (App Router) dashboard (`(app)` group, shadcn/ui + TanStack Query); `/` redirects to `/login`; Next proxies `/api` to the backend (`API_PROXY_URL`) |
 | `templates/` | 20 ready-to-clone transactional email templates (JSON) + `import.sh` |
 | `docs/` | quickstart, configuration, authentication (accounts/RBAC/SSO), administration |
-| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec (every endpoint of the three surfaces below; the SCIM 2.0 surface under `/scim/v2` is separate and documented in docs/authentication.md) |
+| `web/app/public/openapi.yaml` | The public OpenAPI 3.0 spec. It is the contract the SDKs are written from, so an endpoint missing here is missing from all of them: campaigns, subscribers and layouts were absent until 2026-09-14 and no SDK had them. Verify with the route-vs-spec diff before a release. The SCIM 2.0 surface under `/scim/v2` is separate, see docs/authentication.md |
 
 ## The API surfaces
 

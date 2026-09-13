@@ -15,6 +15,23 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The OpenAPI spec was missing 21 endpoints, and so was every SDK.**
+  Campaigns, broadcast subscribers and template layouts have been routed
+  since v0.5, and none of them ever reached
+  `web/app/public/openapi.yaml`. The SDKs are written from that spec, so
+  all eight of them were missing exactly those three surfaces: not eight
+  separate oversights, one contract that nobody checked. The spec now
+  documents all 59 server routes, including the request bodies for
+  subscriber import, campaign scheduling and layout wrappers.
+- `scripts/check-api-coverage.py` compares the router against the spec in
+  both directions and runs in CI, so the next endpoint cannot be added
+  without being written down. A route with no operation is an
+  undocumented endpoint; an operation with no route is a promise the
+  server does not keep.
+
+
 ## [0.8.3] - 2026-09-11
 
 ### Added
