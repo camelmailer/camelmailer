@@ -541,6 +541,296 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Success" }
 
+  /api/v2/server/streams/{permalink}/subscribers:
+    get:
+      tags: [Streams]
+      summary: List a broadcast stream's subscribers
+      description: |
+        Subscribers are wired to one stream, not to a global contact list.
+        Each carries `id`, `address`, `status` (`subscribed` or
+        `unsubscribed`) and `created_at`.
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { description: NotFound (no such stream) }
+    post:
+      tags: [Streams]
+      summary: Add or update one subscriber
+      description: |
+        Upserts by address, so calling it twice is safe. `status` defaults to
+        `subscribed`; the only other accepted value is `unsubscribed`.
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [address]
+              properties:
+                address: { type: string, format: email }
+                status:
+                  type: string
+                  enum: [subscribed, unsubscribed]
+                  default: subscribed
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+        "422": { description: "ValidationError (status is not one of the two values)" }
+  /api/v2/server/streams/{permalink}/subscribers/import:
+    post:
+      tags: [Streams]
+      summary: Bulk-add subscribers
+      description: |
+        Upserts every address as `subscribed`. Blanks and duplicates within
+        the request are skipped. Answers `added` (how many were written) and
+        `total` (how many the request carried after that filtering).
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [addresses]
+              properties:
+                addresses:
+                  type: array
+                  items: { type: string, format: email }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/streams/{permalink}/subscribers/{address}:
+    delete:
+      tags: [Streams]
+      summary: Remove a subscriber
+      security: [{ ServerApiKey: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Permalink" }
+        - { name: address, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/streams/{permalink}/subscribers/{address}/complaint:
+    post:
+      tags: [Streams]
+      summary: Record a spam complaint against a subscriber
+      description: |
+        Writes a stream-scoped `complaint` suppression and flips the
+        subscription to `unsubscribed`. Idempotent.
+      security: [{ ServerApiKey: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Permalink" }
+        - { name: address, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/streams/{permalink}/send:
+    post:
+      tags: [Streams]
+      summary: Send one message to every subscriber of a broadcast stream
+      description: |
+        The same content to everyone currently `subscribed`. Either supply
+        `subject` with `html_body`/`text_body`, or a `template` permalink with
+        an optional `template_model`. Answers `queued` and `skipped`;
+        recipients beyond the per-request cap of 1000 are reported as skipped
+        rather than queued.
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                from: { type: string, description: bare From address }
+                subject: { type: string }
+                html_body: { type: string }
+                text_body: { type: string }
+                template: { type: string, description: template permalink }
+                template_model: { type: object, additionalProperties: true }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/streams/{permalink}/campaigns:
+    get:
+      tags: [Campaigns]
+      summary: List the campaigns of one stream
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Campaigns]
+      summary: Create a campaign on a stream
+      description: |
+        Creates it as a `draft`. Scheduling and sending are separate calls, so
+        a campaign can be written and reviewed before anything leaves.
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                from: { type: string, description: bare From address }
+                subject: { type: string }
+                html_body: { type: string }
+                text_body: { type: string }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/server/streams/{permalink}/campaigns/{id}:
+    get:
+      tags: [Campaigns]
+      summary: Show a campaign of one stream
+      security: [{ ServerApiKey: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Permalink" }
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/campaigns:
+    get:
+      tags: [Campaigns]
+      summary: List every campaign on this server
+      description: |
+        Each row carries its audience stream's `permalink` and `name` under
+        `stream`, so a list needs no second lookup.
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Campaigns]
+      summary: Create a campaign, naming its stream in the body
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+  /api/v2/server/campaigns/{id}:
+    get:
+      tags: [Campaigns]
+      summary: Show a campaign with its statistics
+      description: |
+        Alongside the campaign, `stats` reports `total`, `sent`, `delivered`,
+        `failed`, `opened`, `clicked` and `unsubscribed`, attributed through
+        `messages.campaign_id`.
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Campaigns]
+      summary: Update a draft or scheduled campaign
+      description: |
+        Setting `scheduled_at` moves a draft to `scheduled`; clearing it with
+        an explicit `null` drops it back to `draft`. A campaign that is
+        already sending cannot be edited.
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, nullable: true }
+                from: { type: string }
+                subject: { type: string, nullable: true }
+                html_body: { type: string, nullable: true }
+                text_body: { type: string, nullable: true }
+                scheduled_at:
+                  type: string
+                  format: date-time
+                  nullable: true
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/campaigns/{id}/send:
+    post:
+      tags: [Campaigns]
+      summary: Send a campaign now
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/campaigns/{id}/cancel:
+    post:
+      tags: [Campaigns]
+      summary: Cancel a scheduled or sending campaign
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
+  /api/v2/server/layouts:
+    get:
+      tags: [Templates]
+      summary: List layouts
+      description: |
+        A layout is the wrapper a template renders into: `html_wrapper` and
+        `text_wrapper`, with the message body substituted for `content`.
+      security: [{ ServerApiKey: [] }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    post:
+      tags: [Templates]
+      summary: Create a layout
+      description: |
+        `html_wrapper` has to embed the body raw, as `{{{ content }}}` or
+        `{{& content }}`. Escaped interpolation would show the message markup
+        as text, so it is refused.
+      security: [{ ServerApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, html_wrapper]
+              properties:
+                name: { type: string }
+                permalink: { type: string }
+                html_wrapper: { type: string }
+                text_wrapper: { type: string }
+      responses:
+        "201": { $ref: "#/components/responses/Success" }
+        "422": { description: "ValidationError (html_wrapper does not embed {{{ content }}})" }
+  /api/v2/server/layouts/{permalink}:
+    get:
+      tags: [Templates]
+      summary: Show a layout
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Templates]
+      summary: Update a layout
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+    delete:
+      tags: [Templates]
+      summary: Delete a layout
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+  /api/v2/server/layouts/{permalink}/logo:
+    post:
+      tags: [Templates]
+      summary: Upload a layout logo
+      description: |
+        Stored in the database and served unauthenticated from
+        `/assets/layouts/{uuid}/logo`, because mail clients fetch it without
+        a session.
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+
   /api/v2/server/templates:
     get:
       tags: [Templates]
