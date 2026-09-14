@@ -15,6 +15,12 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-14
+
+Documentation only: no behaviour changed. Every fix here is a place where
+the written contract disagreed with the running server, and every one of
+them had already been copied into the SDKs.
+
 ### Fixed
 
 - **The OpenAPI spec was missing 21 endpoints, and so was every SDK.**
@@ -30,6 +36,25 @@ integration tests) is green.
   without being written down. A route with no operation is an
   undocumented endpoint; an operation with no route is a promise the
   server does not keep.
+- **The two campaign create routes were described as if they were one.**
+  The spec called `POST /streams/{permalink}/campaigns` a way to create a
+  draft, with scheduling and sending as separate calls. That handler sets
+  the status to `sending` and expands the campaign to the stream's
+  subscribers before the response returns; it never reads
+  `scheduled_at`. The planning surface is the other route, `POST
+  /campaigns`, whose request body was undocumented altogether, so
+  `stream`, `scheduled_at` and `send_now` were invisible even though they
+  decide the campaign's initial status. Anyone following the old
+  description would have broadcast to their whole list while meaning to
+  compose something for review, and the SDKs did exactly that.
+  `docs/campaigns.md` now names both routes as well.
+- **The stream request bodies were undocumented.** `POST /streams`
+  accepts a `permalink`; without it the API derives one from the name, so
+  a caller that has to know the permalink up front had to create the
+  stream and then search the list for the one it just made. Two SDKs
+  shipped without a way to set it. `PATCH /streams/{permalink}` had no
+  request body at all, which hid its `archived` field, the only way to
+  unarchive a stream.
 
 
 ## [0.8.3] - 2026-09-11
