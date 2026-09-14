@@ -661,10 +661,14 @@ paths:
         "200": { $ref: "#/components/responses/Success" }
     post:
       tags: [Campaigns]
-      summary: Create a campaign on a stream
+      summary: Create a campaign on a stream and send it immediately
       description: |
-        Creates it as a `draft`. Scheduling and sending are separate calls, so
-        a campaign can be written and reviewed before anything leaves.
+        Creates the campaign with status `sending` and expands it to the
+        stream's subscribers before the response returns. There is no draft
+        to review and no schedule to set, so `scheduled_at` is not accepted
+        here.
+
+        Use `POST /api/v2/server/campaigns` to compose a campaign that waits.
       security: [{ ServerApiKey: [] }]
       parameters: [{ $ref: "#/components/parameters/Permalink" }]
       requestBody:
@@ -705,7 +709,36 @@ paths:
     post:
       tags: [Campaigns]
       summary: Create a campaign, naming its stream in the body
+      description: |
+        The planning surface. The initial status follows the request:
+        `send_now` wins, then a `scheduled_at` (status `scheduled`), else a
+        `draft`. Nothing leaves until the schedule is due or the campaign is
+        sent explicitly.
       security: [{ ServerApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stream, from]
+              properties:
+                stream:
+                  type: string
+                  description: permalink of the broadcast stream to send to
+                name: { type: string }
+                from: { type: string, description: bare From address }
+                subject: { type: string }
+                html_body: { type: string }
+                text_body: { type: string }
+                scheduled_at:
+                  type: string
+                  format: date-time
+                  description: RFC 3339 send time; arms the campaign as `scheduled`
+                send_now:
+                  type: boolean
+                  default: false
+                  description: send on creation, overriding `scheduled_at`
       responses:
         "201": { $ref: "#/components/responses/Success" }
   /api/v2/server/campaigns/{id}:

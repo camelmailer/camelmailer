@@ -107,6 +107,14 @@ curl -s -X POST "$API/api/v2/server/campaigns" \
 
 The response is `201` with `{ "campaign": { … } }`, status `draft`.
 
+There is a second create route, `POST
+/api/v2/server/streams/{permalink}/campaigns`, which names the stream in
+the path. It always sends: the campaign is created with status `sending`
+and expanded to the stream's subscribers before the response returns, so
+it accepts no `scheduled_at`. Reach for it when the campaign is meant to
+go out on the spot, and for anything you want to review first use the
+route above.
+
 ### Edit
 
 `PATCH /api/v2/server/campaigns/{id}` edits a `draft` or `scheduled`
