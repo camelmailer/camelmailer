@@ -515,6 +515,13 @@ paths:
               properties:
                 name: { type: string }
                 stream_type: { type: string, enum: [transactional, broadcast] }
+                permalink:
+                  type: string
+                  description: |
+                    URL-safe identifier used in every later call and in the
+                    `stream` field of a send. Derived from the name when
+                    omitted, so a caller that has to know it up front should
+                    set it.
       responses:
         "201": { $ref: "#/components/responses/Success" }
   /api/v2/server/streams/{permalink}:
@@ -530,6 +537,20 @@ paths:
       summary: Update a stream
       security: [{ ServerApiKey: [] }]
       parameters: [{ $ref: "#/components/parameters/Permalink" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                stream_type: { type: string, enum: [transactional, broadcast] }
+                archived:
+                  type: boolean
+                  description: |
+                    Archives or unarchives the stream. Archived streams reject
+                    new messages; this is the only way to unarchive one, since
+                    the archive endpoint is one-way.
       responses:
         "200": { $ref: "#/components/responses/Success" }
   /api/v2/server/streams/{permalink}/archive:
