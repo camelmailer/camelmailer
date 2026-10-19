@@ -115,4 +115,29 @@ describe("webhookSamplePayload", () => {
     )
     expect(sample.payload.bounce.message_id).toBe("bounce@mx.example.com")
   })
+
+  it("carries the Postal message hash on open, click and complaint samples", () => {
+    const keys = (value: object) => Object.keys(value).sort()
+    for (const event of ["MessageLoaded", "MessageLinkClicked", "MessageComplained"]) {
+      const sample = JSON.parse(webhookSamplePayload(event))
+      expect(keys(sample)).toEqual(messageBouncedSampleShape.top_level)
+      expect(keys(sample.payload.message)).toEqual(messageBouncedSampleShape.message)
+    }
+    const clicked = JSON.parse(webhookSamplePayload("MessageLinkClicked"))
+    expect(keys(clicked.payload)).toEqual([
+      "ip_address",
+      "message",
+      "timestamp",
+      "url",
+      "user_agent",
+    ])
+    const complained = JSON.parse(webhookSamplePayload("MessageComplained"))
+    expect(keys(complained.payload)).toEqual([
+      "address",
+      "feedback_type",
+      "message",
+      "timestamp",
+      "user_agent",
+    ])
+  })
 })

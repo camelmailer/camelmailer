@@ -2514,6 +2514,19 @@ async fn html_outgoing_mail_gets_click_links_rewritten_and_an_open_pixel() {
     let pool = test_pool(&base).await;
     let s = setup(pool).await;
     let smtp = mock_smtp("250 Accepted").await;
+    let hook = mock_http(axum::http::StatusCode::OK).await;
+    s.store
+        .create_webhook(NewWebhook {
+            server_id: s.server.id,
+            name: "engagement".into(),
+            url: hook.url.clone(),
+            all_events: false,
+            sign: false,
+            events: vec!["MessageLoaded".into(), "MessageLinkClicked".into()],
+            headers: Default::default(),
+        })
+        .await
+        .unwrap();
 
     let message_id = s
         .sink
@@ -2604,6 +2617,18 @@ async fn html_outgoing_mail_gets_click_links_rewritten_and_an_open_pixel() {
         .unwrap();
     assert_eq!(clicks, 1);
     assert_eq!(opens, 1);
+
+    // and each queued its webhook, carrying the request's client details
+    assert_eq!(worker.drain_webhooks().await.unwrap(), 2);
+    let hooks = hook.requests.lock().unwrap().clone();
+    assert_eq!(hooks[0]["event"], "MessageLinkClicked");
+    assert_eq!(hooks[0]["payload"]["url"], "https://example.com/offer");
+    assert_eq!(hooks[0]["payload"]["ip_address"], "9.9.9.9");
+    assert_eq!(hooks[0]["payload"]["message"]["id"], message_id);
+    assert_eq!(hooks[0]["payload"]["message"]["to"], "user@dest.example");
+    assert_eq!(hooks[1]["event"], "MessageLoaded");
+    assert_eq!(hooks[1]["payload"]["message"]["id"], message_id);
+    assert_eq!(hooks[1]["payload"]["ip_address"], "");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3265,4 +3290,133 @@ async fn return_path_arf_reports_precede_bounce_correlation() {
         .unwrap();
     assert_eq!(original.status, "Sent");
     assert_eq!(stored.bounce_for_id, None);
+}
+
+/// An ARF report for mail that carried the sender's own List-Unsubscribe
+/// header (no engine `/track/u/` token), as a transactional stream does.
+fn arf_mail_with_sender_unsubscribe(message_token: Option<&str>, rcpt: &str) -> Vec<u8> {
+    let message_token_header = message_token
+        .map(|token| format!("X-CamelMailer-MsgID: {token}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "From: feedback@isp.example\r\n\
+         To: fbl@org.example\r\n\
+         Subject: Complaint\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/report; report-type=\"feedback-report\"; boundary=\"B\"\r\n\
+         \r\n\
+         --B\r\n\
+         Content-Type: message/feedback-report\r\n\
+         \r\n\
+         Feedback-Type: abuse\r\n\
+         User-Agent: ISP-FBL/1.0\r\n\
+         Version: 1\r\n\
+         \r\n\
+         --B\r\n\
+         Content-Type: message/rfc822\r\n\
+         \r\n\
+         From: <news@org.example>\r\n\
+         To: <{rcpt}>\r\n\
+         Subject: Sequence step 2\r\n\
+         {message_token_header}\
+         List-Unsubscribe: <https://app.org.example/unsubscribe/abc>\r\n\
+         \r\n\
+         Hello\r\n\
+         --B--\r\n"
+    )
+    .into_bytes()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arf_reports_without_an_engine_unsubscribe_token_still_fire_message_complained() {
+    use camelmailer_core::ServerStore;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let hook = mock_http(axum::http::StatusCode::OK).await;
+    s.store
+        .create_webhook(NewWebhook {
+            server_id: s.server.id,
+            name: "complaints".into(),
+            url: hook.url.clone(),
+            all_events: false,
+            sign: false,
+            events: vec!["MessageComplained".into()],
+            headers: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    let original_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "r@dest.example"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // 1) matched through the engine message token quoted in the original
+    let mut report = outgoing_message(s.server.id, "fbl@org.example");
+    report.scope = MessageScope::Incoming;
+    report.raw_message = arf_mail_with_sender_unsubscribe(Some(&original.token), "r@dest.example");
+    let report_id = s.sink.insert_message(&report).await.unwrap();
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::FeedbackReportIngested
+    );
+    let deliveries = s
+        .sink
+        .deliveries_for_message(s.server.id, report_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        deliveries[0].details.as_deref(),
+        Some(format!("spam complaint recorded for <msg:{original_id}>").as_str())
+    );
+
+    // 2) a report with no token falls back to the recipient
+    report.raw_message = arf_mail_with_sender_unsubscribe(None, "r@dest.example");
+    s.sink.insert_message(&report).await.unwrap();
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::FeedbackReportIngested
+    );
+
+    assert_eq!(worker.drain_webhooks().await.unwrap(), 2);
+    let hooks = hook.requests.lock().unwrap().clone();
+    for hook in &hooks {
+        assert_eq!(hook["event"], "MessageComplained");
+        assert_eq!(hook["payload"]["message"]["id"], original_id);
+        assert_eq!(hook["payload"]["message"]["token"], original.token);
+        assert_eq!(hook["payload"]["message"]["direction"], "outgoing");
+        assert_eq!(hook["payload"]["address"], "r@dest.example");
+        assert_eq!(hook["payload"]["feedback_type"], "abuse");
+        assert_eq!(hook["payload"]["user_agent"], "ISP-FBL/1.0");
+    }
+
+    // The sender owns opt-out for its own List-Unsubscribe: no suppression,
+    // and the original keeps its delivery status.
+    assert!(
+        !ServerStore::address_suppressed(&s.store, s.server.id, "r@dest.example", None)
+            .await
+            .unwrap()
+    );
+    let original = s
+        .sink
+        .message_by_id(s.server.id, original_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.status, "Sent");
 }

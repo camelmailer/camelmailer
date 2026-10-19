@@ -235,15 +235,20 @@ pub struct IpAddress {
     pub priority: i32,
 }
 
-/// The webhook event names the worker can fire. The only valid values for
-/// [`Webhook::events`]; API validation and the worker's filter both use
-/// this list, so it is the single source of truth.
-pub const WEBHOOK_EVENTS: [&str; 5] = [
+/// The webhook event names Camelmailer can fire (the worker for delivery,
+/// bounce and complaint events, the tracking endpoints for opens and
+/// clicks). The only valid values for [`Webhook::events`]; API validation
+/// and the webhook fan-out both use this list, so it is the single source
+/// of truth.
+pub const WEBHOOK_EVENTS: [&str; 8] = [
     "MessageSent",
     "MessageDelayed",
     "MessageDeliveryFailed",
     "MessageHeld",
     "MessageBounced",
+    "MessageLoaded",
+    "MessageLinkClicked",
+    "MessageComplained",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -169,6 +169,21 @@ export const WEBHOOK_EVENT_META: Record<
     label: "Bounced",
     description: "A returned DSN was matched to an outgoing message.",
   },
+  MessageLoaded: {
+    tone: "teal",
+    label: "Opened",
+    description: "A recipient loaded the open-tracking pixel.",
+  },
+  MessageLinkClicked: {
+    tone: "teal",
+    label: "Clicked",
+    description: "A recipient clicked a tracked link.",
+  },
+  MessageComplained: {
+    tone: "red",
+    label: "Complained",
+    description: "A mailbox provider reported a spam complaint.",
+  },
 }
 
 const SAMPLE_DETAILS: Record<string, string> = {
@@ -207,19 +222,44 @@ function webhookMessageSample(
 export function webhookSamplePayload(event: string): string {
   const messageTimestamp = Date.now() / 1000
   const timestamp = Math.floor(messageTimestamp)
+  const message = webhookMessageSample(
+    1234,
+    "abc123message",
+    "outgoing",
+    "original@example.com",
+    "recipient@example.com",
+    "sender@yourdomain.com",
+    "Example message",
+    messageTimestamp - 60,
+  )
+  const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+  const engagement: Record<string, object> = {
+    MessageLoaded: {
+      message,
+      ip_address: "203.0.113.10",
+      user_agent: userAgent,
+      timestamp: messageTimestamp,
+    },
+    MessageLinkClicked: {
+      message,
+      url: "https://example.com/offer",
+      ip_address: "203.0.113.10",
+      user_agent: userAgent,
+      timestamp: messageTimestamp,
+    },
+    MessageComplained: {
+      message,
+      address: "recipient@example.com",
+      feedback_type: "abuse",
+      user_agent: "Example-FBL/1.0",
+      timestamp: messageTimestamp,
+    },
+  }
   const payload =
-    event === "MessageBounced"
+    engagement[event] ??
+    (event === "MessageBounced"
       ? {
-          original_message: webhookMessageSample(
-            1234,
-            "abc123message",
-            "outgoing",
-            "original@example.com",
-            "recipient@example.com",
-            "sender@yourdomain.com",
-            "Example message",
-            messageTimestamp - 60,
-          ),
+          original_message: message,
           bounce: webhookMessageSample(
             1235,
             "def456bounce",
@@ -241,7 +281,7 @@ export function webhookSamplePayload(event: string): string {
             bounce: false,
           },
           details: SAMPLE_DETAILS[event] ?? "Test delivery",
-        }
+        })
   return JSON.stringify(
     {
       event,

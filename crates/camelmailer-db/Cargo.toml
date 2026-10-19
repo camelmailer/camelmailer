@@ -8,6 +8,7 @@ license.workspace = true
 camelmailer-config = { workspace = true }
 camelmailer-core = { workspace = true }
 chrono = { workspace = true }
+mailparse = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 sqlx = { workspace = true }

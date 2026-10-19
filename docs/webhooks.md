@@ -3,7 +3,9 @@
 A webhook is an HTTP callback Camelmailer sends to your application when
 something happens to a message: it was accepted by the recipient's mail
 server, it was deferred, it failed permanently, it was held before
-sending, or a later DSN reported that it bounced. You register a URL per
+sending, a later DSN reported that it bounced, the recipient opened it or
+clicked a link, or the recipient's mailbox provider reported a spam
+complaint. You register a URL per
 mail server, choose which events it
 receives, and Camelmailer POSTs a small JSON body to that URL every time
 a matching event fires. Each request carries an RSA signature so your
@@ -11,12 +13,12 @@ receiver can confirm the payload really came from your installation.
 
 Webhooks report on the delivery lifecycle of your outgoing mail. For
 inbound mail that arrives at your server, use an
-[inbound route](inbound.md) with an HTTP endpoint target instead. For
-click and open data, see [Tracking](tracking.md).
+[inbound route](inbound.md) with an HTTP endpoint target instead. How
+opens and clicks are recorded is described in [Tracking](tracking.md).
 
 ## Event types
 
-Camelmailer fires five events about the fate of outgoing messages. These
+Camelmailer fires eight events about the fate of outgoing messages. These
 names are the single source of truth (`WEBHOOK_EVENTS` in
 `camelmailer-core`); the API rejects any other value at registration
 time.
@@ -28,6 +30,9 @@ time.
 | `MessageDeliveryFailed` | Delivery failed for good: a hard (5xx) rejection, or the retry attempts were exhausted. | `HardFail` |
 | `MessageHeld` | An outgoing message was held before sending. Today this fires when the recipient is on the server's [suppression list](suppressions.md). | `Held` |
 | `MessageBounced` | A DSN received at the return path reported `Action: failed` and was correlated to the original outgoing message. Delay and successful-delivery DSNs do not fire this event. | `Bounced` on the original; `Processed` on the DSN |
+| `MessageLoaded` | A recipient loaded the open-tracking pixel. Fires on every load. | none (a `loads` row) |
+| `MessageLinkClicked` | A recipient followed a tracked link. Fires on every click. | none (a `link_clicks` row) |
+| `MessageComplained` | A feedback-loop (ARF) abuse report arrived for an outgoing message. See [Feedback loops](suppressions.md#feedback-loops-fbl--arf). | `Processed` on the report |
 
 A message can produce several events over its life. A message that is
 deferred twice and then delivered produces two `MessageDelayed` events
@@ -62,7 +67,7 @@ The envelope fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `event` | string | One of the five event names above. |
+| `event` | string | One of the eight event names above. |
 | `timestamp` | integer | When the event was enqueued, Unix seconds. |
 | `uuid` | string | Unique per delivery. Also sent as the `X-CamelMailer-UUID` header, and stable across retries of the same event, so it doubles as an idempotency key. |
 | `payload.message.id` | integer | The message id (matches the id in the messages API and dashboard). |
@@ -74,7 +79,9 @@ The envelope fields:
 | `payload.details` | string | A short human-readable reason. For `MessageSent` it is the remote server's acceptance line; for the failure and delay events it is the SMTP response; for `MessageHeld` it explains the hold. |
 
 The first four events use the common `message` and `details` payload above.
-`MessageBounced` carries both correlated messages:
+The other four use Postal's message hash instead (`id`, `token`,
+`direction`, `message_id`, `to`, `from`, `subject`, `timestamp`,
+`spam_status`, `tag`). `MessageBounced` carries both correlated messages:
 
 Camelmailer inspects the inbound DSN before building this payload, so the
 `bounce.spam_status` value is the stored inspection verdict. Reprocessing an
@@ -113,6 +120,73 @@ empty string when the message has no Subject header.
       "spam_status": "NotChecked",
       "tag": null
     }
+  }
+}
+```
+
+`MessageLoaded` and `MessageLinkClicked` carry the opened message, the
+client's IP address (first `X-Forwarded-For` hop) and User-Agent (capped
+at 255 characters), and the event time as Unix seconds with milliseconds.
+A click adds the original `url`:
+
+```json
+{
+  "event": "MessageLinkClicked",
+  "timestamp": 1720000300,
+  "uuid": "0c3b9a52-7f0e-4b8f-9a55-1c2d3e4f5a6b",
+  "payload": {
+    "message": {
+      "id": 1234,
+      "token": "abc123message",
+      "direction": "outgoing",
+      "message_id": "original@example.com",
+      "to": "recipient@example.com",
+      "from": "sender@yourdomain.com",
+      "subject": "Example message",
+      "timestamp": 1720000000.123,
+      "spam_status": "NotChecked",
+      "tag": null
+    },
+    "url": "https://example.com/offer",
+    "ip_address": "203.0.113.10",
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "timestamp": 1720000300.456
+  }
+}
+```
+
+`MessageLoaded` has the same shape without `url`. Neither event fires
+when the message itself has been pruned by retention.
+
+`MessageComplained` names the complaining `address`, the report's
+`feedback_type` (currently always `abuse`) and, when the report carries
+one, the reporting system's `user_agent`. `message` is the matched
+outgoing message, or `null` when the report only identifies the
+recipient. See [Feedback loops](suppressions.md#feedback-loops-fbl--arf)
+for how a report is matched.
+
+```json
+{
+  "event": "MessageComplained",
+  "timestamp": 1720086400,
+  "uuid": "a7e1f0d2-3c4b-4d5e-8f90-123456789abc",
+  "payload": {
+    "message": {
+      "id": 1234,
+      "token": "abc123message",
+      "direction": "outgoing",
+      "message_id": "original@example.com",
+      "to": "recipient@example.com",
+      "from": "sender@yourdomain.com",
+      "subject": "Example message",
+      "timestamp": 1720000000.123,
+      "spam_status": "NotChecked",
+      "tag": null
+    },
+    "address": "recipient@example.com",
+    "feedback_type": "abuse",
+    "user_agent": "Example-FBL/1.0",
+    "timestamp": 1720086400.789
   }
 }
 ```
@@ -207,6 +281,10 @@ the newer bounce. Subscriber rows stay locked while Camelmailer inserts their
 requests. Deleting a webhook during fan-out waits for this transaction to
 commit, then removes the newly queued request through the existing cascade
 without rolling back the message state or queue action.
+
+`MessageLoaded` and `MessageLinkClicked` requests commit with the recorded
+open or click, and `MessageComplained` requests with the complaint
+suppression, so neither side can exist without the other.
 
 - **Queue.** Deliveries are stored in a `webhook_requests` table and
   picked up one at a time with `FOR UPDATE SKIP LOCKED`, so several
@@ -349,9 +427,9 @@ receiver works before real traffic flows.
 
 ## Honest gaps
 
-- There is no separate complaint, open, or click webhook today. Feedback-loop
-  (ARF) complaints are recorded on the message and in the observability API;
-  open and click activity lives in [Tracking](tracking.md).
+- `MessageComplained` fires for ARF abuse reports only. The manual
+  complaint endpoint (`POST …/subscribers/{address}/complaint`) records the
+  suppression without a webhook, since it has no message to report.
 - `MessageHeld` currently fires for the suppression-list hold on outgoing
   mail. Inbound messages held by spam or virus inspection are stored and
   visible on the message, and do not emit a webhook.

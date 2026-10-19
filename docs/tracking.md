@@ -226,6 +226,12 @@ A message shared through a public
 [share link](quickstart.md) carries its opens and clicks along with the
 decoded bodies, so support can triage engagement without an account.
 
+**As webhooks.** Every recorded open queues `MessageLoaded` and every
+recorded click queues `MessageLinkClicked` for the server's subscribed
+[webhooks](webhooks.md), in the same transaction that stores the event.
+Like Postal, they fire on each load and each click, repeats included, so
+a receiver counts or dedupes them itself.
+
 ## Privacy and disabling tracking
 
 Open and click tracking record the recipient's IP address and

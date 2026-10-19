@@ -15,6 +15,25 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Open, click and complaint webhooks.** Three new events, with Postal's
+  names and message hash: `MessageLoaded` (the open pixel was loaded),
+  `MessageLinkClicked` (a tracked link was followed, with its `url`) and
+  `MessageComplained` (a feedback-loop abuse report arrived, with the
+  complaining `address`, `feedback_type` and the reporter's
+  `user_agent`). Opens and clicks fire on every load and click, like
+  Postal, and their requests commit with the recorded event. The webhook
+  editor, the test-send endpoint and the OpenAPI spec list all three.
+- **Complaints now resolve without the engine's unsubscribe token.** A
+  report for mail that carried the sender's own `List-Unsubscribe`
+  header (for example from a transactional stream) is matched to the
+  original through the quoted `X-CamelMailer-MsgID`, then its
+  `Message-ID`, then the most recent outgoing message to the recipient in
+  the last 30 days. Such a match fires `MessageComplained` but writes no
+  suppression; broadcast complaints keep their stream-scoped suppression
+  and opt-out as before.
+
 ## [0.8.4] - 2026-09-14
 
 Documentation only: no behaviour changed. Every fix here is a place where

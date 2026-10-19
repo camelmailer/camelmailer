@@ -1197,6 +1197,9 @@ async fn webhooks_reject_unknown_event_names_listing_the_valid_ones() {
             "MessageDeliveryFailed",
             "MessageHeld",
             "MessageBounced",
+            "MessageLoaded",
+            "MessageLinkClicked",
+            "MessageComplained",
         ] {
             assert!(message.contains(valid), "{message} should list {valid}");
         }
