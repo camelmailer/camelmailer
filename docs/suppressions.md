@@ -119,9 +119,20 @@ it. From there:
   that recipient **and** flips their subscription on that stream to
   `unsubscribed`. The delivery is marked `Processed` with the note "spam
   complaint recorded for the broadcast recipient".
+- Every **abuse** report is also matched to the complained-about outgoing
+  message and queues a `MessageComplained` [webhook](webhooks.md). The
+  match tries the engine's `X-CamelMailer-MsgID` token quoted in the
+  original, then its `Message-ID`, then the most recent outgoing message
+  (last 30 days) to the recipient. This covers mail that carries the
+  sender's own `List-Unsubscribe` header instead of the engine's. Such a
+  match fires the webhook but writes no suppression, since only the
+  sender knows what the complaint should stop; act on it in your
+  receiver. The match runs on the mail server that received the report,
+  so point the feedback loop at an address that routes to the sending
+  server.
 - A report that parses but has nothing to action (a non-abuse feedback
-  type, or no recoverable recipient token) is recorded as `Processed` and
-  taken no further.
+  type, or neither a message nor a recipient to attribute it to) is
+  recorded as `Processed` and taken no further.
 - A storage error while recording the complaint is treated as transient
   and retried with backoff, so a complaint is not lost to a blip.
 

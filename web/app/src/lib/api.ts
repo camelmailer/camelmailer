@@ -345,6 +345,9 @@ export const WEBHOOK_EVENTS = [
   "MessageDeliveryFailed",
   "MessageHeld",
   "MessageBounced",
+  "MessageLoaded",
+  "MessageLinkClicked",
+  "MessageComplained",
 ] as const
 
 export type SenderAddress = {

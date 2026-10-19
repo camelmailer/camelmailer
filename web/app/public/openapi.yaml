@@ -2419,7 +2419,7 @@ paths:
               properties:
                 event:
                   type: string
-                  enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld, MessageBounced]
+                  enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld, MessageBounced, MessageLoaded, MessageLinkClicked, MessageComplained]
       responses:
         "200": { $ref: "#/components/responses/Success" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2973,7 +2973,7 @@ components:
           description: Subscribed event names; empty = all events.
           items:
             type: string
-            enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld, MessageBounced]
+            enum: [MessageSent, MessageDelayed, MessageDeliveryFailed, MessageHeld, MessageBounced, MessageLoaded, MessageLinkClicked, MessageComplained]
         headers:
           type: object
           description: |
