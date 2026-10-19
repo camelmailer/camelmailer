@@ -5,6 +5,9 @@
 //! bridge onto the async pool via `block_in_place`, so they must run on a
 //! multi-threaded tokio runtime (which the SMTP server does).
 
+use crate::webhook_payload::{
+    message_hash_from_row, postal_webhook_timestamp, MESSAGE_HASH_COLUMNS,
+};
 use async_trait::async_trait;
 use camelmailer_core::{
     auth, store, token, ActivityEvent, AdminApiKey, AdminStore, Campaign, CampaignStats,
@@ -234,7 +237,7 @@ fn webhook_from_row(row: &PgRow) -> Webhook {
     }
 }
 
-async fn enqueue_webhook_requests(
+pub(crate) async fn enqueue_webhook_requests(
     tx: &mut Transaction<'_, Postgres>,
     server_id: Id,
     event: &str,
@@ -280,6 +283,44 @@ async fn enqueue_webhook_requests(
         .bind(body.to_string())
         .bind(webhook.sign)
         .bind(&headers)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// The suppression side of an ARF complaint resolved through a one-click
+/// unsubscribe token: an idempotent stream-scoped `complaint` suppression
+/// plus the opt-out for that stream, inside the caller's tenant transaction.
+async fn write_feedback_complaint(
+    tx: &mut Transaction<'_, Postgres>,
+    server_id: Id,
+    stream_id: Option<Id>,
+    address: &str,
+) -> Result<(), sqlx::Error> {
+    // ON CONFLICT DO NOTHING against the
+    // (server_id, address, COALESCE(stream_id, 0)) unique index.
+    sqlx::query(
+        "INSERT INTO suppressions (server_id, type, address, reason, stream_id)
+         VALUES ($1, 'complaint', $2, 'Spam complaint (feedback loop)', $3)
+         ON CONFLICT (server_id, address, COALESCE(stream_id, 0)) DO NOTHING",
+    )
+    .bind(server_id as i64)
+    .bind(address)
+    .bind(stream_id.map(|id| id as i64))
+    .execute(&mut **tx)
+    .await?;
+    // Flip the opt-in to `unsubscribed` for the targeted stream.
+    if let Some(stream_id) = stream_id {
+        sqlx::query(
+            "INSERT INTO subscriptions (server_id, stream_id, address, status)
+             VALUES ($1, $2, $3, 'unsubscribed')
+             ON CONFLICT (server_id, stream_id, address)
+             DO UPDATE SET status = 'unsubscribed'",
+        )
+        .bind(server_id as i64)
+        .bind(stream_id as i64)
+        .bind(address)
         .execute(&mut **tx)
         .await?;
     }
@@ -2734,34 +2775,9 @@ impl camelmailer_core::ServerStore for PgStore {
         set_tenant_context(&mut tx, server_id)
             .await
             .map_err(Self::sqlx_error)?;
-        // Idempotent stream-scoped suppression: ON CONFLICT DO NOTHING against
-        // the (server_id, address, COALESCE(stream_id, 0)) unique index.
-        sqlx::query(
-            "INSERT INTO suppressions (server_id, type, address, reason, stream_id)
-             VALUES ($1, 'complaint', $2, 'Spam complaint (feedback loop)', $3)
-             ON CONFLICT (server_id, address, COALESCE(stream_id, 0)) DO NOTHING",
-        )
-        .bind(server_id as i64)
-        .bind(&address)
-        .bind(stream_id.map(|id| id as i64))
-        .execute(&mut *tx)
-        .await
-        .map_err(Self::sqlx_error)?;
-        // Flip the opt-in to `unsubscribed` for the targeted stream. Same tx.
-        if let Some(stream_id) = stream_id {
-            sqlx::query(
-                "INSERT INTO subscriptions (server_id, stream_id, address, status)
-                 VALUES ($1, $2, $3, 'unsubscribed')
-                 ON CONFLICT (server_id, stream_id, address)
-                 DO UPDATE SET status = 'unsubscribed'",
-            )
-            .bind(server_id as i64)
-            .bind(stream_id as i64)
-            .bind(&address)
-            .execute(&mut *tx)
+        write_feedback_complaint(&mut tx, server_id, stream_id, &address)
             .await
             .map_err(Self::sqlx_error)?;
-        }
         tx.commit().await.map_err(Self::sqlx_error)?;
         Ok(true)
     }
@@ -3710,6 +3726,46 @@ pub enum BounceCorrelationOutcome {
     NotMatched,
 }
 
+/// What an ARF feedback report says about the complained-about message.
+/// Every field is optional evidence; [`PgMessageSink::record_feedback_complaint`]
+/// tries them strongest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeedbackComplaint {
+    /// The `Feedback-Type` (e.g. `abuse`).
+    pub feedback_type: String,
+    /// The reporting system's `User-Agent`, if the report names one.
+    pub user_agent: Option<String>,
+    /// The engine's `/track/u/{token}` one-click unsubscribe token, present
+    /// when the original went out on a broadcast stream.
+    pub unsubscribe_token: Option<String>,
+    /// Engine message tokens (`X-CamelMailer-MsgID` / `X-Postal-MsgID`)
+    /// quoted in the embedded original.
+    pub message_tokens: Vec<String>,
+    /// The embedded original's `Message-ID`, without angle brackets.
+    pub message_id: Option<String>,
+    /// The complaining recipient (bare address).
+    pub recipient: Option<String>,
+}
+
+/// Result of recording one ARF complaint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedbackComplaintOutcome {
+    /// `MessageComplained` was queued. `message_id` is the matched outgoing
+    /// message (if any); `suppressed` is true when the unsubscribe token also
+    /// wrote the stream-scoped complaint suppression.
+    Recorded {
+        message_id: Option<i64>,
+        address: String,
+        suppressed: bool,
+    },
+    /// Neither a message nor a recipient could be recovered.
+    NotMatched,
+}
+
+/// How far back the recipient-only fallback looks for the complained-about
+/// message. Feedback loops report within hours to a few days.
+const COMPLAINT_RECIPIENT_LOOKBACK_DAYS: i32 = 30;
+
 /// Queue change committed with an outbound delivery result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundQueueAction {
@@ -4440,6 +4496,130 @@ impl PgMessageSink {
 
         tx.commit().await?;
         Ok(BounceCorrelationOutcome::Correlated(Box::new(original)))
+    }
+
+    /// Record an ARF spam complaint and queue `MessageComplained`.
+    ///
+    /// The tenant is the unsubscribe token's server when the report carries a
+    /// valid engine token (broadcast streams), otherwise `server_id`, the
+    /// server that received the report. Within that tenant the complained
+    /// message is matched by engine message token, then by `Message-ID`, then
+    /// by the most recent outgoing message to the recipient. The last two
+    /// cover senders that set their own List-Unsubscribe header (no engine
+    /// token in the report).
+    ///
+    /// Only the unsubscribe-token path writes a suppression (stream-scoped,
+    /// as before). The webhook fires whenever a message or at least a
+    /// recipient is known, with `message: null` when only the recipient is.
+    /// The suppression and every webhook request commit together.
+    pub async fn record_feedback_complaint(
+        &self,
+        server_id: Id,
+        complaint: &FeedbackComplaint,
+    ) -> Result<FeedbackComplaintOutcome, sqlx::Error> {
+        let token_target = match complaint.unsubscribe_token.as_deref() {
+            Some(token) => sqlx::query(
+                "SELECT server_id, stream_id, address FROM unsubscribe_tokens WHERE token = $1",
+            )
+            .bind(token)
+            .fetch_optional(&self.store.pool)
+            .await?
+            .map(|row| {
+                (
+                    row.get::<i64, _>("server_id") as Id,
+                    row.get::<Option<i64>, _>("stream_id").map(|id| id as Id),
+                    row.get::<String, _>("address"),
+                )
+            }),
+            None => None,
+        };
+        let tenant = token_target
+            .as_ref()
+            .map_or(server_id, |(server_id, _, _)| *server_id);
+        let recipient = token_target
+            .as_ref()
+            .map(|(_, _, address)| address.clone())
+            .or_else(|| complaint.recipient.clone());
+
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, tenant).await?;
+
+        let mut message = None;
+        if !complaint.message_tokens.is_empty() {
+            message = sqlx::query(&format!(
+                "SELECT {MESSAGE_HASH_COLUMNS} FROM messages
+                 WHERE token = ANY($1::text[]) AND scope = 'outgoing'
+                 ORDER BY array_position($1::text[], token), id
+                 LIMIT 1"
+            ))
+            .bind(&complaint.message_tokens)
+            .fetch_optional(&mut *tx)
+            .await?;
+        }
+        if message.is_none() {
+            if let Some(message_id) = complaint.message_id.as_deref() {
+                // Stored as the raw header value, normally `<id>`.
+                let variants = vec![format!("<{message_id}>"), message_id.to_string()];
+                message = sqlx::query(&format!(
+                    "SELECT {MESSAGE_HASH_COLUMNS} FROM messages
+                     WHERE scope = 'outgoing' AND btrim(message_id_header) = ANY($1::text[])
+                     ORDER BY id DESC
+                     LIMIT 1"
+                ))
+                .bind(&variants)
+                .fetch_optional(&mut *tx)
+                .await?;
+            }
+        }
+        if message.is_none() {
+            if let Some(recipient) = recipient.as_deref() {
+                message = sqlx::query(&format!(
+                    "SELECT {MESSAGE_HASH_COLUMNS} FROM messages
+                     WHERE scope = 'outgoing' AND lower(rcpt_to) = lower($1)
+                       AND created_at > now() - make_interval(days => $2)
+                     ORDER BY id DESC
+                     LIMIT 1"
+                ))
+                .bind(recipient)
+                .bind(COMPLAINT_RECIPIENT_LOOKBACK_DAYS)
+                .fetch_optional(&mut *tx)
+                .await?;
+            }
+        }
+
+        // The token's address is authoritative, then the matched message's
+        // recipient; the report's own recipient is the last resort (some
+        // feedback loops redact it).
+        let message_id = message.as_ref().map(|row| row.get::<i64, _>("id"));
+        let address = token_target
+            .as_ref()
+            .map(|(_, _, address)| address.clone())
+            .or_else(|| message.as_ref().map(|row| row.get("rcpt_to")))
+            .or(recipient);
+        let Some(address) = address else {
+            tx.commit().await?;
+            return Ok(FeedbackComplaintOutcome::NotMatched);
+        };
+
+        if let Some((_, stream_id, _)) = &token_target {
+            write_feedback_complaint(&mut tx, tenant, *stream_id, &address).await?;
+        }
+
+        let payload = serde_json::json!({
+            "message": message.as_ref().map(message_hash_from_row),
+            "address": address,
+            "feedback_type": complaint.feedback_type,
+            "user_agent": complaint.user_agent,
+            "timestamp": postal_webhook_timestamp(chrono::Utc::now()),
+        });
+        enqueue_webhook_requests(&mut tx, tenant, "MessageComplained", &payload).await?;
+
+        tx.commit().await?;
+        Ok(FeedbackComplaintOutcome::Recorded {
+            message_id,
+            address,
+            suppressed: token_target.is_some(),
+        })
     }
 
     pub async fn deliveries_for_message(

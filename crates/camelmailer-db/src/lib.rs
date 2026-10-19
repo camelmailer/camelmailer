@@ -17,11 +17,12 @@ mod org_sso_pg;
 mod pg_store;
 mod queue;
 mod tracking;
+pub mod webhook_payload;
 mod webhook_queue;
 
 pub use pg_store::{
-    BounceCorrelationOutcome, BounceOriginal, Delivery, OutboundQueueAction, PgMessageSink,
-    PgStore, StoredMessage,
+    BounceCorrelationOutcome, BounceOriginal, Delivery, FeedbackComplaint,
+    FeedbackComplaintOutcome, OutboundQueueAction, PgMessageSink, PgStore, StoredMessage,
 };
 pub use queue::{PgQueue, QueuedMessageRow};
 pub use webhook_queue::{PgWebhookQueue, WebhookLogEntry, WebhookRequestRow};

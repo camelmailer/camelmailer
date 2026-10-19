@@ -204,6 +204,34 @@ async fn bounced_test_events_use_the_correlation_payload_shape() {
 }
 
 #[tokio::test]
+async fn engagement_and_complaint_test_events_use_the_postal_message_hash() {
+    let (base, recorded) = start_mock_endpoint().await;
+    let (app, webhook_id) = build(&format!("{base}/ok"), None).await;
+
+    for event in ["MessageLoaded", "MessageLinkClicked", "MessageComplained"] {
+        let (status, body) = post_test(&app, webhook_id, json!({ "event": event })).await;
+        assert_eq!(status, StatusCode::OK, "{event}");
+        assert_eq!(body["data"]["result"]["delivered"], true, "{event}");
+    }
+
+    let requests = recorded.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (headers, payload) in requests.iter() {
+        assert_eq!(
+            headers["x-camelmailer-event"],
+            payload["event"].as_str().unwrap()
+        );
+        assert_eq!(payload["test"], true);
+        assert_eq!(payload["payload"]["message"]["direction"], "outgoing");
+        assert_eq!(payload["payload"]["message"]["to"], "recipient@example.com");
+        assert!(payload["payload"].get("details").is_none());
+    }
+    assert!(requests[0].1["payload"]["ip_address"].is_string());
+    assert_eq!(requests[1].1["payload"]["url"], "https://example.com/offer");
+    assert_eq!(requests[2].1["payload"]["feedback_type"], "abuse");
+}
+
+#[tokio::test]
 async fn a_timeout_reports_a_transport_error() {
     let (base, _) = start_mock_endpoint().await;
     let (app, webhook_id) = build(

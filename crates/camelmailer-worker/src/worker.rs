@@ -14,9 +14,12 @@ use crate::ssrf::SsrfGuard;
 use crate::tracking;
 use base64::Engine;
 use camelmailer_core::{AdminStore, RouteMode};
+use camelmailer_db::webhook_payload::{
+    postal_webhook_message_id, postal_webhook_subject, postal_webhook_timestamp,
+};
 use camelmailer_db::{
-    BounceCorrelationOutcome, BounceOriginal, OutboundQueueAction, PgMessageSink, PgQueue, PgStore,
-    PgWebhookQueue, StoredMessage,
+    BounceCorrelationOutcome, BounceOriginal, FeedbackComplaintOutcome, OutboundQueueAction,
+    PgMessageSink, PgQueue, PgStore, PgWebhookQueue, StoredMessage,
 };
 use serde_json::json;
 use std::time::Duration;
@@ -48,28 +51,6 @@ struct BounceWebhookFields<'a> {
     tag: Option<&'a str>,
 }
 
-fn postal_webhook_message_id(value: Option<&str>) -> Option<String> {
-    value.map(|value| {
-        let after_open = value.rsplit_once('<').map_or(value, |(_, rest)| rest);
-        after_open
-            .split_once('>')
-            .map_or(after_open, |(message_id, _)| message_id)
-            .trim()
-            .to_string()
-    })
-}
-
-fn postal_webhook_subject(value: Option<&str>) -> String {
-    let Some(value) = value else {
-        return String::new();
-    };
-    let raw_header = format!("Subject: {value}");
-    let decoded = mailparse::parse_header(raw_header.as_bytes())
-        .map(|(header, _)| header.get_value())
-        .unwrap_or_else(|_| value.to_string());
-    decoded.chars().take(200).collect()
-}
-
 impl<'a> From<&'a StoredMessage> for BounceWebhookFields<'a> {
     fn from(message: &'a StoredMessage) -> Self {
         Self {
@@ -80,7 +61,7 @@ impl<'a> From<&'a StoredMessage> for BounceWebhookFields<'a> {
             to: &message.rcpt_to,
             from_address: &message.mail_from,
             subject: postal_webhook_subject(message.subject.as_deref()),
-            timestamp: message.created_at.timestamp_millis() as f64 / 1000.0,
+            timestamp: postal_webhook_timestamp(message.created_at),
             spam_status: &message.spam_status,
             tag: message.tag.as_deref(),
         }
@@ -97,7 +78,7 @@ impl<'a> From<&'a BounceOriginal> for BounceWebhookFields<'a> {
             to: &message.rcpt_to,
             from_address: &message.mail_from,
             subject: postal_webhook_subject(message.subject.as_deref()),
-            timestamp: message.created_at.timestamp_millis() as f64 / 1000.0,
+            timestamp: postal_webhook_timestamp(message.created_at),
             spam_status: &message.spam_status,
             tag: message.tag.as_deref(),
         }
@@ -815,11 +796,12 @@ impl Worker {
     }
 
     /// Parse an inbound message as an ARF feedback-loop (spam-complaint)
-    /// report and, when it is an abuse report that maps back to a broadcast
-    /// recipient, record a stream-scoped complaint (suppression + opt-out) for
-    /// that recipient. Parse failures / non-abuse reports hold the message
-    /// (like any undeliverable inbound mail); storage failures retry with
-    /// backoff. Mirrors [`Self::ingest_dmarc_report`]; never panics.
+    /// report and, when it is an abuse report, record the complaint and queue
+    /// `MessageComplained`. A broadcast recipient (resolved via the
+    /// List-Unsubscribe token) also gets a stream-scoped complaint
+    /// suppression and opt-out. Parse failures hold the message (like any
+    /// undeliverable inbound mail); storage failures retry with backoff.
+    /// Mirrors [`Self::ingest_dmarc_report`]; never panics.
     async fn ingest_feedback_report(
         &self,
         queued: &camelmailer_db::QueuedMessageRow,
@@ -845,22 +827,43 @@ impl Worker {
             }
         };
 
-        // Only abuse reports that map back to a broadcast recipient (via the
-        // original message's List-Unsubscribe token) become complaints. A
-        // report without a usable token, or a non-abuse feedback type, is
-        // stored but actioned no further — like an accepted inbound with
-        // nothing to deliver.
-        let is_abuse = report.feedback_type == "abuse";
-        if let (true, Some(token)) = (is_abuse, report.unsubscribe_token.as_deref()) {
-            match camelmailer_core::ServerStore::record_complaint_by_token(&self.store, token).await
+        // Abuse reports become complaints. A broadcast original resolves via
+        // its List-Unsubscribe token (and is suppressed for that stream); any
+        // other original resolves via the engine message token, Message-ID,
+        // or recipient. Either way subscribed webhooks get
+        // `MessageComplained`. Non-abuse feedback types are stored but
+        // actioned no further, like an accepted inbound with nothing to
+        // deliver.
+        if report.feedback_type == "abuse" {
+            let complaint = camelmailer_db::FeedbackComplaint {
+                feedback_type: report.feedback_type.clone(),
+                user_agent: report.user_agent.clone(),
+                unsubscribe_token: report.unsubscribe_token.clone(),
+                message_tokens: report.message_tokens.clone(),
+                message_id: report.original_message_id.clone(),
+                recipient: report.recipient(),
+            };
+            match self
+                .sink
+                .record_feedback_complaint(message.server_id, &complaint)
+                .await
             {
-                Ok(matched) => {
+                Ok(outcome) => {
                     self.queue.complete(queued.id).await?;
-                    let detail = if matched {
-                        "spam complaint recorded for the broadcast recipient".to_string()
-                    } else {
-                        "feedback report parsed; unsubscribe token did not match a recipient"
-                            .to_string()
+                    let detail = match outcome {
+                        FeedbackComplaintOutcome::Recorded {
+                            suppressed: true, ..
+                        } => "spam complaint recorded for the broadcast recipient".to_string(),
+                        FeedbackComplaintOutcome::Recorded {
+                            message_id: Some(id),
+                            ..
+                        } => format!("spam complaint recorded for <msg:{id}>"),
+                        FeedbackComplaintOutcome::Recorded { address, .. } => {
+                            format!("spam complaint recorded for {address}; no matching message")
+                        }
+                        FeedbackComplaintOutcome::NotMatched => {
+                            "feedback report parsed; no matching message or recipient".to_string()
+                        }
                     };
                     self.sink
                         .record_delivery(
@@ -890,8 +893,7 @@ impl Worker {
                 }
             }
         } else {
-            // Recognised ARF, but nothing to action (non-abuse type, or no
-            // recoverable recipient token). Store and move on.
+            // Recognised ARF of a non-abuse type. Store and move on.
             self.queue.complete(queued.id).await?;
             self.sink
                 .record_delivery(
@@ -1190,28 +1192,5 @@ impl Worker {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{postal_webhook_message_id, postal_webhook_subject};
-
-    #[test]
-    fn postal_webhook_message_ids_drop_angle_brackets_and_surrounding_text() {
-        assert_eq!(
-            postal_webhook_message_id(Some("prefix <original@example.com> suffix")),
-            Some("original@example.com".to_string())
-        );
-        assert_eq!(postal_webhook_message_id(None), None);
-    }
-
-    #[test]
-    fn postal_webhook_subjects_are_decoded_capped_and_never_null() {
-        assert_eq!(postal_webhook_subject(Some("=?UTF-8?Q?Ol=C3=A1?=")), "Olá");
-
-        let long = "x".repeat(201);
-        assert_eq!(postal_webhook_subject(Some(&long)), "x".repeat(200));
-        assert_eq!(postal_webhook_subject(None), "");
     }
 }

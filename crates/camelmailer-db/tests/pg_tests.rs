@@ -6174,3 +6174,363 @@ async fn message_volume_counts_three_nested_windows_per_tenant() {
     assert_eq!(other_volume.month.failed, 1);
     assert_eq!(other_volume.day.total, 1);
 }
+
+// ------------------------------------------- engagement + complaint webhooks
+
+fn hook(server_id: camelmailer_core::Id, name: &str, events: &[&str]) -> NewWebhook {
+    NewWebhook {
+        server_id,
+        name: name.into(),
+        url: format!("https://{name}.example/hook"),
+        all_events: events.is_empty(),
+        sign: false,
+        events: events.iter().map(|event| event.to_string()).collect(),
+        headers: Default::default(),
+    }
+}
+
+/// `(webhook_id, event, body)` of every queued webhook request, in id order.
+async fn queued_webhooks(pool: &PgPool) -> Vec<(i64, String, serde_json::Value)> {
+    sqlx::query("SELECT webhook_id, event, payload FROM webhook_requests ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get::<i64, _>("webhook_id"),
+                row.get::<String, _>("event"),
+                serde_json::from_str(&row.get::<String, _>("payload")).unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn outgoing_for(server_id: camelmailer_core::Id, rcpt_to: &str) -> QueuedMessage {
+    let mut message = message_for(server_id, rcpt_to);
+    message.scope = MessageScope::Outgoing;
+    message.tag = Some("welcome".into());
+    message.raw_message = b"Message-ID: <hello-1@sender.example>\r\n\
+        Subject: =?UTF-8?Q?Ol=C3=A1?=\r\n\r\nHello.\r\n"
+        .to_vec();
+    message
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_opens_and_clicks_queue_postal_engagement_webhooks() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+
+    let opens_only = f
+        .store
+        .create_webhook(hook(f.server.id, "opens", &["MessageLoaded"]))
+        .await
+        .unwrap();
+    let everything = f
+        .store
+        .create_webhook(hook(f.server.id, "everything", &[]))
+        .await
+        .unwrap();
+    // subscribed to something else: gets nothing
+    f.store
+        .create_webhook(hook(f.server.id, "sent", &["MessageSent"]))
+        .await
+        .unwrap();
+
+    let (message_id, token) = sink
+        .insert_message_returning(&outgoing_for(f.server.id, "reader@dest.example"))
+        .await
+        .unwrap();
+    let open_token = f
+        .store
+        .create_open_token(f.server.id, message_id)
+        .await
+        .unwrap();
+    let (link_id, _) = sink
+        .create_link(f.server.id, message_id, "https://example.com/offer")
+        .await
+        .unwrap();
+    let click_token = f
+        .store
+        .create_click_token(
+            f.server.id,
+            message_id,
+            link_id,
+            "https://example.com/offer",
+        )
+        .await
+        .unwrap();
+
+    let open = f.store.resolve_token(&open_token).await.unwrap().unwrap();
+    f.store
+        .record_open(&open, "203.0.113.10", "Mail/1.0")
+        .await
+        .unwrap();
+    // Postal semantics: every load fires, repeats included.
+    f.store
+        .record_open(&open, "203.0.113.10", "Mail/1.0")
+        .await
+        .unwrap();
+    let click = f.store.resolve_token(&click_token).await.unwrap().unwrap();
+    f.store
+        .record_click(&click, "203.0.113.11", "Browser/2.0")
+        .await
+        .unwrap();
+
+    let queued = queued_webhooks(&pool).await;
+    let summary: Vec<(i64, &str)> = queued
+        .iter()
+        .map(|(webhook_id, event, _)| (*webhook_id, event.as_str()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (opens_only.id as i64, "MessageLoaded"),
+            (everything.id as i64, "MessageLoaded"),
+            (opens_only.id as i64, "MessageLoaded"),
+            (everything.id as i64, "MessageLoaded"),
+            (everything.id as i64, "MessageLinkClicked"),
+        ]
+    );
+
+    let (_, _, loaded) = &queued[0];
+    assert_eq!(loaded["event"], "MessageLoaded");
+    let payload = &loaded["payload"];
+    assert_eq!(payload["ip_address"], "203.0.113.10");
+    assert_eq!(payload["user_agent"], "Mail/1.0");
+    assert!(payload["timestamp"].is_f64());
+    let message = &payload["message"];
+    assert_eq!(message["id"], message_id);
+    assert_eq!(message["token"], token);
+    assert_eq!(message["direction"], "outgoing");
+    assert_eq!(message["message_id"], "hello-1@sender.example");
+    assert_eq!(message["to"], "reader@dest.example");
+    assert_eq!(message["from"], "sender@example.com");
+    assert_eq!(message["subject"], "Olá");
+    assert_eq!(message["tag"], "welcome");
+    assert_eq!(message["spam_status"], "NotChecked");
+    assert!(message["timestamp"].is_f64());
+
+    let (_, _, clicked) = &queued[4];
+    assert_eq!(clicked["payload"]["url"], "https://example.com/offer");
+    assert_eq!(clicked["payload"]["ip_address"], "203.0.113.11");
+    assert_eq!(clicked["payload"]["user_agent"], "Browser/2.0");
+    assert_eq!(clicked["payload"]["message"]["id"], message_id);
+
+    // the events themselves are still recorded
+    assert_eq!(
+        ServerStore::opens(&f.store, f.server.id, message_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feedback_complaints_resolve_without_an_unsubscribe_token() {
+    use camelmailer_db::{FeedbackComplaint, FeedbackComplaintOutcome};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    f.store
+        .create_webhook(hook(f.server.id, "complaints", &["MessageComplained"]))
+        .await
+        .unwrap();
+
+    let (older_id, _) = sink
+        .insert_message_returning(&outgoing_for(f.server.id, "jane@dest.example"))
+        .await
+        .unwrap();
+    let mut newer = outgoing_for(f.server.id, "jane@dest.example");
+    newer.raw_message =
+        b"Message-ID: <newer@sender.example>\r\nSubject: Later\r\n\r\nHi\r\n".to_vec();
+    let (newer_id, newer_token) = sink.insert_message_returning(&newer).await.unwrap();
+
+    let abuse = |complaint: FeedbackComplaint| FeedbackComplaint {
+        feedback_type: "abuse".into(),
+        ..complaint
+    };
+
+    // 1) the engine message token wins
+    let outcome = sink
+        .record_feedback_complaint(
+            f.server.id,
+            &abuse(FeedbackComplaint {
+                message_tokens: vec!["unknown".into(), newer_token.clone()],
+                message_id: Some("hello-1@sender.example".into()),
+                recipient: Some("someone@else.example".into()),
+                user_agent: Some("Yahoo!-Mail-Feedback/2.0".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        FeedbackComplaintOutcome::Recorded {
+            message_id: Some(newer_id),
+            address: "jane@dest.example".into(),
+            suppressed: false,
+        }
+    );
+
+    // 2) then the original's Message-ID
+    let outcome = sink
+        .record_feedback_complaint(
+            f.server.id,
+            &abuse(FeedbackComplaint {
+                message_id: Some("hello-1@sender.example".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        FeedbackComplaintOutcome::Recorded { message_id: Some(id), .. } if id == older_id
+    ));
+
+    // 3) then the most recent outgoing message to the recipient
+    let outcome = sink
+        .record_feedback_complaint(
+            f.server.id,
+            &abuse(FeedbackComplaint {
+                recipient: Some("JANE@dest.example".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        FeedbackComplaintOutcome::Recorded { message_id: Some(id), .. } if id == newer_id
+    ));
+
+    // 4) a recipient with no message still fires, with `message: null`
+    let outcome = sink
+        .record_feedback_complaint(
+            f.server.id,
+            &abuse(FeedbackComplaint {
+                recipient: Some("nobody@dest.example".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        FeedbackComplaintOutcome::Recorded {
+            message_id: None,
+            address: "nobody@dest.example".into(),
+            suppressed: false,
+        }
+    );
+
+    // 5) nothing to attribute it to: no webhook
+    let outcome = sink
+        .record_feedback_complaint(f.server.id, &abuse(FeedbackComplaint::default()))
+        .await
+        .unwrap();
+    assert_eq!(outcome, FeedbackComplaintOutcome::NotMatched);
+
+    let queued = queued_webhooks(&pool).await;
+    assert_eq!(queued.len(), 4);
+    assert!(queued
+        .iter()
+        .all(|(_, event, _)| event == "MessageComplained"));
+    let first = &queued[0].2["payload"];
+    assert_eq!(first["message"]["id"], newer_id);
+    assert_eq!(first["message"]["message_id"], "newer@sender.example");
+    assert_eq!(first["address"], "jane@dest.example");
+    assert_eq!(first["feedback_type"], "abuse");
+    assert_eq!(first["user_agent"], "Yahoo!-Mail-Feedback/2.0");
+    assert!(first["timestamp"].is_f64());
+    assert_eq!(queued[1].2["payload"]["message"]["id"], older_id);
+    assert!(queued[1].2["payload"]["user_agent"].is_null());
+    assert!(queued[3].2["payload"]["message"].is_null());
+    assert_eq!(queued[3].2["payload"]["address"], "nobody@dest.example");
+
+    // None of the fallback paths writes a suppression.
+    assert!(
+        !ServerStore::address_suppressed(&f.store, f.server.id, "jane@dest.example", None)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feedback_complaints_with_an_unsubscribe_token_suppress_and_fire() {
+    use camelmailer_core::NewStream;
+    use camelmailer_db::{FeedbackComplaint, FeedbackComplaintOutcome};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    f.store
+        .create_webhook(hook(f.server.id, "everything", &[]))
+        .await
+        .unwrap();
+    let stream = ServerStore::create_stream(
+        &f.store,
+        NewStream {
+            server_id: f.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let token = ServerStore::create_unsubscribe_token(
+        &f.store,
+        f.server.id,
+        Some(stream.id),
+        "r@dest.example",
+    )
+    .await
+    .unwrap();
+    let (message_id, _) = sink
+        .insert_message_returning(&outgoing_for(f.server.id, "r@dest.example"))
+        .await
+        .unwrap();
+
+    let outcome = sink
+        .record_feedback_complaint(
+            f.server.id,
+            &FeedbackComplaint {
+                feedback_type: "abuse".into(),
+                unsubscribe_token: Some(token),
+                message_id: Some("hello-1@sender.example".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        FeedbackComplaintOutcome::Recorded {
+            message_id: Some(message_id),
+            address: "r@dest.example".into(),
+            suppressed: true,
+        }
+    );
+    assert!(ServerStore::address_suppressed(
+        &f.store,
+        f.server.id,
+        "r@dest.example",
+        Some(stream.id)
+    )
+    .await
+    .unwrap());
+    let queued = queued_webhooks(&pool).await;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].1, "MessageComplained");
+    assert_eq!(queued[0].2["payload"]["message"]["id"], message_id);
+}

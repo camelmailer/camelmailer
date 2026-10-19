@@ -2,11 +2,57 @@
 //! cross-tenant lookup table (the public endpoints are unauthenticated and
 //! only carry a token); the recorded click/load rows land in the
 //! RLS-protected `link_clicks` / `loads` tables under the resolved tenant.
+//!
+//! Every recorded open or click also queues `MessageLoaded` /
+//! `MessageLinkClicked` for the subscribed webhooks, in the same transaction
+//! as the recorded row (like Postal, on every load and every click; receivers
+//! count or dedupe).
 
-use crate::pg_store::{set_tenant_context, PgStore};
+use crate::pg_store::{enqueue_webhook_requests, set_tenant_context, PgStore};
+use crate::webhook_payload::{
+    message_hash_from_row, postal_webhook_timestamp, MESSAGE_HASH_COLUMNS,
+};
 use async_trait::async_trait;
 use camelmailer_core::{token, Id, StoreError, TrackingStore, TrackingTarget};
-use sqlx::Row;
+use serde_json::{json, Value};
+use sqlx::{Postgres, Row, Transaction};
+
+/// The Postal message hash of `message_id`, read under the tenant context
+/// already set on `tx`. `None` when the message is gone (e.g. pruned by
+/// retention); Postal then skips the webhook too.
+async fn message_hash(
+    tx: &mut Transaction<'_, Postgres>,
+    message_id: i64,
+) -> Result<Option<Value>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT {MESSAGE_HASH_COLUMNS} FROM messages WHERE id = $1"
+    ))
+    .bind(message_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.as_ref().map(message_hash_from_row))
+}
+
+/// `MessageLoaded` payload (Postal's shape plus the event `timestamp`).
+fn loaded_payload(message: Value, ip_address: &str, user_agent: &str) -> Value {
+    json!({
+        "message": message,
+        "ip_address": ip_address,
+        "user_agent": user_agent,
+        "timestamp": postal_webhook_timestamp(chrono::Utc::now()),
+    })
+}
+
+/// `MessageLinkClicked` payload (Postal's shape plus the event `timestamp`).
+fn link_clicked_payload(message: Value, url: &str, ip_address: &str, user_agent: &str) -> Value {
+    json!({
+        "message": message,
+        "url": url,
+        "ip_address": ip_address,
+        "user_agent": user_agent,
+        "timestamp": postal_webhook_timestamp(chrono::Utc::now()),
+    })
+}
 
 impl PgStore {
     /// Register a click-tracking token for a message's link and return it.
@@ -99,6 +145,16 @@ impl TrackingStore for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| StoreError::Other(e.to_string()))?;
+        if let Some(message) = message_hash(&mut tx, target.message_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?
+        {
+            let url = target.target_url.as_deref().unwrap_or_default();
+            let payload = link_clicked_payload(message, url, ip_address, user_agent);
+            enqueue_webhook_requests(&mut tx, target.server_id, "MessageLinkClicked", &payload)
+                .await
+                .map_err(|e| StoreError::Other(e.to_string()))?;
+        }
         tx.commit()
             .await
             .map_err(|e| StoreError::Other(e.to_string()))?;
@@ -130,6 +186,15 @@ impl TrackingStore for PgStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| StoreError::Other(e.to_string()))?;
+        if let Some(message) = message_hash(&mut tx, target.message_id)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))?
+        {
+            let payload = loaded_payload(message, ip_address, user_agent);
+            enqueue_webhook_requests(&mut tx, target.server_id, "MessageLoaded", &payload)
+                .await
+                .map_err(|e| StoreError::Other(e.to_string()))?;
+        }
         tx.commit()
             .await
             .map_err(|e| StoreError::Other(e.to_string()))?;

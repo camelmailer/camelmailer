@@ -116,20 +116,46 @@ pub fn sample_payload(event: &str, uuid: &str) -> Value {
     let now = chrono::Utc::now();
     let timestamp = now.timestamp();
     let message_timestamp = now.timestamp_millis() as f64 / 1000.0;
-    let payload = if event == "MessageBounced" {
+    // Postal's message hash, as carried by the bounce, open, click and
+    // complaint events.
+    let message = json!({
+        "id": 1234,
+        "token": "abc123message",
+        "direction": "outgoing",
+        "message_id": "original@example.com",
+        "to": "recipient@example.com",
+        "from": "sender@yourdomain.com",
+        "subject": "Example message",
+        "timestamp": message_timestamp - 60.0,
+        "spam_status": "NotChecked",
+        "tag": null,
+    });
+    let payload = if event == "MessageLoaded" {
         json!({
-            "original_message": {
-                "id": 1234,
-                "token": "abc123message",
-                "direction": "outgoing",
-                "message_id": "original@example.com",
-                "to": "recipient@example.com",
-                "from": "sender@yourdomain.com",
-                "subject": "Example message",
-                "timestamp": message_timestamp - 60.0,
-                "spam_status": "NotChecked",
-                "tag": null,
-            },
+            "message": message,
+            "ip_address": "203.0.113.10",
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "timestamp": message_timestamp,
+        })
+    } else if event == "MessageLinkClicked" {
+        json!({
+            "message": message,
+            "url": "https://example.com/offer",
+            "ip_address": "203.0.113.10",
+            "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "timestamp": message_timestamp,
+        })
+    } else if event == "MessageComplained" {
+        json!({
+            "message": message,
+            "address": "recipient@example.com",
+            "feedback_type": "abuse",
+            "user_agent": "Example-FBL/1.0",
+            "timestamp": message_timestamp,
+        })
+    } else if event == "MessageBounced" {
+        json!({
+            "original_message": message,
             "bounce": {
                 "id": 1235,
                 "token": "def456bounce",
@@ -301,6 +327,48 @@ mod tests {
             payload["payload"]["bounce"]["message_id"],
             "bounce@mx.example.com"
         );
+    }
+
+    #[test]
+    fn engagement_samples_carry_the_postal_message_hash() {
+        let message_keys = |payload: &Value| {
+            let mut keys: Vec<String> = payload["payload"]["message"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        let expected = [
+            "direction",
+            "from",
+            "id",
+            "message_id",
+            "spam_status",
+            "subject",
+            "tag",
+            "timestamp",
+            "to",
+            "token",
+        ];
+
+        let loaded = sample_payload("MessageLoaded", "uuid-1");
+        assert_eq!(message_keys(&loaded), expected);
+        assert!(loaded["payload"]["ip_address"].is_string());
+        assert!(loaded["payload"]["user_agent"].is_string());
+        assert!(loaded["payload"]["timestamp"].is_f64());
+
+        let clicked = sample_payload("MessageLinkClicked", "uuid-1");
+        assert_eq!(message_keys(&clicked), expected);
+        assert_eq!(clicked["payload"]["url"], "https://example.com/offer");
+
+        let complained = sample_payload("MessageComplained", "uuid-1");
+        assert_eq!(message_keys(&complained), expected);
+        assert_eq!(complained["payload"]["address"], "recipient@example.com");
+        assert_eq!(complained["payload"]["feedback_type"], "abuse");
+        assert!(complained["payload"].get("details").is_none());
     }
 
     #[test]

@@ -37,6 +37,46 @@ pub struct FeedbackReport {
     pub unsubscribe_token: Option<String>,
     /// The `Original-Rcpt-To` of the feedback part, if present.
     pub original_rcpt: Option<String>,
+    /// The `User-Agent` of the feedback part (the reporting system), if
+    /// present.
+    pub user_agent: Option<String>,
+    /// Engine message tokens (`X-CamelMailer-MsgID` / `X-Postal-MsgID`)
+    /// found in the embedded original message.
+    pub message_tokens: Vec<String>,
+    /// The embedded original's `Message-ID`, without angle brackets.
+    pub original_message_id: Option<String>,
+    /// The embedded original's `To` address, without angle brackets. A
+    /// fallback for reports that omit `Original-Rcpt-To`.
+    pub original_to: Option<String>,
+}
+
+impl FeedbackReport {
+    /// The complaining recipient: `Original-Rcpt-To` when the report has
+    /// one, else the embedded original's `To`. Bare address, no brackets.
+    pub fn recipient(&self) -> Option<String> {
+        self.original_rcpt
+            .as_deref()
+            .or(self.original_to.as_deref())
+            .and_then(bare_address)
+    }
+}
+
+/// `Name <a@b.example>` / `<a@b.example>` / `a@b.example` → `a@b.example`.
+/// The first address of a list wins. `None` when nothing address-like is
+/// left.
+fn bare_address(value: &str) -> Option<String> {
+    let first = value.split(',').next().unwrap_or(value);
+    let inner = match (first.find('<'), first.rfind('>')) {
+        (Some(open), Some(close)) if open < close => &first[open + 1..close],
+        _ => first,
+    };
+    let inner = inner.trim();
+    let inner = inner
+        .strip_prefix("rfc822;")
+        .or_else(|| inner.strip_prefix("RFC822;"))
+        .unwrap_or(inner)
+        .trim();
+    (inner.contains('@') && !inner.contains(char::is_whitespace)).then(|| inner.to_string())
 }
 
 /// A decoded leaf MIME part, keeping the content-type so the feedback and
@@ -217,6 +257,17 @@ fn token_from_list_unsubscribe(value: &str) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
+/// The header block of an embedded original (everything up to the first
+/// blank line), so a token-looking line in its body is never read as a
+/// header.
+fn original_headers(raw: &[u8]) -> &[u8] {
+    let body = body_of(raw);
+    if body.is_empty() {
+        return raw;
+    }
+    &raw[..raw.len() - body.len()]
+}
+
 // ----------------------------------------------------------------- extract
 
 /// Extract the feedback fields from a raw inbound ARF report: verify the
@@ -253,23 +304,49 @@ pub fn extract_feedback(raw_message: &[u8]) -> Result<FeedbackReport, ArfError> 
     let original_rcpt = header(&feedback_headers, "original-rcpt-to")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let user_agent = header(&feedback_headers, "user-agent")
+        .map(|value| value.trim().chars().take(255).collect::<String>())
+        .filter(|value| !value.is_empty());
 
     // The embedded original message (full body or headers only) carries the
-    // List-Unsubscribe header the token rides on.
-    let unsubscribe_token = parts
-        .iter()
-        .find(|part| {
-            let lower = part.content_type.to_lowercase();
-            let lower = lower.trim_start();
-            lower.starts_with("message/rfc822") || lower.starts_with("message/rfc822-headers")
-        })
+    // List-Unsubscribe header the token rides on, and the engine's own
+    // message token and Message-ID that map the report back to the stored
+    // message when the sender used its own List-Unsubscribe.
+    let original = parts.iter().find(|part| {
+        let lower = part.content_type.to_lowercase();
+        let lower = lower.trim_start();
+        lower.starts_with("message/rfc822") || lower.starts_with("message/rfc822-headers")
+    });
+    let unsubscribe_token = original
         .and_then(|part| header_value(&part.body, "list-unsubscribe"))
         .and_then(|value| token_from_list_unsubscribe(&value));
+    let message_tokens = original
+        .map(|part| camelmailer_core::bounce::original_message_tokens(original_headers(&part.body)))
+        .unwrap_or_default();
+    let original_message_id = original
+        .and_then(|part| header_value(&part.body, "message-id"))
+        .and_then(|value| {
+            let value = value.trim();
+            let value = value
+                .find('<')
+                .zip(value.rfind('>'))
+                .filter(|(open, close)| open < close)
+                .map_or(value, |(open, close)| &value[open + 1..close]);
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        });
+    let original_to = original
+        .and_then(|part| header_value(&part.body, "to"))
+        .and_then(|value| bare_address(&value));
 
     Ok(FeedbackReport {
         feedback_type,
         unsubscribe_token,
         original_rcpt,
+        user_agent,
+        message_tokens,
+        original_message_id,
+        original_to,
     })
 }
 
@@ -343,6 +420,75 @@ mod tests {
             report.original_rcpt.as_deref(),
             Some("<recipient@customer.example>")
         );
+    }
+
+    #[test]
+    fn extracts_the_fields_that_map_a_report_to_the_stored_message() {
+        let report = extract_feedback(&sample_arf()).unwrap();
+        assert_eq!(report.user_agent.as_deref(), Some("SomeGenerator/1.0"));
+        assert_eq!(
+            report.original_message_id.as_deref(),
+            Some("8787KJKJ3K4J3K4J3K4J3.mail@sender.example.com")
+        );
+        assert_eq!(
+            report.original_to.as_deref(),
+            Some("recipient@customer.example")
+        );
+        assert_eq!(
+            report.recipient().as_deref(),
+            Some("recipient@customer.example")
+        );
+        // the sample carries no engine message token
+        assert!(report.message_tokens.is_empty());
+    }
+
+    #[test]
+    fn recovers_the_engine_message_token_from_the_original_headers_only() {
+        // A sender with its own List-Unsubscribe: no /track/u/ token, but the
+        // engine's X-CamelMailer-MsgID header survives in the original. A
+        // token-looking line in the original's body is ignored.
+        let message =
+            b"Content-Type: multipart/report; report-type=\"feedback-report\"; boundary=\"b\"\r\n\
+            \r\n\
+            --b\r\n\
+            Content-Type: message/feedback-report\r\n\
+            \r\n\
+            Feedback-Type: abuse\r\n\
+            \r\n\
+            --b\r\n\
+            Content-Type: message/rfc822\r\n\
+            \r\n\
+            From: Sender <news@sender.example>\r\n\
+            To: \"Jane\" <Jane@Customer.example>\r\n\
+            X-CamelMailer-MsgID: engineTok42\r\n\
+            List-Unsubscribe: <https://app.sender.example/unsubscribe/xyz>\r\n\
+            \r\n\
+            X-Postal-MsgID: bodyTok\r\n\
+            --b--\r\n"
+                .to_vec();
+        let report = extract_feedback(&message).unwrap();
+        assert_eq!(report.unsubscribe_token, None);
+        assert_eq!(report.message_tokens, vec!["engineTok42".to_string()]);
+        assert_eq!(report.original_rcpt, None);
+        assert_eq!(report.recipient().as_deref(), Some("Jane@Customer.example"));
+        assert_eq!(report.user_agent, None);
+    }
+
+    #[test]
+    fn bare_addresses_lose_brackets_display_names_and_the_rfc822_prefix() {
+        assert_eq!(
+            bare_address("<a@b.example>").as_deref(),
+            Some("a@b.example")
+        );
+        assert_eq!(
+            bare_address("Name <a@b.example>, other@c.example").as_deref(),
+            Some("a@b.example")
+        );
+        assert_eq!(
+            bare_address("rfc822; a@b.example").as_deref(),
+            Some("a@b.example")
+        );
+        assert_eq!(bare_address("undisclosed-recipients:;"), None);
     }
 
     #[test]
