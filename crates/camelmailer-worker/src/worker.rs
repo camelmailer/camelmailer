@@ -924,7 +924,9 @@ impl Worker {
             return Ok(message.raw_message.clone());
         }
 
-        let Some((headers, body)) = tracking::html_body(&message.raw_message) else {
+        // The decoded HTML of the first text/html part; a message without one
+        // (or in a charset that cannot be rewritten safely) goes as it came.
+        let Some(body) = tracking::html_of(&message.raw_message) else {
             return Ok(message.raw_message.clone());
         };
 
@@ -976,7 +978,8 @@ impl Worker {
         let pixel_url = format!("{tracking_base_url}/track/o/{open_token}.gif");
         let rewritten = tracking::inject_open_pixel(&rewritten, &pixel_url);
 
-        Ok(tracking::reassemble(&headers, &rewritten))
+        Ok(tracking::with_html(&message.raw_message, &rewritten)
+            .unwrap_or_else(|| message.raw_message.clone()))
     }
 
     fn message_payload(&self, message: &StoredMessage, details: &str) -> serde_json::Value {

@@ -15,6 +15,17 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tracking in quoted-printable and multipart mail.** The open pixel was
+  written raw into the encoded body, so a quoted-printable HTML part (any
+  mail with umlauts or long lines) ended in a broken tag such as
+  `<img src="" alt="width=&quot;" height=" style=isplay:none">`, and its
+  `href=3D"…"` links were never rewritten. Tracking now decodes the first
+  `text/html` part of the MIME tree, rewrites it and encodes it again the
+  same way; multipart messages are tracked too, other parts stay
+  byte-for-byte.
+
 ## [0.9.0] - 2026-10-19
 
 ### Added
