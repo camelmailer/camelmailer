@@ -4,10 +4,15 @@
 //! to a `/track/c/<token>` redirect, and an invisible `/track/o/<token>.gif`
 //! pixel is appended before `</body>`.
 //!
-//! This operates on the message's HTML part only. Finding it in a full MIME
-//! message is a larger job; here we rewrite an HTML body (single-part
-//! `text/html` messages and the common inline case), which is enough to
-//! exercise and verify the machinery end to end.
+//! The rewrite works on the *decoded* HTML of the message's first
+//! `text/html` part, found by walking the MIME tree (`html_of`), and the
+//! result is encoded again with that part's own Content-Transfer-Encoding
+//! before it goes back in its place (`with_html`). Rewriting the encoded
+//! bytes instead put a raw `<img src="…">` into quoted-printable text, where
+//! every `=` starts an escape: mail clients showed a broken tag at the end of
+//! each tracked mail, and `href=3D"…"` links were never rewritten at all.
+//! Everything outside that one part — other parts, attachments, line
+//! endings — is left byte-for-byte as it was.
 
 /// Returns the byte offset of the body separator (the empty line) so callers
 /// can split headers from body.
@@ -23,10 +28,6 @@ fn body_offset(raw_message: &[u8]) -> Option<usize> {
                 .position(|w| w == b"\n\n")
                 .map(|p| p + 2)
         })
-}
-
-fn is_html(headers: &str) -> bool {
-    headers.to_lowercase().contains("text/html")
 }
 
 /// True when the message carries a cryptographic signature that a tracking
@@ -196,23 +197,267 @@ pub fn inject_open_pixel(html: &str, pixel_url: &str) -> String {
     }
 }
 
-/// Split a raw message into (headers, body_html) when the body is HTML.
-pub fn html_body(raw_message: &[u8]) -> Option<(String, String)> {
-    let offset = body_offset(raw_message)?;
-    let headers = String::from_utf8_lossy(&raw_message[..offset]).to_string();
-    if !is_html(&headers) {
-        return None;
-    }
-    let body = String::from_utf8_lossy(&raw_message[offset..]).to_string();
-    Some((headers, body))
+/// How a part's body is encoded on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Encoding {
+    /// 7bit, 8bit, binary or none given: the bytes are the text.
+    Identity,
+    QuotedPrintable,
+    Base64,
 }
 
-/// Reassemble a raw message from its header block and a new HTML body.
-pub fn reassemble(headers: &str, new_body: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(headers.len() + new_body.len());
-    out.extend_from_slice(headers.as_bytes());
-    out.extend_from_slice(new_body.as_bytes());
+/// Where the HTML part's body sits in the raw message, and how it is encoded.
+#[derive(Debug, Clone, Copy)]
+struct HtmlPart {
+    start: usize,
+    end: usize,
+    encoding: Encoding,
+}
+
+const MAX_DEPTH: usize = 8;
+
+/// The value of a header in a parsed header list (names are lower-case).
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+/// A parameter of a structured header value (`boundary`, `charset`).
+fn parameter(value: &str, name: &str) -> Option<String> {
+    value.split(';').skip(1).find_map(|part| {
+        let (key, raw) = part.trim().split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| raw.trim().trim_matches('"').to_string())
+    })
+}
+
+/// Byte ranges of the parts of a multipart body, between its delimiters.
+/// The line break before a delimiter belongs to the delimiter (RFC 2046).
+fn multipart_ranges(body: &[u8], boundary: &str) -> Vec<(usize, usize)> {
+    let delimiter = format!("--{boundary}");
+    let delimiter = delimiter.as_bytes();
+    // Delimiter lines: at the start of the body or after a line break.
+    let mut lines: Vec<(usize, usize, bool)> = Vec::new(); // (line start, after line, closing)
+    let mut at = 0;
+    while at + delimiter.len() <= body.len() {
+        let line_start = at == 0 || body[at - 1] == b'\n';
+        if line_start && body[at..].starts_with(delimiter) {
+            let rest = &body[at + delimiter.len()..];
+            let closing = rest.starts_with(b"--");
+            let line_end = rest
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|p| at + delimiter.len() + p + 1)
+                .unwrap_or(body.len());
+            lines.push((at, line_end, closing));
+            if closing {
+                break;
+            }
+            at = line_end;
+            continue;
+        }
+        at += 1;
+    }
+
+    lines
+        .windows(2)
+        .map(|pair| {
+            let start = pair[0].1;
+            let mut end = pair[1].0;
+            if end > start && body[end - 1] == b'\n' {
+                end -= 1;
+                if end > start && body[end - 1] == b'\r' {
+                    end -= 1;
+                }
+            }
+            (start, end.max(start))
+        })
+        .collect()
+}
+
+/// The first `text/html` part that is not an attachment, searched depth-first.
+/// A charset other than UTF-8 (or its ASCII subset) is left alone: rewriting
+/// it as UTF-8 would garble it.
+fn find_html(raw: &[u8], base: usize, depth: usize) -> Option<HtmlPart> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    let headers = camelmailer_core::message::parse_headers(raw);
+    let content_type = header(&headers, "content-type").unwrap_or("text/plain");
+    let offset = body_offset(raw)?;
+    let body = &raw[offset..];
+    let media = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    if media.starts_with("multipart/") {
+        // A signed container is never touched (see `is_signed`).
+        if media == "multipart/signed" {
+            return None;
+        }
+        let boundary = parameter(content_type, "boundary")?;
+        return multipart_ranges(body, &boundary)
+            .into_iter()
+            .find_map(|(start, end)| {
+                find_html(&body[start..end], base + offset + start, depth + 1)
+            });
+    }
+
+    if media != "text/html"
+        || header(&headers, "content-disposition")
+            .is_some_and(|d| d.trim().to_ascii_lowercase().starts_with("attachment"))
+    {
+        return None;
+    }
+    if let Some(charset) = parameter(content_type, "charset") {
+        if !matches!(
+            charset.to_ascii_lowercase().as_str(),
+            "utf-8" | "utf8" | "us-ascii"
+        ) {
+            return None;
+        }
+    }
+    let encoding = match header(&headers, "content-transfer-encoding")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "quoted-printable" => Encoding::QuotedPrintable,
+        "base64" => Encoding::Base64,
+        _ => Encoding::Identity,
+    };
+
+    Some(HtmlPart {
+        start: base + offset,
+        end: base + raw.len(),
+        encoding,
+    })
+}
+
+fn decode_quoted_printable(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        match body[i] {
+            b'=' if body[i + 1..].starts_with(b"\r\n") => i += 3,
+            b'=' if body[i + 1..].starts_with(b"\n") => i += 2,
+            b'=' if i + 2 < body.len() => {
+                match std::str::from_utf8(&body[i + 1..i + 3])
+                    .ok()
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                {
+                    Some(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(b'=');
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
     out
+}
+
+/// Quoted-printable (RFC 2045 §6.7): line breaks of the text stay hard line
+/// breaks (CRLF), lines are soft-broken before 76 characters, and `=`,
+/// non-ASCII bytes and whitespace at a line's end are escaped.
+fn encode_quoted_printable(text: &[u8]) -> Vec<u8> {
+    const MAX: usize = 75; // room for the soft break's "="
+    let mut out = Vec::with_capacity(text.len() * 11 / 10);
+    let lines: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
+    for (n, line) in lines.iter().enumerate() {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let mut width = 0;
+        for (i, &byte) in line.iter().enumerate() {
+            let last = i + 1 == line.len();
+            let literal = (byte == b' ' || byte == b'\t') && !last
+                || (33..=126).contains(&byte) && byte != b'=';
+            let piece: Vec<u8> = if literal {
+                vec![byte]
+            } else {
+                format!("={byte:02X}").into_bytes()
+            };
+            if width + piece.len() > MAX {
+                out.extend_from_slice(b"=\r\n");
+                width = 0;
+            }
+            width += piece.len();
+            out.extend_from_slice(&piece);
+        }
+        if n + 1 < lines.len() {
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out
+}
+
+fn decode(encoding: Encoding, body: &[u8]) -> Option<Vec<u8>> {
+    match encoding {
+        Encoding::Identity => Some(body.to_vec()),
+        Encoding::QuotedPrintable => Some(decode_quoted_printable(body)),
+        Encoding::Base64 => {
+            use base64::Engine;
+            let compact: Vec<u8> = body
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(compact)
+                .ok()
+        }
+    }
+}
+
+fn encode(encoding: Encoding, text: &[u8]) -> Vec<u8> {
+    match encoding {
+        Encoding::Identity => text.to_vec(),
+        Encoding::QuotedPrintable => encode_quoted_printable(text),
+        Encoding::Base64 => {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(text);
+            let lines: Vec<&str> = b64
+                .as_bytes()
+                .chunks(76)
+                .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+                .collect();
+            lines.join("\r\n").into_bytes()
+        }
+    }
+}
+
+/// The decoded HTML of a message's first `text/html` part, if it has one that
+/// tracking may rewrite.
+pub fn html_of(raw_message: &[u8]) -> Option<String> {
+    let part = find_html(raw_message, 0, 0)?;
+    let bytes = decode(part.encoding, &raw_message[part.start..part.end])?;
+    String::from_utf8(bytes).ok()
+}
+
+/// The message with its first `text/html` part replaced by `html`, encoded as
+/// that part was. Every other byte of the message is kept as it was.
+pub fn with_html(raw_message: &[u8], html: &str) -> Option<Vec<u8>> {
+    let part = find_html(raw_message, 0, 0)?;
+    let encoded = encode(part.encoding, html.as_bytes());
+    let mut out = Vec::with_capacity(raw_message.len() + encoded.len());
+    out.extend_from_slice(&raw_message[..part.start]);
+    out.extend_from_slice(&encoded);
+    out.extend_from_slice(&raw_message[part.end..]);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -251,17 +496,6 @@ mod tests {
     }
 
     #[test]
-    fn html_body_only_for_html_messages() {
-        let html = b"Content-Type: text/html\r\n\r\n<body>x</body>";
-        let (headers, body) = html_body(html).unwrap();
-        assert!(headers.contains("text/html"));
-        assert_eq!(body, "<body>x</body>");
-
-        let text = b"Content-Type: text/plain\r\n\r\nplain";
-        assert!(html_body(text).is_none());
-    }
-
-    #[test]
     fn detects_signed_messages() {
         // top-level multipart/signed (S/MIME or PGP/MIME)
         let smime = b"Content-Type: multipart/signed; protocol=\"application/pkcs7-signature\"; \
@@ -283,14 +517,6 @@ mod tests {
         // the literal string in body text must not trip the header check
         let mentions = b"Content-Type: text/html\r\n\r\n<body>we use multipart/signed mail</body>";
         assert!(!is_signed(mentions));
-    }
-
-    #[test]
-    fn reassemble_round_trips() {
-        let raw = b"Content-Type: text/html\r\n\r\n<body>x</body>";
-        let (headers, body) = html_body(raw).unwrap();
-        let rebuilt = reassemble(&headers, &body);
-        assert_eq!(rebuilt, raw);
     }
 
     // Item 4: a long href carrying HTML entities and percent-encoding must
@@ -369,10 +595,11 @@ Content-Disposition: attachment; filename=\"a.bin\"\r\n\
         );
         let raw = raw.into_bytes();
 
-        // Not an HTML top level, so the tracking pass never rewrites it: the
-        // worker returns the raw message byte-for-byte (no line-ending rewrite,
-        // no dropped bytes). Regression guard for the mangled-attachment bug.
-        assert!(html_body(&raw).is_none());
+        // No HTML part, so the tracking pass never rewrites it: the worker
+        // returns the raw message byte-for-byte (no line-ending rewrite, no
+        // dropped bytes). Regression guard for the mangled-attachment bug.
+        assert!(html_of(&raw).is_none());
+        assert!(with_html(&raw, "<p>x</p>").is_none());
         assert!(!is_signed(&raw));
 
         // And the (untouched) base64 still decodes to the exact payload — the
@@ -388,17 +615,151 @@ Content-Disposition: attachment; filename=\"a.bin\"\r\n\
     }
 
     // Item 3: a single-part text/html body with mixed line endings and
-    // non-ASCII UTF-8 round-trips through split → (no-op) rewrite → reassemble
+    // non-ASCII UTF-8 round-trips through decode → (no-op) rewrite → encode
     // with every byte intact.
     #[test]
     fn html_body_round_trips_mixed_endings_and_utf8() {
         let raw = "Content-Type: text/html; charset=utf-8\r\n\r\n\
 <p>Grüße\nüber\r\nZeilen — ohne Verlust</p>"
             .as_bytes();
-        let (headers, body) = html_body(raw).unwrap();
-        let (rewritten, urls) = rewrite_links(&body, |u| u.to_string());
+        let html = html_of(raw).unwrap();
+        let (rewritten, urls) = rewrite_links(&html, |u| u.to_string());
         assert!(urls.is_empty());
-        let rebuilt = reassemble(&headers, &rewritten);
+        let rebuilt = with_html(raw, &rewritten).unwrap();
         assert_eq!(rebuilt, raw, "no bytes may be dropped or altered");
+    }
+
+    /// What a tracked message reads as once a client has decoded it.
+    fn displayed_html(raw: &[u8]) -> String {
+        camelmailer_core::mime::extract_bodies(raw).html.unwrap()
+    }
+
+    /// The message the API builds for an HTML body with umlauts and long
+    /// lines: quoted-printable, as `mail-builder` encodes it.
+    fn built_message(html: &str, text: Option<&str>) -> Vec<u8> {
+        camelmailer_core::mime::build_message(&camelmailer_core::mime::BuildParams {
+            from: camelmailer_core::mime::Address::new("sender@example.com"),
+            to: vec![camelmailer_core::mime::Address::new("kunde@example.com")],
+            subject: "Ihr Raum".into(),
+            html_body: Some(html.into()),
+            text_body: text.map(str::to_string),
+            ..Default::default()
+        })
+    }
+
+    // The bug this module had: a raw pixel and untouched hrefs inside
+    // quoted-printable text. The client saw `<img src="" alt="width=&quot;"
+    // height=" style=isplay:none">` and no link was ever tracked.
+    #[test]
+    fn tracks_a_quoted_printable_body_and_keeps_it_quoted_printable() {
+        let link = "https://app.example.com/r/abc?invite=xyz&amp;utm=mail";
+        let html = format!(
+            "<html><body><p>Guten Tag Frau Müller, über diesen Link öffnen Sie Ihren Raum, der für Sie vorbereitet wurde:</p>\n<a href=\"{link}\">Raum öffnen</a></body></html>"
+        );
+        let raw = built_message(&html, None);
+        let raw_text = String::from_utf8_lossy(&raw).to_lowercase();
+        assert!(raw_text.contains("content-transfer-encoding: quoted-printable"));
+
+        // Quoted-printable carries line breaks as CRLF.
+        let decoded = html_of(&raw).unwrap();
+        assert_eq!(decoded, html.replace('\n', "\r\n"));
+        let (rewritten, urls) =
+            rewrite_links(&decoded, |_| "https://track.example/track/c/TOKEN".into());
+        assert_eq!(
+            urls,
+            vec!["https://app.example.com/r/abc?invite=xyz&utm=mail"]
+        );
+        let rewritten = inject_open_pixel(&rewritten, "https://track.example/track/o/OPEN.gif");
+        let tracked = with_html(&raw, &rewritten).unwrap();
+
+        let shown = displayed_html(&tracked);
+        assert!(shown.contains(r#"<a href="https://track.example/track/c/TOKEN">Raum öffnen</a>"#));
+        assert!(shown.contains(r#"<img src="https://track.example/track/o/OPEN.gif" alt="" width="1" height="1" style="display:none"/></body>"#));
+        assert!(shown.contains("Frau Müller"));
+
+        // Still valid quoted-printable: every `=` is an escape or a soft
+        // break, and no line is longer than 76 characters.
+        let body = &tracked[tracked.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..];
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body
+            .replace("=\r\n", "")
+            .contains("src=3D\"https://track.example"));
+        assert!(body.lines().all(|line| line.len() <= 76), "{body}");
+    }
+
+    #[test]
+    fn rewrites_only_the_html_part_of_a_multipart_message() {
+        use base64::Engine;
+        let attachment = base64::engine::general_purpose::STANDARD.encode([0u8, 1, 2, 3, 254, 255]);
+        let raw = format!(
+            "From: sender@example.com\r\n\
+Content-Type: multipart/mixed; boundary=\"outer\"\r\n\
+\r\n\
+--outer\r\n\
+Content-Type: multipart/alternative; boundary=inner\r\n\
+\r\n\
+--inner\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Grüße, https://example.com\r\n\
+--inner\r\n\
+Content-Type: text/html; charset=\"utf-8\"\r\n\
+Content-Transfer-Encoding: quoted-printable\r\n\
+\r\n\
+<p>Gr=C3=BC=C3=9Fe <a href=3D\"https://example.com\">x</a></p>\r\n\
+--inner--\r\n\
+--outer\r\n\
+Content-Type: application/pdf\r\n\
+Content-Transfer-Encoding: base64\r\n\
+Content-Disposition: attachment; filename=\"a.pdf\"\r\n\
+\r\n\
+{attachment}\r\n\
+--outer--\r\n"
+        )
+        .into_bytes();
+
+        let html = html_of(&raw).unwrap();
+        assert_eq!(html, "<p>Grüße <a href=\"https://example.com\">x</a></p>");
+        let tracked = with_html(&raw, &inject_open_pixel(&html, "https://t/o.gif")).unwrap();
+        let text = String::from_utf8(tracked.clone()).unwrap();
+
+        assert!(displayed_html(&tracked).ends_with(r#"style="display:none"/>"#));
+        // Everything around the HTML part is untouched.
+        let before_html = "Grüße, https://example.com\r\n--inner\r\n";
+        assert!(text.contains(before_html));
+        assert!(text.ends_with(&format!("{attachment}\r\n--outer--\r\n")));
+        assert!(text.contains("\r\n--inner--\r\n--outer\r\n"));
+    }
+
+    #[test]
+    fn keeps_a_base64_html_part_base64() {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("<body>Grüße</body>");
+        let raw = format!("Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n").into_bytes();
+
+        let html = html_of(&raw).unwrap();
+        assert_eq!(html, "<body>Grüße</body>\n".trim_end());
+        let tracked = with_html(&raw, &inject_open_pixel(&html, "https://t/o.gif")).unwrap();
+        assert!(displayed_html(&tracked).contains(r#"Grüße<img src="https://t/o.gif""#));
+        assert!(String::from_utf8_lossy(&tracked).contains("Content-Transfer-Encoding: base64"));
+    }
+
+    #[test]
+    fn leaves_an_html_part_in_another_charset_alone() {
+        let raw = b"Content-Type: text/html; charset=iso-8859-1\r\n\r\n<body>Gr\xfc\xdfe</body>";
+        assert!(html_of(raw).is_none());
+        assert!(with_html(raw, "<body/>").is_none());
+    }
+
+    #[test]
+    fn quoted_printable_round_trips() {
+        let text =
+            "a=b über\r\nzweite Zeile mit Leerzeichen am Ende \r\n".to_string() + &"x".repeat(200);
+        let encoded = encode_quoted_printable(text.as_bytes());
+        assert!(String::from_utf8(encoded.clone())
+            .unwrap()
+            .lines()
+            .all(|l| l.len() <= 76));
+        assert_eq!(decode_quoted_printable(&encoded), text.as_bytes());
     }
 }

@@ -17,6 +17,14 @@ send time so the numbers roll up into message detail, per-server
 Tracking touches the **HTML part only**. A text-only message keeps its
 body verbatim and produces no open or click events.
 
+The HTML part is the first `text/html` part that is not an attachment,
+wherever it sits in the MIME tree (a single-part message, or inside
+`multipart/alternative` / `multipart/mixed`). It is rewritten decoded and
+encoded again with its own Content-Transfer-Encoding — quoted-printable
+stays quoted-printable, base64 stays base64 — so every other part and every
+byte around it go out unchanged. An HTML part in a charset other than UTF-8
+or US-ASCII is not tracked rather than risk garbling it.
+
 ## What each technique does
 
 | | Open tracking | Click tracking |
