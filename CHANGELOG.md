@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-23
+
 ### Fixed
 
 - **Tracking in quoted-printable and multipart mail.** The open pixel was
@@ -1110,7 +1112,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/camelmailer/camelmailer/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/camelmailer/camelmailer/compare/v0.8.4...v0.9.0
 [0.8.0]: https://github.com/camelmailer/camelmailer/compare/v0.7.8...v0.8.0
 [0.7.8]: https://github.com/camelmailer/camelmailer/compare/v0.7.7...v0.7.8
