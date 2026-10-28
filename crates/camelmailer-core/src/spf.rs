@@ -153,7 +153,15 @@ pub trait SpfResolver: Send + Sync {
 
 /// The RFC 7208 §4.6.4 processing limit: at most 10 DNS-querying mechanisms
 /// / modifiers per evaluation, to bound work and stop include/redirect loops.
+/// Each `include`, `a`, `mx`, `ptr`, `exists` and `redirect=` costs one,
+/// covering the record it fetches; the initial TXT query for the domain
+/// being checked costs nothing.
 const MAX_DNS_LOOKUPS: u32 = 10;
+
+/// RFC 7208 §4.6.4: one `mx` mechanism may look up the addresses of at most
+/// 10 exchanges. These lookups have their own limit and do not count
+/// towards [`MAX_DNS_LOOKUPS`].
+const MAX_MX_ADDRESS_LOOKUPS: usize = 10;
 
 /// Evaluate the SPF policy of `domain` for a message arriving from
 /// `client_ip`. Never blocks the caller's decision — it only returns the
@@ -332,10 +340,10 @@ impl<'a> Evaluator<'a> {
     /// Fetch the single `v=spf1` TXT record for `domain`. `Ok(None)` = no
     /// policy; `Err(_)` carries the SPF result to short-circuit with
     /// (temperror on lookup failure, permerror on multiple records).
+    ///
+    /// Spends no lookup: the `include:` or `redirect=` that leads here has
+    /// already paid for this query, and the top-level query is free.
     async fn fetch_spf_record(&self, domain: &str) -> Result<Option<String>, SpfResult> {
-        if !self.spend_lookup() {
-            return Err(SpfResult::PermError);
-        }
         let records = match self.resolver.txt(domain).await {
             Ok(records) => records,
             Err(_) => return Err(SpfResult::TempError),
@@ -443,10 +451,10 @@ impl<'a> Evaluator<'a> {
             Ok(hosts) => hosts,
             Err(_) => return MechanismOutcome::Error(SpfResult::TempError),
         };
+        if hosts.len() > MAX_MX_ADDRESS_LOOKUPS {
+            return MechanismOutcome::Error(SpfResult::PermError);
+        }
         for host in hosts {
-            if !self.spend_lookup() {
-                return MechanismOutcome::Error(SpfResult::PermError);
-            }
             match self.resolver.ip_addresses(&host).await {
                 Ok(addresses) => {
                     if addresses.iter().any(|addr| ip_matches(*addr, ip, cidr)) {
@@ -746,6 +754,63 @@ mod tests {
         resolver.add_txt("b.example", "v=spf1 include:a.example -all");
         assert_eq!(
             evaluate(&resolver, "a.example", ip("192.0.2.1")).await,
+            SpfResult::PermError
+        );
+    }
+
+    #[tokio::test]
+    async fn ten_lookups_are_allowed_and_the_eleventh_permerrors() {
+        // RFC 7208 §4.6.4 counts each include once, not the TXT query it
+        // makes, and not the initial query for the checked domain. This is
+        // the shape of a flattened record: a, mx and a chain of includes.
+        let chain = |links: usize| {
+            let resolver = StaticSpfResolver::new();
+            resolver.add_txt("acme.com", "v=spf1 a mx include:spf0.acme.com -all");
+            resolver.add_mx("acme.com", "mx.acme.com");
+            for n in 0..links {
+                let next = if n + 1 < links {
+                    format!(" include:spf{}.acme.com", n + 1)
+                } else {
+                    " ip4:192.0.2.0/24".to_string()
+                };
+                resolver.add_txt(
+                    &format!("spf{n}.acme.com"),
+                    &format!("v=spf1 ip4:198.51.100.{n}{next} -all"),
+                );
+            }
+            resolver
+        };
+
+        // a + mx + 8 includes = 10 lookups.
+        assert_eq!(
+            evaluate(&chain(8), "acme.com", ip("192.0.2.1")).await,
+            SpfResult::Pass
+        );
+        // a + mx + 9 includes = 11.
+        assert_eq!(
+            evaluate(&chain(9), "acme.com", ip("192.0.2.1")).await,
+            SpfResult::PermError
+        );
+    }
+
+    #[tokio::test]
+    async fn mx_address_lookups_have_their_own_limit() {
+        // Exchange address lookups do not spend the ten-lookup budget, but
+        // one mx may not resolve more than ten exchanges.
+        let resolver = StaticSpfResolver::new();
+        resolver.add_txt("acme.com", "v=spf1 mx -all");
+        for n in 0..10 {
+            resolver.add_mx("acme.com", &format!("mx{n}.acme.com"));
+        }
+        resolver.add_address("mx9.acme.com", ip("192.0.2.9"));
+        assert_eq!(
+            evaluate(&resolver, "acme.com", ip("192.0.2.9")).await,
+            SpfResult::Pass
+        );
+
+        resolver.add_mx("acme.com", "mx10.acme.com");
+        assert_eq!(
+            evaluate(&resolver, "acme.com", ip("192.0.2.9")).await,
             SpfResult::PermError
         );
     }
