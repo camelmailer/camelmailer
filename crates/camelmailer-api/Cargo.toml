@@ -8,6 +8,7 @@ license.workspace = true
 async-trait = { workspace = true }
 sha2 = { workspace = true }
 hickory-resolver = { workspace = true }
+ipnet = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 rsa = { workspace = true }
