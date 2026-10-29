@@ -1462,3 +1462,87 @@ fn usage_seeded_before_the_connection_counts_against_the_limit() {
         3
     );
 }
+
+// ------------------------------------------------- organization quota
+
+#[test]
+fn data_past_the_organization_limit_is_refused_with_the_monthly_message() {
+    let mut setup = TestSetup::new();
+    setup
+        .fixtures
+        .set_organization_policy(camelmailer_core::OrganizationPolicy {
+            monthly_send_limit: Some(2),
+            ..Default::default()
+        });
+    setup.fixtures.record_sends(2);
+    authenticated_session(&mut setup);
+    setup.fixtures.verified_server_domain("example.com");
+    assert_eq!(
+        line(&setup.session.handle("RCPT TO: over@dest.example")),
+        "250 OK"
+    );
+    let reply = finish_submission(&mut setup.session, None, "Over the plan");
+    assert!(line(&reply).starts_with("550 5.7.1 "), "{}", line(&reply));
+    assert!(
+        line(&reply).contains("monthly send limit of 2"),
+        "{}",
+        line(&reply)
+    );
+    assert!(setup.sink.messages().is_empty());
+}
+
+#[test]
+fn the_stricter_of_server_and_organization_limit_decides_over_smtp() {
+    // The organization has room; the server's own limit is the stricter.
+    let mut setup = TestSetup::new();
+    setup
+        .fixtures
+        .set_organization_policy(camelmailer_core::OrganizationPolicy {
+            monthly_send_limit: Some(100),
+            ..Default::default()
+        });
+    setup.fixtures.set_send_limit(Some(1));
+    setup.fixtures.record_sends(1);
+    authenticated_session(&mut setup);
+    setup.fixtures.verified_server_domain("example.com");
+    setup.session.handle("RCPT TO: over@dest.example");
+    let reply = finish_submission(&mut setup.session, None, "Over the server");
+    assert!(
+        line(&reply).contains("messages per 30 days"),
+        "{}",
+        line(&reply)
+    );
+}
+
+#[test]
+fn an_organization_with_room_accepts_submissions() {
+    let mut setup = TestSetup::new();
+    setup
+        .fixtures
+        .set_organization_policy(camelmailer_core::OrganizationPolicy {
+            monthly_send_limit: Some(5),
+            ..Default::default()
+        });
+    setup.fixtures.record_sends(1);
+    authenticated_session(&mut setup);
+    setup.fixtures.verified_server_domain("example.com");
+    setup.session.handle("RCPT TO: fine@dest.example");
+    let reply = finish_submission(&mut setup.session, None, "Fine");
+    assert_eq!(line(&reply), "250 OK");
+}
+
+#[test]
+fn a_suspended_organization_is_refused_at_rcpt_like_a_suspended_server() {
+    let mut setup = TestSetup::new();
+    setup
+        .fixtures
+        .set_organization_policy(camelmailer_core::OrganizationPolicy {
+            suspended: true,
+            suspension_reason: Some("Unpaid".into()),
+            ..Default::default()
+        });
+    authenticated_session(&mut setup);
+    let reply = setup.session.handle("RCPT TO: anyone@dest.example");
+    assert_eq!(line(&reply), "535 Organization has been suspended");
+    assert!(setup.session.recipients().is_empty());
+}

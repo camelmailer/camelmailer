@@ -11,11 +11,14 @@ pub mod bounce;
 pub mod dmarc;
 pub mod dns;
 pub mod hashing;
+pub mod lifecycle;
 pub mod message;
 pub mod mime;
 pub mod model;
 pub mod org_sso;
+pub mod quota;
 pub mod received_header;
+pub mod retention;
 pub mod send_limit;
 pub mod server_store;
 pub mod spf;
@@ -39,6 +42,7 @@ pub use dmarc::{
     NewDmarcReport, DMARC_REPORTS_ENDPOINT,
 };
 pub use dns::{DnsError, DnsResolver, StaticDnsResolver};
+pub use lifecycle::LifecycleEvent;
 pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueueMessagesOutcome, QueuedMessage,
     SentMessage,
@@ -48,7 +52,9 @@ pub use org_sso::{
     NewOrgEmailDomain, NewOrgSsoConnection, OrgEmailDomain, OrgSsoConnection,
     OrgSsoConnectionUpdate, OrgSsoStore, SsoKind,
 };
-pub use send_limit::SendAllowance;
+pub use quota::{OrganizationPolicy, UsageMonth};
+pub use retention::{RetentionOverrides, RetentionPeriods};
+pub use send_limit::{LimitScope, SendAllowance};
 pub use server_store::{
     is_valid_delivery_status, ActivityEvent, ApiRequestFilter, ApiRequestRecord, CampaignStats,
     CampaignUpdate, DeliveryRecord, DeliveryStats, IdempotencyLookup, IdempotencyRequest,

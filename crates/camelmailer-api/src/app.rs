@@ -40,9 +40,9 @@ pub struct ApiState {
     pub global_admin_api_key: Option<String>,
     /// The full configuration (auth policy, OIDC, hostnames).
     pub config: camelmailer_config::Config,
-    /// Billing backend (hosted cloud only). `None` on self-hosted
-    /// installations: billing endpoints then report disabled.
-    pub billing: Option<Arc<dyn crate::billing::BillingProvider>>,
+    /// Billing backend. [`crate::billing::NoBilling`] unless a custom build
+    /// installs a provider; billing endpoints then report disabled.
+    pub billing: Arc<dyn crate::billing::BillingProvider>,
     /// Full SPF resolution (TXT + A/AAAA + MX) for the domain health check,
     /// which evaluates a sending domain's SPF against this installation's
     /// sending addresses instead of matching the record text. `None` (the
@@ -92,7 +92,7 @@ impl ApiState {
             auth_store: None,
             global_admin_api_key,
             config: camelmailer_config::Config::default(),
-            billing: None,
+            billing: Arc::new(crate::billing::NoBilling),
             dns_resolver,
             installation_dkim_public_key: None,
             sso_github: Arc::new(crate::sso::HttpGithub::default()),
@@ -115,7 +115,7 @@ impl ApiState {
             auth_store: None,
             global_admin_api_key,
             config: camelmailer_config::Config::default(),
-            billing: None,
+            billing: Arc::new(crate::billing::NoBilling),
             dns_resolver: Arc::new(crate::dns::HickoryDnsResolver),
             installation_dkim_public_key: None,
             sso_github: Arc::new(crate::sso::HttpGithub::default()),
@@ -283,7 +283,7 @@ impl ApiState {
             auth_store,
             global_admin_api_key,
             config,
-            billing,
+            billing: billing.unwrap_or_else(|| Arc::new(crate::billing::NoBilling)),
             dns_resolver,
             installation_dkim_public_key,
             sso_github,
@@ -292,6 +292,17 @@ impl ApiState {
             org_sso_store: None,
             spf_resolver: None,
         })
+    }
+
+    /// Install a billing provider (custom builds). Same shape as
+    /// [`ApiState::with_spf_resolver`]: returns a fresh state.
+    pub fn with_billing(
+        self: Arc<Self>,
+        billing: Arc<dyn crate::billing::BillingProvider>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.billing = billing;
+        Arc::new(state)
     }
 
     /// Attach a full SPF resolver so the domain health check can evaluate a
@@ -522,8 +533,20 @@ fn required_role(rest: &[&str], method: &axum::http::Method) -> camelmailer_core
                 Role::Admin
             }
         }
-        // billing (hosted cloud): reads and the portal are both admin+
+        // billing: reads, checkout and the portal are all admin+
         Some(&"billing") => Role::Admin,
+        // monthly usage: readable by every member
+        Some(&"usage") => Role::Viewer,
+        // quota and suspension: readable by every member; writes are
+        // additionally reserved for installation administrators by the
+        // handlers (an owner must not lift their own limit)
+        Some(&"limits") | Some(&"suspend") | Some(&"unsuspend") => {
+            if read {
+                Role::Viewer
+            } else {
+                Role::Owner
+            }
+        }
         // tenant SSO configuration holds provider secrets; only admins and
         // owners may see or change it.
         Some(&"sso") => Role::Admin,
@@ -956,6 +979,7 @@ async fn organizations_create(
                     return render_store_error(Some(&start.0), error);
                 }
             }
+            crate::lifecycle::organization_created(&state, &organization, principal.user()).await;
             render_success(
                 Some(&start.0),
                 StatusCode::CREATED,
@@ -979,11 +1003,22 @@ async fn organizations_show(
     Path(permalink): Path<String>,
 ) -> ApiResponse {
     match find_organization(&state, &permalink).await {
-        Ok(Some(organization)) => render_success(
-            Some(&start.0),
-            StatusCode::OK,
-            json!({ "organization": organization_json(&organization) }),
-        ),
+        Ok(Some(organization)) => {
+            let policy = match state.store.organization_policy(organization.id).await {
+                Ok(policy) => policy,
+                Err(error) => return render_store_error(Some(&start.0), error),
+            };
+            render_success(
+                Some(&start.0),
+                StatusCode::OK,
+                json!({
+                    "organization": organization_json(&organization),
+                    // How long this organization's data is kept (null =
+                    // forever), after its own overrides.
+                    "retention": crate::quota::retention_json(&state, &policy),
+                }),
+            )
+        }
         Ok(None) => render_not_found(Some(&start.0)),
         Err(error) => render_store_error(Some(&start.0), error),
     }
@@ -1028,11 +1063,17 @@ async fn organizations_update(
 async fn organizations_destroy(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
+    principal: axum::Extension<Principal>,
     Path(permalink): Path<String>,
 ) -> ApiResponse {
     match find_organization(&state, &permalink).await {
         Ok(Some(organization)) => match state.store.delete_organization(organization.id).await {
-            Ok(_) => render_deleted(Some(&start.0)),
+            Ok(true) => {
+                crate::lifecycle::organization_deleted(&state, &organization, principal.user())
+                    .await;
+                render_deleted(Some(&start.0))
+            }
+            Ok(false) => render_deleted(Some(&start.0)),
             Err(error) => render_store_error(Some(&start.0), error),
         },
         Ok(None) => render_not_found(Some(&start.0)),
@@ -1325,7 +1366,7 @@ async fn servers_unsuspend(
 /// "field set to null, clear it". Plain `#[serde(default)]` collapses both
 /// to `None`, which makes a nullable column impossible to clear through a
 /// PATCH (the class of bug behind postalserver/postal#3562).
-fn null_is_explicit<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+pub(crate) fn null_is_explicit<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     T: Deserialize<'de>,
     D: serde::Deserializer<'de>,
@@ -1831,6 +1872,34 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             axum::routing::post(crate::billing::billing_portal),
         )
         .route(
+            "/organizations/{permalink}/billing/plans",
+            get(crate::billing::billing_plans),
+        )
+        .route(
+            "/organizations/{permalink}/billing/checkout",
+            axum::routing::post(crate::billing::billing_checkout),
+        )
+        .route(
+            "/organizations/{permalink}/billing/usage",
+            axum::routing::post(crate::billing::billing_usage_session),
+        )
+        .route(
+            "/organizations/{permalink}/usage",
+            get(crate::quota::usage_show),
+        )
+        .route(
+            "/organizations/{permalink}/limits",
+            get(crate::quota::limits_show).patch(crate::quota::limits_update),
+        )
+        .route(
+            "/organizations/{permalink}/suspend",
+            axum::routing::post(crate::quota::organization_suspend),
+        )
+        .route(
+            "/organizations/{permalink}/unsuspend",
+            axum::routing::post(crate::quota::organization_unsuspend),
+        )
+        .route(
             "/organizations/{permalink}/members",
             get(crate::memberships::members_index).post(crate::memberships::members_create),
         )
@@ -1908,6 +1977,41 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .nest("/api/v2/admin", admin)
+}
+
+/// The complete HTTP application the `web-server` role serves: the admin,
+/// server, auth, SSO, OIDC, SAML, SCIM, share, asset and unsubscribe
+/// routers, the tracking endpoints when a tracking store is given, and the
+/// CORS layer from `web_server.cors_origins`. A custom build calls this with
+/// its own [`ApiState`] (e.g. one carrying a billing provider) and may merge
+/// further routes before serving it.
+pub fn build_app(
+    state: Arc<ApiState>,
+    tracking: Option<Arc<dyn camelmailer_core::TrackingStore>>,
+) -> Router {
+    let cors_origins = state.config.web_server.cors_origins.clone();
+    let mut router = build_router(state.clone())
+        .merge(build_assets_router(state.clone()))
+        .merge(crate::server_api::build_server_router(state.clone()))
+        .merge(crate::share::build_share_router(state.clone()))
+        .merge(crate::auth_api::build_auth_router(state.clone()))
+        .merge(crate::sso::build_sso_router(state.clone()))
+        .merge(crate::org_sso_login::build_org_sso_login_router(
+            state.clone(),
+        ))
+        .merge(crate::oidc::build_oidc_router(state.clone()))
+        .merge(crate::saml::build_saml_router(state.clone()))
+        .merge(crate::scim::build_scim_router(state.clone()))
+        .merge(crate::tracking::unsubscribe_router(state));
+    if let Some(store) = tracking {
+        router = router.merge(crate::tracking::tracking_router(Arc::new(
+            crate::tracking::TrackingState { store },
+        )));
+    }
+    if let Some(cors) = crate::cors::cors_layer(&cors_origins) {
+        router = router.layer(cors);
+    }
+    router
 }
 
 /// Unauthenticated public asset serving. Layout logos are stored in Postgres

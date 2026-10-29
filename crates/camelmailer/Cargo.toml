@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Headless, API-first transactional mail delivery platform: SMTP in and out, HTTP APIs for everything, backed by PostgreSQL"
 
+[lib]
+name = "camelmailer"
+path = "src/lib.rs"
+
 [[bin]]
 name = "camelmailer"
 path = "src/main.rs"

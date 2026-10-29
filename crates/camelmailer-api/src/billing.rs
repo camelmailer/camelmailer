@@ -1,31 +1,40 @@
-//! Stripe billing for the hosted cloud offering.
+//! The billing seam: a provider-neutral [`BillingProvider`] trait and the
+//! organization billing endpoints built on it.
 //!
-//! Entirely opt-in via the `billing` config group: self-hosted
-//! installations keep the default (`enabled: false`), which makes
-//! `GET …/billing` report `enabled: false` (the dashboard then shows no
-//! billing UI at all) and `POST …/billing/portal` answer 403
-//! `BillingDisabled`.
+//! The open-source build ships [`NoBilling`] (the default, billing off) and
+//! [`MockBilling`] for tests. A real provider lives outside this repository:
+//! a separate crate implements the trait and builds its own binary through
+//! `camelmailer::Extensions`, so self-hosted installations never carry a
+//! payment integration.
 //!
-//! The Stripe integration is deliberately SDK-free: two form-encoded
-//! `POST`s against the public REST API (`/v1/customers`,
-//! `/v1/billing_portal/sessions`) authenticated with the secret key as a
-//! Bearer token. Stripe error details are logged, never forwarded to the
-//! client — callers only ever see the stable `BillingUnavailable` code.
+//! The dashboard renders what a provider hands back as an [`EmbedSession`]:
+//! a web component (`element`) loaded from `script_url` and initialised with
+//! a short-lived `token` and optional `attributes`, or, when the provider
+//! has no component, a plain `url` to open. A provider decides which of the
+//! two it offers per session.
+//!
+//! Billing is active only when `billing.enabled` is set **and** the
+//! installed provider reports [`BillingProvider::enabled`]. Otherwise
+//! `GET …/billing` reports `enabled: false` and every other billing
+//! endpoint answers 403 `BillingDisabled`. Provider errors are logged and
+//! never forwarded: callers only see the stable `BillingUnavailable` code.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::Json;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::app::{
-    find_organization, render_error, render_not_found, render_store_error, render_success,
-    ApiResponse, ApiState, Principal, RequestStart,
+    find_organization, render_error, render_not_found, render_parameter_missing,
+    render_store_error, render_success, ApiResponse, ApiState, Principal, RequestStart,
 };
 
 /// A failed interaction with the billing provider. The message is for the
-/// server log only — API handlers must map this to the generic
-/// `BillingUnavailable` error and never forward the detail to the client.
+/// server log only; API handlers map it to `BillingUnavailable`.
 #[derive(Debug)]
 pub struct BillingError(pub String);
 
@@ -37,174 +46,166 @@ impl std::fmt::Display for BillingError {
 
 impl std::error::Error for BillingError {}
 
-/// The billing backend: Stripe in production ([`StripeBilling`]), an
-/// in-memory fake in tests ([`MockBilling`]).
+/// The organization a billing call is about, as the provider sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BillingOrganization {
+    pub id: camelmailer_core::Id,
+    pub uuid: String,
+    pub permalink: String,
+    pub name: String,
+    /// The provider customer id once [`BillingProvider::ensure_customer`]
+    /// returned one (stored in `organizations.billing_customer_id`).
+    pub customer_id: Option<String>,
+    /// The email address of the acting user, when the request carries a
+    /// user session (machine keys have none).
+    pub user_email: Option<String>,
+    /// The dashboard URL to come back to (`auth.frontend_url`), if known.
+    pub return_url: Option<String>,
+}
+
+/// What the dashboard needs to show a provider-supplied UI.
+///
+/// With `element` and `script_url` set, the dashboard loads the script once
+/// and renders `<{element} token="{token}" {attributes…}>`. With only `url`
+/// set it shows a link (or redirects). Both may be set; the link is then the
+/// fallback when the script cannot load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbedSession {
+    /// URL of the script that defines the custom element.
+    pub script_url: Option<String>,
+    /// Custom element name, e.g. `rs-checkout`. Must contain a hyphen.
+    pub element: Option<String>,
+    /// Short-lived token passed as the element's `token` attribute.
+    pub token: Option<String>,
+    /// Extra attributes for the element.
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+    /// Plain link fallback (hosted checkout or portal page).
+    pub url: Option<String>,
+    /// When the token stops working, if the provider says.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A price as the provider states it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Price {
+    /// Amount in the currency's minor unit (cents).
+    pub amount_minor: i64,
+    /// ISO 4217 code, e.g. `EUR`.
+    pub currency: String,
+    /// Billing interval, e.g. `month` or `year`.
+    pub interval: Option<String>,
+}
+
+/// One plan a customer can choose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plan {
+    /// Stable code passed back to [`BillingProvider::checkout_session`].
+    pub code: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// Outgoing messages per month included in the plan, if limited.
+    pub monthly_send_limit: Option<i64>,
+    pub price: Option<Price>,
+    /// Short feature bullets for display.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+/// The billing backend of an installation.
 #[async_trait::async_trait]
 pub trait BillingProvider: Send + Sync {
+    /// A short name for logs and the status endpoint, e.g. `none`.
+    fn name(&self) -> &str;
+
+    /// Whether this provider actually bills. [`NoBilling`] answers `false`.
+    fn enabled(&self) -> bool {
+        true
+    }
+
     /// Create (or look up on the provider side) the customer for an
-    /// organization and return its provider customer id. `email` is the
-    /// address of the acting user when the request carries a user session
-    /// (machine keys have none).
-    async fn ensure_customer(
+    /// organization and return its provider customer id. Called once per
+    /// organization; the result is stored and passed back afterwards in
+    /// [`BillingOrganization::customer_id`].
+    async fn ensure_customer(&self, org: &BillingOrganization) -> Result<String, BillingError>;
+
+    /// Start a checkout for `plan_code`.
+    async fn checkout_session(
         &self,
-        org_permalink: &str,
-        org_name: &str,
-        email: Option<&str>,
-    ) -> Result<String, BillingError>;
+        org: &BillingOrganization,
+        plan_code: &str,
+    ) -> Result<EmbedSession, BillingError>;
 
-    /// Create a billing-portal session for the customer and return the
-    /// URL to redirect the browser to.
-    async fn portal_session(
+    /// Open the customer's subscription management (plan, payment method,
+    /// invoices).
+    async fn portal_session(&self, org: &BillingOrganization)
+        -> Result<EmbedSession, BillingError>;
+
+    /// A provider-rendered usage view, if the provider has one. The
+    /// dashboard always shows Camelmailer's own usage figure as well.
+    async fn usage_session(
         &self,
-        customer_id: &str,
-        return_url: Option<&str>,
-    ) -> Result<String, BillingError>;
+        _org: &BillingOrganization,
+    ) -> Result<Option<EmbedSession>, BillingError> {
+        Ok(None)
+    }
+
+    /// The plans on offer.
+    async fn plans(&self) -> Result<Vec<Plan>, BillingError>;
 }
 
-// -------------------------------------------------------------- Stripe
+// ------------------------------------------------------------ NoBilling
 
-/// Stripe over plain HTTPS (reqwest), no SDK.
-pub struct StripeBilling {
-    secret_key: String,
-    base_url: String,
-    client: reqwest::Client,
-}
-
-impl StripeBilling {
-    pub fn new(secret_key: String) -> Self {
-        Self::with_base_url(secret_key, "https://api.stripe.com".into())
-    }
-
-    /// Point the client at a different host — used by tests to talk to a
-    /// local mock server instead of Stripe.
-    pub fn with_base_url(secret_key: String, base_url: String) -> Self {
-        Self {
-            secret_key,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
-        }
-    }
-
-    fn customers_url(&self) -> String {
-        format!("{}/v1/customers", self.base_url)
-    }
-
-    fn portal_sessions_url(&self) -> String {
-        format!("{}/v1/billing_portal/sessions", self.base_url)
-    }
-
-    /// One form-encoded POST against the Stripe API. Provider errors are
-    /// logged here with full detail; the returned [`BillingError`] is only
-    /// ever logged again, never rendered to a client.
-    async fn post_form(
-        &self,
-        url: &str,
-        form: &[(&'static str, String)],
-        what: &str,
-    ) -> Result<serde_json::Value, BillingError> {
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(&self.secret_key)
-            .form(form)
-            .send()
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, what, "stripe request failed");
-                BillingError(format!("{what}: request failed: {error}"))
-            })?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            tracing::error!(%status, body, what, "stripe returned an error");
-            return Err(BillingError(format!("{what}: stripe returned {status}")));
-        }
-        serde_json::from_str(&body).map_err(|error| {
-            tracing::error!(%error, what, "stripe returned invalid JSON");
-            BillingError(format!("{what}: invalid JSON: {error}"))
-        })
-    }
-}
-
-/// The form body of `POST /v1/customers` — kept as a pure function so the
-/// encoding is unit-testable without HTTP.
-fn customer_form(
-    org_permalink: &str,
-    org_name: &str,
-    email: Option<&str>,
-) -> Vec<(&'static str, String)> {
-    let mut form = vec![
-        ("name", org_name.to_string()),
-        ("metadata[org_permalink]", org_permalink.to_string()),
-    ];
-    if let Some(email) = email.filter(|e| !e.is_empty()) {
-        form.push(("email", email.to_string()));
-    }
-    form
-}
-
-/// The form body of `POST /v1/billing_portal/sessions`.
-fn portal_form(customer_id: &str, return_url: Option<&str>) -> Vec<(&'static str, String)> {
-    let mut form = vec![("customer", customer_id.to_string())];
-    if let Some(url) = return_url.filter(|u| !u.is_empty()) {
-        form.push(("return_url", url.to_string()));
-    }
-    form
-}
+/// The default provider: billing is off. Every call fails, and
+/// [`BillingProvider::enabled`] is `false`, so the endpoints never reach it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoBilling;
 
 #[async_trait::async_trait]
-impl BillingProvider for StripeBilling {
-    async fn ensure_customer(
+impl BillingProvider for NoBilling {
+    fn name(&self) -> &str {
+        "none"
+    }
+
+    fn enabled(&self) -> bool {
+        false
+    }
+
+    async fn ensure_customer(&self, _org: &BillingOrganization) -> Result<String, BillingError> {
+        Err(BillingError("billing is not enabled".into()))
+    }
+
+    async fn checkout_session(
         &self,
-        org_permalink: &str,
-        org_name: &str,
-        email: Option<&str>,
-    ) -> Result<String, BillingError> {
-        let form = customer_form(org_permalink, org_name, email);
-        let body = self
-            .post_form(&self.customers_url(), &form, "create customer")
-            .await?;
-        body["id"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| BillingError("create customer: response carries no id".into()))
+        _org: &BillingOrganization,
+        _plan_code: &str,
+    ) -> Result<EmbedSession, BillingError> {
+        Err(BillingError("billing is not enabled".into()))
     }
 
     async fn portal_session(
         &self,
-        customer_id: &str,
-        return_url: Option<&str>,
-    ) -> Result<String, BillingError> {
-        let form = portal_form(customer_id, return_url);
-        let body = self
-            .post_form(&self.portal_sessions_url(), &form, "create portal session")
-            .await?;
-        body["url"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| BillingError("create portal session: response carries no url".into()))
+        _org: &BillingOrganization,
+    ) -> Result<EmbedSession, BillingError> {
+        Err(BillingError("billing is not enabled".into()))
+    }
+
+    async fn plans(&self) -> Result<Vec<Plan>, BillingError> {
+        Ok(Vec::new())
     }
 }
 
 // ---------------------------------------------------------------- mock
 
-/// The recorded arguments of the last `ensure_customer` call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MockCustomerRequest {
-    pub org_permalink: String,
-    pub org_name: String,
-    pub email: Option<String>,
-}
-
-/// In-memory [`BillingProvider`] for tests: counts calls, records
-/// arguments, fails on demand.
+/// In-memory [`BillingProvider`] for tests: counts calls, records the last
+/// organization, fails on demand. Sessions point at `https://billing.example`.
 #[derive(Default)]
 pub struct MockBilling {
     customers_created: AtomicUsize,
-    portal_sessions_created: AtomicUsize,
+    sessions_created: AtomicUsize,
     fail: AtomicBool,
-    last_customer_request: Mutex<Option<MockCustomerRequest>>,
-    last_portal_customer: Mutex<Option<String>>,
+    last_organization: Mutex<Option<BillingOrganization>>,
+    last_plan: Mutex<Option<String>>,
 }
 
 impl MockBilling {
@@ -221,52 +222,94 @@ impl MockBilling {
         self.customers_created.load(Ordering::SeqCst)
     }
 
-    pub fn portal_sessions_created(&self) -> usize {
-        self.portal_sessions_created.load(Ordering::SeqCst)
+    pub fn sessions_created(&self) -> usize {
+        self.sessions_created.load(Ordering::SeqCst)
     }
 
-    pub fn last_customer_request(&self) -> Option<MockCustomerRequest> {
-        self.last_customer_request.lock().unwrap().clone()
+    pub fn last_organization(&self) -> Option<BillingOrganization> {
+        self.last_organization.lock().unwrap().clone()
     }
 
-    pub fn last_portal_customer(&self) -> Option<String> {
-        self.last_portal_customer.lock().unwrap().clone()
+    pub fn last_plan(&self) -> Option<String> {
+        self.last_plan.lock().unwrap().clone()
+    }
+
+    fn check(&self, org: Option<&BillingOrganization>) -> Result<(), BillingError> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(BillingError("mock: failure requested".into()));
+        }
+        if let Some(org) = org {
+            *self.last_organization.lock().unwrap() = Some(org.clone());
+        }
+        Ok(())
+    }
+
+    fn session(&self, element: &str, org: &BillingOrganization) -> EmbedSession {
+        self.sessions_created.fetch_add(1, Ordering::SeqCst);
+        let customer = org.customer_id.clone().unwrap_or_default();
+        EmbedSession {
+            script_url: Some("https://billing.example/elements.js".into()),
+            element: Some(element.into()),
+            token: Some(format!("tok_{element}_{customer}")),
+            attributes: BTreeMap::new(),
+            url: Some(format!("https://billing.example/{element}/{customer}")),
+            expires_at: None,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl BillingProvider for MockBilling {
-    async fn ensure_customer(
-        &self,
-        org_permalink: &str,
-        org_name: &str,
-        email: Option<&str>,
-    ) -> Result<String, BillingError> {
-        if self.fail.load(Ordering::SeqCst) {
-            return Err(BillingError("mock: ensure_customer failed".into()));
-        }
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    async fn ensure_customer(&self, org: &BillingOrganization) -> Result<String, BillingError> {
+        self.check(Some(org))?;
         let n = self.customers_created.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.last_customer_request.lock().unwrap() = Some(MockCustomerRequest {
-            org_permalink: org_permalink.to_string(),
-            org_name: org_name.to_string(),
-            email: email.map(str::to_string),
-        });
         Ok(format!("cus_mock_{n}"))
+    }
+
+    async fn checkout_session(
+        &self,
+        org: &BillingOrganization,
+        plan_code: &str,
+    ) -> Result<EmbedSession, BillingError> {
+        self.check(Some(org))?;
+        *self.last_plan.lock().unwrap() = Some(plan_code.to_string());
+        Ok(self.session("rs-checkout", org))
     }
 
     async fn portal_session(
         &self,
-        customer_id: &str,
-        _return_url: Option<&str>,
-    ) -> Result<String, BillingError> {
-        if self.fail.load(Ordering::SeqCst) {
-            return Err(BillingError("mock: portal_session failed".into()));
-        }
-        self.portal_sessions_created.fetch_add(1, Ordering::SeqCst);
-        *self.last_portal_customer.lock().unwrap() = Some(customer_id.to_string());
-        Ok(format!(
-            "https://billing.stripe.example/session/{customer_id}"
-        ))
+        org: &BillingOrganization,
+    ) -> Result<EmbedSession, BillingError> {
+        self.check(Some(org))?;
+        Ok(self.session("rs-subscription", org))
+    }
+
+    async fn usage_session(
+        &self,
+        org: &BillingOrganization,
+    ) -> Result<Option<EmbedSession>, BillingError> {
+        self.check(Some(org))?;
+        Ok(Some(self.session("rs-usage", org)))
+    }
+
+    async fn plans(&self) -> Result<Vec<Plan>, BillingError> {
+        self.check(None)?;
+        Ok(vec![Plan {
+            code: "base".into(),
+            name: "Base".into(),
+            description: Some("Mock plan".into()),
+            monthly_send_limit: Some(5000),
+            price: Some(Price {
+                amount_minor: 500,
+                currency: "EUR".into(),
+                interval: Some("month".into()),
+            }),
+            features: vec!["5,000 emails per month".into()],
+        }])
     }
 }
 
@@ -281,10 +324,24 @@ fn render_billing_unavailable(start: Option<&RequestStart>) -> ApiResponse {
     )
 }
 
+fn render_billing_disabled(start: Option<&RequestStart>) -> ApiResponse {
+    render_error(
+        start,
+        StatusCode::FORBIDDEN,
+        "BillingDisabled",
+        "Billing is not enabled on this installation",
+    )
+}
+
+/// Whether billing is on: configured and backed by a real provider.
+pub(crate) fn billing_active(state: &ApiState) -> bool {
+    state.config.billing.enabled && state.billing.enabled()
+}
+
 /// `GET /api/v2/admin/organizations/{org}/billing` (admin/owner).
 ///
-/// Always 200 for authorized callers: `{ enabled: false, … }` simply tells
-/// the frontend to hide billing (self-hosted installations).
+/// Always 200 for authorized callers: `{ enabled: false, … }` tells the
+/// dashboard to show usage only.
 pub(crate) async fn billing_show(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
@@ -295,11 +352,11 @@ pub(crate) async fn billing_show(
         Ok(None) => return render_not_found(Some(&start.0)),
         Err(error) => return render_store_error(Some(&start.0), error),
     };
-    if !state.config.billing.enabled || state.billing.is_none() {
+    if !billing_active(&state) {
         return render_success(
             Some(&start.0),
             StatusCode::OK,
-            json!({ "enabled": false, "has_customer": false }),
+            json!({ "enabled": false, "provider": null, "has_customer": false }),
         );
     }
     let has_customer = match state
@@ -313,85 +370,173 @@ pub(crate) async fn billing_show(
     render_success(
         Some(&start.0),
         StatusCode::OK,
-        json!({ "enabled": true, "has_customer": has_customer }),
+        json!({
+            "enabled": true,
+            "provider": state.billing.name(),
+            "has_customer": has_customer,
+        }),
     )
 }
 
+/// Resolve the organization, require active billing, and make sure the
+/// provider customer exists (created on first use, stored only after the
+/// provider reported success).
+async fn billing_organization(
+    state: &ApiState,
+    start: &RequestStart,
+    principal: &Principal,
+    org_permalink: &str,
+) -> Result<BillingOrganization, ApiResponse> {
+    let organization = match find_organization(state, org_permalink).await {
+        Ok(Some(organization)) => organization,
+        Ok(None) => return Err(render_not_found(Some(start))),
+        Err(error) => return Err(render_store_error(Some(start), error)),
+    };
+    if !billing_active(state) {
+        return Err(render_billing_disabled(Some(start)));
+    }
+    let existing = state
+        .store
+        .organization_billing_customer_id(organization.id)
+        .await
+        .map_err(|error| render_store_error(Some(start), error))?;
+    let mut org = BillingOrganization {
+        id: organization.id,
+        uuid: organization.uuid.clone(),
+        permalink: organization.permalink.clone(),
+        name: organization.name.clone(),
+        customer_id: existing,
+        user_email: principal.user().map(|user| user.email_address.clone()),
+        return_url: state.config.auth.frontend_url.clone(),
+    };
+    if org.customer_id.is_none() {
+        let customer_id = match state.billing.ensure_customer(&org).await {
+            Ok(customer_id) => customer_id,
+            Err(error) => {
+                tracing::error!(%error, organization = %org.permalink,
+                    "creating the billing customer failed");
+                return Err(render_billing_unavailable(Some(start)));
+            }
+        };
+        state
+            .store
+            .set_organization_billing_customer_id(organization.id, &customer_id)
+            .await
+            .map_err(|error| render_store_error(Some(start), error))?;
+        org.customer_id = Some(customer_id);
+    }
+    Ok(org)
+}
+
+fn render_session(
+    start: &RequestStart,
+    org: &BillingOrganization,
+    what: &str,
+    result: Result<EmbedSession, BillingError>,
+) -> ApiResponse {
+    match result {
+        Ok(session) => render_success(
+            Some(start),
+            StatusCode::OK,
+            json!({ "url": session.url, "session": session }),
+        ),
+        Err(error) => {
+            tracing::error!(%error, organization = %org.permalink, what, "billing session failed");
+            render_billing_unavailable(Some(start))
+        }
+    }
+}
+
+/// `GET /api/v2/admin/organizations/{org}/billing/plans` (admin/owner).
+pub(crate) async fn billing_plans(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path(org_permalink): Path<String>,
+) -> ApiResponse {
+    match find_organization(&state, &org_permalink).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return render_not_found(Some(&start.0)),
+        Err(error) => return render_store_error(Some(&start.0), error),
+    }
+    if !billing_active(&state) {
+        return render_billing_disabled(Some(&start.0));
+    }
+    match state.billing.plans().await {
+        Ok(plans) => render_success(Some(&start.0), StatusCode::OK, json!({ "plans": plans })),
+        Err(error) => {
+            tracing::error!(%error, "listing billing plans failed");
+            render_billing_unavailable(Some(&start.0))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CheckoutBody {
+    plan_code: Option<String>,
+}
+
+/// `POST /api/v2/admin/organizations/{org}/billing/checkout` (admin/owner):
+/// `{ plan_code }` → `{ url, session }`.
+pub(crate) async fn billing_checkout(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    principal: axum::Extension<Principal>,
+    Path(org_permalink): Path<String>,
+    body: Option<Json<CheckoutBody>>,
+) -> ApiResponse {
+    let Some(plan_code) = body
+        .and_then(|Json(body)| body.plan_code)
+        .filter(|code| !code.trim().is_empty())
+    else {
+        return render_parameter_missing(
+            Some(&start.0),
+            "param is missing or the value is empty: plan_code",
+        );
+    };
+    let org = match billing_organization(&state, &start.0, &principal.0, &org_permalink).await {
+        Ok(org) => org,
+        Err(response) => return response,
+    };
+    let result = state.billing.checkout_session(&org, &plan_code).await;
+    render_session(&start.0, &org, "checkout", result)
+}
+
 /// `POST /api/v2/admin/organizations/{org}/billing/portal` (admin/owner or
-/// admin API key).
-///
-/// Creates the Stripe customer on first use (idempotent: an existing
-/// customer is reused), then opens a billing-portal session and returns
-/// its `{ url }`. The customer id is persisted only after Stripe reported
-/// success, so a failed call leaves nothing half-stored.
+/// admin API key) → `{ url, session }`.
 pub(crate) async fn billing_portal(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
     principal: axum::Extension<Principal>,
     Path(org_permalink): Path<String>,
 ) -> ApiResponse {
-    let organization = match find_organization(&state, &org_permalink).await {
-        Ok(Some(organization)) => organization,
-        Ok(None) => return render_not_found(Some(&start.0)),
-        Err(error) => return render_store_error(Some(&start.0), error),
+    let org = match billing_organization(&state, &start.0, &principal.0, &org_permalink).await {
+        Ok(org) => org,
+        Err(response) => return response,
     };
-    let provider = match (state.config.billing.enabled, state.billing.as_ref()) {
-        (true, Some(provider)) => provider,
-        _ => {
-            return render_error(
-                Some(&start.0),
-                StatusCode::FORBIDDEN,
-                "BillingDisabled",
-                "Billing is not enabled on this installation",
-            )
-        }
-    };
+    let result = state.billing.portal_session(&org).await;
+    render_session(&start.0, &org, "portal", result)
+}
 
-    let existing = match state
-        .store
-        .organization_billing_customer_id(organization.id)
-        .await
-    {
-        Ok(existing) => existing,
-        Err(error) => return render_store_error(Some(&start.0), error),
+/// `POST /api/v2/admin/organizations/{org}/billing/usage` (admin/owner) →
+/// `{ session }`, `session` null when the provider has no usage view.
+pub(crate) async fn billing_usage_session(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    principal: axum::Extension<Principal>,
+    Path(org_permalink): Path<String>,
+) -> ApiResponse {
+    let org = match billing_organization(&state, &start.0, &principal.0, &org_permalink).await {
+        Ok(org) => org,
+        Err(response) => return response,
     };
-    let customer_id = match existing {
-        Some(customer_id) => customer_id,
-        None => {
-            let email = principal.user().map(|user| user.email_address.as_str());
-            let customer_id = match provider
-                .ensure_customer(&organization.permalink, &organization.name, email)
-                .await
-            {
-                Ok(customer_id) => customer_id,
-                Err(error) => {
-                    tracing::error!(%error, organization = %organization.permalink,
-                        "creating the billing customer failed");
-                    return render_billing_unavailable(Some(&start.0));
-                }
-            };
-            // Persist only after the provider reported success.
-            if let Err(error) = state
-                .store
-                .set_organization_billing_customer_id(organization.id, &customer_id)
-                .await
-            {
-                return render_store_error(Some(&start.0), error);
-            }
-            customer_id
-        }
-    };
-
-    let return_url = state.config.billing.portal_return_url.as_deref().or(state
-        .config
-        .auth
-        .frontend_url
-        .as_deref());
-    match provider.portal_session(&customer_id, return_url).await {
-        Ok(url) => render_success(Some(&start.0), StatusCode::OK, json!({ "url": url })),
+    match state.billing.usage_session(&org).await {
+        Ok(session) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "session": session }),
+        ),
         Err(error) => {
-            tracing::error!(%error, organization = %organization.permalink,
-                "creating the billing portal session failed");
+            tracing::error!(%error, organization = %org.permalink, "billing usage session failed");
             render_billing_unavailable(Some(&start.0))
         }
     }
@@ -401,68 +546,43 @@ pub(crate) async fn billing_portal(
 mod tests {
     use super::*;
 
-    /// Encode a form exactly like `RequestBuilder::form` does (build the
-    /// request without sending it and inspect the body bytes).
-    fn encode(form: &[(&'static str, String)]) -> String {
-        let request = reqwest::Client::new()
-            .post("http://localhost/ignored")
-            .form(form)
-            .build()
-            .unwrap();
-        String::from_utf8(request.body().unwrap().as_bytes().unwrap().to_vec()).unwrap()
+    fn org() -> BillingOrganization {
+        BillingOrganization {
+            id: 1,
+            uuid: "u".into(),
+            permalink: "acme".into(),
+            name: "Acme".into(),
+            customer_id: None,
+            user_email: None,
+            return_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn no_billing_is_disabled_and_refuses_every_call() {
+        let provider = NoBilling;
+        assert!(!provider.enabled());
+        assert_eq!(provider.name(), "none");
+        assert!(provider.ensure_customer(&org()).await.is_err());
+        assert!(provider.checkout_session(&org(), "base").await.is_err());
+        assert!(provider.portal_session(&org()).await.is_err());
+        assert_eq!(provider.usage_session(&org()).await.unwrap(), None);
+        assert!(provider.plans().await.unwrap().is_empty());
     }
 
     #[test]
-    fn customer_form_encodes_name_metadata_and_email() {
-        let form = customer_form("acme-org", "Acme & Söhne", Some("owner@acme.example"));
-        assert_eq!(
-            encode(&form),
-            "name=Acme+%26+S%C3%B6hne&metadata%5Borg_permalink%5D=acme-org&email=owner%40acme.example"
-        );
-    }
-
-    #[test]
-    fn customer_form_omits_a_missing_or_empty_email() {
-        assert_eq!(
-            encode(&customer_form("acme", "Acme", None)),
-            "name=Acme&metadata%5Borg_permalink%5D=acme"
-        );
-        assert_eq!(
-            encode(&customer_form("acme", "Acme", Some(""))),
-            "name=Acme&metadata%5Borg_permalink%5D=acme"
-        );
-    }
-
-    #[test]
-    fn portal_form_encodes_customer_and_optional_return_url() {
-        assert_eq!(
-            encode(&portal_form(
-                "cus_123",
-                Some("https://app.example.com/billing?x=1")
-            )),
-            "customer=cus_123&return_url=https%3A%2F%2Fapp.example.com%2Fbilling%3Fx%3D1"
-        );
-        assert_eq!(encode(&portal_form("cus_123", None)), "customer=cus_123");
-    }
-
-    #[test]
-    fn stripe_urls_are_built_from_the_base_url() {
-        let stripe = StripeBilling::new("sk_test_1".into());
-        assert_eq!(
-            stripe.customers_url(),
-            "https://api.stripe.com/v1/customers"
-        );
-        assert_eq!(
-            stripe.portal_sessions_url(),
-            "https://api.stripe.com/v1/billing_portal/sessions"
-        );
-
-        // Trailing slashes are normalized, mock hosts work.
-        let stripe = StripeBilling::with_base_url("sk".into(), "http://127.0.0.1:9999/".into());
-        assert_eq!(stripe.customers_url(), "http://127.0.0.1:9999/v1/customers");
-        assert_eq!(
-            stripe.portal_sessions_url(),
-            "http://127.0.0.1:9999/v1/billing_portal/sessions"
-        );
+    fn an_embed_session_serializes_every_field() {
+        let session = EmbedSession {
+            script_url: Some("https://b.example/x.js".into()),
+            element: Some("rs-checkout".into()),
+            token: Some("t".into()),
+            attributes: BTreeMap::from([("locale".into(), "de".into())]),
+            url: None,
+            expires_at: None,
+        };
+        let value = serde_json::to_value(&session).unwrap();
+        assert_eq!(value["element"], json!("rs-checkout"));
+        assert_eq!(value["attributes"]["locale"], json!("de"));
+        assert_eq!(value["url"], json!(null));
     }
 }

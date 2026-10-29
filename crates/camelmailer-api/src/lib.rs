@@ -4,6 +4,7 @@ pub mod app;
 mod app_mailer;
 pub mod auth_api;
 pub mod billing;
+pub mod captcha;
 pub mod cors;
 pub mod dns;
 mod memberships;
@@ -23,10 +24,15 @@ mod workspace;
 mod xmldsig;
 
 mod insights;
+mod lifecycle;
+mod quota;
 
-pub use app::{build_assets_router, build_router, ApiState};
+pub use app::{build_app, build_assets_router, build_router, ApiState};
 pub use auth_api::build_auth_router;
-pub use billing::{BillingError, BillingProvider, MockBilling, StripeBilling};
+pub use billing::{
+    BillingError, BillingOrganization, BillingProvider, EmbedSession, MockBilling, NoBilling, Plan,
+    Price,
+};
 pub use cors::cors_layer;
 pub use dns::HickoryDnsResolver;
 pub use oidc::build_oidc_router;

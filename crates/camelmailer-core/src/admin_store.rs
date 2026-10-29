@@ -315,8 +315,35 @@ pub trait AdminStore: Send + Sync {
         domain_name: &str,
     ) -> Result<Option<Id>, StoreError>;
 
-    // billing (hosted cloud): the Stripe customer attached to an
-    // organization (`organizations.billing_customer_id`, nullable)
+    // organization quota and suspension (migration 0047)
+    /// The organization's sending policy; the default (unlimited, not
+    /// suspended) for an organization nobody set one for.
+    async fn organization_policy(
+        &self,
+        organization_id: Id,
+    ) -> Result<crate::OrganizationPolicy, StoreError>;
+    async fn set_organization_policy(
+        &self,
+        organization_id: Id,
+        policy: &crate::OrganizationPolicy,
+    ) -> Result<(), StoreError>;
+    /// Outgoing messages of the organization in `month`, across all of its
+    /// servers (the authoritative monthly counter).
+    async fn organization_send_usage(
+        &self,
+        organization_id: Id,
+        month: crate::UsageMonth,
+    ) -> Result<i64, StoreError>;
+
+    /// Queue an installation lifecycle event for the worker to deliver to
+    /// `lifecycle_webhooks.urls`.
+    async fn enqueue_lifecycle_event(
+        &self,
+        event: &crate::LifecycleEvent,
+    ) -> Result<(), StoreError>;
+
+    // billing: the billing provider's customer attached to an organization
+    // (`organizations.billing_customer_id`, nullable)
     async fn organization_billing_customer_id(
         &self,
         organization_id: Id,
@@ -572,6 +599,60 @@ impl AdminStore for crate::store::MemoryStore {
                 DomainOwner::Organization(id) => id == server.organization_id,
             })
             .map(|d| d.id))
+    }
+
+    async fn organization_policy(
+        &self,
+        organization_id: Id,
+    ) -> Result<crate::OrganizationPolicy, StoreError> {
+        Ok(crate::Store::send_policy_for_organization(
+            self,
+            organization_id,
+        ))
+    }
+
+    async fn set_organization_policy(
+        &self,
+        organization_id: Id,
+        policy: &crate::OrganizationPolicy,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if !inner.organizations.contains_key(&organization_id) {
+            return Err(StoreError::Other(format!(
+                "organization {organization_id} not found"
+            )));
+        }
+        inner
+            .organization_policies
+            .insert(organization_id, policy.clone());
+        Ok(())
+    }
+
+    async fn organization_send_usage(
+        &self,
+        organization_id: Id,
+        month: crate::UsageMonth,
+    ) -> Result<i64, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .organization_send_counters
+            .get(&(organization_id, month))
+            .copied()
+            .unwrap_or(0))
+    }
+
+    async fn enqueue_lifecycle_event(
+        &self,
+        event: &crate::LifecycleEvent,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .write()
+            .unwrap()
+            .lifecycle_events
+            .push(event.clone());
+        Ok(())
     }
 
     async fn organization_billing_customer_id(
@@ -1148,7 +1229,15 @@ impl AdminStore for crate::store::MemoryStore {
     }
 
     async fn delete_user(&self, id: Id) -> Result<bool, StoreError> {
-        Ok(self.inner.write().unwrap().users.remove(&id).is_some())
+        let mut inner = self.inner.write().unwrap();
+        // Mirror Postgres: keep the audit events, drop the person's address.
+        for event in inner.auth_events.iter_mut() {
+            if event.user_id == Some(id) {
+                event.email_address = None;
+                event.user_id = None;
+            }
+        }
+        Ok(inner.users.remove(&id).is_some())
     }
 
     async fn list_ip_pools(&self) -> Result<Vec<IpPool>, StoreError> {

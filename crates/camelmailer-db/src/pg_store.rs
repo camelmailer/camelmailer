@@ -31,6 +31,45 @@ pub struct PgStore {
 }
 
 impl PgStore {
+    /// The organization's quota and suspension columns.
+    pub async fn organization_policy_async(
+        &self,
+        organization_id: Id,
+    ) -> Result<camelmailer_core::OrganizationPolicy, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "SELECT monthly_send_limit, suspended, suspension_reason, {RETENTION_COLUMNS}
+             FROM organizations WHERE id = $1"
+        ))
+        .bind(organization_id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|row| camelmailer_core::OrganizationPolicy {
+                monthly_send_limit: row.get("monthly_send_limit"),
+                suspended: row.get("suspended"),
+                suspension_reason: row.get("suspension_reason"),
+                retention: retention_overrides_from_row(&row),
+            })
+            .unwrap_or_default())
+    }
+
+    /// Outgoing messages of an organization in one calendar month.
+    pub async fn organization_send_usage_async(
+        &self,
+        organization_id: Id,
+        month: camelmailer_core::UsageMonth,
+    ) -> Result<i64, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT sent FROM organization_send_counters
+             WHERE organization_id = $1 AND month = $2",
+        )
+        .bind(organization_id as i64)
+        .bind(month.first_day())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| row.get::<i64, _>("sent")).unwrap_or(0))
+    }
+
     /// Must be created from within a tokio runtime.
     pub fn new(pool: PgPool) -> Self {
         Self {
@@ -711,6 +750,72 @@ impl AdminStore for PgStore {
         .await
         .map_err(Self::sqlx_error)?;
         Ok(organization)
+    }
+
+    async fn organization_policy(
+        &self,
+        organization_id: Id,
+    ) -> Result<camelmailer_core::OrganizationPolicy, StoreError> {
+        self.organization_policy_async(organization_id)
+            .await
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn set_organization_policy(
+        &self,
+        organization_id: Id,
+        policy: &camelmailer_core::OrganizationPolicy,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE organizations
+             SET monthly_send_limit = $2, suspended = $3, suspension_reason = $4,
+                 retention_message_content_days = $5,
+                 retention_message_metadata_days = $6,
+                 retention_webhook_log_days = $7,
+                 retention_dmarc_report_days = $8
+             WHERE id = $1",
+        )
+        .bind(organization_id as i64)
+        .bind(policy.monthly_send_limit)
+        .bind(policy.suspended)
+        .bind(&policy.suspension_reason)
+        .bind(policy.retention.message_content_days.map(|d| d as i32))
+        .bind(policy.retention.message_metadata_days.map(|d| d as i32))
+        .bind(policy.retention.webhook_log_days.map(|d| d as i32))
+        .bind(policy.retention.dmarc_report_days.map(|d| d as i32))
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::Other(format!(
+                "organization {organization_id} not found"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn organization_send_usage(
+        &self,
+        organization_id: Id,
+        month: camelmailer_core::UsageMonth,
+    ) -> Result<i64, StoreError> {
+        self.organization_send_usage_async(organization_id, month)
+            .await
+            .map_err(Self::sqlx_error)
+    }
+
+    async fn enqueue_lifecycle_event(
+        &self,
+        event: &camelmailer_core::LifecycleEvent,
+    ) -> Result<(), StoreError> {
+        sqlx::query("INSERT INTO lifecycle_events (uuid, event, payload) VALUES ($1, $2, $3)")
+            .bind(&event.id)
+            .bind(&event.event)
+            .bind(event.body())
+            .execute(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(())
     }
 
     async fn organization_billing_customer_id(
@@ -1624,12 +1729,23 @@ impl AdminStore for PgStore {
     }
 
     async fn delete_user(&self, id: Id) -> Result<bool, StoreError> {
-        sqlx::query("DELETE FROM users WHERE id = $1")
+        // The audit log keeps the events (the foreign key nulls user_id) but
+        // not the address of a deleted person: anonymise in the same
+        // transaction as the delete.
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        sqlx::query("UPDATE auth_events SET email_address = NULL WHERE user_id = $1")
             .bind(id as i64)
-            .execute(&self.pool)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        let deleted = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(id as i64)
+            .execute(&mut *tx)
             .await
             .map(|result| result.rows_affected() > 0)
-            .map_err(Self::sqlx_error)
+            .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)?;
+        Ok(deleted)
     }
 
     async fn list_ip_pools(&self) -> Result<Vec<IpPool>, StoreError> {
@@ -3612,6 +3728,33 @@ impl Store for PgStore {
         None
     }
 
+    fn send_policy_for_organization(
+        &self,
+        organization_id: Id,
+    ) -> camelmailer_core::OrganizationPolicy {
+        // A failed read falls back to the default policy; the usage read
+        // below fails closed, and the rest of the session would fail on the
+        // next query anyway.
+        self.wait(self.organization_policy_async(organization_id))
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, organization_id, "could not read the organization policy");
+                camelmailer_core::OrganizationPolicy::default()
+            })
+    }
+
+    fn organization_month_usage(&self, organization_id: Id) -> i64 {
+        // Fail closed like `send_usage`: an unreadable counter reads as
+        // fully consumed.
+        self.wait(self.organization_send_usage_async(
+            organization_id,
+            camelmailer_core::UsageMonth::current(),
+        ))
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, organization_id, "could not read organization usage");
+            i64::MAX
+        })
+    }
+
     fn send_usage(&self, server_id: Id) -> i64 {
         // A failed read must not open the gate: report the limit as fully
         // consumed so an unreachable database refuses submissions rather
@@ -3914,6 +4057,7 @@ async fn insert_message_in_tx(
         .bind(message.server_id as i64)
         .execute(&mut **tx)
         .await?;
+        count_organization_send(tx, message.server_id).await?;
     }
 
     Ok(camelmailer_core::SentMessage {
@@ -3921,6 +4065,88 @@ async fn insert_message_in_tx(
         token: public_token,
         rcpt_to: message.rcpt_to.clone(),
     })
+}
+
+/// The organization columns holding retention overrides (migration 0048).
+pub(crate) const RETENTION_COLUMNS: &str = "retention_message_content_days, \
+     retention_message_metadata_days, retention_webhook_log_days, retention_dmarc_report_days";
+
+pub(crate) fn retention_overrides_from_row(row: &PgRow) -> camelmailer_core::RetentionOverrides {
+    let days = |column: &str| row.get::<Option<i32>, _>(column).map(|d| d.max(0) as u32);
+    camelmailer_core::RetentionOverrides {
+        message_content_days: days("retention_message_content_days"),
+        message_metadata_days: days("retention_message_metadata_days"),
+        webhook_log_days: days("retention_webhook_log_days"),
+        dmarc_report_days: days("retention_dmarc_report_days"),
+    }
+}
+
+/// Count one outgoing message against its organization's month, and queue an
+/// `organization.usage_threshold` lifecycle event the first time in a month
+/// the count reaches 80 % or 100 % of the organization's limit. Runs in the
+/// transaction that stores the message, so the counter cannot drift from
+/// what was stored and an event exists exactly when the crossing committed.
+async fn count_organization_send(
+    tx: &mut Transaction<'_, Postgres>,
+    server_id: Id,
+) -> Result<(), sqlx::Error> {
+    let row = sqlx::query(
+        "WITH counted AS (
+             INSERT INTO organization_send_counters (organization_id, month, sent)
+             SELECT organization_id,
+                    date_trunc('month', now() AT TIME ZONE 'UTC')::date, 1
+             FROM servers WHERE id = $1
+             ON CONFLICT (organization_id, month)
+             DO UPDATE SET sent = organization_send_counters.sent + 1
+             RETURNING organization_id, month, sent
+         )
+         SELECT c.month, c.sent, o.id, o.uuid, o.name, o.permalink,
+                o.require_two_factor, o.monthly_send_limit
+         FROM counted c JOIN organizations o ON o.id = c.organization_id",
+    )
+    .bind(server_id as i64)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let limit: Option<i64> = row.get("monthly_send_limit");
+    let sent: i64 = row.get("sent");
+    let thresholds = camelmailer_core::quota::reached_thresholds(sent, limit);
+    if thresholds.is_empty() {
+        return Ok(());
+    }
+    let month = camelmailer_core::UsageMonth::of(row.get::<chrono::NaiveDate, _>("month"));
+    let organization = organization_from_row(&row);
+    for threshold in thresholds {
+        let inserted = sqlx::query(
+            "INSERT INTO organization_usage_alerts (organization_id, month, threshold)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(organization.id as i64)
+        .bind(month.first_day())
+        .bind(threshold as i16)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            continue;
+        }
+        let event = camelmailer_core::lifecycle::usage_threshold_event(
+            &organization,
+            month,
+            threshold,
+            sent,
+            limit.unwrap_or_default(),
+        );
+        sqlx::query("INSERT INTO lifecycle_events (uuid, event, payload) VALUES ($1, $2, $3)")
+            .bind(&event.id)
+            .bind(&event.event)
+            .bind(event.body())
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 /// [`MessageSink`] backed by the RLS-protected `messages` table. All access

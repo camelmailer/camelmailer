@@ -425,6 +425,65 @@ disable it. The detail view shows the example payload for each subscribed
 event and offers the same test-send as the API, so you can confirm your
 receiver works before real traffic flows.
 
+## Installation lifecycle events
+
+Separate from the per-server message webhooks above, an installation can
+forward its own lifecycle to an outside system, typically a billing or CRM
+service. The operator configures one list of URLs and one shared secret in
+the `lifecycle_webhooks` config group (see
+[Configuration](configuration.md#lifecycle_webhooks-installation-events));
+there is no API or dashboard for it, and it is off by default.
+
+| Event | Fires when | `data` |
+|---|---|---|
+| `organization.created` | An organization is created through the admin API or as a new user's starter workspace. | `organization`, `user` (the creator, or null for an admin API key) |
+| `organization.deleted` | An organization is deleted. | `organization`, `user` |
+| `user.registered` | An account is created: self-registration, invitation, first SSO login, SCIM or the admin API. | `user`, `source` (`registration`, `invitation`, `sso`, `scim`, `admin`) |
+| `organization.usage_threshold` | An organization with a monthly send limit reaches 80 % or 100 % of it. Each threshold fires once per calendar month. | `organization`, `month` (`YYYY-MM`), `threshold` (80 or 100), `sent`, `limit` |
+
+`organization` is `{ id, uuid, permalink, name }`; `user` is
+`{ id, uuid, email_address, first_name, last_name }`.
+
+Every request is a `POST` with this body:
+
+```json
+{
+  "id": "6f0c5c1e-3f0b-4c69-9a43-0d8a3a7f2b11",
+  "event": "organization.usage_threshold",
+  "created_at": "2026-10-30T09:12:44Z",
+  "data": {
+    "organization": { "id": 7, "uuid": "…", "permalink": "acme", "name": "Acme" },
+    "month": "2026-10",
+    "threshold": 80,
+    "sent": 4000,
+    "limit": 5000
+  }
+}
+```
+
+and these headers:
+
+| Header | Value |
+|---|---|
+| `X-Camelmailer-Event` | the event name |
+| `X-Camelmailer-Event-Id` | the `id` from the body |
+| `X-Camelmailer-Signature` | `t=<unix seconds>,v1=<hex>` |
+
+`v1` is the lowercase hex HMAC-SHA256 of `"{t}.{raw body}"` with
+`lifecycle_webhooks.secret` as the key. Verify it over the raw bytes before
+parsing, compare in constant time, and reject a `t` far from your clock
+(five minutes is a sensible window). `camelmailer_core::lifecycle::verify_signature`
+implements exactly this for a Rust receiver.
+
+Events are written to an outbox in the same transaction as their cause
+(for usage thresholds, the transaction that stores the message) and the
+worker delivers them to every URL. An event counts as delivered when every
+URL answers `2xx`; otherwise all URLs get it again with the same backoff as
+message webhooks, up to ten attempts. Delivery is therefore at least once:
+deduplicate on `id`. Lifecycle URLs are operator configuration, so they may
+point at a private network. While no URL is configured the worker discards
+the outbox during housekeeping.
+
 ## Honest gaps
 
 - `MessageComplained` fires for ARF abuse reports only. The manual

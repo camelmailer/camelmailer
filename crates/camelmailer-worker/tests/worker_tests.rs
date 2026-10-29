@@ -3420,3 +3420,521 @@ async fn arf_reports_without_an_engine_unsubscribe_token_still_fire_message_comp
         .unwrap();
     assert_eq!(original.status, "Sent");
 }
+
+// ------------------------------------------------ lifecycle webhooks
+
+/// A receiver that records (headers, body) and answers `status`.
+async fn start_lifecycle_receiver(
+    status: u16,
+) -> (String, Arc<Mutex<Vec<(axum::http::HeaderMap, String)>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hooks", listener.local_addr().unwrap());
+    let seen: Arc<Mutex<Vec<(axum::http::HeaderMap, String)>>> = Arc::default();
+    let log = seen.clone();
+    let app = axum::Router::new().route(
+        "/hooks",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push((headers, body));
+                axum::http::StatusCode::from_u16(status).unwrap()
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, seen)
+}
+
+fn lifecycle_config(urls: Vec<String>) -> camelmailer_config::Config {
+    let mut config = camelmailer_config::Config::default();
+    config.lifecycle_webhooks.urls = urls;
+    config.lifecycle_webhooks.secret = Some("whsec_test".into());
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_events_are_delivered_signed_to_every_url() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let store = PgStore::new(pool.clone());
+    let (first, first_seen) = start_lifecycle_receiver(200).await;
+    let (second, second_seen) = start_lifecycle_receiver(204).await;
+    let event = camelmailer_core::LifecycleEvent::new(
+        camelmailer_core::lifecycle::USER_REGISTERED,
+        serde_json::json!({ "user": { "email_address": "ada@example.com" } }),
+    );
+    store.enqueue_lifecycle_event(&event).await.unwrap();
+
+    let worker = Worker::new(&lifecycle_config(vec![first, second]), store);
+    assert_eq!(
+        worker.process_next_lifecycle_event().await.unwrap(),
+        Some(camelmailer_worker::WebhookOutcome::Delivered)
+    );
+    assert_eq!(worker.process_next_lifecycle_event().await.unwrap(), None);
+
+    for seen in [first_seen, second_seen] {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (headers, body) = &seen[0];
+        assert_eq!(body, &event.body());
+        assert_eq!(headers["x-camelmailer-event"], "user.registered");
+        assert_eq!(headers["x-camelmailer-event-id"], event.id.as_str());
+        let signature = headers["x-camelmailer-signature"].to_str().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(camelmailer_core::lifecycle::verify_signature(
+            "whsec_test",
+            signature,
+            body,
+            now,
+            300
+        ));
+        assert!(!camelmailer_core::lifecycle::verify_signature(
+            "wrong", signature, body, now, 300
+        ));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_lifecycle_url_is_retried_with_backoff() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let store = PgStore::new(pool.clone());
+    let (url, seen) = start_lifecycle_receiver(500).await;
+    store
+        .enqueue_lifecycle_event(&camelmailer_core::LifecycleEvent::new(
+            camelmailer_core::lifecycle::ORGANIZATION_DELETED,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let worker = Worker::new(&lifecycle_config(vec![url]), store);
+    assert_eq!(
+        worker.process_next_lifecycle_event().await.unwrap(),
+        Some(camelmailer_worker::WebhookOutcome::Retrying)
+    );
+    // Backed off, so not ready again yet.
+    assert_eq!(worker.process_next_lifecycle_event().await.unwrap(), None);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let queue = camelmailer_db::PgLifecycleQueue::new(pool, 1);
+    let pending = queue.pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].attempts, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_lifecycle_urls_housekeeping_drops_the_outbox() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let store = PgStore::new(pool.clone());
+    store
+        .enqueue_lifecycle_event(&camelmailer_core::LifecycleEvent::new(
+            camelmailer_core::lifecycle::ORGANIZATION_CREATED,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let worker = Worker::new(&camelmailer_config::Config::default(), store);
+    assert_eq!(worker.process_next_lifecycle_event().await.unwrap(), None);
+    worker.housekeep().await.unwrap();
+    let queue = camelmailer_db::PgLifecycleQueue::new(pool, 1);
+    assert!(queue.pending().await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------- data retention
+
+struct RetentionFixture {
+    pool: PgPool,
+    store: PgStore,
+    org: camelmailer_core::Organization,
+    server: camelmailer_core::Server,
+}
+
+async fn retention_fixture(base: &str) -> RetentionFixture {
+    let pool = test_pool(base).await;
+    let store = PgStore::new(pool.clone());
+    let org = store
+        .create_organization(NewOrganization {
+            name: "Ret".into(),
+            permalink: "ret".into(),
+        })
+        .await
+        .unwrap();
+    let server = store
+        .create_server(NewServer {
+            organization_id: org.id,
+            name: "S".into(),
+            permalink: "s".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    RetentionFixture {
+        pool,
+        store,
+        org,
+        server,
+    }
+}
+
+impl RetentionFixture {
+    /// Store an outgoing message created `age_days` ago (not queued).
+    async fn message(&self, age_days: i64) -> i64 {
+        use camelmailer_core::ServerStore;
+        let sent = self
+            .store
+            .store_outgoing(QueuedMessage {
+                server_id: self.server.id,
+                rcpt_to: format!("r{age_days}@d.example"),
+                mail_from: "a@b.example".into(),
+                raw_message: b"Subject: x\r\n\r\nsecret body".to_vec(),
+                received_with_ssl: false,
+                scope: MessageScope::Outgoing,
+                bounce: false,
+                domain_id: None,
+                credential_id: None,
+                route_id: None,
+                tag: None,
+                metadata: None,
+                stream_id: None,
+            })
+            .await
+            .unwrap();
+        let mut tx = self.tenant().await;
+        sqlx::query(
+            "UPDATE messages SET created_at = now() - make_interval(days => $1::int) WHERE id = $2",
+        )
+        .bind(age_days as i32)
+        .bind(sent.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO deliveries (server_id, message_id, status, details, created_at)
+             VALUES ($1, $2, 'Sent', 'ok', now())",
+        )
+        .bind(self.server.id as i64)
+        .bind(sent.id)
+        .execute(&mut *tx)
+        .await
+        .ok();
+        tx.commit().await.unwrap();
+        sqlx::query("DELETE FROM queued_messages WHERE message_id = $1")
+            .bind(sent.id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        sent.id
+    }
+
+    async fn tenant(&self) -> sqlx::Transaction<'static, Postgres> {
+        let mut tx = self.pool.begin().await.unwrap();
+        sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+            .bind(self.server.id.to_string())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx
+    }
+
+    /// (id, raw length, content purged) of every message.
+    async fn messages(&self) -> Vec<(i64, usize, bool)> {
+        let mut tx = self.tenant().await;
+        let rows = sqlx::query(
+            "SELECT id, length(raw_message) AS len, content_purged_at IS NOT NULL AS purged
+             FROM messages ORDER BY id",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        use sqlx::Row;
+        rows.iter()
+            .map(|row| {
+                (
+                    row.get::<i64, _>("id"),
+                    row.get::<i32, _>("len") as usize,
+                    row.get::<bool, _>("purged"),
+                )
+            })
+            .collect()
+    }
+
+    async fn count_in_tenant(&self, table: &str) -> i64 {
+        let mut tx = self.tenant().await;
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        count
+    }
+
+    async fn count(&self, table: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn set_overrides(&self, overrides: camelmailer_core::RetentionOverrides) {
+        self.store
+            .set_organization_policy(
+                self.org.id,
+                &camelmailer_core::OrganizationPolicy {
+                    retention: overrides,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+}
+
+fn retention_config(yaml: &str) -> camelmailer_config::Config {
+    let mut config = camelmailer_config::Config::from_yaml(yaml).unwrap();
+    // Small batches so the loop runs more than once.
+    config.retention.batch_size = 2;
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_default_keeps_every_message_forever() {
+    let base = require_db!();
+    let f = retention_fixture(&base).await;
+    f.message(4000).await;
+    let worker = Worker::new(&retention_config(""), f.store.clone());
+    let report = worker.apply_retention().await.unwrap();
+    assert_eq!(report.messages_deleted, 0);
+    assert_eq!(report.message_content_purged, 0);
+    assert_eq!(f.messages().await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_is_purged_before_metadata_is_deleted() {
+    let base = require_db!();
+    let f = retention_fixture(&base).await;
+    let fresh = f.message(1).await;
+    let mid = f.message(40).await;
+    let mid2 = f.message(41).await;
+    let mid3 = f.message(42).await;
+    let old = f.message(400).await;
+    let worker = Worker::new(
+        &retention_config("retention:\n  message_content_days: 30\n  message_metadata_days: 365\n"),
+        f.store.clone(),
+    );
+    let report = worker.apply_retention().await.unwrap();
+    assert_eq!(report.messages_deleted, 1);
+    assert_eq!(
+        report.message_content_purged, 3,
+        "batched over two statements"
+    );
+    let messages = f.messages().await;
+    let ids: Vec<i64> = messages.iter().map(|m| m.0).collect();
+    assert!(!ids.contains(&old));
+    for (id, len, purged) in &messages {
+        if *id == fresh {
+            assert!(*len > 0 && !purged);
+        } else {
+            assert!([mid, mid2, mid3].contains(id));
+            assert_eq!(*len, 0);
+            assert!(*purged);
+        }
+    }
+    // The deleted message took its deliveries along.
+    let deliveries = f.count_in_tenant("deliveries").await;
+    assert_eq!(deliveries, 4);
+    // A second pass finds nothing new.
+    assert!(
+        worker
+            .apply_retention()
+            .await
+            .unwrap()
+            .message_content_purged
+            == 0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_deprecated_message_retention_days_still_deletes_messages() {
+    let base = require_db!();
+    let f = retention_fixture(&base).await;
+    f.message(1).await;
+    f.message(100).await;
+    let worker = Worker::new(
+        &retention_config("camelmailer:\n  message_retention_days: 30\n"),
+        f.store.clone(),
+    );
+    assert_eq!(worker.apply_retention().await.unwrap().messages_deleted, 1);
+    assert_eq!(f.messages().await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_organization_override_beats_the_installation_default() {
+    let base = require_db!();
+    let f = retention_fixture(&base).await;
+    f.message(10).await;
+    f.message(100).await;
+    // Installation keeps 30 days; this organization keeps forever.
+    f.set_overrides(camelmailer_core::RetentionOverrides {
+        message_metadata_days: Some(0),
+        ..Default::default()
+    })
+    .await;
+    let worker = Worker::new(
+        &retention_config("retention:\n  message_metadata_days: 30\n"),
+        f.store.clone(),
+    );
+    assert_eq!(worker.apply_retention().await.unwrap().messages_deleted, 0);
+    // Installation keeps forever; this organization keeps 5 days.
+    f.set_overrides(camelmailer_core::RetentionOverrides {
+        message_metadata_days: Some(5),
+        ..Default::default()
+    })
+    .await;
+    let worker = Worker::new(&retention_config(""), f.store.clone());
+    assert_eq!(worker.apply_retention().await.unwrap().messages_deleted, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_logs_dmarc_reports_and_auth_events_expire_by_class() {
+    let base = require_db!();
+    let f = retention_fixture(&base).await;
+    let mut tx = f.tenant().await;
+    for age in [1, 100] {
+        sqlx::query(
+            "INSERT INTO webhook_request_log
+                 (server_id, uuid, event, url, attempt, success, created_at)
+             VALUES ($1, 'u', 'MessageSent', 'https://x', 1, true,
+                     now() - make_interval(days => $2::int))",
+        )
+        .bind(f.server.id as i64)
+        .bind(age)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let report_id: i64 = sqlx::query_scalar(
+            "INSERT INTO dmarc_reports
+                 (server_id, domain, report_id, date_range_begin, date_range_end, received_at)
+             VALUES ($1, 'd.example', $2, now(), now(), now() - make_interval(days => $3::int))
+             RETURNING id",
+        )
+        .bind(f.server.id as i64)
+        .bind(format!("r{age}"))
+        .bind(age)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO dmarc_report_records
+                 (server_id, report_id, source_ip, count, disposition, dkim_aligned, spf_aligned)
+             VALUES ($1, $2, '192.0.2.1', 1, 'none', true, true)",
+        )
+        .bind(f.server.id as i64)
+        .bind(report_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    for age in [1, 100] {
+        sqlx::query(
+            "INSERT INTO auth_events (email_address, event, created_at)
+             VALUES ('a@b.example', 'login.success', now() - make_interval(days => $1::int))",
+        )
+        .bind(age)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    }
+    let worker = Worker::new(
+        &retention_config(
+            "retention:\n  webhook_log_days: 30\n  dmarc_report_days: 30\n  auth_event_days: 30\n",
+        ),
+        f.store.clone(),
+    );
+    let report = worker.apply_retention().await.unwrap();
+    assert_eq!(report.webhook_log_deleted, 1);
+    assert_eq!(report.dmarc_reports_deleted, 1);
+    assert_eq!(report.auth_events_deleted, 1);
+    assert_eq!(f.count_in_tenant("webhook_request_log").await, 1);
+    assert_eq!(f.count_in_tenant("dmarc_reports").await, 1);
+    assert_eq!(f.count_in_tenant("dmarc_report_records").await, 1);
+    assert_eq!(f.count("auth_events").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_auth_tokens_are_always_deleted_and_live_ones_kept() {
+    let base = require_db!();
+    let f = retention_fixture(&base).await;
+    let user = f
+        .store
+        .create_user(camelmailer_core::NewUser {
+            email_address: "u@b.example".into(),
+            first_name: "U".into(),
+            last_name: "B".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+    for (hash, offset) in [("expired", -1), ("live", 1)] {
+        for table in ["auth_sessions", "password_resets"] {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (user_id, token_hash, expires_at)
+                 VALUES ($1, $2, now() + make_interval(hours => $3::int))"
+            ))
+            .bind(user.id as i64)
+            .bind(format!("{table}-{hash}"))
+            .bind(offset)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO oidc_states (state, pkce_verifier, nonce, expires_at)
+             VALUES ($1, 'v', 'n', now() + make_interval(hours => $2::int))",
+        )
+        .bind(hash)
+        .bind(offset)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    }
+    // The default configuration: everything else is kept forever.
+    let worker = Worker::new(&retention_config(""), f.store.clone());
+    let report = worker.apply_retention().await.unwrap();
+    assert_eq!(report.expired_tokens_deleted, 3);
+    assert_eq!(f.count("auth_sessions").await, 1);
+    assert_eq!(f.count("password_resets").await, 1);
+    assert_eq!(f.count("oidc_states").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_user_anonymises_their_audit_events() {
+    let base = require_db!();
+    let f = retention_fixture(&base).await;
+    let user = f
+        .store
+        .create_user(camelmailer_core::NewUser {
+            email_address: "gone@b.example".into(),
+            first_name: "G".into(),
+            last_name: "B".into(),
+            admin: false,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO auth_events (user_id, email_address, event) VALUES ($1, 'gone@b.example', 'login.success')",
+    )
+    .bind(user.id as i64)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    assert!(f.store.delete_user(user.id).await.unwrap());
+    let (user_id, email): (Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT user_id, email_address FROM auth_events")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(user_id, None);
+    assert_eq!(email, None);
+}

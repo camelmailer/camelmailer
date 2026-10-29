@@ -5768,14 +5768,8 @@ async fn smtp_idempotency_replays_before_quota_rejection_in_postgres() {
         chrono::Utc::now() + chrono::Duration::hours(24),
     );
     request.operation = "smtp.send".into();
-    let available = SendAllowance {
-        limit: Some(1),
-        used: 0,
-    };
-    let exhausted = SendAllowance {
-        limit: Some(1),
-        used: 1,
-    };
+    let available = SendAllowance::server(Some(1), 0);
+    let exhausted = SendAllowance::server(Some(1), 1);
     assert_eq!(
         sink.queue_messages(messages(), Some(request.clone()), available),
         QueueMessagesOutcome::Stored
@@ -5817,14 +5811,7 @@ async fn smtp_idempotency_replays_before_quota_rejection_in_postgres() {
         1
     );
     assert_eq!(
-        retry_sink.queue_messages(
-            messages(),
-            Some(new),
-            SendAllowance {
-                limit: Some(2),
-                used: 1
-            }
-        ),
+        retry_sink.queue_messages(messages(), Some(new), SendAllowance::server(Some(2), 1)),
         QueueMessagesOutcome::Stored
     );
     assert_eq!(sink.send_usage(f.server.id).await.unwrap(), 2);
@@ -6533,4 +6520,189 @@ async fn feedback_complaints_with_an_unsubscribe_token_suppress_and_fire() {
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].1, "MessageComplained");
     assert_eq!(queued[0].2["payload"]["message"]["id"], message_id);
+}
+
+// ------------------------------------------- organization quota (0047)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn organization_policy_round_trips_and_defaults_to_unlimited() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let policy = f
+        .store
+        .organization_policy(f.organization.id)
+        .await
+        .unwrap();
+    assert_eq!(policy, camelmailer_core::OrganizationPolicy::default());
+
+    let set = camelmailer_core::OrganizationPolicy {
+        monthly_send_limit: Some(5000),
+        suspended: true,
+        suspension_reason: Some("Unpaid".into()),
+        retention: camelmailer_core::RetentionOverrides {
+            message_content_days: Some(30),
+            message_metadata_days: Some(0),
+            webhook_log_days: None,
+            dmarc_report_days: Some(90),
+        },
+    };
+    f.store
+        .set_organization_policy(f.organization.id, &set)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .organization_policy(f.organization.id)
+            .await
+            .unwrap(),
+        set
+    );
+    // The sync view used by the SMTP session agrees.
+    let store = f.store.clone();
+    let org_id = f.organization.id;
+    let sync = tokio::task::spawn_blocking(move || store.send_policy_for_organization(org_id))
+        .await
+        .unwrap();
+    assert_eq!(sync, set);
+    assert!(f
+        .store
+        .set_organization_policy(999_999, &set)
+        .await
+        .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outgoing_mail_counts_per_organization_and_month_across_servers() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    for (server, rcpt) in [(f.server.id, "a@d.example"), (other.id, "b@d.example")] {
+        let mut message = message_for(server, rcpt);
+        message.scope = MessageScope::Outgoing;
+        f.store.store_outgoing(message).await.unwrap();
+    }
+    // Incoming mail is not a send.
+    f.store
+        .store_outgoing(message_for(f.server.id, "in@d.example"))
+        .await
+        .unwrap();
+    let month = camelmailer_core::UsageMonth::current();
+    assert_eq!(
+        f.store
+            .organization_send_usage(f.organization.id, month)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        f.store
+            .organization_send_usage(
+                f.organization.id,
+                camelmailer_core::UsageMonth::parse("2001-01").unwrap()
+            )
+            .await
+            .unwrap(),
+        0
+    );
+    let store = f.store.clone();
+    let org_id = f.organization.id;
+    let sync = tokio::task::spawn_blocking(move || store.organization_month_usage(org_id))
+        .await
+        .unwrap();
+    assert_eq!(sync, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_thresholds_queue_one_lifecycle_event_each_per_month() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    f.store
+        .set_organization_policy(
+            f.organization.id,
+            &camelmailer_core::OrganizationPolicy {
+                monthly_send_limit: Some(5),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let queue = camelmailer_db::PgLifecycleQueue::new(pool.clone(), 1);
+    for index in 0..6 {
+        let mut message = message_for(f.server.id, &format!("r{index}@d.example"));
+        message.scope = MessageScope::Outgoing;
+        f.store.store_outgoing(message).await.unwrap();
+        let expected = match index {
+            0..=2 => 0, // 1..3 of 5
+            3 => 1,     // 4 of 5 = 80 %
+            _ => 2,     // 5 and 6 of 5: 100 % fires once
+        };
+        assert_eq!(
+            queue.pending().await.unwrap().len(),
+            expected,
+            "after {index}"
+        );
+    }
+    let pending = queue.pending().await.unwrap();
+    let first: serde_json::Value = serde_json::from_str(&pending[0].payload).unwrap();
+    assert_eq!(pending[0].event, "organization.usage_threshold");
+    assert_eq!(first["data"]["threshold"], serde_json::json!(80));
+    assert_eq!(first["data"]["sent"], serde_json::json!(4));
+    assert_eq!(
+        first["data"]["organization"]["permalink"],
+        serde_json::json!("example-org")
+    );
+    assert_eq!(first["id"], serde_json::json!(pending[0].uuid));
+    let second: serde_json::Value = serde_json::from_str(&pending[1].payload).unwrap();
+    assert_eq!(second["data"]["threshold"], serde_json::json!(100));
+
+    // Deleting the organization keeps the outbox (no foreign key) and drops
+    // its counters.
+    f.store
+        .delete_organization(f.organization.id)
+        .await
+        .unwrap();
+    assert_eq!(queue.pending().await.unwrap().len(), 2);
+    let counters: i64 = sqlx::query_scalar("SELECT count(*) FROM organization_send_counters")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(counters, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lifecycle_queue_dequeues_retries_and_completes() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let event = camelmailer_core::LifecycleEvent::new(
+        camelmailer_core::lifecycle::ORGANIZATION_CREATED,
+        serde_json::json!({ "organization": { "permalink": "x" } }),
+    );
+    f.store.enqueue_lifecycle_event(&event).await.unwrap();
+    let queue = camelmailer_db::PgLifecycleQueue::new(pool.clone(), 1);
+    let row = queue.dequeue("w1").await.unwrap().unwrap();
+    assert_eq!(row.uuid, event.id);
+    assert_eq!(row.payload, event.body());
+    // Locked: a second worker sees nothing.
+    assert!(queue.dequeue("w2").await.unwrap().is_none());
+    queue.retry(row.id, row.attempts, "HTTP 500").await.unwrap();
+    // Backed off: not ready yet.
+    assert!(queue.dequeue("w2").await.unwrap().is_none());
+    assert_eq!(queue.pending().await.unwrap()[0].attempts, 1);
+    queue.complete(row.id).await.unwrap();
+    assert!(queue.pending().await.unwrap().is_empty());
+    f.store.enqueue_lifecycle_event(&event.clone()).await.ok();
+    assert_eq!(queue.discard_all().await.unwrap(), 1);
 }

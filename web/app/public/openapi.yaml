@@ -113,9 +113,16 @@ paths:
         retry-safe submission; completed results are retained for 24 hours.
 
         A server with a `send_limit` answers `429` with the error code
-        `SendLimitExceeded` once the trailing 30-day window is full. A
+        `SendLimitExceeded` once the trailing 30-day window is full. An
+        organization with a `monthly_send_limit` answers `429` with
+        `OrganizationQuotaExceeded` once the calendar month (UTC) is used up
+        across all of its servers. The stricter of the two applies. A
         request naming more recipients than the remainder is refused whole,
         so the response never leaves some recipients queued and others not.
+        A suspended organization answers `403 OrganizationSuspended`.
+
+        The same rules apply to every send endpoint (batch, template,
+        stream and campaign sends) and to SMTP submission.
       security: [{ ServerApiKey: [] }]
       parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
       requestBody:
@@ -144,6 +151,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "409": { $ref: "#/components/responses/Conflict" }
         "422": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/OrganizationSuspended" }
         "429": { $ref: "#/components/responses/SendLimitExceeded" }
     get:
       tags: [Messages]
@@ -1116,6 +1124,16 @@ paths:
                 first_name: { type: string }
                 last_name: { type: string }
                 password: { type: string, description: At least auth.minimum_password_length characters }
+                captcha_token:
+                  type: string
+                  description: >-
+                    Required when `captcha.provider` is set (see
+                    `GET /api/v2/auth/features`). The token from the captcha
+                    widget; `cap-token` (the Cap widget's form field name)
+                    is accepted as an alias. Missing: `400
+                    ParameterMissing`; rejected by the verifier: `422
+                    CaptchaInvalid`; verifier unreachable: `503
+                    CaptchaUnavailable`.
       responses:
         "201":
           description: Account created and session issued
@@ -1302,6 +1320,21 @@ paths:
                             properties:
                               enabled: { type: boolean }
                               name: { type: string }
+                          captcha:
+                            type: object
+                            description: >-
+                              The captcha protecting registration. The
+                              widget talks to `endpoint` directly; the secret
+                              is never exposed.
+                            properties:
+                              provider: { type: string, enum: [none, cap] }
+                              endpoint:
+                                type: string
+                                nullable: true
+                                example: "https://captcha.example.com/site-key/"
+                          billing:
+                            type: boolean
+                            description: Whether a billing provider is active on this installation
                           sso:
                             type: array
                             description: Social providers as {id, name, type} — never secrets
@@ -1558,11 +1591,28 @@ paths:
   /api/v2/admin/organizations/{org}:
     get:
       tags: [Organizations]
-      summary: Show an organization (includes require_two_factor)
+      summary: Show an organization (includes require_two_factor and data retention)
+      description: |
+        Readable by every member. `retention` holds the effective retention
+        periods in days after the organization's overrides (`null` = kept
+        forever) and the overrides themselves.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters: [{ $ref: "#/components/parameters/Org" }]
       responses:
-        "200": { $ref: "#/components/responses/Success" }
+        "200":
+          description: The organization
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          organization: { type: object }
+                          retention: { $ref: "#/components/schemas/OrganizationRetention" }
     patch:
       tags: [Organizations]
       summary: Update an organization (owner)
@@ -1771,15 +1821,149 @@ paths:
       responses:
         "201": { $ref: "#/components/responses/Success" }
 
+  /api/v2/admin/organizations/{org}/usage:
+    get:
+      tags: [Organizations]
+      summary: Monthly sending usage of an organization
+      description: |
+        The authoritative counter of outgoing messages across all servers of
+        the organization for one calendar month (UTC), with the current
+        monthly limit and what is left of it. Readable by every member of
+        the organization and by admin API keys that reach it. `limit` and
+        `remaining` are null for an unlimited organization. A past month is
+        reported against today's limit (limits are not versioned).
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Org"
+        - name: month
+          in: query
+          required: false
+          description: "`YYYY-MM`; defaults to the current month (UTC)"
+          schema: { type: string, example: "2026-10" }
+      responses:
+        "200":
+          description: Usage
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          usage: { $ref: "#/components/schemas/OrganizationUsage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/admin/organizations/{org}/limits:
+    get:
+      tags: [Organizations]
+      summary: Monthly send limit and suspension of an organization
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200":
+          description: Limits
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          limits: { $ref: "#/components/schemas/OrganizationLimits" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Organizations]
+      summary: Change the monthly send limit or suspension (installation admins)
+      description: |
+        Only global administrators and unscoped admin API keys may write;
+        organization owners and scoped keys get `403 AccessDenied`, so a
+        tenant cannot lift its own quota. Absent fields stay as they are;
+        `monthly_send_limit: null` removes the limit. Unsuspending clears the
+        reason; suspending without a reason stores "Suspended via Admin API".
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                monthly_send_limit: { type: integer, minimum: 0, nullable: true }
+                suspended: { type: boolean }
+                suspension_reason: { type: string, nullable: true }
+                retention:
+                  $ref: "#/components/schemas/RetentionOverrides"
+            example: { monthly_send_limit: 50000, retention: { message_content_days: 30 } }
+      responses:
+        "200":
+          description: The limits after the change
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          limits: { $ref: "#/components/schemas/OrganizationLimits" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/admin/organizations/{org}/suspend:
+    post:
+      tags: [Organizations]
+      summary: Suspend an organization (installation admins)
+      description: |
+        Every server of the organization stops sending: the HTTP send
+        endpoints answer `403 OrganizationSuspended`, SMTP submission answers
+        `535 Organization has been suspended` at RCPT TO. Inbound mail, reads
+        and the dashboard keep working.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v2/admin/organizations/{org}/unsuspend:
+    post:
+      tags: [Organizations]
+      summary: Lift an organization's suspension (installation admins)
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v2/admin/organizations/{org}/billing:
     get:
       tags: [Organizations]
       summary: Billing status of an organization (admin)
       description: |
-        Hosted cloud only. Always `200` for authorized callers:
-        `{ enabled: false, has_customer: false }` on installations without
-        billing (the default for self-hosted) — the dashboard hides all
-        billing UI in that case.
+        Always `200` for admins and owners. `enabled` is true only when
+        `billing.enabled` is set and the build carries a billing provider
+        (the open-source build has none, so self-hosted installations report
+        `enabled: false` and the dashboard shows usage only).
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters: [{ $ref: "#/components/parameters/Org" }]
       responses:
@@ -1796,26 +1980,19 @@ paths:
                         type: object
                         properties:
                           enabled: { type: boolean }
+                          provider: { type: string, nullable: true }
                           has_customer: { type: boolean }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
-  /api/v2/admin/organizations/{org}/billing/portal:
-    post:
+  /api/v2/admin/organizations/{org}/billing/plans:
+    get:
       tags: [Organizations]
-      summary: Open the Stripe billing portal (admin)
-      description: |
-        Creates the Stripe customer for the organization on first use
-        (idempotent — an existing customer is reused, the customer id is
-        persisted only after Stripe reported success) and returns the URL
-        of a fresh billing-portal session. `403 BillingDisabled` when the
-        `billing` config group is off (self-hosted); `502
-        BillingUnavailable` when Stripe cannot be reached (details are
-        logged, never forwarded).
+      summary: Plans offered by the billing provider (admin)
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
       parameters: [{ $ref: "#/components/parameters/Org" }]
       responses:
         "200":
-          description: Portal session created
+          description: Plans
           content:
             application/json:
               schema:
@@ -1826,10 +2003,133 @@ paths:
                       data:
                         type: object
                         properties:
-                          url: { type: string, example: "https://billing.stripe.com/p/session/…" }
+                          plans:
+                            type: array
+                            items: { $ref: "#/components/schemas/Plan" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
-          description: Billing is not enabled on this installation (`BillingDisabled`)
+          description: Billing is not enabled on this installation (`BillingDisabled`), or the caller is not admin/owner
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: The billing provider is unavailable (`BillingUnavailable`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /api/v2/admin/organizations/{org}/billing/checkout:
+    post:
+      tags: [Organizations]
+      summary: Start a checkout for a plan (admin)
+      description: |
+        Creates the provider customer on first use (stored only after the
+        provider reported success) and returns an embed session for the
+        provider's checkout component.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_code]
+              properties:
+                plan_code: { type: string }
+      responses:
+        "200":
+          description: A provider session for the dashboard
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          url: { type: string, nullable: true, description: Same as session.url (link fallback) }
+                          session: { $ref: "#/components/schemas/EmbedSession" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Billing is not enabled on this installation (`BillingDisabled`), or the caller is not admin/owner
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: The billing provider is unavailable (`BillingUnavailable`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /api/v2/admin/organizations/{org}/billing/portal:
+    post:
+      tags: [Organizations]
+      summary: Open subscription management (admin)
+      description: |
+        Creates the provider customer on first use and returns an embed
+        session for the provider's subscription component, or a plain link.
+        `403 BillingDisabled` without an active provider; `502
+        BillingUnavailable` when the provider fails (details are logged,
+        never forwarded).
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200":
+          description: A provider session for the dashboard
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          url: { type: string, nullable: true, description: Same as session.url (link fallback) }
+                          session: { $ref: "#/components/schemas/EmbedSession" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Billing is not enabled on this installation (`BillingDisabled`), or the caller is not admin/owner
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: The billing provider is unavailable (`BillingUnavailable`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  /api/v2/admin/organizations/{org}/billing/usage:
+    post:
+      tags: [Organizations]
+      summary: Provider usage view (admin)
+      description: The provider's own usage component, if it has one; `session` is null otherwise.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Org" }]
+      responses:
+        "200":
+          description: Usage session
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/SuccessEnvelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          session:
+                            allOf: [{ $ref: "#/components/schemas/EmbedSession" }]
+                            nullable: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: Billing is not enabled on this installation (`BillingDisabled`), or the caller is not admin/owner
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorEnvelope" }
@@ -2774,8 +3074,18 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
     SendLimitExceeded:
       description: >
-        The server has reached its send limit for the current 30-day window.
-        The error code is `SendLimitExceeded`.
+        A send limit is used up. `SendLimitExceeded`: the server's limit for
+        the current 30-day window. `OrganizationQuotaExceeded`: the
+        organization's monthly limit (calendar month, UTC, across all of its
+        servers). Nothing was stored.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    OrganizationSuspended:
+      description: >
+        The organization is suspended, so none of its servers may send. The
+        error code is `OrganizationSuspended`; the message carries the
+        suspension reason.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
@@ -2786,6 +3096,75 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
   schemas:
+    OrganizationUsage:
+      type: object
+      properties:
+        organization: { type: string, description: Organization permalink }
+        month: { type: string, example: "2026-10" }
+        period_start: { type: string, format: date-time }
+        period_end: { type: string, format: date-time, description: Exclusive; the quota resets here }
+        sent: { type: integer, description: Outgoing messages stored in the month }
+        limit: { type: integer, nullable: true }
+        remaining: { type: integer, nullable: true }
+        suspended: { type: boolean }
+        suspension_reason: { type: string, nullable: true }
+    OrganizationLimits:
+      type: object
+      properties:
+        monthly_send_limit: { type: integer, nullable: true }
+        suspended: { type: boolean }
+        suspension_reason: { type: string, nullable: true }
+        retention: { $ref: "#/components/schemas/RetentionOverrides" }
+    RetentionOverrides:
+      type: object
+      description: >-
+        Per-organization retention in days. In a PATCH an absent field is
+        left unchanged; `null` inherits the installation default; `0` keeps
+        forever; 1 to 36500 keeps that many days.
+      properties:
+        message_content_days: { type: integer, minimum: 0, maximum: 36500, nullable: true }
+        message_metadata_days: { type: integer, minimum: 0, maximum: 36500, nullable: true }
+        webhook_log_days: { type: integer, minimum: 0, maximum: 36500, nullable: true }
+        dmarc_report_days: { type: integer, minimum: 0, maximum: 36500, nullable: true }
+    OrganizationRetention:
+      type: object
+      description: Effective retention in days; null means kept forever.
+      properties:
+        message_content_days: { type: integer, nullable: true }
+        message_metadata_days: { type: integer, nullable: true }
+        webhook_log_days: { type: integer, nullable: true }
+        dmarc_report_days: { type: integer, nullable: true }
+        auth_event_days: { type: integer, nullable: true, description: Installation-wide }
+        api_request_days: { type: integer, nullable: true, description: Installation-wide }
+        overrides: { $ref: "#/components/schemas/RetentionOverrides" }
+    EmbedSession:
+      type: object
+      description: >-
+        What the dashboard needs to show a provider-supplied UI: load
+        `script_url` once and render `<{element} token="{token}">` with the
+        extra `attributes`, or open `url` when there is no component.
+      properties:
+        script_url: { type: string, nullable: true }
+        element: { type: string, nullable: true, example: rs-checkout }
+        token: { type: string, nullable: true }
+        attributes: { type: object, additionalProperties: { type: string } }
+        url: { type: string, nullable: true }
+        expires_at: { type: string, format: date-time, nullable: true }
+    Plan:
+      type: object
+      properties:
+        code: { type: string }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        monthly_send_limit: { type: integer, nullable: true }
+        price:
+          type: object
+          nullable: true
+          properties:
+            amount_minor: { type: integer, description: Minor currency unit (cents) }
+            currency: { type: string, example: EUR }
+            interval: { type: string, nullable: true, example: month }
+        features: { type: array, items: { type: string } }
     SuccessEnvelope:
       type: object
       required: [status, time]

@@ -341,22 +341,45 @@ async fn prepare_send(
     // remainder is refused outright rather than half-stored, which would
     // leave the caller unable to tell which recipients were accepted.
     let recipients = (to.len() + cc.len() + bcc.len()) as i64;
-    if let Some(limit) = server.send_limit {
-        let used = server_store
-            .send_usage(server.id)
+    // The organization gate: a suspended organization sends nothing, and
+    // its monthly limit applies next to the server's own; the stricter of
+    // the two decides (and names itself in the error).
+    let (org_policy, org_allowance) =
+        crate::quota::organization_allowance(state, server.organization_id)
             .await
             .map_err(|_| internal_error())?;
-        let allowance = camelmailer_core::SendAllowance {
-            limit: Some(limit),
-            used: used.saturating_add(pending_recipients),
-        };
-        if !allowance.allows(recipients) {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "SendLimitExceeded".into(),
-                allowance.rejection_message(),
-            ));
-        }
+    if org_policy.suspended {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "OrganizationSuspended".into(),
+            match &org_policy.suspension_reason {
+                Some(reason) => format!("This organization has been suspended: {reason}"),
+                None => "This organization has been suspended".into(),
+            },
+        ));
+    }
+    let server_allowance = match server.send_limit {
+        Some(limit) => camelmailer_core::SendAllowance::server(
+            Some(limit),
+            server_store
+                .send_usage(server.id)
+                .await
+                .map_err(|_| internal_error())?
+                .saturating_add(pending_recipients),
+        ),
+        None => camelmailer_core::SendAllowance::unlimited(),
+    };
+    let org_allowance = camelmailer_core::SendAllowance::organization(
+        org_allowance.limit,
+        org_allowance.used.saturating_add(pending_recipients),
+    );
+    let allowance = server_allowance.stricter(org_allowance);
+    if !allowance.allows(recipients) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            allowance.error_code().into(),
+            allowance.rejection_message(),
+        ));
     }
 
     // From authorization: the server (or its org) must own a verified

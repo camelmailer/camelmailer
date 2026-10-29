@@ -172,6 +172,66 @@ reason to watch: the server dashboard's Send limit field sets it, the
 Servers table on the organization page shows it, and a server over its
 limit refuses further sends with an error the sender can see.
 
+## Organization quota and suspension
+
+An organization can carry a **monthly send limit** across all of its
+servers, counted per calendar month in UTC. It is unlimited by default.
+When it is used up, every send of the organization is refused with
+`429 OrganizationQuotaExceeded` on the HTTP API and `550 5.7.1` at the end
+of SMTP DATA, until the month turns. The per-server limit keeps working
+next to it, and the stricter of the two decides.
+
+**Suspending an organization** stops outgoing mail from all of its servers:
+the HTTP send endpoints answer `403 OrganizationSuspended` with the
+reason, and SMTP submission answers `535 Organization has been suspended`
+at `RCPT TO`. Inbound mail, the dashboard and reads keep working, so the
+tenant can still see what happened.
+
+Only global administrators and unscoped admin API keys may change either;
+an organization owner can read them but cannot lift their own quota.
+
+```bash
+# Set a monthly limit (null removes it).
+curl -X PATCH -H "X-Admin-API-Key: $KEY" -H 'content-type: application/json' \
+  -d '{"monthly_send_limit": 50000}' \
+  https://mail.example.com/api/v2/admin/organizations/acme/limits
+
+# Suspend and lift.
+curl -X POST -H "X-Admin-API-Key: $KEY" -H 'content-type: application/json' \
+  -d '{"reason": "Unpaid invoice"}' \
+  https://mail.example.com/api/v2/admin/organizations/acme/suspend
+curl -X POST -H "X-Admin-API-Key: $KEY" \
+  https://mail.example.com/api/v2/admin/organizations/acme/unsuspend
+
+# Usage of one month (members of the organization may read this too).
+curl -H "X-Admin-API-Key: $KEY" \
+  'https://mail.example.com/api/v2/admin/organizations/acme/usage?month=2026-10'
+```
+
+The usage answer:
+
+```json
+{
+  "usage": {
+    "organization": "acme",
+    "month": "2026-10",
+    "period_start": "2026-10-01T00:00:00Z",
+    "period_end": "2026-11-01T00:00:00Z",
+    "sent": 4120,
+    "limit": 50000,
+    "remaining": 45880,
+    "suspended": false,
+    "suspension_reason": null
+  }
+}
+```
+
+The counter is written in the transaction that stores each outgoing
+message and is never pruned, so it stays correct when message retention
+deletes old messages. Reaching 80 % and 100 % of the limit raises an
+[`organization.usage_threshold` lifecycle event](webhooks.md#installation-lifecycle-events)
+once each per month.
+
 ## What this view does not do
 
 - It reports counters, and it raises no alert of its own. Nothing here

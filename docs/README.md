@@ -60,7 +60,8 @@ send your first message in about five minutes, then read
 
 | Page | What it covers |
 |---|---|
-| [Cloud pricing and the public beta](pricing.md) | The beta cap, the coming Base package, over-quota options, and where billing lives |
+| [Data retention](retention.md) | How long each kind of data is kept, organization overrides, and the cleanup job |
+| [Usage and billing](pricing.md) | The monthly usage figure, organization limits, and where billing lives |
 | [Import and export](import-export.md) | CSV and JSON export, and CSV import, across the dashboard resource lists |
 
 ## Reference

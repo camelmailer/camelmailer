@@ -503,6 +503,8 @@ async fn resolve_user(
         })
         .await
         .map_err(map_store_error)?;
+    crate::lifecycle::user_registered(state, &user, crate::lifecycle::RegistrationSource::Sso)
+        .await;
     let _ = store
         .record_auth_event(NewAuthEvent {
             user_id: Some(user.id),

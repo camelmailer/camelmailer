@@ -115,6 +115,7 @@ async fn try_bootstrap(
     auth_store
         .upsert_membership(organization.id, user.id, Role::Owner)
         .await?;
+    crate::lifecycle::organization_created(state, &organization, Some(user)).await;
 
     let server = state
         .store
