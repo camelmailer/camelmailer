@@ -18,8 +18,25 @@ describe("embedPlan", () => {
       element: "rs-checkout",
       scriptUrl: "https://billing.example/elements.js",
       attributes: { token: "tok_1" },
+      companions: [],
       fallbackUrl: "https://billing.example/checkout/1",
     })
+  })
+
+  it("renders companions with the same token and drops unsafe ones", () => {
+    const plan = embedPlan({
+      ...base,
+      element: "rs-subscription",
+      companions: [
+        { element: "rs-invoices" },
+        { element: "rs-usage", attributes: { metric: "emails", token: "other", onload: "x" } },
+        { element: "iframe", attributes: {} },
+      ],
+    })
+    expect(plan.kind === "element" && plan.companions).toEqual([
+      { element: "rs-invoices", attributes: { token: "tok_1" } },
+      { element: "rs-usage", attributes: { metric: "emails", token: "tok_1" } },
+    ])
   })
 
   it("falls back to the link without a usable element or script", () => {

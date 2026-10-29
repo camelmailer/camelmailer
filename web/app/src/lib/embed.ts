@@ -36,12 +36,16 @@ export function safeAttributes(attributes: Record<string, string> | null | undef
   return result
 }
 
+export type EmbedElement = { element: string; attributes: Record<string, string> }
+
 export type EmbedPlan =
   | {
       kind: "element"
       element: string
       scriptUrl: string
       attributes: Record<string, string>
+      /** Further elements rendered after the first, same script and token. */
+      companions: EmbedElement[]
       fallbackUrl: string | null
     }
   | { kind: "link"; url: string }
@@ -53,13 +57,23 @@ export function embedPlan(session: EmbedSession | null | undefined): EmbedPlan {
   if (!session) return { kind: "none" }
   const fallbackUrl = isHttpUrl(session.url) ? session.url : null
   if (isCustomElementName(session.element) && isHttpUrl(session.script_url)) {
-    const attributes = safeAttributes(session.attributes)
-    if (session.token) attributes.token = session.token
+    const withToken = (attributes: Record<string, string> | null | undefined) => {
+      const safe = safeAttributes(attributes)
+      if (session.token) safe.token = session.token
+      return safe
+    }
+    const companions = (session.companions ?? [])
+      .filter((companion) => isCustomElementName(companion?.element))
+      .map((companion) => ({
+        element: companion.element,
+        attributes: withToken(companion.attributes),
+      }))
     return {
       kind: "element",
       element: session.element,
       scriptUrl: session.script_url,
-      attributes,
+      attributes: withToken(session.attributes),
+      companions,
       fallbackUrl,
     }
   }

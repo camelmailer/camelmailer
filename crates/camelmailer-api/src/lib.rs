@@ -30,8 +30,8 @@ mod quota;
 pub use app::{build_app, build_assets_router, build_router, ApiState};
 pub use auth_api::build_auth_router;
 pub use billing::{
-    BillingError, BillingOrganization, BillingProvider, EmbedSession, MockBilling, NoBilling, Plan,
-    Price,
+    BillingError, BillingOrganization, BillingProvider, EmbedCompanion, EmbedSession, MockBilling,
+    NoBilling, Plan, Price,
 };
 pub use cors::cors_layer;
 pub use dns::HickoryDnsResolver;

@@ -1,8 +1,9 @@
 "use client"
 
 // Renders an EmbedSession from the billing provider: its custom element
-// (loaded from the provider's script) with a short-lived token, or a plain
-// link when the provider offers no component or its script fails to load.
+// (loaded from the provider's script) with a short-lived token, followed by
+// any companion elements sharing that token, or a plain link when the
+// provider offers no component or its script fails to load.
 
 import { createElement, useEffect, useState } from "react"
 import { ExternalLinkIcon } from "lucide-react"
@@ -57,5 +58,13 @@ export function EmbedSessionView({
       </p>
     )
   }
-  return createElement(plan.element, plan.attributes)
+  if (plan.companions.length === 0) return createElement(plan.element, plan.attributes)
+  return (
+    <div className="space-y-6">
+      {createElement(plan.element, plan.attributes)}
+      {plan.companions.map((companion, index) =>
+        createElement(companion.element, { key: index, ...companion.attributes }),
+      )}
+    </div>
+  )
 }

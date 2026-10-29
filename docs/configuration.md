@@ -264,9 +264,14 @@ fn main() -> std::process::ExitCode {
 The provider is used when `billing.enabled` is true. Checkout, portal and
 usage calls return an embed session: a custom element name, the script that
 defines it and a short-lived token, which the dashboard renders in place,
-plus an optional link fallback. `Extensions::routes` adds HTTP routes to the
-web server; `camelmailer::build_state` and `camelmailer_api::build_app` are
-there for a binary that wants to assemble the server itself.
+plus an optional link fallback. `companions` lists further elements from the
+same script that take the same token (an invoice list under a subscription
+view, for example). `Extensions::routes` adds HTTP routes to the web server,
+and `Extensions::on_start` runs once when the web server starts, inside the
+runtime, which is the place to spawn background tasks such as a periodic
+sync. `camelmailer::build_state` and `camelmailer_api::build_app` are there
+for a binary that wants to assemble the server itself, or for a command of
+its own that needs the same storage.
 
 ### `retention:` how long data is kept
 

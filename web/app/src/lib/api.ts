@@ -136,6 +136,8 @@ export type EmbedSession = {
   element: string | null
   token: string | null
   attributes: Record<string, string>
+  /** Further elements from the same script, given the same token. */
+  companions?: { element: string; attributes?: Record<string, string> }[]
   url: string | null
   expires_at: string | null
 }

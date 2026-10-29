@@ -47,8 +47,15 @@ pub type BillingFactory = Arc<
 /// Adds routes to the web server's application, with access to the state.
 pub type RouterHook = Arc<dyn Fn(Arc<ApiState>) -> axum::Router + Send + Sync>;
 
+/// Runs once when the web server starts, after the state is built and
+/// before it begins to listen. It is called inside the Tokio runtime, so it
+/// may `tokio::spawn` background tasks (periodic syncs and the like); it
+/// must not block.
+pub type StartHook = Arc<dyn Fn(Arc<ApiState>) + Send + Sync>;
+
 /// What a custom build plugs into the stock process roles. The default is
-/// the open-source behaviour: no billing provider, no extra routes.
+/// the open-source behaviour: no billing provider, no extra routes, no
+/// start hook.
 #[derive(Clone, Default)]
 pub struct Extensions {
     /// The billing provider. Used only when `billing.enabled` is set;
@@ -56,6 +63,10 @@ pub struct Extensions {
     pub billing: Option<BillingFactory>,
     /// Extra routes merged into the web server's router.
     pub routes: Option<RouterHook>,
+    /// Called once in the `web-server` role with the built state, e.g. to
+    /// spawn background tasks. Only the web server runs it, so a task
+    /// started here runs once per web-server process.
+    pub on_start: Option<StartHook>,
 }
 
 /// The CLI entry point of the stock binary: [`main_with`] without
@@ -368,7 +379,10 @@ pub async fn web_server_with(extensions: Extensions) -> std::io::Result<()> {
 
     let mut router = build_app(state.clone(), tracking);
     if let Some(routes) = &extensions.routes {
-        router = router.merge(routes(state));
+        router = router.merge(routes(state.clone()));
+    }
+    if let Some(on_start) = &extensions.on_start {
+        on_start(state);
     }
     if !config.web_server.cors_origins.is_empty() {
         tracing::info!(origins = ?config.web_server.cors_origins, "CORS enabled");

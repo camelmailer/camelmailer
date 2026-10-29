@@ -52,15 +52,17 @@ integration tests) is green.
   dashboard's usage page. Every period defaults to keeping data forever, as
   before.
 - **The `camelmailer` crate is also a library.** `camelmailer::main_with`
-  with `Extensions { billing, routes }` lets a separate crate build its own
-  binary with a billing provider or extra routes;
-  `camelmailer_api::build_app` assembles the whole HTTP application.
+  with `Extensions { billing, routes, on_start }` lets a separate crate
+  build its own binary with a billing provider, extra routes and background
+  tasks started with the web server; `camelmailer_api::build_app` assembles
+  the whole HTTP application.
 
 ### Changed
 
 - **Billing is provider neutral.** `BillingProvider` now offers customer,
   checkout, portal, optional usage view and plans, returning embed sessions
-  (a web component with a token, or a link) that the dashboard renders. The
+  (a web component with a token, or a link, plus optional companion
+  elements sharing the token) that the dashboard renders. The
   open-source build ships `NoBilling` only. `billing.enabled` without a
   provider keeps billing off.
 - `camelmailer.message_retention_days` is deprecated in favour of

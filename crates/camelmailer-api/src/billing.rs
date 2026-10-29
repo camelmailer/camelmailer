@@ -66,8 +66,9 @@ pub struct BillingOrganization {
 /// What the dashboard needs to show a provider-supplied UI.
 ///
 /// With `element` and `script_url` set, the dashboard loads the script once
-/// and renders `<{element} token="{token}" {attributes…}>`. With only `url`
-/// set it shows a link (or redirects). Both may be set; the link is then the
+/// and renders `<{element} token="{token}" {attributes…}>`, followed by each
+/// of the `companions` with the same script and token. With only `url` set
+/// it shows a link (or redirects). Both may be set; the link is then the
 /// fallback when the script cannot load.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbedSession {
@@ -80,10 +81,25 @@ pub struct EmbedSession {
     /// Extra attributes for the element.
     #[serde(default)]
     pub attributes: BTreeMap<String, String>,
+    /// Further elements from the same script that take the same token,
+    /// rendered after `element` in this order (for example an invoice list
+    /// below a subscription view).
+    #[serde(default)]
+    pub companions: Vec<EmbedCompanion>,
     /// Plain link fallback (hosted checkout or portal page).
     pub url: Option<String>,
     /// When the token stops working, if the provider says.
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A further element of an [`EmbedSession`]: same script, same token.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbedCompanion {
+    /// Custom element name, e.g. `rs-invoices`. Must contain a hyphen.
+    pub element: String,
+    /// Extra attributes for the element.
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
 }
 
 /// A price as the provider states it.
@@ -252,6 +268,7 @@ impl MockBilling {
             element: Some(element.into()),
             token: Some(format!("tok_{element}_{customer}")),
             attributes: BTreeMap::new(),
+            companions: Vec::new(),
             url: Some(format!("https://billing.example/{element}/{customer}")),
             expires_at: None,
         }
@@ -577,6 +594,10 @@ mod tests {
             element: Some("rs-checkout".into()),
             token: Some("t".into()),
             attributes: BTreeMap::from([("locale".into(), "de".into())]),
+            companions: vec![EmbedCompanion {
+                element: "rs-invoices".into(),
+                attributes: BTreeMap::new(),
+            }],
             url: None,
             expires_at: None,
         };
@@ -584,5 +605,12 @@ mod tests {
         assert_eq!(value["element"], json!("rs-checkout"));
         assert_eq!(value["attributes"]["locale"], json!("de"));
         assert_eq!(value["url"], json!(null));
+        assert_eq!(value["companions"][0]["element"], json!("rs-invoices"));
+        // A provider that predates companions still deserializes.
+        let old: EmbedSession = serde_json::from_value(json!({
+            "script_url": null, "element": null, "token": null, "url": null, "expires_at": null
+        }))
+        .unwrap();
+        assert!(old.companions.is_empty());
     }
 }
