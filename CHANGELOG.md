@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-10-30
+
 ### Added
 
 - **Bulk delete in the admin lists.** Organizations and users can be
@@ -1257,7 +1259,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/camelmailer/camelmailer/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/camelmailer/camelmailer/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/camelmailer/camelmailer/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/camelmailer/camelmailer/compare/v0.9.0...v0.9.1
