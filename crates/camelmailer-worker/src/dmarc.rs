@@ -69,11 +69,12 @@ pub fn parse_report_xml(xml: &[u8]) -> Result<AggregateReport, DmarcParseError> 
     use quick_xml::events::Event;
 
     let mut reader = quick_xml::Reader::from_reader(xml);
-    reader.config_mut().trim_text(true);
 
     // element path, e.g. ["feedback", "record", "row", "source_ip"]
     let mut path: Vec<String> = Vec::new();
     let mut buffer = Vec::new();
+    // text of the innermost open element, collected until its end tag
+    let mut text = String::new();
 
     let mut org_name = None;
     let mut org_email = None;
@@ -101,7 +102,9 @@ pub fn parse_report_xml(xml: &[u8]) -> Result<AggregateReport, DmarcParseError> 
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(start)) => {
-                let name = String::from_utf8_lossy(start.name().as_ref()).to_lowercase();
+                // text before a child element is mixed content, not a value
+                text.clear();
+                let name = start.name().as_ref().to_lowercase();
                 if path.is_empty() && name != "feedback" {
                     return Err(DmarcParseError::Xml(format!(
                         "unexpected root element <{name}> (expected <feedback>)"
@@ -113,6 +116,75 @@ pub fn parse_report_xml(xml: &[u8]) -> Result<AggregateReport, DmarcParseError> 
                 path.push(name);
             }
             Ok(Event::End(_)) => {
+                // An element's text arrives as Text events interleaved with
+                // GeneralRef events (`&amp;`, `&#38;`); it is complete here.
+                let value = std::mem::take(&mut text).trim().to_string();
+                if !value.is_empty() {
+                    let joined = path.join("/");
+                    match joined.as_str() {
+                        "feedback/report_metadata/org_name" => org_name = Some(value),
+                        "feedback/report_metadata/email" => org_email = Some(value),
+                        "feedback/report_metadata/report_id" => report_id = Some(value),
+                        "feedback/report_metadata/date_range/begin" => {
+                            begin = Some(epoch_to_datetime(&value, "date_range/begin")?)
+                        }
+                        "feedback/report_metadata/date_range/end" => {
+                            end = Some(epoch_to_datetime(&value, "date_range/end")?)
+                        }
+                        "feedback/policy_published/domain" => domain = Some(value),
+                        "feedback/record/row/source_ip" => {
+                            if let Some(record) = current.as_mut() {
+                                record.source_ip = value;
+                            }
+                        }
+                        "feedback/record/row/count" => {
+                            if let Some(record) = current.as_mut() {
+                                record.count = value.parse().unwrap_or(0);
+                            }
+                        }
+                        "feedback/record/row/policy_evaluated/disposition" => {
+                            if let Some(record) = current.as_mut() {
+                                record.disposition = value.to_lowercase();
+                            }
+                        }
+                        "feedback/record/row/policy_evaluated/dkim" => {
+                            if let Some(record) = current.as_mut() {
+                                record.dkim_aligned = value.eq_ignore_ascii_case("pass");
+                            }
+                        }
+                        "feedback/record/row/policy_evaluated/spf" => {
+                            if let Some(record) = current.as_mut() {
+                                record.spf_aligned = value.eq_ignore_ascii_case("pass");
+                            }
+                        }
+                        "feedback/record/identifiers/header_from" => {
+                            if let Some(record) = current.as_mut() {
+                                record.header_from = Some(value);
+                            }
+                        }
+                        "feedback/record/identifiers/envelope_from" => {
+                            if let Some(record) = current.as_mut() {
+                                record.envelope_from = Some(value);
+                            }
+                        }
+                        // first auth result wins (reports may list several)
+                        "feedback/record/auth_results/dkim/result" => {
+                            if let Some(record) = current.as_mut() {
+                                record
+                                    .dkim_result
+                                    .get_or_insert_with(|| value.to_lowercase());
+                            }
+                        }
+                        "feedback/record/auth_results/spf/result" => {
+                            if let Some(record) = current.as_mut() {
+                                record
+                                    .spf_result
+                                    .get_or_insert_with(|| value.to_lowercase());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 if path.len() == 2 && path[1] == "record" {
                     if let Some(record) = current.take() {
                         records.push(record);
@@ -120,78 +192,22 @@ pub fn parse_report_xml(xml: &[u8]) -> Result<AggregateReport, DmarcParseError> 
                 }
                 path.pop();
             }
-            Ok(Event::Text(text)) => {
-                let value = text
-                    .unescape()
-                    .map_err(|error| DmarcParseError::Xml(error.to_string()))?
-                    .trim()
-                    .to_string();
-                if value.is_empty() {
-                    continue;
-                }
-                let joined = path.join("/");
-                match joined.as_str() {
-                    "feedback/report_metadata/org_name" => org_name = Some(value),
-                    "feedback/report_metadata/email" => org_email = Some(value),
-                    "feedback/report_metadata/report_id" => report_id = Some(value),
-                    "feedback/report_metadata/date_range/begin" => {
-                        begin = Some(epoch_to_datetime(&value, "date_range/begin")?)
-                    }
-                    "feedback/report_metadata/date_range/end" => {
-                        end = Some(epoch_to_datetime(&value, "date_range/end")?)
-                    }
-                    "feedback/policy_published/domain" => domain = Some(value),
-                    "feedback/record/row/source_ip" => {
-                        if let Some(record) = current.as_mut() {
-                            record.source_ip = value;
+            Ok(Event::Text(chunk)) => text.push_str(&chunk.xml10_content()),
+            Ok(Event::GeneralRef(reference)) => {
+                let resolved = reference
+                    .resolve_char_ref()
+                    .map_err(|error| DmarcParseError::Xml(error.to_string()))?;
+                match resolved {
+                    Some(ch) => text.push(ch),
+                    None => match quick_xml::escape::resolve_predefined_entity(&reference) {
+                        Some(entity) => text.push_str(entity),
+                        None => {
+                            return Err(DmarcParseError::Xml(format!(
+                                "unknown entity &{};",
+                                &*reference
+                            )))
                         }
-                    }
-                    "feedback/record/row/count" => {
-                        if let Some(record) = current.as_mut() {
-                            record.count = value.parse().unwrap_or(0);
-                        }
-                    }
-                    "feedback/record/row/policy_evaluated/disposition" => {
-                        if let Some(record) = current.as_mut() {
-                            record.disposition = value.to_lowercase();
-                        }
-                    }
-                    "feedback/record/row/policy_evaluated/dkim" => {
-                        if let Some(record) = current.as_mut() {
-                            record.dkim_aligned = value.eq_ignore_ascii_case("pass");
-                        }
-                    }
-                    "feedback/record/row/policy_evaluated/spf" => {
-                        if let Some(record) = current.as_mut() {
-                            record.spf_aligned = value.eq_ignore_ascii_case("pass");
-                        }
-                    }
-                    "feedback/record/identifiers/header_from" => {
-                        if let Some(record) = current.as_mut() {
-                            record.header_from = Some(value);
-                        }
-                    }
-                    "feedback/record/identifiers/envelope_from" => {
-                        if let Some(record) = current.as_mut() {
-                            record.envelope_from = Some(value);
-                        }
-                    }
-                    // first auth result wins (reports may list several)
-                    "feedback/record/auth_results/dkim/result" => {
-                        if let Some(record) = current.as_mut() {
-                            record
-                                .dkim_result
-                                .get_or_insert_with(|| value.to_lowercase());
-                        }
-                    }
-                    "feedback/record/auth_results/spf/result" => {
-                        if let Some(record) = current.as_mut() {
-                            record
-                                .spf_result
-                                .get_or_insert_with(|| value.to_lowercase());
-                        }
-                    }
-                    _ => {}
+                    },
                 }
             }
             Ok(Event::Eof) => {
@@ -243,7 +259,10 @@ fn payload_to_xml(bytes: &[u8]) -> Result<Vec<u8>, DmarcParseError> {
             .find(|&i| {
                 archive
                     .by_index(i)
-                    .map(|f| f.name().to_lowercase().ends_with(".xml"))
+                    .map(|f| {
+                        f.name()
+                            .is_ok_and(|name| name.to_lowercase().ends_with(".xml"))
+                    })
                     .unwrap_or(false)
             })
             .unwrap_or(0);
@@ -483,6 +502,35 @@ mod tests {
         assert_eq!(record.spf_result.as_deref(), Some("pass"));
         assert_eq!(record.header_from.as_deref(), Some("example.com"));
         assert_eq!(record.envelope_from.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn resolves_entity_and_character_references_inside_values() {
+        // quick-xml reports `&amp;` and `&#38;` as separate events between
+        // text chunks; the value must still come out whole and unescaped.
+        let xml = br#"<?xml version="1.0"?>
+<feedback>
+  <report_metadata>
+    <org_name>Smith &amp; Sons &#38; Co &lt;mail&gt;</org_name>
+    <report_id>r&#x2d;1</report_id>
+    <date_range><begin>1335571200</begin><end>1335657599</end></date_range>
+  </report_metadata>
+  <policy_published><domain>example.com</domain></policy_published>
+</feedback>"#;
+        let report = parse_report_xml(xml).unwrap();
+        assert_eq!(report.org_name.as_deref(), Some("Smith & Sons & Co <mail>"));
+        assert_eq!(report.report_id, "r-1");
+        assert_eq!(report.domain, "example.com");
+    }
+
+    #[test]
+    fn rejects_an_unknown_entity_reference() {
+        let xml =
+            b"<feedback><report_metadata><org_name>&bogus;</org_name></report_metadata></feedback>";
+        assert!(matches!(
+            parse_report_xml(xml),
+            Err(DmarcParseError::Xml(_))
+        ));
     }
 
     #[test]
