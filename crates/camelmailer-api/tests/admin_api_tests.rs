@@ -2200,8 +2200,9 @@ async fn spf_warns_with_the_address_when_the_record_really_does_not_authorize_us
 
 #[tokio::test]
 async fn spf_falls_back_to_the_text_check_without_a_configured_sending_address() {
-    // No IP pool: the host's egress address is not knowable here, so the
-    // endpoint keeps the behaviour it always had rather than guessing.
+    // No IP pool and no record at dns.spf_include listing addresses: the
+    // host's egress address is not knowable here, so the endpoint keeps the
+    // behaviour it always had rather than guessing.
     let dns = Arc::new(StaticDnsResolver::new());
     let spf = Arc::new(camelmailer_core::StaticSpfResolver::new());
     let store = Arc::new(MemoryStore::new());
@@ -2235,5 +2236,109 @@ async fn spf_falls_back_to_the_text_check_without_a_configured_sending_address()
     assert!(
         text.starts_with("add "),
         "expected the text-comparison advice: {text}"
+    );
+}
+
+// ------------------------------------- SPF health: declared addresses
+//
+// Without an IP pool the check evaluates the addresses this installation's
+// own SPF record (`dns.spf_include`, `spf.postal.example.com` in the default
+// config) lists. That is what lets a flattened record, which replaces the
+// include with the addresses it resolved to, read `ok`.
+
+/// An app with a full SPF resolver but no IP pool, plus a domain to check.
+async fn build_app_without_ip_pool(
+    domain: &str,
+) -> (
+    Router,
+    Arc<StaticDnsResolver>,
+    Arc<camelmailer_core::StaticSpfResolver>,
+) {
+    let dns = Arc::new(StaticDnsResolver::new());
+    let spf = Arc::new(camelmailer_core::StaticSpfResolver::new());
+    let store = Arc::new(MemoryStore::new());
+    let state = ApiState::new_with_resolver(store, Some(GLOBAL_KEY.to_string()), dns.clone())
+        .with_spf_resolver(spf.clone());
+    let app = build_router(state);
+    for (path, body) in [
+        (
+            "/api/v2/admin/organizations".to_string(),
+            json!({ "name": "Acme", "permalink": "acme" }),
+        ),
+        (
+            "/api/v2/admin/organizations/acme/servers".to_string(),
+            json!({ "name": "Mail", "permalink": "mail" }),
+        ),
+        (format!("{BASE}/domains"), json!({ "name": domain })),
+    ] {
+        request(&app, "POST", &path, Some(GLOBAL_KEY), Some(body)).await;
+    }
+    (app, dns, spf)
+}
+
+#[tokio::test]
+async fn spf_passes_for_a_flattened_record_covering_the_declared_addresses() {
+    let (app, dns, spf) = build_app_without_ip_pool("flat.example").await;
+    spf.add_txt(
+        "spf.postal.example.com",
+        "v=spf1 ip4:203.0.113.10 ip4:198.51.100.0/30 -all",
+    );
+    // The include was replaced by the addresses it resolved to, spread over a
+    // chain of records the way flattening tools publish them.
+    let record = "v=spf1 a mx include:spf0.flat.example ~all";
+    dns.add_txt("flat.example", record);
+    spf.add_txt("flat.example", record);
+    spf.add_txt(
+        "spf0.flat.example",
+        "v=spf1 ip4:192.0.2.0/24 include:spf1.flat.example -all",
+    );
+    spf.add_txt(
+        "spf1.flat.example",
+        "v=spf1 ip4:203.0.113.10 ip4:198.51.100.0/29 -all",
+    );
+
+    let check = spf_check(&app, "flat.example").await;
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(check["problems"].as_array().unwrap().is_empty(), "{check}");
+}
+
+#[tokio::test]
+async fn spf_names_a_declared_address_the_flattened_record_misses() {
+    let (app, dns, spf) = build_app_without_ip_pool("stale.example").await;
+    spf.add_txt(
+        "spf.postal.example.com",
+        "v=spf1 ip4:203.0.113.10 ip4:203.0.113.20 -all",
+    );
+    // Flattened before 203.0.113.20 was added to the include.
+    let record = "v=spf1 ip4:203.0.113.10 ~all";
+    dns.add_txt("stale.example", record);
+    spf.add_txt("stale.example", record);
+
+    let check = spf_check(&app, "stale.example").await;
+    assert_eq!(check["status"], "warning", "{check}");
+    let text = check["problems"].as_array().unwrap()[0].as_str().unwrap();
+    assert!(text.contains("does not authorize"), "{text}");
+    assert!(text.contains("sending address 203.0.113.20 "), "{text}");
+}
+
+#[tokio::test]
+async fn spf_compares_text_when_the_declared_record_is_not_only_addresses() {
+    // An include inside our own record could hide an address, so the check
+    // does not claim the domain authorizes everything we send from.
+    let (app, dns, spf) = build_app_without_ip_pool("partial.example").await;
+    spf.add_txt(
+        "spf.postal.example.com",
+        "v=spf1 ip4:203.0.113.10 include:relay.example -all",
+    );
+    let record = "v=spf1 ip4:203.0.113.10 ~all";
+    dns.add_txt("partial.example", record);
+    spf.add_txt("partial.example", record);
+
+    let check = spf_check(&app, "partial.example").await;
+    assert_eq!(check["status"], "warning", "{check}");
+    let text = check["problems"].as_array().unwrap()[0].as_str().unwrap();
+    assert!(
+        text.starts_with("add include:spf.postal.example.com"),
+        "{text}"
     );
 }

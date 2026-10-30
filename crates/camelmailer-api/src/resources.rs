@@ -611,8 +611,9 @@ enum SpfAuthorization {
     /// evaluator cannot resolve, so no claim is made. Carries the message.
     Unverifiable { reason: String },
     /// Evaluation was not possible at all: no SPF resolver is configured, or
-    /// this installation does not pin its source addresses. The caller
-    /// compares the record text instead, as it always did.
+    /// this installation neither pins its source addresses nor lists them in
+    /// its own SPF record. The caller compares the record text instead, as it
+    /// always did.
     TextFallback,
 }
 
@@ -646,14 +647,18 @@ async fn spf_authorization(
     let Some(resolver) = state.spf_resolver.as_ref() else {
         return SpfAuthorization::TextFallback;
     };
-    let (addresses, truncated) = sending_addresses(state, server).await;
+    // One memoizing wrapper for the whole batch: every address walks the
+    // same record tree, so the queries are issued once between them.
+    let memoizing = crate::dns::MemoizingSpfResolver::new(resolver.as_ref());
+    let (mut addresses, mut truncated) = sending_addresses(state, server).await;
+    if addresses.is_empty() {
+        (addresses, truncated) =
+            declared_sending_addresses(&memoizing, &state.config.dns.spf_include).await;
+    }
     if addresses.is_empty() {
         return SpfAuthorization::TextFallback;
     }
 
-    // One memoizing wrapper for the whole batch: every address walks the
-    // same record tree, so the queries are issued once between them.
-    let memoizing = crate::dns::MemoizingSpfResolver::new(resolver.as_ref());
     let mut unauthorized: Vec<std::net::IpAddr> = Vec::new();
     for address in &addresses {
         match camelmailer_core::spf::evaluate_verifiable(&memoizing, domain, *address).await {
@@ -691,7 +696,7 @@ async fn spf_authorization(
         // them. Say so rather than implying full coverage.
         return SpfAuthorization::Unverifiable {
             reason: format!(
-                "the first {MAX_SPF_CHECK_ADDRESSES} sending addresses are authorized; the pool holds more than this check evaluates"
+                "the first {MAX_SPF_CHECK_ADDRESSES} sending addresses are authorized; this installation sends from more than this check evaluates"
             ),
         };
     }
@@ -751,6 +756,77 @@ async fn sending_addresses(
                         addresses.push(address);
                     }
                 }
+            }
+        }
+    }
+    let truncated = addresses.len() > MAX_SPF_CHECK_ADDRESSES;
+    addresses.truncate(MAX_SPF_CHECK_ADDRESSES);
+    (addresses, truncated)
+}
+
+/// The addresses this installation's own SPF record declares, used when no IP
+/// pool pins the source address.
+///
+/// `dns.spf_include` names the record sending domains include to authorize
+/// this installation, so its `ip4:`/`ip6:` terms are where the installation
+/// says it sends from. A domain whose SPF is flattened (the include replaced
+/// by the addresses it resolved to) never names the include, yet authorizes
+/// those addresses all the same; evaluating them answers the question the
+/// text comparison cannot. A range contributes its first and last address.
+///
+/// Only a record made of address terms is used. Anything that needs further
+/// lookups (`include:`, `a`, `mx`, `exists:`, `redirect=`) could hide an
+/// address the domain does not authorize, so such a record, a missing one or
+/// a failed lookup yields nothing and the caller compares text instead.
+async fn declared_sending_addresses(
+    resolver: &dyn camelmailer_core::SpfResolver,
+    spf_include: &str,
+) -> (Vec<std::net::IpAddr>, bool) {
+    let nothing = (Vec::new(), false);
+    let name = spf_include.trim();
+    if name.is_empty() {
+        return nothing;
+    }
+    let Ok(records) = resolver.txt(name).await else {
+        return nothing;
+    };
+    let records: Vec<&String> = records
+        .iter()
+        .filter(|record| camelmailer_core::dmarc::is_spf_record(record))
+        .collect();
+    let [record] = records.as_slice() else {
+        return nothing;
+    };
+
+    let mut addresses: Vec<std::net::IpAddr> = Vec::new();
+    for term in record.split_whitespace().skip(1) {
+        let lower = term.to_ascii_lowercase();
+        let (authorizes, mechanism) = match lower.strip_prefix(['-', '~', '?']) {
+            Some(rest) => (false, rest),
+            None => (true, lower.strip_prefix('+').unwrap_or(&lower)),
+        };
+        if mechanism == "all" || mechanism.starts_with("exp=") {
+            continue;
+        }
+        let Some(spec) = mechanism
+            .strip_prefix("ip4:")
+            .or_else(|| mechanism.strip_prefix("ip6:"))
+        else {
+            return nothing;
+        };
+        let network = match spec.parse::<ipnet::IpNet>() {
+            Ok(network) => network,
+            Err(_) => match spec.parse::<std::net::IpAddr>() {
+                Ok(address) => ipnet::IpNet::from(address),
+                Err(_) => return nothing,
+            },
+        };
+        if !authorizes {
+            continue;
+        }
+        for address in [network.network(), network.broadcast()] {
+            if !addresses.contains(&address) {
+                addresses.push(address);
             }
         }
     }

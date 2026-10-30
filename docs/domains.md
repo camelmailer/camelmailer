@@ -185,9 +185,20 @@ verify rather than proposing an edit:
   rather than a verdict about the record.
 
 Without an IP pool the source address is whatever the host uses for outbound
-connections, which the API cannot know. The check then falls back to looking
-for this installation's mechanism in the record text and suggesting it if
-absent, which is the older, weaker behaviour.
+connections, which the API cannot know. The check then reads the record at
+`dns.spf_include`, the one sending domains include to authorize this
+installation, and evaluates the domain's policy against the addresses it lists
+(a range by its first and last address). That keeps a **flattened** record
+`ok`: tools that replace `include:` chains with the addresses they resolve to
+remove our mechanism from the text, yet still authorize every address we send
+from. When an address is missing, for example because the record was
+flattened before it was added, the warning names it.
+
+This only works when the `dns.spf_include` record consists of `ip4:`/`ip6:`
+terms. If it is missing, cannot be looked up, or contains anything that needs
+further lookups (`include:`, `a`, `mx`, `exists:`, `redirect=`), the check
+falls back to looking for this installation's mechanism in the record text and
+suggesting it if absent, which is the older, weaker behaviour.
 
 The check reads `ignored` for a domain with `check_spf` set to `false`.
 

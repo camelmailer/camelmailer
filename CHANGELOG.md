@@ -59,6 +59,14 @@ integration tests) is green.
 
 ### Changed
 
+- **SPF health check without an IP pool.** The check now evaluates the
+  domain's SPF against the addresses listed in the installation's own
+  `dns.spf_include` record instead of looking for `include:<dns.spf_include>`
+  in the text. A flattened record, which lists those addresses rather than
+  the include, now reads `ok`, and a warning names any address it misses.
+  The text comparison remains the fallback when that record is missing or
+  is not made only of `ip4:`/`ip6:` terms.
+
 - **Billing is provider neutral.** `BillingProvider` now offers customer,
   checkout, portal, optional usage view and plans, returning embed sessions
   (a web component with a token, or a link, plus optional companion
@@ -74,6 +82,18 @@ integration tests) is green.
   public-beta plan preview in the dashboard. `billing.stripe_secret_key`
   and `billing.portal_return_url` still load, are ignored, and log a
   deprecation warning.
+
+### Fixed
+
+- **SPF lookup limit counted twice.** The evaluator charged each `include:`
+  and `redirect=` two of RFC 7208's ten DNS lookups (the mechanism and the
+  TXT query it makes), also charged the initial query for the checked
+  domain, and charged every MX exchange's address lookup. A valid record
+  with `a`, `mx` and a few chained includes, the usual shape of a flattened
+  record, evaluated to `permerror` in the domain health check and in the
+  `Received-SPF` header of inbound mail. Each lookup mechanism now costs
+  one, and MX address lookups have their own limit of ten per `mx` as the
+  RFC specifies.
 
 Migrations `0047` and `0048`.
 
