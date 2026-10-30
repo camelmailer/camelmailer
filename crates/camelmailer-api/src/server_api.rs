@@ -793,7 +793,7 @@ async fn messages_send_batch(
         }
     }
 
-    let mut plan = Vec::with_capacity(messages.len());
+    let mut plan = Vec::new();
     let mut pending_recipients = 0;
     for message in messages {
         match prepare_send(&state, &server.0, message, pending_recipients).await {
@@ -3824,7 +3824,7 @@ async fn messages_send_with_template_batch(
         }
     }
 
-    let mut plan = Vec::with_capacity(messages.len());
+    let mut plan = Vec::new();
     let mut pending_recipients = 0;
     for body in messages {
         let outcome = match build_templated_message(&state, &server.0, body).await {

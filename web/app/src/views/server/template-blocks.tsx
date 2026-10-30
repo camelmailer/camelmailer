@@ -99,7 +99,15 @@ const BLOCK_LABEL: Record<BlockType, string> = Object.fromEntries(
 // ---------- serialization ----------
 
 function esc(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;")
+}
+
+/** A URL for href/src: http(s), mailto, a data: image, a relative path or a
+ * {{ placeholder }}. Anything else (javascript:, vbscript:, ...) becomes "#". */
+function safeUrl(url: string): string {
+  const u = url.trim()
+  if (/^(https?:|mailto:|data:image\/|\/|#|\{\{)/i.test(u) || !/^[a-z][a-z0-9+.-]*:/i.test(u)) return esc(u)
+  return "#"
 }
 // Keep {{ mustache }} placeholders intact but escape everything else, and turn
 // newlines into <br> for multi-line text.
@@ -114,10 +122,10 @@ function blockToHtml(block: Block): string {
     case "text":
       return `<p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#3f3f46;">${escMultiline(block.text)}</p>`
     case "button":
-      return `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:8px 0 20px;"><tr><td style="border-radius:8px;background:${esc(block.color)};"><a href="${esc(block.url)}" style="display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:8px;">${esc(block.label)}</a></td></tr></table>`
+      return `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:8px 0 20px;"><tr><td style="border-radius:8px;background:${esc(block.color)};"><a href="${safeUrl(block.url)}" style="display:inline-block;padding:12px 24px;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:8px;">${esc(block.label)}</a></td></tr></table>`
     case "image": {
-      const img = `<img src="${esc(block.src)}" alt="${esc(block.alt)}" style="display:block;width:100%;max-width:100%;border-radius:8px;margin:0 0 16px;">`
-      return block.href ? `<a href="${esc(block.href)}">${img}</a>` : img
+      const img = `<img src="${safeUrl(block.src)}" alt="${esc(block.alt)}" style="display:block;width:100%;max-width:100%;border-radius:8px;margin:0 0 16px;">`
+      return block.href ? `<a href="${safeUrl(block.href)}">${img}</a>` : img
     }
     case "list": {
       const items = block.items
@@ -131,7 +139,7 @@ function blockToHtml(block: Block): string {
     case "divider":
       return `<hr style="border:none;border-top:1px solid #e4e4e7;margin:24px 0;">`
     case "spacer":
-      return `<div style="height:${block.size}px;line-height:${block.size}px;font-size:0;">&nbsp;</div>`
+      return `<div style="height:${Number(block.size) || 0}px;line-height:${Number(block.size) || 0}px;font-size:0;">&nbsp;</div>`
     case "footer":
       return `<p style="margin:16px 0 0;font-size:12px;line-height:1.5;color:#a1a1aa;">${escMultiline(block.text)}</p>`
   }

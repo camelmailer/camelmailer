@@ -47,7 +47,15 @@ export const DEFAULT_LAYOUT: LayoutModel = {
 }
 
 function esc(v: string): string {
-  return v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  return v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;")
+}
+
+/** A URL for href/src: http(s), mailto, a data: image, a relative path or a
+ * {{ placeholder }}. Anything else (javascript:, vbscript:, ...) becomes "#". */
+function safeUrl(url: string): string {
+  const u = url.trim()
+  if (/^(https?:|mailto:|data:image\/|\/|#|\{\{)/i.test(u) || !/^[a-z][a-z0-9+.-]*:/i.test(u)) return esc(u)
+  return "#"
 }
 const escM = (v: string) => esc(v).replace(/\r?\n/g, "<br>")
 
@@ -56,7 +64,7 @@ const MARKER_RE = /<!--cm:layout:([A-Za-z0-9+/=]*)-->/
 /** Full html_wrapper document for a layout model (with round-trip marker). */
 export function layoutToWrapper(m: LayoutModel): string {
   const header = m.logo
-    ? `<img src="${m.logo}" alt="${esc(m.brand)}" style="display:block;height:${m.logoHeight}px;border:0;">`
+    ? `<img src="${safeUrl(m.logo)}" alt="${esc(m.brand)}" style="display:block;height:${Number(m.logoHeight) || 28}px;border:0;">`
     : `<span style="color:#ffffff;font-size:18px;font-weight:700;letter-spacing:.3px;">${escM(m.brand)}</span>`
   const marker = `<!--cm:layout:${btoa(encodeURIComponent(JSON.stringify(m)))}-->`
   const font = esc(m.fontFamily)

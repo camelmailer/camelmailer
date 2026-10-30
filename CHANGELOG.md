@@ -17,6 +17,16 @@ integration tests) is green.
 
 ### Security
 
+- **Template and layout builder escaping.** Values written into HTML
+  attributes (button and image links, image sources, alt text, colours,
+  fonts) now escape quotes, so a value cannot close the attribute. Link and
+  image URLs accept http(s), mailto, data images, relative paths and
+  placeholders only; `javascript:` and other schemes become `#`.
+- The digest that equalizes login timing for unknown addresses is hashed
+  from a random value per process instead of a fixed string.
+- Batch send, batch templated send and message import no longer reserve
+  memory sized by the request before validating it.
+
 - **Dashboard: Next.js 16.4.3.** The dashboard ran Next.js 16.2.10, which
   is affected by several critical advisories, among them unauthenticated
   remote code execution in the image optimizer, in `use cache` functions

@@ -2436,7 +2436,7 @@ pub(crate) async fn messages_import(
     // row is written. A per-item decode failure is deferred to the import
     // loop (reported in `failed`); the size cap rejects the whole request.
     let engine = base64::engine::general_purpose::STANDARD;
-    let mut raws: Vec<Result<Vec<u8>, String>> = Vec::with_capacity(batch.messages.len());
+    let mut raws: Vec<Result<Vec<u8>, String>> = Vec::new();
     let mut total_bytes: usize = 0;
     for item in &batch.messages {
         match engine.decode(item.raw_message_base64.as_bytes()) {
