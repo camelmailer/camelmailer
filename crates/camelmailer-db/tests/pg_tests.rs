@@ -6706,3 +6706,254 @@ async fn the_lifecycle_queue_dequeues_retries_and_completes() {
     f.store.enqueue_lifecycle_event(&event.clone()).await.ok();
     assert_eq!(queue.discard_all().await.unwrap(), 1);
 }
+
+async fn second_server(f: &PgFixtures, permalink: &str) -> camelmailer_core::Server {
+    f.store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: permalink.into(),
+            permalink: permalink.into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dequeue_takes_turns_between_servers() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let quiet = second_server(&f, "quiet").await;
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+
+    // One server queues a large send first, the other one mail after it.
+    for n in 0..50 {
+        queue
+            .enqueue(10_000 + n, f.server.id, "bulk.example")
+            .await
+            .unwrap();
+    }
+    queue
+        .enqueue(20_000, quiet.id, "reset.example")
+        .await
+        .unwrap();
+
+    // The quiet server's mail is delivered second, not 51st.
+    let first = queue.dequeue("w").await.unwrap().unwrap();
+    let second = queue.dequeue("w").await.unwrap().unwrap();
+    assert_eq!(first.server_id, f.server.id);
+    assert_eq!(second.message_id, 20_000);
+
+    // With only one server left, the queue drains in order.
+    let mut rest = Vec::new();
+    while let Some(row) = queue.dequeue("w").await.unwrap() {
+        rest.push(row.message_id);
+    }
+    assert_eq!(rest, (10_001..10_050).collect::<Vec<_>>());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dequeue_delivers_transactional_mail_before_bulk_within_a_server() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+
+    for n in 0..5 {
+        queue
+            .enqueue_with_kind(30_000 + n, f.server.id, "list.example", true)
+            .await
+            .unwrap();
+    }
+    queue
+        .enqueue_with_kind(40_000, f.server.id, "user.example", false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        queue.dequeue("w").await.unwrap().unwrap().message_id,
+        40_000
+    );
+    assert_eq!(
+        queue.dequeue("w").await.unwrap().unwrap().message_id,
+        30_000
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filtered_worker_serves_only_its_part_of_the_queue() {
+    use camelmailer_db::{QueueFilter, QueueKind};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other = second_server(&f, "other").await;
+    let all = camelmailer_db::PgQueue::new(pool.clone());
+    all.enqueue_with_kind(1, f.server.id, "a.example", false)
+        .await
+        .unwrap();
+    all.enqueue_with_kind(2, f.server.id, "a.example", true)
+        .await
+        .unwrap();
+    all.enqueue_with_kind(3, other.id, "b.example", false)
+        .await
+        .unwrap();
+
+    let only_other = camelmailer_db::PgQueue::new(pool.clone()).with_filter(QueueFilter {
+        servers: Some(vec![other.id]),
+        ..QueueFilter::default()
+    });
+    assert_eq!(
+        only_other.dequeue("w").await.unwrap().unwrap().message_id,
+        3
+    );
+    assert!(only_other.dequeue("w").await.unwrap().is_none());
+
+    let bulk_elsewhere = camelmailer_db::PgQueue::new(pool.clone()).with_filter(QueueFilter {
+        exclude_servers: vec![other.id],
+        kind: QueueKind::Bulk,
+        ..QueueFilter::default()
+    });
+    assert_eq!(
+        bulk_elsewhere
+            .dequeue("w")
+            .await
+            .unwrap()
+            .unwrap()
+            .message_id,
+        2
+    );
+    assert!(bulk_elsewhere.dequeue("w").await.unwrap().is_none());
+
+    let transactional = camelmailer_db::PgQueue::new(pool.clone()).with_filter(QueueFilter {
+        kind: QueueKind::Transactional,
+        ..QueueFilter::default()
+    });
+    assert_eq!(
+        transactional
+            .dequeue("w")
+            .await
+            .unwrap()
+            .unwrap()
+            .message_id,
+        1
+    );
+    assert!(transactional.dequeue("w").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_dequeues_never_hand_out_a_row_twice() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let other = second_server(&f, "other").await;
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    for n in 0..40 {
+        let server = if n % 2 == 0 { f.server.id } else { other.id };
+        queue
+            .enqueue(50_000 + n, server, "x.example")
+            .await
+            .unwrap();
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for worker in 0..4 {
+        let queue = queue.clone();
+        tasks.spawn(async move {
+            let mut got = Vec::new();
+            while let Some(row) = queue.dequeue(&format!("w{worker}")).await.unwrap() {
+                got.push(row.id);
+            }
+            got
+        });
+    }
+    let mut all = Vec::new();
+    while let Some(got) = tasks.join_next().await {
+        all.extend(got.unwrap());
+    }
+    all.sort_unstable();
+    let before = all.len();
+    all.dedup();
+    assert_eq!(all.len(), before, "a row was dequeued twice");
+    assert_eq!(all.len(), 40);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broadcast_and_campaign_mail_is_queued_as_bulk() {
+    use camelmailer_core::{NewStream, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let broadcast = ServerStore::create_stream(
+        &f.store,
+        NewStream {
+            server_id: f.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let sink = PgMessageSink::new(f.store.clone());
+    let transactional = sink
+        .insert_message(&message_for(f.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let newsletter = sink
+        .insert_message(&QueuedMessage {
+            stream_id: Some(broadcast.id),
+            ..message_for(f.server.id, "list@dest.example")
+        })
+        .await
+        .unwrap();
+    let campaign = sink
+        .insert_message(&message_for(f.server.id, "campaign@dest.example"))
+        .await
+        .unwrap();
+    ServerStore::set_message_campaign(&f.store, f.server.id, campaign, 7)
+        .await
+        .unwrap();
+
+    let bulk = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT bulk FROM queued_messages WHERE message_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert!(!bulk(transactional).await);
+    assert!(bulk(newsletter).await);
+    assert!(bulk(campaign).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_scope_permalinks_resolve_or_fail_loudly() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+
+    let ids = camelmailer_db::resolve_server_permalinks(
+        &pool,
+        &["example-org/example-server".to_string()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids, vec![f.server.id]);
+    assert!(
+        camelmailer_db::resolve_server_permalinks(&pool, &["example-org/nope".to_string()])
+            .await
+            .is_err()
+    );
+    assert!(
+        camelmailer_db::resolve_server_permalinks(&pool, &["no-slash".to_string()])
+            .await
+            .is_err()
+    );
+}

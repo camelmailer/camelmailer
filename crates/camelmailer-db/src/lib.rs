@@ -27,7 +27,7 @@ pub use pg_store::{
     BounceCorrelationOutcome, BounceOriginal, Delivery, FeedbackComplaint,
     FeedbackComplaintOutcome, OutboundQueueAction, PgMessageSink, PgStore, StoredMessage,
 };
-pub use queue::{PgQueue, QueuedMessageRow};
+pub use queue::{resolve_server_permalinks, PgQueue, QueueFilter, QueueKind, QueuedMessageRow};
 pub use retention::{RetentionReport, RetentionTarget};
 pub use webhook_queue::{PgWebhookQueue, WebhookLogEntry, WebhookRequestRow};
 

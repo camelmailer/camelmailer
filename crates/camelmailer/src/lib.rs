@@ -407,11 +407,52 @@ pub async fn worker() -> std::io::Result<()> {
             "the worker requires PostgreSQL (postgres.enabled: true or DATABASE_URL)",
         ));
     }
+    let settings = config
+        .worker
+        .with_env_overrides()
+        .map_err(std::io::Error::other)?;
     let store = connect_pg(&config).await?;
-    Worker::new(&config, store)
+    let filter = worker_queue_filter(&store, &settings)
+        .await
+        .map_err(std::io::Error::other)?;
+    tracing::info!(
+        servers = ?settings.servers,
+        exclude_servers = ?settings.exclude_servers,
+        deliver = ?settings.deliver,
+        "worker delivery scope"
+    );
+    Arc::new(Worker::new(&config, store).with_delivery(filter, settings.threads))
         .run()
         .await
         .map_err(std::io::Error::other)
+}
+
+/// The part of the queue this worker serves, from `worker.servers`,
+/// `worker.exclude_servers` and `worker.deliver`.
+async fn worker_queue_filter(
+    store: &camelmailer_db::PgStore,
+    settings: &camelmailer_config::Worker,
+) -> Result<camelmailer_db::QueueFilter, String> {
+    let servers = if settings.servers.is_empty() {
+        None
+    } else {
+        Some(camelmailer_db::resolve_server_permalinks(store.pool(), &settings.servers).await?)
+    };
+    Ok(camelmailer_db::QueueFilter {
+        servers,
+        exclude_servers: camelmailer_db::resolve_server_permalinks(
+            store.pool(),
+            &settings.exclude_servers,
+        )
+        .await?,
+        kind: match settings.deliver {
+            camelmailer_config::WorkerDeliver::All => camelmailer_db::QueueKind::All,
+            camelmailer_config::WorkerDeliver::Transactional => {
+                camelmailer_db::QueueKind::Transactional
+            }
+            camelmailer_config::WorkerDeliver::Bulk => camelmailer_db::QueueKind::Bulk,
+        },
+    })
 }
 
 pub async fn smtp_server() -> std::io::Result<()> {
