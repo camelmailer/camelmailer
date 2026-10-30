@@ -55,6 +55,12 @@ export function count(value: number): string {
 
 /// "1 message" / "4 messages", for the sentences the attention strip
 /// builds out of counters.
+/// The first few names of a selection, then how many more.
+export function listed(names: string[], shown = 8) {
+  if (names.length <= shown) return names.join(", ")
+  return `${names.slice(0, shown).join(", ")} and ${names.length - shown} more`
+}
+
 export function plural(value: number, singular: string, plural = `${singular}s`): string {
   return `${value.toLocaleString("en-US")} ${value === 1 ? singular : plural}`
 }

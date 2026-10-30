@@ -22,6 +22,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { adminApi, ApiError, type User } from "@/lib/api"
+import { listed, plural } from "@/views/admin/volume"
 
 type UserRow = User & { name: string }
 
@@ -35,6 +36,7 @@ export default function Users() {
   const [password, setPassword] = useState("")
   const [isAdmin, setIsAdmin] = useState(false)
   const [deleteId, setDeleteId] = useState<number | null>(null)
+  const [bulk, setBulk] = useState<{ rows: UserRow[]; done: () => void } | null>(null)
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["admin", "users"] })
 
@@ -159,6 +161,17 @@ export default function Users() {
           ]}
           fillHeight
           initialPageSize={20}
+          getRowId={(row) => String(row.id)}
+          bulkActions={(selected, clear) => (
+            <Button
+              variant="destructive"
+              size="sm"
+              className="h-7"
+              onClick={() => setBulk({ rows: selected, done: clear })}
+            >
+              <Trash2Icon className="size-4" /> Delete
+            </Button>
+          )}
         />
       </div>
 
@@ -223,6 +236,38 @@ export default function Users() {
           } catch (err) {
             toast.error(err instanceof ApiError ? err.message : "Could not delete the user")
           }
+        }}
+      />
+
+      <ConfirmDialog
+        open={bulk !== null}
+        onOpenChange={(open) => !open && setBulk(null)}
+        title={`Delete ${plural(bulk?.rows.length ?? 0, "user")}?`}
+        description={
+          bulk
+            ? `Removes the accounts with their sessions and memberships: ${listed(
+                bulk.rows.map((row) => row.email_address),
+              )}.`
+            : ""
+        }
+        confirmWord={bulk ? `delete ${bulk.rows.length}` : undefined}
+        confirmLabel="Delete users"
+        onConfirm={async () => {
+          if (!bulk) return
+          // One by one, so a failure names the account and the rest go through.
+          const failed: string[] = []
+          for (const row of bulk.rows) {
+            try {
+              await adminApi.users.delete(row.id)
+            } catch {
+              failed.push(row.email_address)
+            }
+          }
+          invalidate()
+          const deleted = bulk.rows.length - failed.length
+          if (deleted > 0) toast.success(`Deleted ${plural(deleted, "user")}.`)
+          if (failed.length > 0) toast.error(`Could not delete ${failed.join(", ")}.`)
+          bulk.done()
         }}
       />
     </Page>
