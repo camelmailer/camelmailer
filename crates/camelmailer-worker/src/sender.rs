@@ -175,15 +175,24 @@ impl SmtpSender {
         // `xn--mnchen-3ya.de` form.
         let domain = to_ascii_domain(domain);
         let domain = domain.as_str();
-        match hickory_resolver::TokioAsyncResolver::tokio_from_system_conf() {
+        let resolver =
+            hickory_resolver::TokioResolver::builder_tokio().and_then(|builder| builder.build());
+        match resolver {
             Ok(resolver) => match resolver.mx_lookup(format!("{domain}.")).await {
                 Ok(lookup) => {
-                    let mut records: Vec<_> = lookup.iter().collect();
-                    records.sort_by_key(|mx| mx.preference());
+                    let mut records: Vec<_> = lookup
+                        .answers()
+                        .iter()
+                        .filter_map(|record| match &record.data {
+                            hickory_resolver::proto::rr::RData::MX(mx) => Some(mx),
+                            _ => None,
+                        })
+                        .collect();
+                    records.sort_by_key(|mx| mx.preference);
                     let endpoints: Vec<Endpoint> = records
                         .iter()
                         .map(|mx| {
-                            Endpoint::mx(mx.exchange().to_utf8().trim_end_matches('.').to_string())
+                            Endpoint::mx(mx.exchange.to_utf8().trim_end_matches('.').to_string())
                         })
                         .collect();
                     if endpoints.is_empty() {
