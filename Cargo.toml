@@ -58,7 +58,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 base64 = "0.22"
 mail-builder = "0.4"
-mailparse = "0.16"
+mailparse = "0.18"
 rand = "0.8"
 hmac = "0.12"
 md-5 = "0.10"
