@@ -43,8 +43,9 @@ pub fn public_key_from_certificate_pem(pem: &str) -> Result<RsaPublicKey, String
     let der = pem_block(pem, "CERTIFICATE")?;
     let certificate = <x509_cert::Certificate as x509_cert::der::Decode>::from_der(&der)
         .map_err(|error| format!("invalid X.509 certificate: {error}"))?;
-    let spki = x509_cert::der::Encode::to_der(&certificate.tbs_certificate.subject_public_key_info)
-        .map_err(|error| format!("invalid certificate key: {error}"))?;
+    let spki =
+        x509_cert::der::Encode::to_der(certificate.tbs_certificate().subject_public_key_info())
+            .map_err(|error| format!("invalid certificate key: {error}"))?;
     RsaPublicKey::from_public_key_der(&spki)
         .map_err(|error| format!("the certificate does not carry an RSA key: {error}"))
 }
@@ -395,7 +396,7 @@ mod tests {
 
     fn test_key() -> &'static RsaPrivateKey {
         static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-        KEY.get_or_init(|| RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap())
+        KEY.get_or_init(|| RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap())
     }
 
     fn c14n_str(xml: &str) -> String {
@@ -520,7 +521,7 @@ mod tests {
     fn a_foreign_key_fails_the_signature() {
         let xml = signed_document(false);
         let doc = Document::parse(&xml).unwrap();
-        let other = RsaPrivateKey::new(&mut rand::thread_rng(), 2048)
+        let other = RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)
             .unwrap()
             .to_public_key();
         let error = verify_enveloped_signature(&doc, doc.root_element(), &other).unwrap_err();

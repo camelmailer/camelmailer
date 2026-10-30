@@ -8,7 +8,7 @@ use camelmailer_core::{
 };
 use camelmailer_db::{PgMessageSink, PgQueue, PgStore};
 use camelmailer_worker::{ProcessOutcome, Worker};
-use rand::Rng;
+use rand::RngExt;
 use sqlx::{PgPool, Postgres};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -32,9 +32,9 @@ macro_rules! require_db {
 
 async fn test_pool_with_connections(base: &str, max_connections: u32) -> PgPool {
     let name: String = {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..12)
-            .map(|_| char::from(b'a' + rng.gen_range(0..26)))
+            .map(|_| char::from(b'a' + rng.random_range(0..26)))
             .collect()
     };
     let db_name = format!("cm_test_{name}");
@@ -2731,7 +2731,7 @@ async fn mock_starttls_smtp() -> MockTlsSmtp {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
     let key =
-        rustls::pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
+        rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()

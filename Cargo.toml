@@ -28,19 +28,19 @@ argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
 hickory-resolver = "0.26"
 idna = "1"
-jsonwebtoken = { version = "9", default-features = false }
-rcgen = "0.13"
-roxmltree = "0.20"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+rcgen = "0.14"
+roxmltree = "0.21"
 flate2 = "1"
-x509-cert = "0.2"
+x509-cert = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rsa = { version = "0.9", features = ["sha2"] }
 sha1 = "0.10"
 sha2 = "0.10"
-tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+tower-http = { version = "0.7", default-features = false, features = ["cors"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 # 0.6.x is the first webauthn-rs line with pure-Rust crypto (crypto-glue) —
 # the 0.5.x releases require OpenSSL, which this workspace deliberately
 # avoids (rustls everywhere). Pinned exactly because it is a -dev release.
@@ -56,10 +56,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-base64 = "0.22"
-mail-builder = "0.4"
-mailparse = "0.16"
-rand = "0.8"
+base64 = "0.23"
+mail-builder = "2"
+mailparse = "0.18"
+rand = "0.10"
 hmac = "0.12"
 md-5 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

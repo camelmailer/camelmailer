@@ -1,16 +1,16 @@
 //! Random token / identifier generation (ports the `Nifty::Utils::RandomString`
 //! and `SecureRandom` usage scattered through the Ruby app).
 
-use rand::Rng;
+use rand::RngExt;
 
 const ALPHANUMERIC: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const LOWER_ALPHANUMERIC: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 const HEX: &[u8] = b"0123456789abcdef";
 
 fn random_string(charset: &[u8], length: usize) -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..length)
-        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .map(|_| charset[rng.random_range(0..charset.len())] as char)
         .collect()
 }
 
@@ -43,7 +43,7 @@ pub fn generate_hex(length: usize) -> String {
 
 /// A UUID v4 string.
 pub fn generate_uuid() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut bytes = [0u8; 16];
     rng.fill(&mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

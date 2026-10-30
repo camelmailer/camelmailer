@@ -15,6 +15,14 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependencies.** Major upgrades of base64 0.23, tower-http 0.7,
+  mail-builder 2, webpki-roots 1, mailparse 0.18, roxmltree 0.21,
+  jsonwebtoken 11 (pure-Rust `rust_crypto` backend), rand 0.10,
+  x509-cert 0.3 and rcgen 0.14 (tests only). The Docker builder image moves
+  to Rust 1.98, matching `rust-toolchain.toml`.
+
 ## [0.10.1] - 2026-10-30
 
 ### Security

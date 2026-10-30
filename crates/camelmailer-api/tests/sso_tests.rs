@@ -24,7 +24,7 @@ use tower::ServiceExt;
 /// One RSA key for the whole test binary (keygen is slow in debug builds).
 fn idp_key() -> &'static RsaPrivateKey {
     static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-    KEY.get_or_init(|| RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap())
+    KEY.get_or_init(|| RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap())
 }
 
 fn sign_id_token(claims: &Value) -> String {
