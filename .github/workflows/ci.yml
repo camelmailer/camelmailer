@@ -13,6 +13,10 @@ on:
     branches: [main]
   pull_request:
 
+# Jobs only read the repository. A job that needs more asks for it.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -20,11 +24,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # The SDKs are written from the OpenAPI spec, so a route that never
@@ -52,9 +56,9 @@ jobs:
     env:
       CAMELMAILER_TEST_DATABASE_URL: postgres://camelmailer_tests:camelmailer_tests@localhost:5432/camelmailer_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The bootstrap user of the postgres image is a superuser, and
       # superusers bypass row-level security no matter what — the RLS
       # tests must run as a plain role (CREATEDB for the throwaway
@@ -65,12 +69,23 @@ jobs:
           -c "CREATE ROLE camelmailer_tests LOGIN PASSWORD 'camelmailer_tests' NOSUPERUSER CREATEDB;"
       - run: cargo test --workspace
 
+  # Known vulnerabilities (RustSec), licenses outside the allow list and
+  # crates from anywhere but crates.io fail the pull request. Rules in
+  # deny.toml.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses bans sources
+
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: false
@@ -88,20 +103,23 @@ jobs:
       run:
         working-directory: web/app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # `defaults.run.working-directory` applies to `run:` steps only, not to
       # action inputs, so the version has to be pointed at explicitly: the
       # `packageManager` field lives in web/app, and the repository root has
       # no package.json for the action to read.
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           package_json_file: web/app/package.json
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: web/app/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      # Known vulnerabilities of high or critical severity in the packages
+      # the dashboard ships with. Dev tooling is left to Dependabot.
+      - run: pnpm audit --prod --audit-level high
       - run: npx tsc --noEmit
       - run: pnpm test
       - run: pnpm run lint
@@ -114,9 +132,9 @@ jobs:
   web-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: web/app
           push: false
