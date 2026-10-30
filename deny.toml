@@ -8,7 +8,19 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Advisories without a fixed release. Each entry names why it is accepted and
+# what clears it; review on every release.
+ignore = [
+    # rsa (Marvin timing side channel): no fixed release, 0.10 is a release
+    # candidate. Used for DKIM signing and JWT; revisit when rsa 0.10 ships.
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release yet" },
+    # crypto-bigint 0.5 via webauthn-rs -> crypto-glue 0.1 -> elliptic-curve
+    # 0.13. Clears when webauthn-rs moves to crypto-glue 0.2.
+    { id = "RUSTSEC-2026-0387", reason = "pinned by webauthn-rs, no upgrade path" },
+    # unsafe-libyaml (unmaintained) via serde_yaml. Replacing serde_yaml
+    # changes public config types, planned as its own change.
+    { id = "RUSTSEC-2024-0449", reason = "serde_yaml replacement planned separately" },
+]
 
 [licenses]
 version = 2
