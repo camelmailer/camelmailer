@@ -17,6 +17,15 @@ integration tests) is green.
 
 ### Security
 
+- **Dashboard: Next.js 16.4.3.** The dashboard ran Next.js 16.2.10, which
+  is affected by several critical advisories, among them unauthenticated
+  remote code execution in the image optimizer, in `use cache` functions
+  and in `next/og`, plus server-side request forgery and denial of
+  service in Server Actions. Transitive packages with high severity
+  advisories (postcss, sharp, nanoid, browserslist, source-map-js) are
+  updated too. Self-hosted installations should upgrade the dashboard
+  image.
+
 - **Dependencies with RustSec advisories upgraded.** `cargo deny check
   advisories` no longer reports these:
   - `zip` 2 to 9 (RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369).
