@@ -36,6 +36,28 @@ integration tests) is green.
   updated too. Self-hosted installations should upgrade the dashboard
   image.
 
+- **Dependencies with RustSec advisories upgraded.** `cargo deny check
+  advisories` no longer reports these:
+  - `zip` 2 to 9 (RUSTSEC-2026-0367, RUSTSEC-2026-0368, RUSTSEC-2026-0369).
+    The worker only reads DMARC report archives into memory and never calls
+    the affected `extract` APIs, but the vulnerable code is gone either way.
+  - `quick-xml` 0.37 to 0.42 (RUSTSEC-2026-0194, RUSTSEC-2026-0195). The
+    DMARC aggregate-report parser handles attacker-controlled XML. It now
+    collects an element's text across the separate entity-reference events
+    the new version emits, so `&amp;` and `&#38;` inside a value still
+    resolve, and an unknown entity is rejected as malformed XML.
+  - `hickory-resolver` 0.24 to 0.26 (`hickory-proto`, RUSTSEC-2026-0119).
+    Domain verification, the SPF health check, inbound SPF and MX lookup
+    in the worker are adapted to the new resolver API. Behaviour is
+    unchanged: "no such record" is still an empty answer, and domain
+    verification still falls back to Google's public resolvers when the
+    system resolver configuration cannot be read.
+  - `rustls-pemfile` (unmaintained, RUSTSEC-2025-0134) is removed. The SMTP
+    server reads its certificate chain and private key through
+    `rustls::pki_types::pem::PemObject` instead.
+  - `rustls`, `rustls-webpki`, `tokio` and `spin` are updated to patched
+    releases in `Cargo.lock`.
+
 ## [0.10.0] - 2026-10-30
 
 ### Added

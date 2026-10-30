@@ -1,0 +1,49 @@
+# cargo-deny: checked in CI (`cargo deny check`). Fails the build on a known
+# vulnerability (RustSec), a license outside the allow list, or a crate from
+# anywhere but crates.io.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Advisories without a fixed release. Each entry names why it is accepted and
+# what clears it; review on every release.
+ignore = [
+    # rsa (Marvin timing side channel): no fixed release, 0.10 is a release
+    # candidate. Used for DKIM signing and JWT; revisit when rsa 0.10 ships.
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release yet" },
+    # crypto-bigint 0.5 via webauthn-rs -> crypto-glue 0.1 -> elliptic-curve
+    # 0.13. Clears when webauthn-rs moves to crypto-glue 0.2.
+    { id = "RUSTSEC-2026-0387", reason = "pinned by webauthn-rs, no upgrade path" },
+    # unsafe-libyaml (unmaintained) via serde_yaml. Replacing serde_yaml
+    # changes public config types, planned as its own change.
+    { id = "RUSTSEC-2024-0449", reason = "serde_yaml replacement planned separately" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

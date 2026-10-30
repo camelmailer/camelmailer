@@ -11,6 +11,8 @@
 use crate::session::{Reply, Session, SessionConfig, State};
 use camelmailer_config::SmtpListenerMode;
 use camelmailer_core::{MessageSink, Store};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -88,20 +90,29 @@ fn load_tls_acceptor(
     // rustls needs a process-wide crypto provider; installing twice is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let certificates = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(
-        certificate_path,
-    )?))
-    .collect::<Result<Vec<_>, _>>()?;
-    let private_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        std::fs::File::open(private_key_path)?,
-    ))?
-    .ok_or_else(|| std::io::Error::other("no private key found in the TLS key file"))?;
+    let certificates = CertificateDer::pem_file_iter(certificate_path)
+        .map_err(pem_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(pem_error)?;
+    let private_key = PrivateKeyDer::from_pem_file(private_key_path).map_err(pem_error)?;
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)
         .map_err(std::io::Error::other)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Map a PEM parsing failure onto `io::Error`, keeping a real I/O error (a
+/// missing or unreadable file) as it is.
+fn pem_error(error: rustls::pki_types::pem::Error) -> std::io::Error {
+    match error {
+        rustls::pki_types::pem::Error::Io(error) => error,
+        rustls::pki_types::pem::Error::NoItemsFound => {
+            std::io::Error::other("no private key found in the TLS key file")
+        }
+        other => std::io::Error::other(other.to_string()),
+    }
 }
 
 /// Modification times of the certificate and key, the signal that a renewal
