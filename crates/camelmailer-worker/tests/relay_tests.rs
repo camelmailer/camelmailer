@@ -20,7 +20,7 @@ fn self_signed_acceptor() -> TlsAcceptor {
     let certified = rcgen::generate_simple_self_signed(vec!["relay.example".into()]).unwrap();
     let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
     let key =
-        rustls::pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
+        rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der()).unwrap();
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)

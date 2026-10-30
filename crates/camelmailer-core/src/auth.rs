@@ -104,9 +104,9 @@ pub fn base32_decode(encoded: &str) -> Option<Vec<u8>> {
 
 /// A fresh 160-bit TOTP secret, base32-encoded for authenticator apps.
 pub fn generate_totp_secret() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 20];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base32_encode(&bytes)
 }
 

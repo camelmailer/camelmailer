@@ -14,7 +14,7 @@ use camelmailer_core::{
     Store, StoreSendOutcome, TrackingStore, TrackingTarget,
 };
 use camelmailer_db::{PgMessageSink, PgStore};
-use rand::Rng;
+use rand::RngExt;
 use sqlx::{PgPool, Postgres, Row};
 
 fn base_url() -> Option<String> {
@@ -106,9 +106,9 @@ async fn sweep_stale_test_databases(base: &str) {
 async fn test_pool_with_connections(base: &str, max_connections: u32) -> PgPool {
     sweep_stale_test_databases(base).await;
     let name: String = {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..12)
-            .map(|_| char::from(b'a' + rng.gen_range(0..26)))
+            .map(|_| char::from(b'a' + rng.random_range(0..26)))
             .collect()
     };
     // The creation time is part of the name so the sweep above can judge age

@@ -23,7 +23,7 @@ fn write_cert_for(directory: &std::path::Path, dns_name: &str) -> (String, Strin
     let cert_path = directory.join("smtp.cert");
     let key_path = directory.join("smtp.key");
     std::fs::write(&cert_path, certified.cert.pem()).unwrap();
-    std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
     (
         cert_path.to_string_lossy().into_owned(),
         key_path.to_string_lossy().into_owned(),

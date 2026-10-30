@@ -28,7 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use camelmailer_core::{Id, NewWebAuthnCredential, WebAuthnCredential};
 use chrono::{Duration, Utc};
-use rand::RngCore;
+use rand::Rng;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -473,7 +473,7 @@ fn fake_request_options(state: &ApiState, email: &str) -> Value {
             .map(|key| AsRef::<[u8]>::as_ref(&key).to_vec())
             .unwrap_or_else(|_| {
                 let mut bytes = vec![0u8; 32];
-                rand::thread_rng().fill_bytes(&mut bytes);
+                rand::rng().fill_bytes(&mut bytes);
                 bytes
             })
     });
@@ -481,7 +481,7 @@ fn fake_request_options(state: &ApiState, email: &str) -> Value {
         .and_then(|generator| generator.generate(email.to_lowercase().as_bytes()))
         .unwrap_or_default();
     let mut challenge = vec![0u8; 32];
-    rand::thread_rng().fill_bytes(&mut challenge);
+    rand::rng().fill_bytes(&mut challenge);
     let options = RequestChallengeResponse {
         public_key: PublicKeyCredentialRequestOptions {
             challenge,

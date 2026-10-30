@@ -25,13 +25,13 @@ const AUDIENCE: &str = "https://postal.example.com";
 /// One RSA key for the whole test binary (keygen is slow in debug builds).
 fn idp_key() -> &'static RsaPrivateKey {
     static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-    KEY.get_or_init(|| RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap())
+    KEY.get_or_init(|| RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap())
 }
 
 /// A different key whose signatures must be rejected.
 fn foreign_key() -> &'static RsaPrivateKey {
     static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-    KEY.get_or_init(|| RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap())
+    KEY.get_or_init(|| RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap())
 }
 
 /// Self-signed X.509 certificate for `idp_key()`, as configured PEM.

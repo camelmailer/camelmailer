@@ -37,6 +37,11 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Odd Node majors are never LTS. Move node by hand to the next even
+    # (LTS) release instead of following every major Dependabot sees.
+    ignore:
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
     groups:
       docker:
         patterns: ["*"]
