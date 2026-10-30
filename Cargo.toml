@@ -29,7 +29,7 @@ async-trait = "0.1"
 hickory-resolver = "0.26"
 idna = "1"
 jsonwebtoken = { version = "9", default-features = false }
-rcgen = "0.13"
+rcgen = "0.14"
 roxmltree = "0.20"
 flate2 = "1"
 x509-cert = "0.2"
