@@ -43,11 +43,13 @@ pub(crate) struct CurrentUser {
     pub(crate) token_hash: String,
 }
 
-/// A stable Argon2 digest used to equalize the timing of logins against
-/// unknown email addresses (user enumeration hardening).
+/// An Argon2 digest used to equalize the timing of logins against unknown
+/// email addresses (user enumeration hardening). Hashed from a random value
+/// once per process, so no password is ever known to match it.
 fn dummy_digest() -> &'static str {
     static DIGEST: OnceLock<String> = OnceLock::new();
-    DIGEST.get_or_init(|| auth::hash_password("timing-equalization-dummy").unwrap())
+    DIGEST
+        .get_or_init(|| auth::hash_password(&camelmailer_core::token::generate_token(32)).unwrap())
 }
 
 fn auth_store(state: &ApiState) -> Option<&Arc<dyn AuthStore>> {
