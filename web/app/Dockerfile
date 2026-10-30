@@ -11,7 +11,7 @@
 #
 # Build context: this directory (web/app).
 
-FROM node:22-alpine AS build
+FROM node:25-alpine AS build
 WORKDIR /app
 RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
@@ -21,7 +21,7 @@ ARG API_PROXY_URL=http://web:5000
 ENV API_PROXY_URL=$API_PROXY_URL
 RUN pnpm run build
 
-FROM node:22-alpine
+FROM node:25-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 RUN corepack enable

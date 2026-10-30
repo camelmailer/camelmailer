@@ -8,7 +8,7 @@
 # native libraries are required at build or run time.
 
 # --------------------------------------------------------------- builder
-FROM rust:1.94-slim AS builder
+FROM rust:1.98-slim AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
