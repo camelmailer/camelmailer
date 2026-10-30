@@ -15,6 +15,12 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Sign-up captcha.** The captcha spans the full form width and is always
+  English, like the rest of the dashboard, instead of following the browser
+  language.
+
 ## [0.10.3] - 2026-10-30
 
 ### Fixed
