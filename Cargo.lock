@@ -363,7 +363,7 @@ version = "0.10.1"
 dependencies = [
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "camelmailer-config",
  "camelmailer-core",
  "chrono",
@@ -408,7 +408,7 @@ version = "0.10.1"
 dependencies = [
  "argon2",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "hmac 0.12.1",
  "ipnet",
@@ -427,7 +427,7 @@ name = "camelmailer-db"
 version = "0.10.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "camelmailer-config",
  "camelmailer-core",
  "camelmailer-smtp",
@@ -446,7 +446,7 @@ name = "camelmailer-smtp"
 version = "0.10.1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "camelmailer-config",
  "camelmailer-core",
  "chrono",
@@ -466,7 +466,7 @@ name = "camelmailer-worker"
 version = "0.10.1"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "camelmailer-api",
  "camelmailer-config",
  "camelmailer-core",

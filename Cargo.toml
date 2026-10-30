@@ -56,7 +56,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 mail-builder = "0.4"
 mailparse = "0.16"
 rand = "0.8"
