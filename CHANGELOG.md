@@ -15,6 +15,18 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Fixed
+
+- **SPF lookup limit counted twice.** The evaluator charged each `include:`
+  and `redirect=` two of RFC 7208's ten DNS lookups (the mechanism and the
+  TXT query it makes), also charged the initial query for the checked
+  domain, and charged every MX exchange's address lookup. A valid record
+  with `a`, `mx` and a few chained includes, the usual shape of a flattened
+  record, evaluated to `permerror` in the domain health check and in the
+  `Received-SPF` header of inbound mail. Each lookup mechanism now costs
+  one, and MX address lookups have their own limit of ten per `mx` as the
+  RFC specifies.
+
 ## [0.9.1] - 2026-10-23
 
 ### Fixed
