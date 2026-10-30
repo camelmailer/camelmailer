@@ -15,6 +15,17 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Security
+
+- **Dashboard: Next.js 16.4.3.** The dashboard ran Next.js 16.2.10, which
+  is affected by several critical advisories, among them unauthenticated
+  remote code execution in the image optimizer, in `use cache` functions
+  and in `next/og`, plus server-side request forgery and denial of
+  service in Server Actions. Transitive packages with high severity
+  advisories (postcss, sharp, nanoid, browserslist, source-map-js) are
+  updated too. Self-hosted installations should upgrade the dashboard
+  image.
+
 ## [0.10.0] - 2026-10-30
 
 ### Added
