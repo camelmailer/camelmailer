@@ -34,6 +34,7 @@ import {
   bounceShare,
   count,
   FLAG_LABELS,
+  listed,
   flags,
   plural,
   windowDescription,
@@ -131,6 +132,9 @@ export default function Organizations() {
   const queryClient = useQueryClient()
   const [range, setRange] = useState<VolumeWindow>("day")
   const [deleting, setDeleting] = useState<OrganizationVolume | null>(null)
+  const [bulk, setBulk] = useState<{ rows: OrganizationVolume[]; done: () => void } | null>(
+    null,
+  )
 
   const overview = useQuery({
     queryKey: ["admin", "overview"],
@@ -150,6 +154,24 @@ export default function Organizations() {
   })
 
   const rows: OrganizationVolume[] = overview.data?.overview.organizations ?? []
+
+  // One request per organization, one after the other, so a failure names
+  // the organization it belongs to and the rest still go through.
+  const removeMany = async (targets: OrganizationVolume[]) => {
+    const failed: string[] = []
+    for (const target of targets) {
+      try {
+        await adminApi.organizations.delete(target.permalink)
+      } catch {
+        failed.push(target.permalink)
+      }
+    }
+    queryClient.invalidateQueries({ queryKey: ["admin", "overview"] })
+    queryClient.invalidateQueries({ queryKey: ["admin", "organizations"] })
+    const deleted = targets.length - failed.length
+    if (deleted > 0) toast.success(`Deleted ${plural(deleted, "organization")}.`)
+    if (failed.length > 0) toast.error(`Could not delete ${failed.join(", ")}.`)
+  }
 
   const columns: ColumnDef<OrganizationVolume>[] = [
     {
@@ -358,6 +380,17 @@ export default function Organizations() {
             ]}
             fillHeight
             initialPageSize={20}
+            getRowId={(row) => row.permalink}
+            bulkActions={(selected, clear) => (
+              <Button
+                variant="destructive"
+                size="sm"
+                className="h-7"
+                onClick={() => setBulk({ rows: selected, done: clear })}
+              >
+                <Trash2Icon className="size-4" /> Delete
+              </Button>
+            )}
           />
         </div>
       </div>
@@ -375,6 +408,29 @@ export default function Organizations() {
         confirmLabel="Delete organization"
         onConfirm={async () => {
           if (deleting) await remove.mutateAsync(deleting.permalink)
+        }}
+      />
+
+      <ConfirmDialog
+        open={bulk !== null}
+        onOpenChange={(open) => !open && setBulk(null)}
+        title={`Delete ${plural(bulk?.rows.length ?? 0, "organization")}?`}
+        description={
+          bulk
+            ? `This removes ${plural(
+                bulk.rows.reduce((sum, row) => sum + row.servers, 0),
+                "server",
+              )} with every domain, credential and message: ${listed(
+                bulk.rows.map((row) => row.permalink),
+              )}. It cannot be undone.`
+            : ""
+        }
+        confirmWord={bulk ? `delete ${bulk.rows.length}` : undefined}
+        confirmLabel="Delete organizations"
+        onConfirm={async () => {
+          if (!bulk) return
+          await removeMany(bulk.rows)
+          bulk.done()
         }}
       />
     </Page>

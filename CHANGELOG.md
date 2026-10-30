@@ -15,6 +15,14 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Bulk delete in the admin lists.** Organizations and users can be
+  selected with checkboxes (or a whole page at once, after search and
+  filters) and deleted together behind one confirmation. Each deletion
+  is its own request, so a failure names the entry and the rest go
+  through.
+
 ### Changed
 
 - **Dependencies.** Major upgrades of base64 0.23, tower-http 0.7,

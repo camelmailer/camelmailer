@@ -15,6 +15,7 @@ import {
   type ColumnFiltersState,
   type Header,
   type RowData,
+  type RowSelectionState,
   type SortingState,
   flexRender,
   getCoreRowModel,
@@ -31,6 +32,7 @@ import {
   ChevronsUpDownIcon,
   ListFilterIcon,
   SearchIcon,
+  XIcon,
 } from "lucide-react"
 
 import { cn } from "@/lib/utils"
@@ -73,6 +75,36 @@ export type DataTableFilter = {
 
 const PAGE_SIZES = [10, 20, 50, 100]
 
+/** A native checkbox that can also show the mixed state, which only exists
+ *  as a DOM property. */
+function SelectBox({
+  checked,
+  indeterminate = false,
+  onChange,
+  label,
+}: {
+  checked: boolean
+  indeterminate?: boolean
+  onChange: (checked: boolean) => void
+  label: string
+}) {
+  const ref = React.useRef<HTMLInputElement>(null)
+  React.useEffect(() => {
+    if (ref.current) ref.current.indeterminate = indeterminate
+  }, [indeterminate])
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      aria-label={label}
+      className="size-4 cursor-pointer accent-primary align-middle"
+      checked={checked}
+      onChange={(e) => onChange(e.target.checked)}
+      onClick={(e) => e.stopPropagation()}
+    />
+  )
+}
+
 export function DataTable<TData, TValue>({
   columns,
   data,
@@ -85,6 +117,8 @@ export function DataTable<TData, TValue>({
   initialPageSize = 10,
   actions,
   fillHeight = false,
+  getRowId,
+  bulkActions,
 }: {
   columns: ColumnDef<TData, TValue>[]
   data: TData[]
@@ -102,15 +136,49 @@ export function DataTable<TData, TValue>({
    *  sticky header, while the toolbar and pagination stay pinned. Use inside a
    *  <Page variant="fill">. */
   fillHeight?: boolean
+  /** A stable id per row, so a selection survives a refetch. */
+  getRowId?: (row: TData) => string
+  /** Turns on row selection: a checkbox column in front, and these actions
+   *  in the toolbar while rows are selected. The header checkbox takes the
+   *  rows of the current page, after search and filters. */
+  bulkActions?: (selected: TData[], clear: () => void) => React.ReactNode
 }) {
   const [sorting, setSorting] = React.useState<SortingState>([])
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>([])
   const [globalFilter, setGlobalFilter] = React.useState("")
+  const [rowSelection, setRowSelection] = React.useState<RowSelectionState>({})
+
+  const allColumns = React.useMemo<ColumnDef<TData, TValue>[]>(() => {
+    if (!bulkActions) return columns
+    const select: ColumnDef<TData, TValue> = {
+      id: "select",
+      enableSorting: false,
+      header: ({ table }) => (
+        <SelectBox
+          label="Select all rows on this page"
+          checked={table.getIsAllPageRowsSelected()}
+          indeterminate={table.getIsSomePageRowsSelected()}
+          onChange={(checked) => table.toggleAllPageRowsSelected(checked)}
+        />
+      ),
+      cell: ({ row }) => (
+        <SelectBox
+          label="Select row"
+          checked={row.getIsSelected()}
+          onChange={(checked) => row.toggleSelected(checked)}
+        />
+      ),
+    }
+    return [select, ...columns]
+  }, [bulkActions, columns])
 
   const table = useReactTable({
     data,
-    columns,
-    state: { sorting, columnFilters, globalFilter },
+    columns: allColumns,
+    state: { sorting, columnFilters, globalFilter, rowSelection },
+    enableRowSelection: !!bulkActions,
+    onRowSelectionChange: setRowSelection,
+    getRowId: getRowId ? (row) => getRowId(row) : undefined,
     onSortingChange: setSorting,
     onColumnFiltersChange: setColumnFilters,
     onGlobalFilterChange: setGlobalFilter,
@@ -136,7 +204,11 @@ export function DataTable<TData, TValue>({
   const first = total === 0 ? 0 : pageIndex * pageSize + 1
   const last = Math.min((pageIndex + 1) * pageSize, total)
 
-  const showToolbar = searchable || filters.length > 0 || !!actions
+  // Only rows still in the data count, so a deleted row drops out by itself.
+  const selected = table.getSelectedRowModel().rows.map((row) => row.original)
+  const clearSelection = () => setRowSelection({})
+
+  const showToolbar = searchable || filters.length > 0 || !!actions || !!bulkActions
 
   // Fill mode renders the header and body as SEPARATE tables so the scrollbar
   // sits beside the rows only (not over the header) and the header underline
@@ -160,7 +232,7 @@ export function DataTable<TData, TValue>({
       const firstRow = bodyTableRef.current?.querySelector<HTMLTableRowElement>(
         "tbody > tr[data-row]",
       )
-      if (firstRow && firstRow.children.length === columns.length) {
+      if (firstRow && firstRow.children.length === allColumns.length) {
         const widths = Array.from(firstRow.children).map(
           (c) => (c as HTMLElement).getBoundingClientRect().width,
         )
@@ -178,7 +250,7 @@ export function DataTable<TData, TValue>({
     if (s) ro.observe(s)
     if (t) ro.observe(t)
     return () => ro.disconnect()
-  }, [fillHeight, rows.length, columns.length, pageIndex, pageSize])
+  }, [fillHeight, rows.length, allColumns.length, pageIndex, pageSize])
 
   // Shared cell renderers so header/body markup is identical in both modes.
   const renderHeadCell = (header: Header<TData, unknown>) => {
@@ -189,7 +261,11 @@ export function DataTable<TData, TValue>({
     return (
       <TableHead
         key={header.id}
-        className={cn("h-10 text-xs font-medium text-muted-foreground", right && "text-right")}
+        className={cn(
+          "h-10 text-xs font-medium text-muted-foreground",
+          right && "text-right",
+          header.column.id === "select" && "w-10",
+        )}
       >
         {header.isPlaceholder ? null : canSort ? (
           <button
@@ -220,7 +296,7 @@ export function DataTable<TData, TValue>({
   const bodyRowsNode = loading ? (
     Array.from({ length: 5 }).map((_, i) => (
       <TableRow key={i} className="hover:bg-transparent">
-        {columns.map((_c, j) => (
+        {allColumns.map((_c, j) => (
           <TableCell key={j} className="py-3">
             <div className="h-4 w-2/3 animate-pulse rounded bg-muted" />
           </TableCell>
@@ -230,7 +306,7 @@ export function DataTable<TData, TValue>({
   ) : rows.length === 0 ? (
     <TableRow className="hover:bg-transparent">
       <TableCell
-        colSpan={columns.length}
+        colSpan={allColumns.length}
         className="py-10 text-center text-sm text-muted-foreground"
       >
         {emptyText}
@@ -238,11 +314,20 @@ export function DataTable<TData, TValue>({
     </TableRow>
   ) : (
     rows.map((row) => (
-      <TableRow key={row.id} data-row className="group">
+      <TableRow
+        key={row.id}
+        data-row
+        data-state={row.getIsSelected() ? "selected" : undefined}
+        className="group"
+      >
         {row.getVisibleCells().map((cell) => (
           <TableCell
             key={cell.id}
-            className={cn("py-3", cell.column.id === "actions" && "text-right")}
+            className={cn(
+              "py-3",
+              cell.column.id === "actions" && "text-right",
+              cell.column.id === "select" && "w-10",
+            )}
           >
             {flexRender(cell.column.columnDef.cell, cell.getContext())}
           </TableCell>
@@ -310,6 +395,16 @@ export function DataTable<TData, TValue>({
             </DropdownMenu>
           )
         })}
+        {bulkActions && selected.length > 0 && (
+          <div className="flex items-center gap-2 rounded-md border border-primary/30 bg-primary/5 py-0.5 pr-0.5 pl-3 text-sm">
+            <span className="tabular-nums">{selected.length} selected</span>
+            {bulkActions(selected, clearSelection)}
+            <Button variant="ghost" size="icon" className="size-7" onClick={clearSelection}>
+              <XIcon className="size-4" />
+              <span className="sr-only">Clear selection</span>
+            </Button>
+          </div>
+        )}
         {actions && <div className="ml-auto flex items-center gap-2">{actions}</div>}
       </div>
       )}
