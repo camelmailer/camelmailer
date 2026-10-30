@@ -283,7 +283,7 @@ deferred (documented so integrators know what not to expect yet):
 - **Webhook trigger granularity and custom HTTP auth headers.**
 - **Per-address sender signatures** and **template push between servers**.
 - **SAML / SCIM** (OIDC is the SSO path) and **WebAuthn**.
-- **Billing** — planned separately for the hosted cloud.
+- **Billing**: the open-source build ships a provider-neutral seam and no payment integration; see `docs/configuration.md`.
 
 ## Community
 

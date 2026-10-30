@@ -9,7 +9,7 @@
 import { Fragment, useEffect, useState, useSyncExternalStore } from "react"
 import Link from "next/link"
 import { useParams, usePathname, useRouter } from "next/navigation"
-import { useMutation, useQuery } from "@tanstack/react-query"
+import { useQuery } from "@tanstack/react-query"
 import {
   AtSignIcon,
   BadgeCheckIcon,
@@ -96,7 +96,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   members: "Members",
   invitations: "Invitations",
   settings: "Settings",
-  billing: "Billing",
+  billing: "Usage",
   domains: "Domains",
   credentials: "Credentials",
   routes: "Routes",
@@ -303,8 +303,8 @@ function NavUser() {
   const isAdmin = me?.user.admin ?? false
   const name = [me?.user.first_name, me?.user.last_name].filter(Boolean).join(" ")
 
-  // External (cloud) billing portal — only shown when billing is enabled for
-  // the active organization; self-hosted reports enabled=false and hides it.
+  // Billing shortcut to the organization's billing page, shown only when a
+  // billing provider is active; self-hosted reports enabled=false.
   const activeOrg = useActiveOrg()
   const role = me?.memberships.find((m) => m.organization.permalink === activeOrg)?.role
   const canBilling = isAdmin || role === "owner" || role === "admin"
@@ -312,14 +312,6 @@ function NavUser() {
     queryKey: ["billing", activeOrg],
     queryFn: () => adminApi.billing(activeOrg!).get(),
     enabled: !!activeOrg && canBilling,
-  })
-  const portal = useMutation({
-    mutationFn: () => adminApi.billing(activeOrg!).portal(),
-    onSuccess: ({ url }) => {
-      window.location.href = url
-    },
-    onError: (err) =>
-      toast.error(err instanceof ApiError ? err.message : "Could not open the billing portal"),
   })
 
   return (
@@ -343,8 +335,8 @@ function NavUser() {
         <DropdownMenuItem onClick={() => router.push("/account")}>
           <BadgeCheckIcon /> My Account
         </DropdownMenuItem>
-        {billing.data?.enabled && (
-          <DropdownMenuItem onClick={() => portal.mutate()} disabled={portal.isPending}>
+        {billing.data?.enabled && activeOrg && (
+          <DropdownMenuItem onClick={() => router.push(`/orgs/${activeOrg}/billing`)}>
             <CreditCardIcon /> Billing
           </DropdownMenuItem>
         )}
@@ -446,16 +438,14 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
             ]
           : []),
         { href: `${orgBase}/settings`, label: "Settings", icon: SettingsIcon, match: "prefix" },
-        ...(showBilling
-          ? [
-              {
-                href: `${orgBase}/billing`,
-                label: "Billing",
-                icon: CreditCardIcon,
-                match: "prefix" as const,
-              },
-            ]
-          : []),
+        // Usage is for every member; the same page grows a billing section
+        // when a billing provider is active.
+        {
+          href: `${orgBase}/billing`,
+          label: showBilling ? "Usage & billing" : "Usage",
+          icon: showBilling ? CreditCardIcon : GaugeIcon,
+          match: "prefix",
+        },
       ]
     : []
 

@@ -95,6 +95,17 @@ impl Fixtures {
         self.store.insert_server(server);
     }
 
+    /// Give the fixture organization a monthly send limit and suspension
+    /// state.
+    pub fn set_organization_policy(&self, policy: crate::OrganizationPolicy) {
+        self.store
+            .inner
+            .write()
+            .unwrap()
+            .organization_policies
+            .insert(self.organization.id, policy);
+    }
+
     /// Count `count` outgoing messages against the server's current window,
     /// without going through the send path.
     pub fn record_sends(&self, count: usize) {

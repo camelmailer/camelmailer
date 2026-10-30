@@ -15,6 +15,48 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Organization quota and suspension.** An organization can carry a
+  `monthly_send_limit` across all of its servers (calendar month, UTC) and
+  can be suspended. Both are enforced at the HTTP send endpoints and at SMTP
+  submission, next to the per-server limit; the stricter limit decides. New
+  error codes `OrganizationQuotaExceeded` (429) and `OrganizationSuspended`
+  (403); SMTP answers `550 5.7.1` and `535 Organization has been suspended`.
+  Admin API: `GET|PATCH /api/v2/admin/organizations/{org}/limits`,
+  `POST …/suspend`, `POST …/unsuspend` (writes for installation
+  administrators only). Default unlimited, so nothing changes until set.
+- **Monthly usage.** An authoritative per-organization monthly counter,
+  written in the transaction that stores each outgoing message, and
+  `GET /api/v2/admin/organizations/{org}/usage?month=YYYY-MM` (readable by
+  members). The dashboard's usage page reads it instead of summing per-server
+  statistics in the browser.
+- **Installation lifecycle webhooks** (`lifecycle_webhooks` config group,
+  off by default): `organization.created`, `organization.deleted`,
+  `user.registered` and `organization.usage_threshold` (80 % and 100 %, once
+  each per month), delivered by the worker with retries and signed with
+  HMAC-SHA256 (`X-Camelmailer-Signature: t=…,v1=…`).
+- **Registration captcha** (`captcha` config group, default `none`): Cap
+  compatible server-side verification of `captcha_token` at
+  `POST /api/v2/auth/register`, and the Cap widget on the sign-up page.
+  `GET /api/v2/auth/features` exposes the provider and endpoint.
+- **Configurable data retention** (`retention` config group, overridable per
+  organization through `PATCH …/limits`): separate periods for message
+  content, message metadata, the webhook log, DMARC reports, the
+  authentication log and the API request log, applied hourly by the worker
+  in batches. Message content can expire before the message record.
+  Expired sessions, password resets, invitations, share links and SSO or
+  passkey state are now always deleted at expiry, and deleting a user
+  removes their email address from the authentication log. The effective
+  periods appear on `GET /api/v2/admin/organizations/{org}` and on the
+  dashboard's usage page. Every period defaults to keeping data forever, as
+  before.
+- **The `camelmailer` crate is also a library.** `camelmailer::main_with`
+  with `Extensions { billing, routes, on_start }` lets a separate crate
+  build its own binary with a billing provider, extra routes and background
+  tasks started with the web server; `camelmailer_api::build_app` assembles
+  the whole HTTP application.
+
 ### Changed
 
 - **SPF health check without an IP pool.** The check now evaluates the
@@ -24,6 +66,22 @@ integration tests) is green.
   the include, now reads `ok`, and a warning names any address it misses.
   The text comparison remains the fallback when that record is missing or
   is not made only of `ip4:`/`ip6:` terms.
+
+- **Billing is provider neutral.** `BillingProvider` now offers customer,
+  checkout, portal, optional usage view and plans, returning embed sessions
+  (a web component with a token, or a link, plus optional companion
+  elements sharing the token) that the dashboard renders. The
+  open-source build ships `NoBilling` only. `billing.enabled` without a
+  provider keeps billing off.
+- `camelmailer.message_retention_days` is deprecated in favour of
+  `retention.message_metadata_days` and still works as an alias.
+
+### Removed
+
+- **The built-in Stripe integration** (`StripeBilling`) and the hardcoded
+  public-beta plan preview in the dashboard. `billing.stripe_secret_key`
+  and `billing.portal_return_url` still load, are ignored, and log a
+  deprecation warning.
 
 ### Fixed
 
@@ -36,6 +94,8 @@ integration tests) is green.
   `Received-SPF` header of inbound mail. Each lookup mechanism now costs
   one, and MX address lookups have their own limit of ten per `mx` as the
   RFC specifies.
+
+Migrations `0047` and `0048`.
 
 ## [0.9.1] - 2026-10-23
 

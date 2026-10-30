@@ -121,9 +121,58 @@ export type Organization = {
 
 export type Role = "viewer" | "member" | "admin" | "owner"
 
-// Billing (hosted cloud). `enabled: false` on self-hosted installations —
-// the UI hides billing entirely in that case.
-export type BillingStatus = { enabled: boolean; has_customer: boolean }
+// Billing. `enabled: false` unless the build carries a billing provider
+// (never on the open-source build); the UI then shows usage only.
+export type BillingStatus = {
+  enabled: boolean
+  provider: string | null
+  has_customer: boolean
+}
+
+// A provider-supplied UI: a custom element loaded from `script_url` and
+// initialised with `token`, or a plain `url` to open.
+export type EmbedSession = {
+  script_url: string | null
+  element: string | null
+  token: string | null
+  attributes: Record<string, string>
+  /** Further elements from the same script, given the same token. */
+  companions?: { element: string; attributes?: Record<string, string> }[]
+  url: string | null
+  expires_at: string | null
+}
+
+export type BillingPlan = {
+  code: string
+  name: string
+  description: string | null
+  monthly_send_limit: number | null
+  price: { amount_minor: number; currency: string; interval: string | null } | null
+  features: string[]
+}
+
+// Effective data retention of an organization, in days (null = forever).
+export type OrganizationRetention = {
+  message_content_days: number | null
+  message_metadata_days: number | null
+  webhook_log_days: number | null
+  dmarc_report_days: number | null
+  auth_event_days: number | null
+  api_request_days: number | null
+}
+
+// GET /organizations/{org}/usage: the server-side monthly counter.
+export type OrganizationUsage = {
+  organization: string
+  month: string
+  period_start: string
+  period_end: string
+  sent: number
+  limit: number | null
+  remaining: number | null
+  suspended: boolean
+  suspension_reason: string | null
+}
 
 export type Membership = {
   role: Role
@@ -422,6 +471,10 @@ export type Features = {
   sso: SsoProviderInfo[]
   // Hosted-cloud legal links, shown on the auth cards when configured.
   legal: { terms_url: string | null; privacy_url: string | null }
+  // Registration captcha; the widget talks to `endpoint` directly.
+  captcha?: { provider: "none" | "cap"; endpoint: string | null }
+  // Whether a billing provider is active on this installation.
+  billing?: boolean
 }
 
 export type PasskeyCredential = {
@@ -689,6 +742,8 @@ export const authApi = {
     first_name: string
     last_name: string
     password: string
+    // Required when features.captcha.provider is not "none".
+    captcha_token?: string
   }) =>
     api.post<{
       session_token: string
@@ -833,8 +888,11 @@ export const adminApi = {
       ),
     create: (name: string) =>
       api.post<{ organization: Organization }>("/api/v2/admin/organizations", { name }),
+    // Also carries the effective data retention (null = kept forever).
     get: (permalink: string) =>
-      api.get<{ organization: Organization }>(`/api/v2/admin/organizations/${permalink}`),
+      api.get<{ organization: Organization; retention?: OrganizationRetention }>(
+        `/api/v2/admin/organizations/${permalink}`,
+      ),
     // Owner-only; currently the one mutable setting is require_two_factor.
     update: (permalink: string, fields: { require_two_factor?: boolean }) =>
       api.patch<{ organization: Organization }>(
@@ -845,11 +903,32 @@ export const adminApi = {
       api.delete<{ deleted: boolean }>(`/api/v2/admin/organizations/${permalink}`),
   },
   billing: (org: string) => ({
-    // 200 with enabled=false when billing is off (self-hosted) — never an error.
+    // 200 with enabled=false when billing is off (self-hosted), never an error.
     get: () => api.get<BillingStatus>(`/api/v2/admin/organizations/${org}/billing`),
-    // 403 BillingDisabled when off; 502 BillingUnavailable when Stripe is down.
-    portal: () => api.post<{ url: string }>(`/api/v2/admin/organizations/${org}/billing/portal`),
+    // The rest answer 403 BillingDisabled when off and 502
+    // BillingUnavailable when the provider fails.
+    plans: () =>
+      api.get<{ plans: BillingPlan[] }>(`/api/v2/admin/organizations/${org}/billing/plans`),
+    checkout: (plan_code: string) =>
+      api.post<{ url: string | null; session: EmbedSession }>(
+        `/api/v2/admin/organizations/${org}/billing/checkout`,
+        { plan_code },
+      ),
+    portal: () =>
+      api.post<{ url: string | null; session: EmbedSession }>(
+        `/api/v2/admin/organizations/${org}/billing/portal`,
+      ),
+    usage: () =>
+      api.post<{ session: EmbedSession | null }>(
+        `/api/v2/admin/organizations/${org}/billing/usage`,
+      ),
   }),
+  // Monthly sending usage across the organization's servers (every member
+  // may read it). `month` is YYYY-MM, default the current month (UTC).
+  usage: (org: string, month?: string) =>
+    api.get<{ usage: OrganizationUsage }>(
+      `/api/v2/admin/organizations/${org}/usage${month ? `?month=${encodeURIComponent(month)}` : ""}`,
+    ),
   members: (org: string) => ({
     list: () => api.get<{ members: Membership[] }>(`/api/v2/admin/organizations/${org}/members`),
     add: (email_address: string, role: Role) =>

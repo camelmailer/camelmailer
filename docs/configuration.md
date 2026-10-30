@@ -224,26 +224,112 @@ web_server:
   cors_origins: []                   # browser origins allowed to call the APIs
 ```
 
-### `billing:` — Stripe billing (hosted cloud)
+### `billing:` billing provider (custom builds)
 
-For the hosted cloud offering only. **Self-hosted installations stay
-completely billing-free**: the group defaults to `enabled: false`, the
+The open-source build carries no payment integration. A billing provider is
+plugged in by a separate crate that depends on the `camelmailer` library
+crate and builds its own binary (see "Building with a billing provider"
+below). Without one, billing stays off whatever this group says: the
 billing endpoints report `enabled: false` / answer `403 BillingDisabled`,
-and the dashboard shows no billing UI at all.
+and the dashboard's usage page shows usage only.
 
 ```yaml
 billing:
-  enabled: false                     # cloud only; requires stripe_secret_key
-  # stripe_secret_key: sk_live_…     # never logged
-  # portal_return_url: https://mail-admin.example.com   # default: auth.frontend_url
+  enabled: false
+  # options:                 # free-form; only the custom provider reads them
+  #   api_url: https://billing.example.com
+  #   api_key: …             # option values are redacted from debug output
 ```
 
-When enabled, organization admins/owners get a **Billing Portal** entry in
-the organization settings. The backend creates the Stripe customer lazily
-on first use (`POST /api/v2/admin/organizations/{org}/billing/portal`,
-idempotent — an existing customer is reused) and redirects into Stripe's
-billing portal. Stripe outages surface as the stable error code
-`BillingUnavailable`; Stripe error details are only ever logged.
+`stripe_secret_key` and `portal_return_url` from earlier releases are still
+accepted so an existing file keeps loading, and each logs a deprecation
+warning at startup. They do nothing.
+
+#### Building with a billing provider
+
+Implement `camelmailer_api::BillingProvider` (customer, checkout, portal,
+optional usage view, plans) and start the stock CLI with it:
+
+```rust
+fn main() -> std::process::ExitCode {
+    camelmailer::main_with(camelmailer::Extensions {
+        billing: Some(std::sync::Arc::new(|config: &camelmailer_config::Config| {
+            Ok(std::sync::Arc::new(MyProvider::from_options(&config.billing.options)?) as _)
+        })),
+        ..Default::default()
+    })
+}
+```
+
+The provider is used when `billing.enabled` is true. Checkout, portal and
+usage calls return an embed session: a custom element name, the script that
+defines it and a short-lived token, which the dashboard renders in place,
+plus an optional link fallback. `companions` lists further elements from the
+same script that take the same token (an invoice list under a subscription
+view, for example). `Extensions::routes` adds HTTP routes to the web server,
+and `Extensions::on_start` runs once when the web server starts, inside the
+runtime, which is the place to spawn background tasks such as a periodic
+sync. `camelmailer::build_state` and `camelmailer_api::build_app` are there
+for a binary that wants to assemble the server itself, or for a command of
+its own that needs the same storage.
+
+### `retention:` how long data is kept
+
+Days per data class; `0` keeps forever. Every class defaults to `0` except
+the API request log (30 days, as before), so an installation that sets
+nothing keeps its data.
+
+```yaml
+retention:
+  message_content_days: 0    # raw MIME, outgoing and inbound
+  message_metadata_days: 0   # message rows, deliveries, opens/clicks, tracking tokens
+  webhook_log_days: 0
+  dmarc_report_days: 0
+  auth_event_days: 0
+  api_request_days: 30
+  batch_size: 1000
+```
+
+`camelmailer.message_retention_days` still works as a deprecated alias of
+`message_metadata_days` (used only while the new key is `0`). Organizations
+can override the first four per class. Expired authentication tokens are
+always removed. The full picture, including what each class covers and the
+override rules, is in [Data retention](retention.md).
+
+### `lifecycle_webhooks:` installation events
+
+Forwards installation-wide events to outside systems such as a billing or
+CRM service. Off while `urls` is empty (the default).
+
+```yaml
+lifecycle_webhooks:
+  urls: [https://billing.example.com/hooks/camelmailer]
+  secret: a-long-random-string       # required when urls is set
+```
+
+Events, payload and signature are described in
+[Webhooks: installation lifecycle events](webhooks.md#installation-lifecycle-events).
+
+### `captcha:` registration captcha
+
+Protects `POST /api/v2/auth/register`. Off by default.
+
+```yaml
+captcha:
+  provider: cap                      # none | cap
+  endpoint: https://captcha.example.com/<site_key>/
+  secret: …                          # never sent to a browser
+```
+
+With `cap` the dashboard's sign-up page renders the
+[Cap](https://trycap.dev) widget against `endpoint` and sends its token as
+`captcha_token`. The server verifies it with
+`POST {endpoint}siteverify` and the body `{"secret": …, "response": token}`,
+expecting `{"success": true}`. A missing token answers `400
+ParameterMissing`, a rejected one `422 CaptchaInvalid`, an unreachable
+verifier `503 CaptchaUnavailable`. `GET /api/v2/auth/features` publishes
+the provider and the endpoint, never the secret. Any service with the same
+siteverify contract works.
 
 ## Production checklist
 

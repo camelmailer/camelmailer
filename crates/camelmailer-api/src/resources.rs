@@ -2721,6 +2721,8 @@ pub(crate) async fn users_create(
             return render_store_error(Some(&start), error);
         }
     }
+    crate::lifecycle::user_registered(&state, &user, crate::lifecycle::RegistrationSource::Admin)
+        .await;
     created(&start, json!({ "user": user_json(&user) }))
 }
 

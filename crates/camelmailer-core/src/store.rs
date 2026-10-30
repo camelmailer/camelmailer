@@ -55,6 +55,16 @@ pub trait Store: Send + Sync {
     /// because the SMTP session checks it after `DATA`.
     fn send_usage(&self, server_id: Id) -> i64;
 
+    /// The sending policy (monthly limit, suspension) of an organization.
+    /// The SMTP session reads it for every authenticated submission.
+    fn send_policy_for_organization(&self, organization_id: Id) -> crate::OrganizationPolicy;
+
+    /// Outgoing messages of an organization, across all of its servers, in
+    /// the current calendar month (UTC). Paired with
+    /// [`crate::OrganizationPolicy::monthly_send_limit`] this gives the
+    /// organization's [`crate::SendAllowance`].
+    fn organization_month_usage(&self, organization_id: Id) -> i64;
+
     /// Does the server have a `__returnpath__` route?
     fn return_path_route_for_server(&self, server_id: Id) -> Option<ResolvedRoute>;
 
@@ -114,13 +124,72 @@ pub fn match_ip_credential(credentials: Vec<Credential>, ip: IpAddr) -> Option<C
         .map(|(_, c)| c)
 }
 
+/// Count one stored outgoing message: the server's daily bucket, the
+/// organization's monthly counter, and any usage threshold it crosses. The
+/// in-memory analogue of the counting in the Postgres insert transaction.
+pub(crate) fn count_outgoing(
+    inner: &mut MemoryStoreInner,
+    server_id: Id,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    *inner
+        .send_counters
+        .entry((server_id, at.date_naive()))
+        .or_insert(0) += 1;
+    let Some(organization) = inner
+        .servers
+        .get(&server_id)
+        .and_then(|server| inner.organizations.get(&server.organization_id))
+        .cloned()
+    else {
+        return;
+    };
+    let month = crate::UsageMonth::of(at.date_naive());
+    let counter = inner
+        .organization_send_counters
+        .entry((organization.id, month))
+        .or_insert(0);
+    *counter += 1;
+    let sent = *counter;
+    let limit = inner
+        .organization_policies
+        .get(&organization.id)
+        .and_then(|policy| policy.monthly_send_limit);
+    for threshold in crate::quota::reached_thresholds(sent, limit) {
+        if inner
+            .usage_alerts
+            .insert((organization.id, month, threshold))
+        {
+            inner
+                .lifecycle_events
+                .push(crate::lifecycle::usage_threshold_event(
+                    &organization,
+                    month,
+                    threshold,
+                    sent,
+                    limit.unwrap_or_default(),
+                ));
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct MemoryStoreInner {
     /// Daily outgoing-message counts per server, the in-memory analogue of
     /// the `server_send_counters` table. Keyed by (server id, UTC date).
     pub(crate) send_counters: HashMap<(Id, chrono::NaiveDate), i64>,
+    /// Monthly outgoing-message counts per organization, the in-memory
+    /// analogue of `organization_send_counters`.
+    pub(crate) organization_send_counters: HashMap<(Id, crate::UsageMonth), i64>,
+    /// Usage thresholds already announced: (organization, month, percent).
+    pub(crate) usage_alerts: std::collections::HashSet<(Id, crate::UsageMonth, u8)>,
+    /// Organization quota and suspension (the `organizations` columns of
+    /// migration 0047 in Postgres).
+    pub(crate) organization_policies: HashMap<Id, crate::OrganizationPolicy>,
+    /// The lifecycle-event outbox, in insertion order.
+    pub(crate) lifecycle_events: Vec<crate::LifecycleEvent>,
     pub(crate) organizations: HashMap<Id, Organization>,
-    /// Stripe customer ids keyed by organization id (the
+    /// Billing-provider customer ids keyed by organization id (the
     /// `organizations.billing_customer_id` column in Postgres).
     pub(crate) billing_customer_ids: HashMap<Id, String>,
     pub(crate) servers: HashMap<Id, Server>,
@@ -278,6 +347,13 @@ impl MemoryStore {
     pub fn delete_organization(&self, id: Id) -> bool {
         let mut inner = self.inner.write().unwrap();
         inner.billing_customer_ids.remove(&id);
+        inner.organization_policies.remove(&id);
+        inner
+            .organization_send_counters
+            .retain(|(organization_id, _), _| *organization_id != id);
+        inner
+            .usage_alerts
+            .retain(|(organization_id, _, _)| *organization_id != id);
         inner.organizations.remove(&id).is_some()
     }
 
@@ -402,13 +478,15 @@ impl MemoryStore {
         let (record, sent) = self.build_message_record(message);
         let mut inner = self.inner.write().unwrap();
         if record.scope == "outgoing" {
-            *inner
-                .send_counters
-                .entry((record.server_id, record.created_at.date_naive()))
-                .or_insert(0) += 1;
+            count_outgoing(&mut inner, record.server_id, record.created_at);
         }
         inner.messages.push(record);
         sent
+    }
+
+    /// The lifecycle events queued so far (tests).
+    pub fn lifecycle_events(&self) -> Vec<crate::LifecycleEvent> {
+        self.inner.read().unwrap().lifecycle_events.clone()
     }
 
     fn build_message_record(
@@ -519,10 +597,7 @@ impl MemoryStore {
                         debug_assert_eq!(message.server_id, server_id);
                         let (record, sent) = self.build_message_record(message);
                         if record.scope == "outgoing" {
-                            *inner
-                                .send_counters
-                                .entry((record.server_id, record.created_at.date_naive()))
-                                .or_insert(0) += 1;
+                            count_outgoing(&mut inner, record.server_id, record.created_at);
                         }
                         inner.messages.push(record);
                         recipients.push(sent);
@@ -1589,6 +1664,26 @@ impl Store for MemoryStore {
             return domains[0];
         }
         None
+    }
+
+    fn send_policy_for_organization(&self, organization_id: Id) -> crate::OrganizationPolicy {
+        self.inner
+            .read()
+            .unwrap()
+            .organization_policies
+            .get(&organization_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn organization_month_usage(&self, organization_id: Id) -> i64 {
+        self.inner
+            .read()
+            .unwrap()
+            .organization_send_counters
+            .get(&(organization_id, crate::UsageMonth::current()))
+            .copied()
+            .unwrap_or(0)
     }
 
     fn send_usage(&self, server_id: Id) -> i64 {

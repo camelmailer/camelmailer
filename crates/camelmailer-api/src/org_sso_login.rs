@@ -650,6 +650,8 @@ async fn resolve_org_user(
         })
         .await
         .map_err(map_store_error)?;
+    crate::lifecycle::user_registered(state, &user, crate::lifecycle::RegistrationSource::Sso)
+        .await;
     auth.link_sso_identity(user.id, &provider, uid)
         .await
         .map_err(map_store_error)?;

@@ -437,6 +437,8 @@ async fn users_create(State(state): State<Arc<ApiState>>, body: Bytes) -> Respon
         Err(error) => return store_error(error),
     };
     record_event(&state, &user, "scim.provision").await;
+    crate::lifecycle::user_registered(&state, &user, crate::lifecycle::RegistrationSource::Scim)
+        .await;
     if !active {
         if let Err(response) = apply_active(&state, &user, false).await {
             return response;

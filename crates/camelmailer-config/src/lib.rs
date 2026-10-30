@@ -104,9 +104,9 @@ pub struct Camelmailer {
     /// deliberately deliver webhooks / routes to a known internal endpoint.
     #[serde(default)]
     pub outbound_allowed_hosts: Vec<String>,
-    /// How many days to keep stored messages (and their deliveries, opens,
-    /// clicks and tracking tokens) before the worker's housekeeping deletes
-    /// them. `0` (the default) keeps messages forever — retention is opt-in.
+    /// Deprecated alias of `retention.message_metadata_days`, used when that
+    /// key is `0`. How many days to keep stored messages (and their
+    /// deliveries, opens, clicks and tracking tokens). `0` keeps forever.
     #[serde(default)]
     pub message_retention_days: u32,
 }
@@ -317,31 +317,171 @@ impl Default for AppMail {
     }
 }
 
-/// Stripe billing for the hosted cloud offering. Self-hosted installations
-/// keep the default (`enabled: false`): no billing endpoints are active and
-/// the dashboard shows no billing UI at all.
+/// Billing, provider neutral. The open-source build ships no billing
+/// provider: a custom binary built on the `camelmailer` library crate plugs
+/// one in (see `camelmailer::Extensions`). Self-hosted installations keep
+/// the default (`enabled: false`), and so does an installation with
+/// `enabled: true` but no provider compiled in: no billing endpoint is
+/// active and the dashboard shows usage only.
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Billing {
     pub enabled: bool,
-    /// Stripe secret key (`sk_live_…` / `sk_test_…`). Required when
-    /// enabled. Never logged: the `Debug` impl redacts it.
-    pub stripe_secret_key: Option<String>,
-    /// Where Stripe's billing portal sends the user back to. Defaults to
-    /// `auth.frontend_url` when unset.
-    pub portal_return_url: Option<String>,
+    /// Free-form settings for the billing provider of a custom build (API
+    /// base URL, credentials, ...). The open-source build never reads them.
+    /// Values are redacted from `Debug` output.
+    pub options: std::collections::BTreeMap<String, serde_yaml::Value>,
+    /// Removed in 0.10 together with the built-in Stripe integration.
+    /// Still accepted so an existing configuration file keeps loading; a
+    /// value only produces a deprecation warning at startup.
+    #[serde(rename = "stripe_secret_key")]
+    pub legacy_stripe_secret_key: Option<String>,
+    /// Removed in 0.10, see `stripe_secret_key`.
+    #[serde(rename = "portal_return_url")]
+    pub legacy_portal_return_url: Option<String>,
 }
 
-/// The secret key must never end up in logs, so `Debug` redacts it.
+/// Provider options may hold secrets, so `Debug` lists their keys only.
 impl std::fmt::Debug for Billing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Billing")
             .field("enabled", &self.enabled)
-            .field(
-                "stripe_secret_key",
-                &self.stripe_secret_key.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("portal_return_url", &self.portal_return_url)
+            .field("options", &self.options.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Installation-wide data retention defaults, in days; `0` keeps forever,
+/// which is the default for every class except the API request log (30, as
+/// before). Organizations can override the per-tenant classes through the
+/// admin API. Expired authentication tokens (sessions, password resets,
+/// invitations, share links, SSO and passkey ceremony state) are always
+/// deleted at expiry, independent of this group.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Retention {
+    /// Raw MIME of stored messages (outgoing and incoming). Capped at
+    /// `message_metadata_days` when that is set.
+    pub message_content_days: u32,
+    /// Message rows, deliveries, opens, clicks, links, tracking tokens.
+    /// Falls back to `camelmailer.message_retention_days` when `0`.
+    pub message_metadata_days: u32,
+    /// The webhook delivery log.
+    pub webhook_log_days: u32,
+    /// Received DMARC aggregate reports.
+    pub dmarc_report_days: u32,
+    /// The authentication audit log (`auth_events`). Installation-wide.
+    pub auth_event_days: u32,
+    /// The per-server API request log. Installation-wide; default 30.
+    pub api_request_days: u32,
+    /// Rows deleted per statement, so a large backlog never holds one long
+    /// transaction or lock.
+    pub batch_size: u32,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            message_content_days: 0,
+            message_metadata_days: 0,
+            webhook_log_days: 0,
+            dmarc_report_days: 0,
+            auth_event_days: 0,
+            api_request_days: 30,
+            batch_size: 1000,
+        }
+    }
+}
+
+/// Installation lifecycle webhooks: organization created/deleted, user
+/// registered, organization usage thresholds. Off while `urls` is empty
+/// (the default). Every request is signed with HMAC-SHA256 over
+/// `"{timestamp}.{body}"` using `secret`.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LifecycleWebhooks {
+    /// Endpoints that receive every event (POST, JSON).
+    pub urls: Vec<String>,
+    /// Shared HMAC secret; required when `urls` is not empty.
+    pub secret: Option<String>,
+}
+
+impl LifecycleWebhooks {
+    pub fn enabled(&self) -> bool {
+        !self.urls.is_empty()
+    }
+}
+
+impl std::fmt::Debug for LifecycleWebhooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LifecycleWebhooks")
+            .field("urls", &self.urls)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+/// Which captcha protects self-registration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptchaProvider {
+    #[default]
+    None,
+    /// Cap (https://trycap.dev), or any service with the same siteverify
+    /// contract.
+    Cap,
+}
+
+impl CaptchaProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CaptchaProvider::None => "none",
+            CaptchaProvider::Cap => "cap",
+        }
+    }
+}
+
+/// Captcha at `POST /api/v2/auth/register`. Off by default.
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Captcha {
+    pub provider: CaptchaProvider,
+    /// The public endpoint including the site key, e.g.
+    /// `https://captcha.example.com/<site_key>/`. The widget talks to it,
+    /// and the server verifies at `{endpoint}siteverify`.
+    pub endpoint: Option<String>,
+    /// The key secret used for server-side verification. Never sent to a
+    /// browser, redacted from `Debug`.
+    pub secret: Option<String>,
+}
+
+impl Captcha {
+    pub fn enabled(&self) -> bool {
+        self.provider != CaptchaProvider::None
+    }
+
+    /// The endpoint with exactly one trailing slash.
+    pub fn normalized_endpoint(&self) -> Option<String> {
+        self.endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(|endpoint| format!("{}/", endpoint.trim_end_matches('/')))
+    }
+
+    /// `{endpoint}siteverify`.
+    pub fn siteverify_url(&self) -> Option<String> {
+        self.normalized_endpoint()
+            .map(|endpoint| format!("{endpoint}siteverify"))
+    }
+}
+
+impl std::fmt::Debug for Captcha {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Captcha")
+            .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
@@ -887,6 +1027,9 @@ pub struct Config {
     pub auth: Auth,
     pub app_mail: AppMail,
     pub billing: Billing,
+    pub lifecycle_webhooks: LifecycleWebhooks,
+    pub captcha: Captcha,
+    pub retention: Retention,
     pub legal: Legal,
     pub oidc: Oidc,
     pub saml: Saml,
@@ -937,6 +1080,40 @@ impl Config {
         config.substitute_config_file_root(&root);
         config.validate()?;
         Ok(config)
+    }
+
+    /// The message metadata period after resolving the deprecated alias
+    /// `camelmailer.message_retention_days`.
+    pub fn message_metadata_retention_days(&self) -> u32 {
+        if self.retention.message_metadata_days > 0 {
+            self.retention.message_metadata_days
+        } else {
+            self.camelmailer.message_retention_days
+        }
+    }
+
+    /// Settings that still load but no longer do anything. The binary logs
+    /// each one at startup.
+    pub fn deprecation_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.billing.legacy_stripe_secret_key.is_some() {
+            warnings.push(
+                "billing.stripe_secret_key is ignored: the built-in Stripe integration was removed; billing providers are plugged in by a custom build".into(),
+            );
+        }
+        if self.camelmailer.message_retention_days > 0 {
+            warnings.push(if self.retention.message_metadata_days > 0 {
+                "camelmailer.message_retention_days is ignored because retention.message_metadata_days is set".into()
+            } else {
+                "camelmailer.message_retention_days is deprecated; use retention.message_metadata_days".into()
+            });
+        }
+        if self.billing.legacy_portal_return_url.is_some() {
+            warnings.push(
+                "billing.portal_return_url is ignored (see billing.stripe_secret_key)".into(),
+            );
+        }
+        warnings
     }
 
     /// Load configuration from the path named by `CAMELMAILER_CONFIG_FILE_PATH`
@@ -1119,17 +1296,46 @@ impl Config {
                 ));
             }
         }
-        if self.billing.enabled
-            && self
-                .billing
-                .stripe_secret_key
+        if self.lifecycle_webhooks.enabled() {
+            if self
+                .lifecycle_webhooks
+                .secret
                 .as_deref()
                 .unwrap_or("")
                 .is_empty()
-        {
-            return Err(ConfigError::Invalid(
-                "billing.stripe_secret_key is required when billing.enabled is true".into(),
-            ));
+            {
+                return Err(ConfigError::Invalid(
+                    "lifecycle_webhooks.secret is required when lifecycle_webhooks.urls is set"
+                        .into(),
+                ));
+            }
+            if let Some(url) = self
+                .lifecycle_webhooks
+                .urls
+                .iter()
+                .find(|url| !(url.starts_with("https://") || url.starts_with("http://")))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "lifecycle_webhooks.urls: {url:?} is not an http(s) URL"
+                )));
+            }
+        }
+        if self.captcha.enabled() {
+            match self.captcha.normalized_endpoint() {
+                Some(endpoint)
+                    if endpoint.starts_with("https://") || endpoint.starts_with("http://") => {}
+                _ => {
+                    return Err(ConfigError::Invalid(
+                        "captcha.endpoint must be an http(s) URL when captcha.provider is set"
+                            .into(),
+                    ))
+                }
+            }
+            if self.captcha.secret.as_deref().unwrap_or("").is_empty() {
+                return Err(ConfigError::Invalid(
+                    "captcha.secret is required when captcha.provider is set".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1617,26 +1823,106 @@ auth:
     fn billing_defaults_to_disabled() {
         let config = Config::default();
         assert!(!config.billing.enabled);
-        assert_eq!(config.billing.stripe_secret_key, None);
-        assert_eq!(config.billing.portal_return_url, None);
+        assert!(config.billing.options.is_empty());
         config.validate().unwrap();
     }
 
     #[test]
-    fn billing_parses_from_yaml() {
+    fn billing_parses_provider_options_from_yaml() {
         let config = Config::from_yaml(
-            "billing:\n  enabled: true\n  stripe_secret_key: sk_test_123\n  portal_return_url: https://app.example.com/billing\n",
+            "billing:\n  enabled: true\n  options:\n    api_url: https://billing.example.com\n    api_key: k-secret\n",
         )
         .unwrap();
+        config.validate().unwrap();
         assert!(config.billing.enabled);
         assert_eq!(
-            config.billing.stripe_secret_key.as_deref(),
-            Some("sk_test_123")
+            config.billing.options["api_url"].as_str(),
+            Some("https://billing.example.com")
         );
+        let debug = format!("{:?}", config.billing);
+        assert!(!debug.contains("k-secret"), "{debug}");
+    }
+
+    #[test]
+    fn legacy_stripe_keys_still_load_with_a_warning() {
+        let config = Config::from_yaml(
+            "billing:\n  enabled: true\n  stripe_secret_key: sk_test_1\n  portal_return_url: https://x.example\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.deprecation_warnings().len(), 2);
+        assert!(Config::default().deprecation_warnings().is_empty());
+    }
+
+    #[test]
+    fn retention_defaults_keep_everything_but_the_api_log() {
+        let config = Config::default();
+        assert_eq!(config.retention.message_content_days, 0);
+        assert_eq!(config.retention.api_request_days, 30);
+        assert_eq!(config.message_metadata_retention_days(), 0);
+        let config = Config::from_yaml(
+            "retention:\n  message_content_days: 30\n  message_metadata_days: 365\n  auth_event_days: 180\n",
+        )
+        .unwrap();
+        assert_eq!(config.retention.message_content_days, 30);
+        assert_eq!(config.message_metadata_retention_days(), 365);
+        assert!(Config::from_yaml("retention:\n  foo: 1\n").is_err());
+    }
+
+    #[test]
+    fn message_retention_days_is_a_deprecated_alias() {
+        let config = Config::from_yaml("camelmailer:\n  message_retention_days: 90\n").unwrap();
+        assert_eq!(config.message_metadata_retention_days(), 90);
+        assert_eq!(config.deprecation_warnings().len(), 1);
+        let config = Config::from_yaml(
+            "camelmailer:\n  message_retention_days: 90\nretention:\n  message_metadata_days: 30\n",
+        )
+        .unwrap();
+        assert_eq!(config.message_metadata_retention_days(), 30);
+    }
+
+    #[test]
+    fn lifecycle_webhooks_require_a_secret_and_http_urls() {
+        assert!(!Config::default().lifecycle_webhooks.enabled());
+        let config =
+            Config::from_yaml("lifecycle_webhooks:\n  urls: [https://hooks.example.com/cm]\n")
+                .unwrap();
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("lifecycle_webhooks:\n  urls: [ftp://x]\n  secret: s\n").unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::from_yaml(
+            "lifecycle_webhooks:\n  urls: [https://hooks.example.com/cm]\n  secret: whsec\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.lifecycle_webhooks.enabled());
+        assert!(!format!("{:?}", config.lifecycle_webhooks).contains("whsec"));
+    }
+
+    #[test]
+    fn captcha_defaults_to_none_and_cap_needs_endpoint_and_secret() {
+        let config = Config::default();
+        assert!(!config.captcha.enabled());
+        assert_eq!(config.captcha.provider.as_str(), "none");
+        let config = Config::from_yaml("captcha:\n  provider: cap\n").unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::from_yaml(
+            "captcha:\n  provider: cap\n  endpoint: https://cap.example.com/abc\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_err());
+        let config = Config::from_yaml(
+            "captcha:\n  provider: cap\n  endpoint: https://cap.example.com/abc\n  secret: shh\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
         assert_eq!(
-            config.billing.portal_return_url.as_deref(),
-            Some("https://app.example.com/billing")
+            config.captcha.siteverify_url().as_deref(),
+            Some("https://cap.example.com/abc/siteverify")
         );
+        assert!(!format!("{:?}", config.captcha).contains("shh"));
+        assert!(Config::from_yaml("captcha:\n  provider: recaptcha\n").is_err());
     }
 
     #[test]
@@ -1653,30 +1939,6 @@ auth:
         );
         assert_eq!(config.auth.webauthn.rp_name, "Example");
         config.validate().unwrap();
-    }
-
-    #[test]
-    fn enabled_billing_requires_the_stripe_secret_key() {
-        let config = Config::from_yaml("billing:\n  enabled: true\n").unwrap();
-        assert!(config.validate().is_err());
-        let config =
-            Config::from_yaml("billing:\n  enabled: true\n  stripe_secret_key: \"\"\n").unwrap();
-        assert!(config.validate().is_err());
-        let config =
-            Config::from_yaml("billing:\n  enabled: true\n  stripe_secret_key: sk_test_1\n")
-                .unwrap();
-        config.validate().unwrap();
-    }
-
-    #[test]
-    fn billing_debug_output_redacts_the_secret_key() {
-        let config = Config::from_yaml(
-            "billing:\n  enabled: true\n  stripe_secret_key: sk_live_supersecret\n",
-        )
-        .unwrap();
-        let debug = format!("{:?}", config.billing);
-        assert!(!debug.contains("sk_live_supersecret"));
-        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

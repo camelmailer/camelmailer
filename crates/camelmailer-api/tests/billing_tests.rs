@@ -1,20 +1,15 @@
-//! Stripe billing (hosted cloud): the org billing status + portal
-//! endpoints against MockBilling, RBAC per the repository conventions,
-//! and StripeBilling against a local mock HTTP server standing in for
-//! the Stripe API.
+//! The provider-neutral billing seam: the org billing status, plans,
+//! checkout, portal and usage-session endpoints against MockBilling, the
+//! NoBilling default, and RBAC per the repository conventions.
 
 use axum::body::Body;
-use axum::extract::RawForm;
-use axum::http::{HeaderMap, Request, StatusCode};
-use axum::routing::post;
-use axum::{Json, Router};
-use camelmailer_api::{
-    build_auth_router, build_router, ApiState, BillingProvider, MockBilling, StripeBilling,
-};
+use axum::http::{Request, StatusCode};
+use axum::Router;
+use camelmailer_api::{build_auth_router, build_router, ApiState, BillingProvider, MockBilling};
 use camelmailer_core::{AdminStore, AuthStore, MemoryStore, NewOrganization, NewUser, Role};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use tower::ServiceExt;
 
 const PASSWORD: &str = "correct-horse-battery";
@@ -28,9 +23,6 @@ fn password_digest() -> &'static str {
 fn billing_config(enabled: bool) -> camelmailer_config::Config {
     let mut config = camelmailer_config::Config::default();
     config.billing.enabled = enabled;
-    if enabled {
-        config.billing.stripe_secret_key = Some("sk_test_1".into());
-    }
     config.auth.frontend_url = Some("https://mail-admin.example.com".into());
     config.validate().unwrap();
     config
@@ -253,17 +245,30 @@ async fn first_portal_call_creates_the_customer_and_returns_the_url() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["data"]["url"],
-        json!("https://billing.stripe.example/session/cus_mock_1")
+        json!("https://billing.example/rs-subscription/cus_mock_1")
+    );
+    // The embed session for the dashboard's web component.
+    let session = &body["data"]["session"];
+    assert_eq!(session["element"], json!("rs-subscription"));
+    assert_eq!(session["token"], json!("tok_rs-subscription_cus_mock_1"));
+    assert_eq!(
+        session["script_url"],
+        json!("https://billing.example/elements.js")
     );
 
-    // The customer was created once, with the acting user's email and the
-    // org permalink as metadata, and persisted.
+    // The customer was created once, with the acting user's email, and
+    // persisted; the provider saw the stored customer id afterwards.
     assert_eq!(h.billing.customers_created(), 1);
-    assert_eq!(h.billing.portal_sessions_created(), 1);
-    let request = h.billing.last_customer_request().unwrap();
-    assert_eq!(request.org_permalink, "acme");
-    assert_eq!(request.org_name, "Acme");
-    assert_eq!(request.email.as_deref(), Some("admin@acme.example"));
+    assert_eq!(h.billing.sessions_created(), 1);
+    let request = h.billing.last_organization().unwrap();
+    assert_eq!(request.permalink, "acme");
+    assert_eq!(request.name, "Acme");
+    assert_eq!(request.user_email.as_deref(), Some("admin@acme.example"));
+    assert_eq!(request.customer_id.as_deref(), Some("cus_mock_1"));
+    assert_eq!(
+        request.return_url.as_deref(),
+        Some("https://mail-admin.example.com")
+    );
     assert_eq!(
         h.store
             .organization_billing_customer_id(org.id)
@@ -305,16 +310,12 @@ async fn second_portal_call_reuses_the_existing_customer() {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             body["data"]["url"],
-            json!("https://billing.stripe.example/session/cus_mock_1")
+            json!("https://billing.example/rs-subscription/cus_mock_1")
         );
     }
     // Idempotent: one customer, two portal sessions.
     assert_eq!(h.billing.customers_created(), 1);
-    assert_eq!(h.billing.portal_sessions_created(), 2);
-    assert_eq!(
-        h.billing.last_portal_customer().as_deref(),
-        Some("cus_mock_1")
-    );
+    assert_eq!(h.billing.sessions_created(), 2);
     assert_eq!(
         h.store
             .organization_billing_customer_id(org.id)
@@ -343,8 +344,8 @@ async fn the_admin_api_key_may_open_the_portal_without_an_email() {
         .as_str()
         .unwrap()
         .starts_with("https://"));
-    let request = h.billing.last_customer_request().unwrap();
-    assert_eq!(request.email, None);
+    let request = h.billing.last_organization().unwrap();
+    assert_eq!(request.user_email, None);
     assert_eq!(
         h.store
             .organization_billing_customer_id(org.id)
@@ -456,123 +457,121 @@ async fn provider_failure_maps_to_billing_unavailable_and_stores_nothing() {
     assert_eq!(h.billing.customers_created(), 1);
 }
 
-// -------------------------------------- StripeBilling against a mock API
+// ------------------------------------------------- plans, checkout, usage
 
-/// A minimal stand-in for the Stripe REST API: records the Authorization
-/// header and the raw form bodies, answers like Stripe would.
-struct MockStripe {
-    base_url: String,
-    requests: Arc<Mutex<Vec<(String, String, String)>>>,
-}
+#[tokio::test]
+async fn plans_checkout_and_usage_sessions_go_through_the_provider() {
+    let h = enabled_harness();
+    let org = h.org("Acme").await;
+    h.member(&org, "owner@acme.example", Role::Owner).await;
+    let token = h.login("owner@acme.example").await;
 
-async fn start_mock_stripe(fail_customers: bool) -> MockStripe {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-    let requests: Arc<Mutex<Vec<(String, String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-
-    let customers_log = requests.clone();
-    let sessions_log = requests.clone();
-    let app = Router::new()
-        .route(
-            "/v1/customers",
-            post(move |headers: HeaderMap, RawForm(body): RawForm| {
-                let log = customers_log.clone();
-                async move {
-                    let auth = headers
-                        .get("authorization")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    log.lock().unwrap().push((
-                        "/v1/customers".into(),
-                        auth,
-                        String::from_utf8(body.to_vec()).unwrap(),
-                    ));
-                    if fail_customers {
-                        (
-                            StatusCode::PAYMENT_REQUIRED,
-                            Json(json!({ "error": { "message": "Your card was declined." } })),
-                        )
-                    } else {
-                        (StatusCode::OK, Json(json!({ "id": "cus_stripe_1" })))
-                    }
-                }
-            }),
+    let (status, body) = h
+        .as_user(
+            &token,
+            "GET",
+            "/api/v2/admin/organizations/acme/billing/plans",
+            None,
         )
-        .route(
-            "/v1/billing_portal/sessions",
-            post(move |headers: HeaderMap, RawForm(body): RawForm| {
-                let log = sessions_log.clone();
-                async move {
-                    let auth = headers
-                        .get("authorization")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-                    log.lock().unwrap().push((
-                        "/v1/billing_portal/sessions".into(),
-                        auth,
-                        String::from_utf8(body.to_vec()).unwrap(),
-                    ));
-                    (
-                        StatusCode::OK,
-                        Json(json!({ "url": "https://billing.stripe.com/p/session/test_123" })),
-                    )
-                }
-            }),
-        );
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    MockStripe { base_url, requests }
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["plans"][0]["code"], json!("base"));
+    assert_eq!(body["data"]["plans"][0]["monthly_send_limit"], json!(5000));
+    assert_eq!(
+        body["data"]["plans"][0]["price"],
+        json!({ "amount_minor": 500, "currency": "EUR", "interval": "month" })
+    );
+
+    // A checkout needs a plan code.
+    let (status, body) = h
+        .as_user(
+            &token,
+            "POST",
+            "/api/v2/admin/organizations/acme/billing/checkout",
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], json!("ParameterMissing"));
+
+    let (status, body) = h
+        .as_user(
+            &token,
+            "POST",
+            "/api/v2/admin/organizations/acme/billing/checkout",
+            Some(json!({ "plan_code": "base" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["session"]["element"], json!("rs-checkout"));
+    assert_eq!(h.billing.last_plan().as_deref(), Some("base"));
+    // The checkout created the customer on first use.
+    assert_eq!(h.billing.customers_created(), 1);
+
+    let (status, body) = h
+        .as_user(
+            &token,
+            "POST",
+            "/api/v2/admin/organizations/acme/billing/usage",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["session"]["element"], json!("rs-usage"));
+    assert_eq!(h.billing.customers_created(), 1, "the customer is reused");
 }
 
 #[tokio::test]
-async fn stripe_billing_posts_form_encoded_requests_with_bearer_auth() {
-    let stripe = start_mock_stripe(false).await;
-    let provider = StripeBilling::with_base_url("sk_test_abc".into(), stripe.base_url.clone());
+async fn billing_enabled_without_a_provider_stays_off() {
+    // `billing.enabled: true` on the open-source build (NoBilling) must
+    // behave like billing disabled, not fail at request time.
+    let h = harness_with(billing_config(true), false);
+    let org = h.org("Acme").await;
+    h.member(&org, "owner@acme.example", Role::Owner).await;
+    let token = h.login("owner@acme.example").await;
 
-    let customer_id = provider
-        .ensure_customer("acme", "Acme & Söhne", Some("owner@acme.example"))
-        .await
-        .unwrap();
-    assert_eq!(customer_id, "cus_stripe_1");
-
-    let url = provider
-        .portal_session(&customer_id, Some("https://app.example.com/billing"))
-        .await
-        .unwrap();
-    assert_eq!(url, "https://billing.stripe.com/p/session/test_123");
-
-    let requests = stripe.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
-    let (path, auth, body) = &requests[0];
-    assert_eq!(path, "/v1/customers");
-    assert_eq!(auth, "Bearer sk_test_abc");
-    assert_eq!(
-        body,
-        "name=Acme+%26+S%C3%B6hne&metadata%5Borg_permalink%5D=acme&email=owner%40acme.example"
-    );
-    let (path, auth, body) = &requests[1];
-    assert_eq!(path, "/v1/billing_portal/sessions");
-    assert_eq!(auth, "Bearer sk_test_abc");
-    assert_eq!(
-        body,
-        "customer=cus_stripe_1&return_url=https%3A%2F%2Fapp.example.com%2Fbilling"
-    );
+    let (status, body) = h
+        .as_user(
+            &token,
+            "GET",
+            "/api/v2/admin/organizations/acme/billing",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["enabled"], json!(false));
+    for path in ["billing/portal", "billing/checkout", "billing/usage"] {
+        let (status, body) = h
+            .as_user(
+                &token,
+                "POST",
+                &format!("/api/v2/admin/organizations/acme/{path}"),
+                Some(json!({ "plan_code": "base" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+        assert_eq!(body["error"]["code"], json!("BillingDisabled"));
+    }
+    let (status, _) = h
+        .as_user(
+            &token,
+            "GET",
+            "/api/v2/admin/organizations/acme/billing/plans",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn stripe_errors_are_mapped_and_not_leaked_verbatim() {
-    let stripe = start_mock_stripe(true).await;
-    let provider = StripeBilling::with_base_url("sk_test_abc".into(), stripe.base_url.clone());
-
-    let error = provider
-        .ensure_customer("acme", "Acme", None)
-        .await
-        .expect_err("a 4xx from stripe must fail");
-    // The error carries the status for the log, but not Stripe's message —
-    // that is only ever logged, never bubbled to clients.
-    assert!(error.to_string().contains("402"), "{error}");
-    assert!(!error.to_string().contains("card was declined"), "{error}");
+async fn the_features_endpoint_reports_billing() {
+    for (harness, expected) in [(enabled_harness(), true), (disabled_harness(), false)] {
+        let (status, body) = harness
+            .request("GET", "/api/v2/auth/features", &[], None)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["data"]["billing"], json!(expected));
+        assert_eq!(body["data"]["captcha"]["provider"], json!("none"));
+        assert_eq!(body["data"]["captcha"]["endpoint"], json!(null));
+    }
 }

@@ -93,12 +93,17 @@ Other conventions:
 
 ## Known deliberate gaps
 
-The one deliberate gap for a self-hosted installation is **billing**: it
-serves only the hosted cloud offering and is opt-in via the `billing`
-config group (Stripe, SDK-free). Self-hosted keeps the default
-(`enabled: false`), so `GET …/billing` reports `enabled: false`, the
-dashboard shows no billing UI, and `POST …/billing/portal` returns 403
-`BillingDisabled`. (The legal pages of the separately hosted marketing
+The one deliberate gap for a self-hosted installation is **billing**: the
+open-source build ships only a provider-neutral seam
+(`camelmailer_api::BillingProvider`, default `NoBilling`). A real provider
+lives in a separate crate that builds its own binary through
+`camelmailer::main_with(Extensions { billing, .. })` (the `camelmailer`
+crate is a library plus the stock binary). Without one, `GET …/billing`
+reports `enabled: false`, the dashboard shows usage only, and the other
+billing endpoints return 403 `BillingDisabled`. Organization quota,
+suspension, the monthly usage counter and installation lifecycle webhooks
+are generic and default off (see `docs/administration.md`,
+`docs/webhooks.md`). (The legal pages of the separately hosted marketing
 site are placeholder templates, marked as such.)
 
 Everything else once listed here has since landed:

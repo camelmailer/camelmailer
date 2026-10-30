@@ -369,6 +369,17 @@ A request naming more recipients than the remainder is refused whole rather
 than partly accepted. Queuing the recipients that fit and dropping the rest
 would leave the caller unable to tell which ones went.
 
+### Organization limits
+
+An organization can carry its own **monthly** limit across all of its
+servers (calendar month, UTC), set by an installation administrator through
+`PATCH /api/v2/admin/organizations/{org}/limits`. Both limits apply and the
+stricter one decides. When the organization's limit is the one that runs
+out, the HTTP error code is `OrganizationQuotaExceeded` (still `429`) and
+the SMTP reply names the monthly limit. A suspended organization answers
+`403 OrganizationSuspended` on HTTP and `535` at SMTP `RCPT TO`. See
+[Administration](administration.md#organization-quota-and-suspension).
+
 ### What counts
 
 Every outgoing message counts once, per recipient, whichever path created it:

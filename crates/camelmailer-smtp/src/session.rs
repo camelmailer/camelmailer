@@ -720,6 +720,14 @@ impl Session {
                 Some(server) if server.suspended => {
                     Reply::line("535 Mail server has been suspended")
                 }
+                Some(server)
+                    if self
+                        .store
+                        .send_policy_for_organization(server.organization_id)
+                        .suspended =>
+                {
+                    Reply::line("535 Organization has been suspended")
+                }
                 Some(server) => {
                     // The idempotency key arrives in DATA. Accept the envelope
                     // here so a completed send can replay at the quota limit.
@@ -1048,14 +1056,31 @@ impl Session {
             .count() as i64;
         // Read current usage for every DATA transaction, rather than caching
         // it across submissions on a persistent connection.
+        // The stricter of the server's 30-day limit and the organization's
+        // monthly limit applies, like on the HTTP send path.
         let allowance = self
             .credential
             .as_ref()
             .and_then(|credential| self.store.server(credential.server_id))
-            .filter(|server| server.send_limit.is_some())
-            .map(|server| camelmailer_core::SendAllowance {
-                limit: server.send_limit,
-                used: self.store.send_usage(server.id),
+            .map(|server| {
+                let server_allowance = match server.send_limit {
+                    Some(limit) => camelmailer_core::SendAllowance::server(
+                        Some(limit),
+                        self.store.send_usage(server.id),
+                    ),
+                    None => camelmailer_core::SendAllowance::unlimited(),
+                };
+                let policy = self
+                    .store
+                    .send_policy_for_organization(server.organization_id);
+                let org_allowance = match policy.monthly_send_limit {
+                    Some(limit) => camelmailer_core::SendAllowance::organization(
+                        Some(limit),
+                        self.store.organization_month_usage(server.organization_id),
+                    ),
+                    None => camelmailer_core::SendAllowance::unlimited(),
+                };
+                server_allowance.stricter(org_allowance)
             })
             .unwrap_or_else(camelmailer_core::SendAllowance::unlimited);
         let outcome = if idempotency.is_some() {

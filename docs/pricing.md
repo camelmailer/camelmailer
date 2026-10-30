@@ -1,74 +1,40 @@
-# Cloud pricing and the public beta
+# Usage and billing
 
-Camelmailer runs in public beta on its EU cloud. Sending is free during the
-beta, and paid plans launch soon. This page covers what the beta includes,
-the plan that is coming, and where all of it lives in the dashboard.
+Every organization has a **Usage** page in the dashboard. It shows how many
+messages the organization sent in the current calendar month (UTC), across
+all of its servers, and, when the installation sets one, the monthly limit
+and what is left of it. The figure comes from the server's own monthly
+counter (`GET /api/v2/admin/organizations/{org}/usage`), so it covers every
+server whether or not it has an API credential.
 
-Pricing applies to the **cloud** offering only. A self-hosted installation
-keeps billing disabled and is never charged; see the note at the end.
+## Limits
 
-## Public beta
+An installation administrator can give an organization a **monthly send
+limit**. At 100 % sending stops: the HTTP API answers `429` with the code
+`OrganizationQuotaExceeded`, SMTP answers `550 5.7.1`, and nothing is
+stored. The limit resets on the first day of the next month. A per-server
+send limit (trailing 30 days) can apply as well, and the stricter of the two
+decides. See [Administration](administration.md#organization-quota-and-suspension)
+and [Send limits](sending.md#send-limits).
 
-While Camelmailer is in public beta, sending is free up to **5,000 emails
-per calendar month**. There is nothing to pay and nothing to set up. Paid
-plans launch after the beta, and you will be able to review them in the
-dashboard before anything is charged.
+A self-hosted installation has no limit on any organization or server unless
+its own operator sets one.
 
-## The Base package (coming soon)
+## Billing
 
-The first paid plan is the **Base package**:
+The open-source build has no payment integration. Billing appears only on an
+installation built with a billing provider (see
+[Configuration](configuration.md#billing-billing-provider-custom-builds)).
+There, organization admins and owners see the provider's plans, checkout and
+subscription management on the same page, rendered by the provider's own web
+components, with a plain link as fallback.
 
-- **€5 per month for 5,000 emails**, billed monthly.
-- The **cloud** offering, hosted on EU infrastructure.
-- **Open and click tracking**, shown right in the app.
-
-Pricing is launching soon, so the Base package appears in the dashboard as a
-preview rather than a purchasable plan today.
-
-## How the cap is enforced
-
-A cloud mail server carries a **send limit** that the operator sets, and both
-submission paths refuse once the trailing 30-day window is full: the HTTP API
-answers `429` with the code `SendLimitExceeded`, and SMTP answers `550 5.7.1`
-at `RCPT TO`. Nothing is stored on a refused send. See
-[Send limits](sending.md#send-limits) for the details, including what counts
-toward the window and what does not.
-
-A self-hosted installation has no limit on any server unless its own operator
-sets one.
-
-## When you pass your quota
-
-The plan preview also shows the two ways over-quota sending will work, so
-you can decide which fits before plans go live:
-
-- **Auto-upgrade.** Keep sending past your quota; the extra volume is billed
-  automatically at the €5 / 5,000 rate.
-- **Buy packages.** Add blocks of 5,000 emails at €5 each, so a month stays
-  within a fixed budget.
-
-This choice is a preview during the beta. You set it for real once paid
-plans launch.
-
-## In the dashboard
-
-Under the organization's **Usage & Billing** page you get three sections:
-
-- **Usage** shows the real sending volume over the last 30 days, summed
-  across the organization's servers (and broken down per server when more
-  than one has an API credential). Connect an API credential on a server to
-  start measuring usage.
-- **Plan** shows the public-beta banner, a quota meter against the 5,000
-  per-month cap, the Base package preview, and the over-quota choice above.
-- **Billing** appears only on the cloud offering when billing is enabled and
-  you are an organization admin or owner: a card that hands off to the
-  secure Stripe portal for subscription, payment methods and invoices.
+The hosted Camelmailer cloud is such a build. Its plans and prices are
+published on camelmailer.com.
 
 ## Self-hosted installations
 
-Billing is the one deliberate cloud-only feature. A self-hosted install runs
-with the `billing` config group disabled, so it is never charged, shows no
-billing portal, and `POST …/billing/portal` returns `403 BillingDisabled`.
-The Usage and Plan sections still render, so you can watch your own sending
-volume. See [Configuration](configuration.md) and
-[Accounts, RBAC and SSO](authentication.md) for the billing config group.
+A self-hosted install is never charged and shows no billing section.
+`GET …/billing` reports `enabled: false` and the other billing endpoints
+answer `403 BillingDisabled`. The usage figure renders all the same, so you
+can watch your own sending volume.

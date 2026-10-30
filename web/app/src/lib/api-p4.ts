@@ -5,21 +5,18 @@
 // Covers three P4 surfaces:
 //   * Statistics view helpers (bounce breakdown, sentence-KPI maths) —
 //     reuses the windowed /stats client from api-p1 (never synthesizes).
-//   * Usage aggregation for the org billing/usage view (real "sent" over
-//     the last 30 days, summed across a server's credentials).
+//   * Usage helpers for the org usage view (the figure itself comes from
+//     the server-side monthly counter, GET …/organizations/{org}/usage).
 //   * The `</>` code-panel catalog: a small, OpenAPI-shaped descriptor of
 //     the public endpoints, rendered to copy-paste snippets in four
 //     languages. Deliberately a static map (no OpenAPI parser) — the
 //     descriptors mirror public/openapi.yaml (paths, methods, examples).
 
-import { adminApi, type Role } from "@/lib/api"
+import { type Role } from "@/lib/api"
 import { serverApiP1 } from "@/lib/api-p1"
 import { type WindowStats } from "@/lib/api"
-import { firstApiCredentialKey } from "@/lib/api-extras"
 
 // --------------------------------------------------------- statistics
-
-const DAY_MS = 86_400_000
 
 /** Aggregate /stats counters over a created_at window (real backend
  *  numbers — one call, includes the bounce breakdown when the server
@@ -91,36 +88,11 @@ export const STAT_COLORS = {
 
 // -------------------------------------------------------------- usage
 
-export type OrgUsage = {
-  /** Outgoing messages created in the last 30 days, summed across every
-   *  server the caller can read (via each server's first API credential).
-   *  null when no server exposed a usable credential — then the UI shows a
-   *  "connect a credential" hint rather than a fabricated zero. */
-  sent30d: number | null
-  /** Per-server contribution, for a small breakdown table. */
-  perServer: { name: string; permalink: string; sent: number | null }[]
-}
-
-/** Real 30-day outbound volume for the whole organization. */
-export async function orgUsage(org: string): Promise<OrgUsage> {
-  const { servers } = await adminApi.servers(org).list()
-  const to = new Date()
-  const from = new Date(to.getTime() - 30 * DAY_MS)
-  const perServer = await Promise.all(
-    servers.map(async (server) => {
-      const key = await firstApiCredentialKey(org, server.permalink)
-      if (!key) return { name: server.name, permalink: server.permalink, sent: null }
-      try {
-        const stats = await statsForRange(key, from, to)
-        return { name: server.name, permalink: server.permalink, sent: stats.outgoing }
-      } catch {
-        return { name: server.name, permalink: server.permalink, sent: null }
-      }
-    }),
-  )
-  const known = perServer.filter((s) => s.sent != null)
-  const sent30d = known.length ? known.reduce((sum, s) => sum + (s.sent ?? 0), 0) : null
-  return { sent30d, perServer }
+/** Share of a monthly limit used, 0..100, or null when unlimited. */
+export function quotaPercent(sent: number, limit: number | null): number | null {
+  if (limit == null) return null
+  if (limit <= 0) return 100
+  return Math.min(100, (sent / limit) * 100)
 }
 
 /** Billing is only surfaced to admins and owners (never viewers/members). */

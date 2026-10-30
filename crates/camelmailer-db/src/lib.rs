@@ -13,18 +13,22 @@
 //! table owner subject to the policy.
 
 mod auth_pg;
+mod lifecycle_queue;
 mod org_sso_pg;
 mod pg_store;
 mod queue;
+mod retention;
 mod tracking;
 pub mod webhook_payload;
 mod webhook_queue;
 
+pub use lifecycle_queue::{LifecycleEventRow, PgLifecycleQueue};
 pub use pg_store::{
     BounceCorrelationOutcome, BounceOriginal, Delivery, FeedbackComplaint,
     FeedbackComplaintOutcome, OutboundQueueAction, PgMessageSink, PgStore, StoredMessage,
 };
 pub use queue::{PgQueue, QueuedMessageRow};
+pub use retention::{RetentionReport, RetentionTarget};
 pub use webhook_queue::{PgWebhookQueue, WebhookLogEntry, WebhookRequestRow};
 
 use sqlx::postgres::PgPoolOptions;

@@ -306,6 +306,11 @@ struct RegisterBody {
     first_name: Option<String>,
     last_name: Option<String>,
     password: Option<String>,
+    /// The captcha token, required when `captcha.provider` is set. Cap's
+    /// widget submits it as `cap-token` in a form, so that name is accepted
+    /// too.
+    #[serde(alias = "cap-token", alias = "cap_token")]
+    captcha_token: Option<String>,
 }
 
 /// `POST /api/v2/auth/register` — open self-registration. Gated behind
@@ -365,6 +370,36 @@ async fn register(
             ),
         );
     }
+    // Captcha last among the checks, right before anything is created, so
+    // a form with a typo does not burn the token.
+    if state.config.captcha.enabled() {
+        let Some(token) = body.captcha_token.filter(|t| !t.trim().is_empty()) else {
+            return render_parameter_missing(
+                Some(&start.0),
+                "param is missing or the value is empty: captcha_token",
+            );
+        };
+        match crate::captcha::verify(&state.config.captcha, &token).await {
+            Ok(()) => {}
+            Err(crate::captcha::CaptchaError::Rejected) => {
+                return render_error(
+                    Some(&start.0),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "CaptchaInvalid",
+                    "The captcha could not be verified; please solve it again",
+                )
+            }
+            Err(crate::captcha::CaptchaError::Unavailable(error)) => {
+                tracing::error!(%error, "captcha verification failed");
+                return render_error(
+                    Some(&start.0),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CaptchaUnavailable",
+                    "The captcha service is unavailable; please try again later",
+                );
+            }
+        }
+    }
     // A duplicate address surfaces as StoreError::Conflict from the store
     // ("Email address has already been taken") → 422 ValidationError.
     let user = match state
@@ -393,6 +428,12 @@ async fn register(
         Some(&user.email_address),
         "registration.success",
         &headers,
+    )
+    .await;
+    crate::lifecycle::user_registered(
+        &state,
+        &user,
+        crate::lifecycle::RegistrationSource::Registration,
     )
     .await;
     // Welcome mail (no token) — a no-op unless app_mail is enabled; a
@@ -1235,6 +1276,12 @@ async fn invitation_accept(
             if let Err(error) = store.set_password_digest(user.id, &digest).await {
                 return render_store_error(Some(&start.0), error);
             }
+            crate::lifecycle::user_registered(
+                &state,
+                &user,
+                crate::lifecycle::RegistrationSource::Invitation,
+            )
+            .await;
             (user, true)
         }
     };
@@ -1352,6 +1399,18 @@ async fn features(
                 "terms_url": state.config.legal.terms_url,
                 "privacy_url": state.config.legal.privacy_url,
             },
+            // The public half only: the widget needs the endpoint, the
+            // secret stays on the server.
+            "captcha": {
+                "provider": state.config.captcha.provider.as_str(),
+                "endpoint": state
+                    .config
+                    .captcha
+                    .enabled()
+                    .then(|| state.config.captcha.normalized_endpoint())
+                    .flatten(),
+            },
+            "billing": crate::billing::billing_active(&state),
         }),
     )
 }

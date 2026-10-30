@@ -38,10 +38,8 @@ camelmailer:
   default_spam_threshold: 5
   default_spam_failure_threshold: 20
 
-  # Delete stored messages (and their deliveries, opens, clicks and tracking
-  # tokens) once they are older than this many days. The worker enforces it
-  # hourly. 0 (the default) keeps messages forever — set a positive value to
-  # opt in to automatic retention.
+  # Deprecated: use retention.message_metadata_days (this value is used
+  # only while that one is 0).
   # message_retention_days: 0
 
   # SSRF guard on outbound webhook / HTTP-route-endpoint requests. On by
@@ -190,16 +188,49 @@ app_mail:
   # from_address: no-reply@example.com   # domain must be verified on that server
   # from_name: Camelmailer
 
-# Stripe billing — for the hosted cloud offering only. Self-hosted
-# installations leave this off (the default): no billing endpoints, no
-# billing UI in the dashboard. When enabled, stripe_secret_key is
-# required; the key is never logged.
+# Billing. The open-source build ships no billing provider, so this stays
+# off on a self-hosted installation (and stays off even when enabled, with a
+# warning at startup). A custom build that plugs in a provider through the
+# `camelmailer` library crate reads its own settings from `options`.
 billing:
   enabled: false
-  # stripe_secret_key: sk_live_…
-  # Where the Stripe billing portal returns the user to; defaults to
-  # auth.frontend_url when unset.
-  # portal_return_url: https://mail-admin.example.com
+  # options:                 # free-form, read only by the custom provider
+  #   api_url: https://billing.example.com
+  #   api_key: …
+
+# Data retention defaults, in days. 0 keeps the data forever, which is the
+# default for everything except the API request log. Organizations can
+# override the first four through the admin API
+# (PATCH /api/v2/admin/organizations/{org}/limits). The worker applies it
+# hourly in batches. Expired sessions, password resets, invitations, share
+# links and SSO/passkey state are always deleted at expiry.
+retention:
+  message_content_days: 0    # raw MIME (outgoing and inbound); capped at message_metadata_days
+  message_metadata_days: 0   # message rows, deliveries, opens/clicks (IP, user agent), tracking tokens
+  webhook_log_days: 0        # webhook delivery log
+  dmarc_report_days: 0       # received DMARC aggregate reports
+  auth_event_days: 0         # authentication audit log
+  api_request_days: 30       # per-server API request log
+  batch_size: 1000           # rows per delete statement
+
+# Installation lifecycle webhooks: organization.created,
+# organization.deleted, user.registered and organization.usage_threshold
+# (80 % and 100 % of an organization's monthly send limit, once each per
+# month). The worker POSTs each event to every URL, signed with
+# HMAC-SHA256 over "{timestamp}.{body}" in the header
+# `X-Camelmailer-Signature: t=<unix>,v1=<hex>`. Off while `urls` is empty.
+lifecycle_webhooks:
+  urls: []
+  # secret: a-long-random-string   # required when urls is set
+
+# Captcha at self-registration (POST /api/v2/auth/register). `cap` speaks
+# the Cap siteverify contract (https://trycap.dev). The endpoint includes
+# the site key; the dashboard loads the widget against it, and the server
+# verifies tokens at {endpoint}siteverify with the secret.
+captcha:
+  provider: none             # none | cap
+  # endpoint: https://captcha.example.com/<site_key>/
+  # secret: …                # never sent to a browser
 
 # OpenID Connect single sign-on (Okta, Entra ID, Google, Keycloak, …).
 # Register the redirect URI:

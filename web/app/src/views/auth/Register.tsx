@@ -1,12 +1,13 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { AuthLegal, AuthShell } from "@/components/auth-shell"
 import { AuthDivider, ProviderButton, providerIcon } from "@/components/auth-social"
 import { Button } from "@/components/ui/button"
+import { CapWidget } from "@/components/cap-widget"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -30,6 +31,12 @@ export default function Register() {
   const [busy, setBusy] = useState(false)
   const [ssoProviders, setSsoProviders] = useState<SsoProviderInfo[]>([])
   const [features, setFeatures] = useState<Features | null>(null)
+  const [captchaToken, setCaptchaToken] = useState<string | null>(null)
+  // Bumped to remount the widget after a rejected token, so it asks again.
+  const [captchaRound, setCaptchaRound] = useState(0)
+  const onCaptchaToken = useCallback((token: string | null) => setCaptchaToken(token), [])
+  const captchaEndpoint =
+    features?.captcha?.provider === "cap" ? features.captcha.endpoint : null
 
   // Social sign-in provisions accounts automatically, so the same
   // providers double as sign-up buttons.
@@ -45,6 +52,10 @@ export default function Register() {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
+    if (captchaEndpoint && !captchaToken) {
+      setError("Please complete the captcha first.")
+      return
+    }
     setBusy(true)
     setError(null)
     try {
@@ -53,6 +64,7 @@ export default function Register() {
         first_name: firstName,
         last_name: lastName,
         password,
+        ...(captchaToken ? { captcha_token: captchaToken } : {}),
       })
       await adopt(result.session_token)
       router.push("/dashboard")
@@ -61,6 +73,10 @@ export default function Register() {
         if (err.code === "RegistrationDisabled") {
           setDisabled(true)
           setError(null)
+        } else if (err.code === "CaptchaInvalid") {
+          setCaptchaToken(null)
+          setCaptchaRound((round) => round + 1)
+          setError(err.message)
         } else {
           setError(err.message)
         }
@@ -137,12 +153,19 @@ export default function Register() {
                   required
                 />
               </div>
+              {captchaEndpoint && (
+                <CapWidget
+                  key={captchaRound}
+                  endpoint={captchaEndpoint}
+                  onToken={onCaptchaToken}
+                />
+              )}
               {error && (
                 <Alert variant="destructive">
                   <AlertDescription>{error}</AlertDescription>
                 </Alert>
               )}
-              <Button type="submit" disabled={busy}>
+              <Button type="submit" disabled={busy || (!!captchaEndpoint && !captchaToken)}>
                 {busy ? "Creating account…" : "Create account"}
               </Button>
               {ssoProviders.length > 0 && <AuthDivider label="Or sign up with" />}

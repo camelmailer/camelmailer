@@ -19,7 +19,7 @@ use camelmailer_db::webhook_payload::{
 };
 use camelmailer_db::{
     BounceCorrelationOutcome, BounceOriginal, FeedbackComplaintOutcome, OutboundQueueAction,
-    PgMessageSink, PgQueue, PgStore, PgWebhookQueue, StoredMessage,
+    PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, StoredMessage,
 };
 use serde_json::json;
 use std::time::Duration;
@@ -27,9 +27,6 @@ use std::time::Duration;
 /// Webhook deliveries are retried this many times before giving up
 /// (mirrors Postal's webhook retry schedule length).
 const WEBHOOK_MAX_ATTEMPTS: i32 = 10;
-
-/// API request-log entries older than this are deleted by housekeeping.
-const API_REQUEST_RETENTION_DAYS: i64 = 30;
 
 /// How often the worker loop runs housekeeping.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(3600);
@@ -126,6 +123,10 @@ pub struct Worker {
     sink: PgMessageSink,
     queue: PgQueue,
     webhook_queue: PgWebhookQueue,
+    /// The installation lifecycle-event outbox.
+    lifecycle_queue: PgLifecycleQueue,
+    /// `lifecycle_webhooks`: where lifecycle events go and the HMAC secret.
+    lifecycle_webhooks: camelmailer_config::LifecycleWebhooks,
     sender: SmtpSender,
     signer: Option<Signer>,
     dkim_selector: String,
@@ -141,10 +142,15 @@ pub struct Worker {
     /// Address guard for outbound webhook / route-endpoint requests (SSRF).
     ssrf_guard: SsrfGuard,
     max_attempts: i32,
-    /// `camelmailer.message_retention_days`. `0` disables message retention
-    /// (keep forever); a positive value prunes messages older than that many
-    /// days during housekeeping.
-    message_retention_days: i64,
+    /// Installation retention defaults (`retention` group, with
+    /// `camelmailer.message_retention_days` as the metadata alias).
+    retention: camelmailer_core::RetentionPeriods,
+    /// `retention.auth_event_days` (0 = keep forever).
+    auth_event_days: u32,
+    /// `retention.api_request_days` (0 = keep forever).
+    api_request_days: u32,
+    /// `retention.batch_size`.
+    retention_batch: i64,
     /// Validated shared SMTP return-path domain. Invalid placeholders retain
     /// the submitted envelope sender.
     return_path_domain: Option<String>,
@@ -187,11 +193,14 @@ impl Worker {
                 "dns.return_path_domain is empty, invalid, or reserved; preserving submitted envelope senders"
             );
         }
+        let lifecycle_queue = PgLifecycleQueue::new(store.pool().clone(), stale_lock_days);
         Self {
             store,
             sink,
             queue,
             webhook_queue,
+            lifecycle_queue,
+            lifecycle_webhooks: config.lifecycle_webhooks.clone(),
             signer,
             dkim_selector: config.dns.dkim_identifier.clone(),
             rspamd,
@@ -207,7 +216,15 @@ impl Worker {
             http,
             ssrf_guard: SsrfGuard::from_config(config),
             max_attempts: config.camelmailer.default_maximum_delivery_attempts as i32,
-            message_retention_days: config.camelmailer.message_retention_days as i64,
+            retention: camelmailer_core::RetentionPeriods::from_days(
+                config.retention.message_content_days,
+                config.message_metadata_retention_days(),
+                config.retention.webhook_log_days,
+                config.retention.dmarc_report_days,
+            ),
+            auth_event_days: config.retention.auth_event_days,
+            api_request_days: config.retention.api_request_days,
+            retention_batch: config.retention.batch_size.max(1) as i64,
             return_path_domain,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
         }
@@ -1105,6 +1122,73 @@ impl Worker {
         }
     }
 
+    /// Deliver one queued lifecycle event to every configured URL, if one is
+    /// ready. The body was rendered at enqueue time; each request is signed
+    /// with HMAC-SHA256 over `"{timestamp}.{body}"`. The event counts as
+    /// delivered when every URL answered 2xx; otherwise it is retried with
+    /// backoff (all URLs again, so receivers dedupe on the event id) and
+    /// dropped after the last attempt. Lifecycle URLs are operator
+    /// configuration, so the tenant SSRF guard does not apply to them.
+    pub async fn process_next_lifecycle_event(
+        &self,
+    ) -> Result<Option<WebhookOutcome>, sqlx::Error> {
+        if !self.lifecycle_webhooks.enabled() {
+            return Ok(None);
+        }
+        let Some(event) = self.lifecycle_queue.dequeue(&self.worker_id).await? else {
+            return Ok(None);
+        };
+        let secret = self.lifecycle_webhooks.secret.clone().unwrap_or_default();
+        let mut failures = Vec::new();
+        for url in &self.lifecycle_webhooks.urls {
+            let timestamp = chrono::Utc::now().timestamp();
+            let signature =
+                camelmailer_core::lifecycle::signature_header(&secret, timestamp, &event.payload);
+            let result = self
+                .http
+                .post(url)
+                .header("content-type", "application/json")
+                .header(camelmailer_core::lifecycle::EVENT_HEADER, &event.event)
+                .header(camelmailer_core::lifecycle::EVENT_ID_HEADER, &event.uuid)
+                .header(camelmailer_core::lifecycle::SIGNATURE_HEADER, signature)
+                .body(event.payload.clone())
+                .send()
+                .await;
+            match result {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => failures.push(format!("{url}: HTTP {}", response.status())),
+                Err(error) => failures.push(format!("{url}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            self.lifecycle_queue.complete(event.id).await?;
+            return Ok(Some(WebhookOutcome::Delivered));
+        }
+        let detail = failures.join("; ");
+        if event.attempts + 1 >= WEBHOOK_MAX_ATTEMPTS {
+            tracing::warn!(event = %event.event, id = %event.uuid, %detail,
+                "lifecycle event given up after {WEBHOOK_MAX_ATTEMPTS} attempts");
+            self.lifecycle_queue.complete(event.id).await?;
+            Ok(Some(WebhookOutcome::GivenUp))
+        } else {
+            tracing::info!(event = %event.event, id = %event.uuid, %detail,
+                "lifecycle event delivery failed, retrying");
+            self.lifecycle_queue
+                .retry(event.id, event.attempts, &detail)
+                .await?;
+            Ok(Some(WebhookOutcome::Retrying))
+        }
+    }
+
+    /// Test/ops helper: deliver every ready lifecycle event.
+    pub async fn drain_lifecycle_events(&self) -> Result<usize, sqlx::Error> {
+        let mut processed = 0;
+        while self.process_next_lifecycle_event().await?.is_some() {
+            processed += 1;
+        }
+        Ok(processed)
+    }
+
     /// Test/ops helper: deliver every ready webhook request.
     pub async fn drain_webhooks(&self) -> Result<usize, sqlx::Error> {
         let mut processed = 0;
@@ -1114,17 +1198,78 @@ impl Worker {
         Ok(processed)
     }
 
-    /// Housekeeping: prune API request-log entries older than the 30-day
-    /// retention and, when `camelmailer.message_retention_days > 0`, stored
-    /// messages older than that window (with their deliveries, opens, clicks,
-    /// tracking tokens and any queued entries), plus send-limit counter
-    /// buckets that have left every window. Returns how many API-request
-    /// rows were removed. Runs periodically from [`Worker::run`].
+    /// Apply data retention once: per server (with its organization's
+    /// overrides) message content, message metadata, the webhook log and
+    /// DMARC reports; installation-wide the auth audit log and the API
+    /// request log; and, always, expired authentication tokens. Every class
+    /// is deleted in batches of `retention.batch_size`. A failing class is
+    /// logged and the pass moves on.
+    pub async fn apply_retention(&self) -> Result<camelmailer_db::RetentionReport, sqlx::Error> {
+        let now = chrono::Utc::now();
+        let batch = self.retention_batch;
+        let mut report = camelmailer_db::RetentionReport::default();
+        for target in self.store.retention_targets().await? {
+            let periods = self.retention.with_overrides(&target.overrides);
+            let server = target.server_id;
+            if let Some(cutoff) =
+                camelmailer_core::retention::cutoff(now, periods.message_metadata_days)
+            {
+                match self
+                    .store
+                    .prune_message_metadata(server, cutoff, batch)
+                    .await
+                {
+                    Ok(n) => report.messages_deleted += n,
+                    Err(error) => tracing::error!(%error, server, "message retention failed"),
+                }
+            }
+            if let Some(cutoff) =
+                camelmailer_core::retention::cutoff(now, periods.message_content_days)
+            {
+                match self
+                    .store
+                    .purge_message_content(server, cutoff, batch)
+                    .await
+                {
+                    Ok(n) => report.message_content_purged += n,
+                    Err(error) => tracing::error!(%error, server, "content retention failed"),
+                }
+            }
+            if let Some(cutoff) = camelmailer_core::retention::cutoff(now, periods.webhook_log_days)
+            {
+                match self.store.prune_webhook_log(server, cutoff, batch).await {
+                    Ok(n) => report.webhook_log_deleted += n,
+                    Err(error) => tracing::error!(%error, server, "webhook log retention failed"),
+                }
+            }
+            if let Some(cutoff) =
+                camelmailer_core::retention::cutoff(now, periods.dmarc_report_days)
+            {
+                match self.store.prune_dmarc_reports(server, cutoff, batch).await {
+                    Ok(n) => report.dmarc_reports_deleted += n,
+                    Err(error) => tracing::error!(%error, server, "DMARC retention failed"),
+                }
+            }
+        }
+        if self.auth_event_days > 0 {
+            let cutoff = now - chrono::Duration::days(self.auth_event_days as i64);
+            report.auth_events_deleted = self.store.prune_auth_events(cutoff, batch).await?;
+        }
+        if self.api_request_days > 0 {
+            let cutoff = now - chrono::Duration::days(self.api_request_days as i64);
+            report.api_requests_deleted = self.store.prune_api_request_log(cutoff, batch).await?;
+        }
+        report.expired_tokens_deleted = self.store.prune_expired_auth_tokens(now, batch).await?;
+        Ok(report)
+    }
+
+    /// Housekeeping: data retention ([`Worker::apply_retention`]), expired
+    /// send-idempotency responses, send-limit counter buckets that have left
+    /// every window, and the lifecycle outbox when nothing can deliver it.
+    /// Returns how many API-request rows were removed. Runs periodically
+    /// from [`Worker::run`].
     pub async fn housekeep(&self) -> Result<u64, camelmailer_core::StoreError> {
         let now = chrono::Utc::now();
-        let api_cutoff = now - chrono::Duration::days(API_REQUEST_RETENTION_DAYS);
-        let removed =
-            camelmailer_core::ServerStore::prune_api_requests(&self.store, api_cutoff).await?;
         let expired_idempotency =
             camelmailer_core::ServerStore::prune_idempotency_requests(&self.store, now).await?;
         if expired_idempotency > 0 {
@@ -1134,18 +1279,18 @@ impl Worker {
             );
         }
 
-        if self.message_retention_days > 0 {
-            let message_cutoff = now - chrono::Duration::days(self.message_retention_days);
-            match camelmailer_core::ServerStore::prune_messages(&self.store, message_cutoff).await {
-                Ok(0) => {}
-                Ok(pruned) => tracing::info!(
-                    pruned,
-                    retention_days = self.message_retention_days,
-                    "pruned expired messages"
-                ),
-                Err(error) => tracing::error!(%error, "message retention pruning error"),
+        let removed = match self.apply_retention().await {
+            Ok(report) => {
+                if !report.is_empty() {
+                    tracing::info!(?report, "data retention applied");
+                }
+                report.api_requests_deleted
             }
-        }
+            Err(error) => {
+                tracing::error!(%error, "data retention error");
+                0
+            }
+        };
 
         // Send-limit counter buckets that have left every 30-day window.
         // Failing to prune them is a housekeeping annoyance rather than a
@@ -1154,6 +1299,20 @@ impl Worker {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "pruned expired send-limit counters"),
             Err(error) => tracing::error!(%error, "send-counter pruning error"),
+        }
+
+        // Without a lifecycle URL nothing can deliver the outbox (usage
+        // threshold events are written by the insert transaction whether or
+        // not anyone listens), so keep it from growing.
+        if !self.lifecycle_webhooks.enabled() {
+            match self.lifecycle_queue.discard_all().await {
+                Ok(0) => {}
+                Ok(dropped) => tracing::info!(
+                    dropped,
+                    "dropped lifecycle events: no lifecycle_webhooks.urls configured"
+                ),
+                Err(error) => tracing::error!(%error, "lifecycle outbox pruning error"),
+            }
         }
         Ok(removed)
     }
@@ -1190,6 +1349,14 @@ impl Worker {
                 }
                 Ok(None) => {}
                 Err(error) => tracing::error!(%error, "webhook processing error"),
+            }
+            match self.process_next_lifecycle_event().await {
+                Ok(Some(outcome)) => {
+                    idle = false;
+                    tracing::debug!(?outcome, "processed lifecycle event");
+                }
+                Ok(None) => {}
+                Err(error) => tracing::error!(%error, "lifecycle event processing error"),
             }
             if idle {
                 tokio::time::sleep(Duration::from_secs(5)).await;
