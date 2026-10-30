@@ -26,7 +26,7 @@ The endpoint resolves, live via DNS:
 
 | Check | Record | Grading |
 |---|---|---|
-| SPF | TXT at `<domain>` | `ok` when exactly one `v=spf1` record exists, it includes this installation (`include:<dns.spf_include>`, or `a:<smtp_hostname>` when no include is configured) and ends in `-all`/`~all`; `warning` on multiple records, a missing mechanism or a soft `?all`/`+all`; `missing` without any `v=spf1` record |
+| SPF | TXT at `<domain>` | `ok` when exactly one `v=spf1` record exists, it authorizes this installation (evaluated against the IP pool's addresses, or the `ip4:`/`ip6:` addresses listed at `dns.spf_include`; otherwise the text must contain `include:<dns.spf_include>`, or `a:<smtp_hostname>` when no include is configured; see [domains.md](domains.md#spf)) and ends in `-all`/`~all`; `warning` on multiple records, a missing mechanism or a soft `?all`/`+all`; `missing` without any `v=spf1` record |
 | DKIM | TXT at `<dkim_identifier>._domainkey.<domain>` | `ok` when the published `p=` equals the key this server signs with (the domain's own key, or the installation key for older domains); `warning` on a mismatch; `missing` without a record |
 | DMARC | TXT at `_dmarc.<domain>` | `ok` when one `v=DMARC1` record with a valid `p=` and an `rua=` exists; `warning` on parse problems, several records or a missing `rua=`; `missing` without a record |
 

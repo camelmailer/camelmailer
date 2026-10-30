@@ -15,6 +15,16 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Changed
+
+- **SPF health check without an IP pool.** The check now evaluates the
+  domain's SPF against the addresses listed in the installation's own
+  `dns.spf_include` record instead of looking for `include:<dns.spf_include>`
+  in the text. A flattened record, which lists those addresses rather than
+  the include, now reads `ok`, and a warning names any address it misses.
+  The text comparison remains the fallback when that record is missing or
+  is not made only of `ip4:`/`ip6:` terms.
+
 ### Fixed
 
 - **SPF lookup limit counted twice.** The evaluator charged each `include:`
