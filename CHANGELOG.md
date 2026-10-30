@@ -15,6 +15,14 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-10-30
+
+### Fixed
+
+- **Sign-up captcha.** The captcha spans the full form width and is always
+  English, like the rest of the dashboard, instead of following the browser
+  language.
+
 ## [0.10.3] - 2026-10-30
 
 ### Fixed
@@ -1267,7 +1275,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.10.3...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.10.4...HEAD
+[0.10.4]: https://github.com/camelmailer/camelmailer/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/camelmailer/camelmailer/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/camelmailer/camelmailer/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/camelmailer/camelmailer/compare/v0.10.0...v0.10.1

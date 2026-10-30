@@ -53,7 +53,13 @@ export function CapWidget({
   }
   return createElement("cap-widget", {
     ref: setElement,
+    // Full width like the inputs around it; the widget reads its width from
+    // this custom property (default 260px).
+    className: "block w-full",
+    style: { "--cap-widget-width": "100%" },
     "data-cap-api-endpoint": endpoint,
+    // The widget follows the browser language otherwise; the dashboard is English.
+    "data-cap-lang": "en",
     // The form submits the token itself; no hidden field is needed.
     "data-cap-hidden-field-name": "cap-token",
   })
