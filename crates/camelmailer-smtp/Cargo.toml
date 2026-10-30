@@ -15,7 +15,6 @@ hmac = { workspace = true }
 md-5 = { workspace = true }
 sha2 = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }

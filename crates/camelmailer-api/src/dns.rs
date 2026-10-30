@@ -5,54 +5,58 @@
 
 use async_trait::async_trait;
 use camelmailer_core::{DnsError, DnsResolver};
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::error::ResolveErrorKind;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolverConfig, GOOGLE};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::NetError;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::TokioResolver;
+
+/// A resolver from the system configuration, falling back to Google's public
+/// resolvers (the hickory 0.24 `ResolverConfig::default()`) when the system
+/// configuration cannot be read.
+fn system_resolver() -> TokioResolver {
+    TokioResolver::builder_tokio()
+        .and_then(|builder| builder.build())
+        .or_else(|_| {
+            TokioResolver::builder_with_config(
+                ResolverConfig::udp_and_tcp(&GOOGLE),
+                TokioRuntimeProvider::default(),
+            )
+            .build()
+        })
+        .expect("a resolver with a static configuration always builds")
+}
 
 pub struct HickoryDnsResolver;
 
 #[async_trait]
 impl DnsResolver for HickoryDnsResolver {
     async fn txt_records(&self, name: &str) -> Result<Vec<String>, DnsError> {
-        let resolver = TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
-        });
+        let resolver = system_resolver();
         match resolver.txt_lookup(format!("{name}.")).await {
-            Ok(lookup) => Ok(lookup
-                .iter()
-                .map(|txt| {
-                    // a TXT record may be split into several character
-                    // strings; verifiers concatenate them
-                    txt.iter()
-                        .map(|data| String::from_utf8_lossy(data).into_owned())
-                        .collect::<String>()
-                })
-                .collect()),
-            Err(error) => match error.kind() {
-                // "no such record" is an answer, not a failure
-                ResolveErrorKind::NoRecordsFound { .. } => Ok(Vec::new()),
-                _ => Err(DnsError::Lookup(error.to_string())),
-            },
+            Ok(lookup) => Ok(txt_strings(&lookup)),
+            // "no such record" is an answer, not a failure
+            Err(error) if error.is_no_records_found() => Ok(Vec::new()),
+            Err(error) => Err(DnsError::Lookup(error.to_string())),
         }
     }
 
     async fn cname(&self, name: &str) -> Result<Option<String>, DnsError> {
-        use hickory_resolver::proto::rr::{RData, RecordType};
-        let resolver = TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
-        });
+        use hickory_resolver::proto::rr::RecordType;
+        let resolver = system_resolver();
         match resolver.lookup(format!("{name}."), RecordType::CNAME).await {
-            Ok(lookup) => Ok(lookup.iter().find_map(|rdata| match rdata {
-                RData::CNAME(target) => {
-                    Some(target.0.to_string().trim_end_matches('.').to_string())
-                }
-                _ => None,
-            })),
-            Err(error) => match error.kind() {
-                // "no such record" is an answer, not a failure
-                ResolveErrorKind::NoRecordsFound { .. } => Ok(None),
-                _ => Err(DnsError::Lookup(error.to_string())),
-            },
+            Ok(lookup) => Ok(lookup
+                .answers()
+                .iter()
+                .find_map(|record| match &record.data {
+                    RData::CNAME(target) => {
+                        Some(target.0.to_string().trim_end_matches('.').to_string())
+                    }
+                    _ => None,
+                })),
+            // "no such record" is an answer, not a failure
+            Err(error) if error.is_no_records_found() => Ok(None),
+            Err(error) => Err(DnsError::Lookup(error.to_string())),
         }
     }
 }
@@ -66,14 +70,12 @@ impl DnsResolver for HickoryDnsResolver {
 /// resolver per lookup would multiply setup cost by a factor of thirty or
 /// more.
 pub struct HickorySpfResolver {
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
 }
 
 impl HickorySpfResolver {
     pub fn new() -> Self {
-        let resolver = TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
-        });
+        let resolver = system_resolver();
         Self { resolver }
     }
 }
@@ -86,28 +88,37 @@ impl Default for HickorySpfResolver {
 
 /// "No such record" is an answer (an empty set), any other failure is a
 /// lookup error, which SPF turns into a temperror rather than a verdict.
-fn empty_on_no_records<T>(
-    error: hickory_resolver::error::ResolveError,
-    empty: T,
-) -> Result<T, DnsError> {
-    match error.kind() {
-        ResolveErrorKind::NoRecordsFound { .. } => Ok(empty),
-        _ => Err(DnsError::Lookup(error.to_string())),
+fn empty_on_no_records<T>(error: NetError, empty: T) -> Result<T, DnsError> {
+    if error.is_no_records_found() {
+        Ok(empty)
+    } else {
+        Err(DnsError::Lookup(error.to_string()))
     }
+}
+
+/// The TXT strings of a lookup. A TXT record may be split into several
+/// character strings; verifiers (and SPF) concatenate them with no separator.
+fn txt_strings(lookup: &hickory_resolver::lookup::Lookup) -> Vec<String> {
+    lookup
+        .answers()
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::TXT(txt) => Some(
+                txt.txt_data
+                    .iter()
+                    .map(|data| String::from_utf8_lossy(data))
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
 }
 
 #[async_trait]
 impl camelmailer_core::SpfResolver for HickorySpfResolver {
     async fn txt(&self, name: &str) -> Result<Vec<String>, DnsError> {
         match self.resolver.txt_lookup(format!("{name}.")).await {
-            Ok(lookup) => Ok(lookup
-                .iter()
-                .map(|txt| {
-                    txt.iter()
-                        .map(|data| String::from_utf8_lossy(data).into_owned())
-                        .collect::<String>()
-                })
-                .collect()),
+            Ok(lookup) => Ok(txt_strings(&lookup)),
             Err(error) => empty_on_no_records(error, Vec::new()),
         }
     }
@@ -122,8 +133,14 @@ impl camelmailer_core::SpfResolver for HickorySpfResolver {
     async fn mx_hosts(&self, name: &str) -> Result<Vec<String>, DnsError> {
         match self.resolver.mx_lookup(format!("{name}.")).await {
             Ok(lookup) => Ok(lookup
+                .answers()
                 .iter()
-                .map(|mx| mx.exchange().to_string().trim_end_matches('.').to_string())
+                .filter_map(|record| match &record.data {
+                    RData::MX(mx) => {
+                        Some(mx.exchange.to_string().trim_end_matches('.').to_string())
+                    }
+                    _ => None,
+                })
                 .collect()),
             Err(error) => empty_on_no_records(error, Vec::new()),
         }

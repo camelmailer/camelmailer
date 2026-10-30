@@ -26,7 +26,7 @@ camelmailer-worker = { path = "crates/camelmailer-worker" }
 
 argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 idna = "1"
 jsonwebtoken = { version = "9", default-features = false }
 rcgen = "0.13"
@@ -36,7 +36,6 @@ x509-cert = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rsa = { version = "0.9", features = ["sha2"] }
-rustls-pemfile = "2"
 sha1 = "0.10"
 sha2 = "0.10"
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
@@ -65,8 +64,8 @@ hmac = "0.12"
 md-5 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 ipnet = "2"
-quick-xml = "0.37"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.42"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 regex = "1"
 subtle = "2"
 thiserror = "2"
