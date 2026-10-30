@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-30
+
 ### Security
 
 - **Template and layout builder escaping.** Values written into HTML
@@ -1239,7 +1241,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/camelmailer/camelmailer/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/camelmailer/camelmailer/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/camelmailer/camelmailer/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/camelmailer/camelmailer/compare/v0.8.4...v0.9.0
