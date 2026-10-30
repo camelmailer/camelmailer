@@ -296,6 +296,56 @@ can override the first four per class. Expired authentication tokens are
 always removed. The full picture, including what each class covers and the
 override rules, is in [Data retention](retention.md).
 
+### `worker:` delivery
+
+```yaml
+worker:
+  threads: 2              # messages one worker process delivers at once
+  servers: []             # only these servers (organization/server); empty = all
+  exclude_servers: []     # never these servers
+  deliver: all            # all | transactional | bulk
+```
+
+The queue is fair without any of this. A worker takes turns between the
+servers that have mail waiting, so one server's 10,000 queued campaign mails
+do not hold back another server's password reset. Within a server,
+transactional mail goes first; bulk mail (broadcast streams and campaigns)
+follows.
+
+`servers`, `exclude_servers` and `deliver` dedicate a worker to part of the
+queue. Each entry is an `organization/server` permalink, and a worker that
+names a server that does not exist refuses to start. A setup that keeps a
+tenant's newsletters away from everyone's transactional mail:
+
+```yaml
+# worker A: everything except the bulk of acme/marketing
+worker: { exclude_servers: [acme/marketing] }
+# worker B: only acme/marketing
+worker: { servers: [acme/marketing], threads: 4 }
+```
+
+Or split by kind of mail, for every server: one worker with
+`deliver: transactional`, one with `deliver: bulk`.
+
+The environment variables `WORKER_THREADS`, `WORKER_SERVERS`,
+`WORKER_EXCLUDE_SERVERS` and `WORKER_DELIVER` override the file (lists are
+comma separated), so one config file can start differently scoped worker
+containers:
+
+```yaml
+services:
+  worker-transactional:
+    command: worker
+    environment: { WORKER_DELIVER: transactional, WORKER_THREADS: "4" }
+  worker-bulk:
+    command: worker
+    environment: { WORKER_DELIVER: bulk }
+    deploy: { replicas: 2 }
+```
+
+Any number of workers, scoped or not, work on the same queue safely; a
+message is handed to exactly one of them.
+
 ### `lifecycle_webhooks:` installation events
 
 Forwards installation-wide events to outside systems such as a billing or
@@ -373,6 +423,7 @@ One binary, four roles — scale each independently:
 camelmailer web-server    # HTTP APIs; stateless, scale horizontally
 camelmailer smtp-server   # SMTP intake; scale behind a TCP LB
 camelmailer worker        # delivery; scale by queue depth (SKIP LOCKED —
-                          # any number of workers cooperate safely)
+                          # any number of workers cooperate safely), fair
+                          # between servers, scopable per tenant (worker:)
 camelmailer initialize    # one-shot migrations (idempotent, run per deploy)
 ```

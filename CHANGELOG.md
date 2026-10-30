@@ -15,6 +15,35 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-31
+
+### Changed
+
+- **Fair delivery queue.** The worker no longer takes the oldest message of
+  the whole queue. It takes turns between the servers with mail waiting, so
+  one server's large send cannot hold back the mail of every other server;
+  concurrent workers spread over the servers. Within a server, transactional
+  mail is delivered before bulk mail (broadcast streams and campaigns).
+  Migration `0049_fair_queue` adds `queued_messages.bulk` and an index; apply
+  migrations before running the updated worker.
+
+### Added
+
+- **Dedicated workers.** `worker.servers`, `worker.exclude_servers`
+  (`organization/server` permalinks) and `worker.deliver` (`all`,
+  `transactional`, `bulk`) scope a worker to part of the queue, for example
+  one worker per tenant or one for transactional and one for bulk mail. The
+  environment variables `WORKER_THREADS`, `WORKER_SERVERS`,
+  `WORKER_EXCLUDE_SERVERS` and `WORKER_DELIVER` override the file, so one
+  config file can start differently scoped containers. A worker naming a
+  server that does not exist refuses to start.
+
+### Fixed
+
+- **`worker.threads` is honoured.** The setting (default 2) was read but
+  never used; a worker process delivered one message at a time. It now runs
+  that many delivery loops.
+
 ## [0.10.4] - 2026-10-30
 
 ### Fixed
@@ -1275,7 +1304,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.10.4...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/camelmailer/camelmailer/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/camelmailer/camelmailer/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/camelmailer/camelmailer/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/camelmailer/camelmailer/compare/v0.10.1...v0.10.2

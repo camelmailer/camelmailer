@@ -600,7 +600,17 @@ pub struct Scim {
 pub struct Worker {
     pub default_health_server_port: u16,
     pub default_health_server_bind_address: String,
+    /// Messages one worker process delivers at the same time.
     pub threads: u32,
+    /// Serve only these servers, as `organization/server` permalinks. Empty
+    /// serves every server. For a worker dedicated to some tenants.
+    pub servers: Vec<String>,
+    /// Never serve these servers (`organization/server`), for example the
+    /// ones a dedicated worker already serves.
+    pub exclude_servers: Vec<String>,
+    /// Which mail this worker delivers: `all`, `transactional` or `bulk`
+    /// (broadcast streams and campaigns).
+    pub deliver: WorkerDeliver,
 }
 
 impl Default for Worker {
@@ -609,7 +619,99 @@ impl Default for Worker {
             default_health_server_port: 9090,
             default_health_server_bind_address: "127.0.0.1".into(),
             threads: 2,
+            servers: Vec::new(),
+            exclude_servers: Vec::new(),
+            deliver: WorkerDeliver::All,
         }
+    }
+}
+
+/// Which mail a worker delivers (`worker.deliver`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerDeliver {
+    /// Everything, transactional before bulk within each server.
+    #[default]
+    All,
+    /// Transactional streams and inbound mail, never bulk.
+    Transactional,
+    /// Only bulk mail: broadcast streams and campaigns.
+    Bulk,
+}
+
+impl Worker {
+    /// The worker settings with the `WORKER_THREADS`, `WORKER_SERVERS`,
+    /// `WORKER_EXCLUDE_SERVERS` and `WORKER_DELIVER` environment variables
+    /// applied, so one config file can start differently scoped worker
+    /// containers. Lists are comma separated.
+    pub fn with_env_overrides(&self) -> Result<Self, ConfigError> {
+        self.with_overrides(|name| std::env::var(name).ok())
+    }
+
+    fn with_overrides(&self, var: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let list = |value: String| -> Vec<String> {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(String::from)
+                .collect()
+        };
+        let mut worker = self.clone();
+        if let Some(value) = var("WORKER_THREADS") {
+            worker.threads = value.trim().parse().map_err(|_| {
+                ConfigError::Invalid(format!("WORKER_THREADS must be a number (got {value:?})"))
+            })?;
+        }
+        if let Some(value) = var("WORKER_SERVERS") {
+            worker.servers = list(value);
+        }
+        if let Some(value) = var("WORKER_EXCLUDE_SERVERS") {
+            worker.exclude_servers = list(value);
+        }
+        if let Some(value) = var("WORKER_DELIVER") {
+            worker.deliver = match value.trim() {
+                "all" => WorkerDeliver::All,
+                "transactional" => WorkerDeliver::Transactional,
+                "bulk" => WorkerDeliver::Bulk,
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "WORKER_DELIVER must be all, transactional or bulk (got {other:?})"
+                    )))
+                }
+            };
+        }
+        worker.validate()?;
+        Ok(worker)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.threads == 0 {
+            return Err(ConfigError::Invalid(
+                "worker.threads must be at least 1".into(),
+            ));
+        }
+        for entry in self.servers.iter().chain(&self.exclude_servers) {
+            if entry
+                .split_once('/')
+                .is_none_or(|(org, server)| org.is_empty() || server.is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "worker.servers and worker.exclude_servers take organization/server \
+                     permalinks (got {entry:?})"
+                )));
+            }
+        }
+        if let Some(both) = self
+            .servers
+            .iter()
+            .find(|entry| self.exclude_servers.contains(entry))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{both:?} is in worker.servers and worker.exclude_servers"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1159,6 +1261,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.worker.validate()?;
         if !matches!(self.camelmailer.web_protocol.as_str(), "http" | "https") {
             return Err(ConfigError::Invalid(format!(
                 "camelmailer.web_protocol must be http or https (got {:?})",
@@ -1362,6 +1465,8 @@ mod tests {
         assert_eq!(config.web_server.default_port, 5000);
         assert_eq!(config.web_server.default_bind_address, "127.0.0.1");
         assert_eq!(config.worker.threads, 2);
+        assert!(config.worker.servers.is_empty());
+        assert_eq!(config.worker.deliver, WorkerDeliver::All);
 
         assert_eq!(config.main_db.host, "localhost");
         assert_eq!(config.main_db.port, 3306);
@@ -2063,5 +2168,47 @@ smtp_server:
             config.web_server.cors_origins,
             vec!["https://app.example.com", "http://localhost:5173"]
         );
+    }
+
+    #[test]
+    fn worker_scope_parses_and_validates() {
+        let config =
+            Config::from_yaml("worker:\n  threads: 4\n  servers: [acme/bulk]\n  deliver: bulk\n")
+                .unwrap();
+        assert_eq!(config.worker.threads, 4);
+        assert_eq!(config.worker.servers, vec!["acme/bulk"]);
+        assert_eq!(config.worker.deliver, WorkerDeliver::Bulk);
+        config.validate().unwrap();
+
+        let typo = Config::from_yaml("worker:\n  servers: [acme]\n").unwrap();
+        assert!(typo.validate().is_err());
+        let both = Config::from_yaml("worker:\n  servers: [acme/a]\n  exclude_servers: [acme/a]\n")
+            .unwrap();
+        assert!(both.validate().is_err());
+        assert!(Config::from_yaml("worker:\n  deliver: newsletters\n").is_err());
+    }
+
+    #[test]
+    fn worker_env_overrides_replace_the_file_values() {
+        let file = Worker {
+            servers: vec!["acme/a".into()],
+            ..Worker::default()
+        };
+        let env = |name: &str| match name {
+            "WORKER_THREADS" => Some("8".to_string()),
+            "WORKER_EXCLUDE_SERVERS" => Some(" acme/b , acme/c ,".to_string()),
+            "WORKER_DELIVER" => Some("transactional".to_string()),
+            _ => None,
+        };
+        let worker = file.with_overrides(env).unwrap();
+        assert_eq!(worker.threads, 8);
+        assert_eq!(worker.servers, vec!["acme/a"]);
+        assert_eq!(worker.exclude_servers, vec!["acme/b", "acme/c"]);
+        assert_eq!(worker.deliver, WorkerDeliver::Transactional);
+
+        let bad = |name: &str| (name == "WORKER_DELIVER").then(|| "some".to_string());
+        assert!(Worker::default().with_overrides(bad).is_err());
+        let zero = |name: &str| (name == "WORKER_THREADS").then(|| "0".to_string());
+        assert!(Worker::default().with_overrides(zero).is_err());
     }
 }

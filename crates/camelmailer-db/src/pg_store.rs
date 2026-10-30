@@ -3241,12 +3241,25 @@ impl camelmailer_core::ServerStore for PgStore {
         set_tenant_context(&mut tx, server_id)
             .await
             .map_err(Self::sqlx_error)?;
-        sqlx::query("UPDATE messages SET campaign_id = $1 WHERE id = $2")
+        let tagged = sqlx::query("UPDATE messages SET campaign_id = $1 WHERE id = $2")
             .bind(campaign_id as i64)
             .bind(message_id)
             .execute(&mut *tx)
             .await
             .map_err(Self::sqlx_error)?;
+        // Campaign mail is bulk whatever its stream, so it waits behind the
+        // server's transactional mail if it is still queued.
+        if tagged.rows_affected() > 0 {
+            sqlx::query(
+                "UPDATE queued_messages SET bulk = true
+                 WHERE message_id = $1 AND server_id = $2",
+            )
+            .bind(message_id)
+            .bind(server_id as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        }
         tx.commit().await.map_err(Self::sqlx_error)?;
         Ok(())
     }
@@ -4035,12 +4048,20 @@ async fn insert_message_in_tx(
         .rsplit_once('@')
         .map(|(_, domain)| domain)
         .unwrap_or_default();
-    sqlx::query("INSERT INTO queued_messages (message_id, server_id, domain) VALUES ($1, $2, $3)")
-        .bind(message_id)
-        .bind(message.server_id as i64)
-        .bind(destination_domain)
-        .execute(&mut **tx)
-        .await?;
+    // Mail on a broadcast stream (campaigns included) is bulk: the worker
+    // delivers a server's transactional mail first.
+    sqlx::query(
+        "INSERT INTO queued_messages (message_id, server_id, domain, bulk)
+         VALUES ($1, $2, $3, coalesce(
+             (SELECT stream_type = 'broadcast' FROM message_streams WHERE id = $4),
+             false))",
+    )
+    .bind(message_id)
+    .bind(message.server_id as i64)
+    .bind(destination_domain)
+    .bind(message.stream_id.map(|id| id as i64))
+    .execute(&mut **tx)
+    .await?;
 
     // Count the message against the server's send limit in the same
     // transaction, so the counter cannot drift from what was stored. The

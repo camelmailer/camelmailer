@@ -19,9 +19,10 @@ use camelmailer_db::webhook_payload::{
 };
 use camelmailer_db::{
     BounceCorrelationOutcome, BounceOriginal, FeedbackComplaintOutcome, OutboundQueueAction,
-    PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, StoredMessage,
+    PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, QueueFilter, StoredMessage,
 };
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Webhook deliveries are retried this many times before giving up
@@ -155,6 +156,8 @@ pub struct Worker {
     /// the submitted envelope sender.
     return_path_domain: Option<String>,
     worker_id: String,
+    /// Delivery loops of this process (`worker.threads`).
+    threads: u32,
 }
 
 impl Worker {
@@ -227,7 +230,17 @@ impl Worker {
             retention_batch: config.retention.batch_size.max(1) as i64,
             return_path_domain,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
+            threads: config.worker.threads.max(1),
         }
+    }
+
+    /// Scope the delivery to part of the queue and set how many messages
+    /// this process delivers at once. The filter comes from `worker.servers`,
+    /// `worker.exclude_servers` and `worker.deliver`, resolved to server ids.
+    pub fn with_delivery(mut self, filter: QueueFilter, threads: u32) -> Self {
+        self.queue = self.queue.with_filter(filter);
+        self.threads = threads.max(1);
+        self
     }
 
     /// Process one queued message, if any is ready. Returns `None` when the
@@ -1317,10 +1330,32 @@ impl Worker {
         Ok(removed)
     }
 
+    /// An extra delivery loop: deliver queued messages, poll when there are
+    /// none. Never returns.
+    async fn deliver_loop(&self) {
+        loop {
+            match self.process_next().await {
+                Ok(Some(outcome)) => tracing::debug!(?outcome, "processed queued message"),
+                Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
+                Err(error) => {
+                    tracing::error!(%error, "queue processing error");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
     /// The long-running worker loop: drain the queue, then poll. Runs
-    /// housekeeping once at startup and then hourly.
-    pub async fn run(&self) -> Result<(), sqlx::Error> {
-        tracing::info!(worker_id = %self.worker_id, "camelmailer worker started");
+    /// housekeeping once at startup and then hourly. With `threads` above 1,
+    /// further loops deliver queued messages alongside; webhooks, lifecycle
+    /// events and housekeeping stay on this one.
+    pub async fn run(self: Arc<Self>) -> Result<(), sqlx::Error> {
+        let mut delivery = tokio::task::JoinSet::new();
+        for _ in 1..self.threads {
+            let worker = Arc::clone(&self);
+            delivery.spawn(async move { worker.deliver_loop().await });
+        }
+        tracing::info!(worker_id = %self.worker_id, threads = self.threads, "camelmailer worker started");
         let mut last_housekeeping: Option<std::time::Instant> = None;
         loop {
             if last_housekeeping.is_none_or(|at| at.elapsed() >= HOUSEKEEPING_INTERVAL) {
