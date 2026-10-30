@@ -15,6 +15,12 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Checkout dialog size.** The billing checkout dialog is wider and
+  scrolls inside the window, so the billing address and card fields no
+  longer run off the top and bottom of the screen.
+
 ## [0.10.2] - 2026-10-30
 
 ### Added

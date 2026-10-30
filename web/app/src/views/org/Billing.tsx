@@ -270,7 +270,7 @@ function BillingSection({ org, hasCustomer }: { org: string; hasCustomer: boolea
       ) : null}
 
       <Dialog open={!!checkout} onOpenChange={(open) => !open && setCheckout(null)}>
-        <DialogContent className="sm:max-w-xl">
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle>{checkout ? `Checkout: ${checkout.plan.name}` : "Checkout"}</DialogTitle>
             <DialogDescription>Payment is handled by the billing provider.</DialogDescription>
