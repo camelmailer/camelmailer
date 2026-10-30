@@ -1,0 +1,42 @@
+# Dependabot: weekly update pull requests, minor and patch bumps grouped per
+# ecosystem so they land as one PR. Security updates come as soon as an
+# advisory is published, independent of this schedule.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /web/app
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      web-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directories: [/, /web/app]
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      docker:
+        patterns: ["*"]
