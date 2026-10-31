@@ -203,13 +203,29 @@ curl -s -X POST "$API/api/v2/server/messages" \
 
 ## Attachments
 
-Each attachment is an object with three required fields:
+Each attachment is an object with three required fields and one optional:
 
 | Field | Type | Notes |
 |---|---|---|
 | `name` | string | The filename, used as the attachment's `Content-Disposition` name. |
 | `content_type` | string | MIME type, for example `application/pdf` or `image/png`. |
 | `data_base64` | string | The file content, base64-encoded (standard alphabet). |
+| `content_id` | string | Optional. Makes the part inline, for an image the HTML body shows as `cid:<content_id>`. Letters, digits and `.-_@+$`, at most 250 characters. |
+
+### Inline images
+
+A logo or another image the HTML body shows gets a `content_id` and is
+referenced as `cid:` in the HTML. Camelmailer puts it next to the HTML body
+in a `multipart/related` part, so mail clients show it in place, load
+nothing from the web and do not list it as an attachment:
+
+```json
+"html_body": "<img src=\"cid:logo@acme.example\" alt=\"Acme\">",
+"attachments": [
+  { "name": "logo.png", "content_type": "image/png",
+    "data_base64": "iVBORw0KGgo…", "content_id": "logo@acme.example" }
+]
+```
 
 Content that fails to decode as base64 returns `422 ValidationError`
 naming the offending attachment, and nothing is queued. Total message size

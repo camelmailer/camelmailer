@@ -340,6 +340,61 @@ async fn send_stores_one_message_per_recipient() {
 }
 
 #[tokio::test]
+async fn inline_attachments_become_related_parts_with_a_content_id() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    let (status, _) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example"],
+            "subject": "Logo",
+            "html_body": "<p><img src=\"cid:logo@org.example\"></p>",
+            "text_body": "Logo",
+            "attachments": [{
+                "name": "logo.png",
+                "content_type": "image/png",
+                "data_base64": "iVBORw0KGgo=",
+                "content_id": "<logo@org.example>"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let raw = String::from_utf8_lossy(&store.messages_for(server_id)[0].raw_message).to_lowercase();
+    assert!(raw.contains("multipart/related"));
+    assert!(raw.contains("content-id: <logo@org.example>"));
+    assert!(!raw.contains("multipart/mixed"));
+}
+
+#[tokio::test]
+async fn an_invalid_content_id_is_a_validation_error() {
+    let (app, token, store, server_id) = build_with_verified_domain().await;
+    let (status, body) = post_json(
+        &app,
+        "/api/v2/server/messages",
+        &token,
+        json!({
+            "from": "news@org.example",
+            "to": ["a@dest.example"],
+            "subject": "Logo",
+            "html_body": "<p>Hi</p>",
+            "attachments": [{
+                "name": "logo.png",
+                "content_type": "image/png",
+                "data_base64": "iVBORw0KGgo=",
+                "content_id": "logo\r\nBcc: victim@example.com"
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(body.to_string().contains("content_id"));
+    assert!(store.messages_for(server_id).is_empty());
+}
+
+#[tokio::test]
 async fn idempotent_send_replays_the_original_response_without_queuing_again() {
     let (app, token, store, server_id) = build_with_verified_domain().await;
     let body = json!({
