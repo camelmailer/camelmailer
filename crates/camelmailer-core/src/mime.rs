@@ -4,6 +4,7 @@
 //! later by the worker at delivery time (keyed off the message's
 //! authenticated domain), exactly as for SMTP-submitted mail.
 
+use mail_builder::mime::MimePart;
 use mail_builder::MessageBuilder;
 
 /// A single recipient address with an optional display name.
@@ -27,6 +28,10 @@ pub struct Attachment {
     pub filename: String,
     pub content_type: String,
     pub data: Vec<u8>,
+    /// Set for an inline part the HTML body references as `cid:<content_id>`
+    /// (a logo, for example). Inline parts go next to the HTML body in a
+    /// multipart/related container instead of becoming attachments.
+    pub content_id: Option<String>,
 }
 
 /// Everything needed to build one outbound message.
@@ -136,30 +141,63 @@ pub fn build_message(params: &BuildParams) -> Vec<u8> {
         }
     }
 
-    match (&params.html_body, &params.text_body) {
-        (Some(html), Some(text)) => {
-            builder = builder.html_body(html.clone()).text_body(text.clone());
-        }
-        (Some(html), None) => {
-            builder = builder.html_body(html.clone());
-        }
-        (None, Some(text)) => {
-            builder = builder.text_body(text.clone());
-        }
-        (None, None) => {
-            builder = builder.text_body(String::new());
-        }
-    }
-
-    for attachment in &params.attachments {
-        builder = builder.attachment(
-            attachment.content_type.clone(),
-            attachment.filename.clone(),
-            attachment.data.clone(),
-        );
-    }
+    let (inline, attached): (Vec<&Attachment>, Vec<&Attachment>) = params
+        .attachments
+        .iter()
+        .partition(|a| a.content_id.is_some() && params.html_body.is_some());
+    builder = builder.body(body_part(params, &inline, &attached));
 
     builder.write_to_vec().unwrap_or_default()
+}
+
+/// The MIME tree of the body:
+///
+/// ```text
+/// multipart/mixed            (only with attachments)
+///   multipart/alternative    (only with both bodies)
+///     text/plain
+///     multipart/related      (only with inline parts)
+///       text/html
+///       inline parts (Content-ID)
+///   attachments
+/// ```
+fn body_part<'a>(
+    params: &'a BuildParams,
+    inline: &[&'a Attachment],
+    attached: &[&'a Attachment],
+) -> MimePart<'a> {
+    let html = params.html_body.as_deref().map(|html| {
+        let html_part = MimePart::new("text/html", html);
+        if inline.is_empty() {
+            html_part
+        } else {
+            let mut parts = vec![html_part];
+            parts.extend(inline.iter().map(|a| {
+                MimePart::new(a.content_type.as_str(), a.data.as_slice())
+                    .inline()
+                    .cid(a.content_id.as_deref().unwrap_or_default())
+            }));
+            MimePart::new("multipart/related", parts)
+        }
+    });
+    let text = params
+        .text_body
+        .as_deref()
+        .map(|text| MimePart::new("text/plain", text));
+    let content = match (text, html) {
+        (Some(text), Some(html)) => MimePart::new("multipart/alternative", vec![text, html]),
+        (None, Some(html)) => html,
+        (Some(text), None) => text,
+        (None, None) => MimePart::new("text/plain", ""),
+    };
+    if attached.is_empty() {
+        return content;
+    }
+    let mut parts = vec![content];
+    parts.extend(attached.iter().map(|a| {
+        MimePart::new(a.content_type.as_str(), a.data.as_slice()).attachment(a.filename.as_str())
+    }));
+    MimePart::new("multipart/mixed", parts)
 }
 
 // ------------------------------------------------------- body extraction
@@ -348,6 +386,49 @@ mod tests {
     }
 
     #[test]
+    fn inline_parts_sit_next_to_the_html_body() {
+        let mut p = params();
+        p.html_body = Some(r#"<p><img src="cid:logo@example"></p>"#.into());
+        p.attachments = vec![
+            Attachment {
+                filename: "logo.png".into(),
+                content_type: "image/png".into(),
+                data: vec![1, 2, 3],
+                content_id: Some("logo@example".into()),
+            },
+            Attachment {
+                filename: "invoice.pdf".into(),
+                content_type: "application/pdf".into(),
+                data: vec![4, 5, 6],
+                content_id: None,
+            },
+        ];
+        let raw = as_string(&build_message(&p)).to_lowercase();
+        let mixed = raw
+            .find("multipart/mixed")
+            .expect("mixed for the attachment");
+        let alternative = raw.find("multipart/alternative").expect("alternative");
+        let related = raw
+            .find("multipart/related")
+            .expect("related for the inline part");
+        assert!(mixed < alternative && alternative < related);
+        assert!(raw.contains("content-id: <logo@example>"));
+        assert!(raw.contains("content-disposition: inline"));
+        assert!(raw.contains("filename=\"invoice.pdf\""));
+        // The extracted bodies still find the HTML inside the related part.
+        let bodies = extract_bodies(&build_message(&p));
+        assert!(bodies.html.unwrap().contains("cid:logo@example"));
+        assert_eq!(bodies.text.as_deref(), Some("Hi"));
+    }
+
+    #[test]
+    fn without_attachments_there_is_no_mixed_container() {
+        let raw = as_string(&build_message(&params())).to_lowercase();
+        assert!(!raw.contains("multipart/mixed"));
+        assert!(!raw.contains("multipart/related"));
+    }
+
+    #[test]
     fn builds_a_multipart_alternative_with_both_bodies() {
         let raw = as_string(&build_message(&params()));
         assert!(raw.contains("From: "));
@@ -378,6 +459,7 @@ mod tests {
             filename: "hello.txt".into(),
             content_type: "text/plain".into(),
             data: b"attachment-body".to_vec(),
+            content_id: None,
         }];
         let raw = as_string(&build_message(&p));
         assert!(raw.to_lowercase().contains("multipart/mixed"));
@@ -457,6 +539,7 @@ mod tests {
             filename: "hello.txt".into(),
             content_type: "text/plain".into(),
             data: b"attachment-body".to_vec(),
+            content_id: None,
         }];
         // multipart/mixed( multipart/alternative(text, html), attachment )
         let bodies = extract_bodies(&build_message(&p));

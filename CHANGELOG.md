@@ -15,6 +15,24 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-31
+
+### Added
+
+- **Inline images.** An attachment with a `content_id` becomes an inline
+  part: the HTML body shows it as `cid:<content_id>`, and it sits next to
+  the HTML body in a `multipart/related` part instead of being listed as an
+  attachment. Mail clients show a logo in place without loading anything
+  from the web. An invalid `content_id` (letters, digits and `.-_@+$`, at
+  most 250 characters) is a `422 ValidationError`.
+
+### Changed
+
+- **MIME structure.** A message is now built as
+  `multipart/mixed` (only with attachments) around `multipart/alternative`
+  (text and HTML), with `multipart/related` for inline parts. Without
+  attachments there is no `multipart/mixed` container any more.
+
 ## [0.11.0] - 2026-10-31
 
 ### Changed

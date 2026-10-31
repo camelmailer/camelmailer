@@ -162,6 +162,29 @@ pub(crate) struct AttachmentInput {
     name: String,
     content_type: String,
     data_base64: String,
+    /// Makes the part inline: the HTML body shows it as `cid:<content_id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_id: Option<String>,
+}
+
+/// A Content-ID is an addr-spec like token: letters, digits and `.-_@+$`,
+/// at most 250 characters. Angle brackets around it are accepted and dropped.
+fn content_id(raw: Option<String>, name: &str) -> Result<Option<String>, ApiError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let id = raw.trim().trim_start_matches('<').trim_end_matches('>');
+    if id.is_empty()
+        || id.len() > 250
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-_@+$".contains(c))
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ValidationError".to_string(),
+            format!("attachment {name:?} has an invalid content_id"),
+        ));
+    }
+    Ok(Some(id.to_owned()))
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -479,10 +502,12 @@ async fn prepare_send(
                         format!("attachment {:?} has invalid base64 data", a.name),
                     )
                 })?;
+            let content_id = content_id(a.content_id, &a.name)?;
             Ok(Attachment {
                 filename: a.name,
                 content_type: a.content_type,
                 data,
+                content_id,
             })
         })
         .collect::<Result<_, _>>()?;
