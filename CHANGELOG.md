@@ -15,6 +15,19 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-05
+
+### Fixed
+
+- **Large messages over TLS reach slow receivers.** The SMTP client never
+  flushed what it wrote. A TLS stream keeps encrypted records until it is
+  flushed, so once the socket pushed back under a receiver that takes its
+  data slowly, the tail of a large message and its final dot could stay in
+  the client: the receiver waited for the end of the message until its own
+  timeout (`421 4.4.2 timeout exceeded`, Hornetsecurity for one) while the
+  worker waited for its reply (`read timeout`). Every command and the
+  message body are now flushed.
+
 ## [0.13.0] - 2026-11-04
 
 ### Added
@@ -1357,7 +1370,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/camelmailer/camelmailer/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/camelmailer/camelmailer/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/camelmailer/camelmailer/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/camelmailer/camelmailer/compare/v0.10.4...v0.11.0

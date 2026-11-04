@@ -192,10 +192,53 @@ impl SmtpConnection {
         }
     }
 
+    /// Writes a command line and flushes it. A TLS stream holds encrypted
+    /// records back until it is flushed, so without the flush a command can
+    /// sit in the client while both sides wait for each other.
     async fn send_line(&mut self, line: &str) -> std::io::Result<()> {
         self.stream
             .write_all(format!("{line}\r\n").as_bytes())
-            .await
+            .await?;
+        self.stream.flush().await
+    }
+
+    /// Sends a message body after a 354: line endings made CRLF, lines
+    /// starting with a dot doubled (RFC 5321 4.5.2), all of it flushed, then
+    /// the final dot, whose reply is waited for with `data_timeout`. Without
+    /// the flush, a TLS stream could keep the tail of a large body and the
+    /// final dot buffered once the socket had pushed back; a receiver that
+    /// takes its data slowly then waited for the end of the message until
+    /// its own timeout (`421 4.4.2 timeout exceeded`).
+    async fn send_data(
+        &mut self,
+        raw_message: &[u8],
+        data_timeout: Duration,
+        read_timeout: Duration,
+    ) -> std::io::Result<(u16, String)> {
+        let mut body = Vec::with_capacity(raw_message.len() + 64);
+        let mut lines: Vec<&[u8]> = raw_message.split(|&b| b == b'\n').collect();
+        if lines.last() == Some(&&b""[..]) {
+            lines.pop();
+        }
+        for line in lines {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.first() == Some(&b'.') {
+                body.push(b'.');
+            }
+            body.extend_from_slice(line);
+            body.extend_from_slice(b"\r\n");
+        }
+        // The body and the reply to its final dot get the data timeout: the
+        // receiver may scan the whole message before it answers.
+        within(data_timeout, "data", async {
+            self.stream.write_all(&body).await?;
+            self.stream.flush().await
+        })
+        .await?;
+        self.timeout = data_timeout;
+        let reply = self.command(".").await;
+        self.timeout = read_timeout;
+        reply
     }
 
     async fn command(&mut self, line: &str) -> std::io::Result<(u16, String)> {
@@ -526,30 +569,9 @@ async fn try_send(
         return Ok(Attempt::Complete(classify(code, response, tls)));
     }
 
-    let mut body = Vec::with_capacity(raw_message.len() + 64);
-    let mut lines: Vec<&[u8]> = raw_message.split(|&b| b == b'\n').collect();
-    if lines.last() == Some(&&b""[..]) {
-        lines.pop();
-    }
-    for line in lines {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.first() == Some(&b'.') {
-            body.push(b'.');
-        }
-        body.extend_from_slice(line);
-        body.extend_from_slice(b"\r\n");
-    }
-    // The body and the reply to its final dot get the data timeout: the
-    // receiver may scan the whole message before it answers.
-    within(
-        params.data_timeout,
-        "data",
-        connection.stream.write_all(&body),
-    )
-    .await?;
-    connection.timeout = params.data_timeout;
-    let (code, response) = connection.command(".").await?;
-    connection.timeout = params.read_timeout;
+    let (code, response) = connection
+        .send_data(raw_message, params.data_timeout, params.read_timeout)
+        .await?;
     let outcome = classify(code, response, tls);
 
     let _ = connection.send_line("QUIT").await;
@@ -599,6 +621,129 @@ async fn upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stream that, like a TLS stream, sends what it was given only when
+    /// it is flushed.
+    struct SendsOnFlush<S> {
+        inner: S,
+        held: Vec<u8>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for SendsOnFlush<S> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for SendsOnFlush<S> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.held.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            while !this.held.is_empty() {
+                let n = std::task::ready!(
+                    std::pin::Pin::new(&mut this.inner).poll_write(cx, &this.held)
+                )?;
+                this.held.drain(..n);
+            }
+            std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_body_and_its_final_dot_reach_a_receiver_behind_a_buffering_stream() {
+        // A small pipe pushes back like a full socket under a slow receiver.
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut connection = SmtpConnection {
+            stream: Box::new(SendsOnFlush {
+                inner: client,
+                held: Vec::new(),
+            }),
+            timeout: Duration::from_secs(2),
+            buffer: Vec::new(),
+        };
+
+        let receiver = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !seen.ends_with(b"\r\n.\r\n") {
+                let n = server.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "client closed before the final dot");
+                seen.extend_from_slice(&chunk[..n]);
+            }
+            server.write_all(b"250 2.0.0 Ok: queued\r\n").await.unwrap();
+            seen
+        });
+
+        // About 300 KB, as an invoice with its PDF and XML, with bare LF
+        // endings and a line that starts with a dot.
+        let mut raw = b"Subject: Ihre Rechnung\n\n.dot line\n".to_vec();
+        for _ in 0..4000 {
+            raw.extend_from_slice(
+                b"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5\n",
+            );
+        }
+
+        let (code, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            connection.send_data(&raw, Duration::from_secs(2), Duration::from_secs(2)),
+        )
+        .await
+        .expect("the final dot never reached the receiver")
+        .unwrap();
+        assert_eq!(code, 250);
+
+        let seen = receiver.await.unwrap();
+        assert!(seen.starts_with(b"Subject: Ihre Rechnung\r\n\r\n..dot line\r\n"));
+        assert!(
+            !seen.windows(2).any(|w| w[1] == b'\n' && w[0] != b'\r'),
+            "bare LF sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_reaches_the_receiver_behind_a_buffering_stream() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut connection = SmtpConnection {
+            stream: Box::new(SendsOnFlush {
+                inner: client,
+                held: Vec::new(),
+            }),
+            timeout: Duration::from_secs(2),
+            buffer: Vec::new(),
+        };
+        let receiver = tokio::spawn(async move {
+            let mut line = [0u8; 64];
+            let n = server.read(&mut line).await.unwrap();
+            server.write_all(b"250 Ok\r\n").await.unwrap();
+            line[..n].to_vec()
+        });
+
+        let (code, _) = connection.command("NOOP").await.unwrap();
+        assert_eq!(code, 250);
+        assert_eq!(receiver.await.unwrap(), b"NOOP\r\n");
+    }
 
     #[test]
     fn tls_mode_from_verify_mode() {
