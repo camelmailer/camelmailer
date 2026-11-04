@@ -1009,15 +1009,23 @@ impl Default for Smtp {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SmtpClient {
+    /// Seconds to wait for the TCP connection to a remote address.
     pub open_timeout: u32,
+    /// Seconds to wait for the greeting, a TLS handshake and each reply.
+    /// RFC 5321 4.5.3.2 asks for five minutes; some receivers hold the
+    /// greeting back on purpose for senders they do not know yet.
     pub read_timeout: u32,
+    /// Seconds to wait while the message body is sent and for the reply to
+    /// its final dot (RFC 5321: ten minutes).
+    pub data_timeout: u32,
 }
 
 impl Default for SmtpClient {
     fn default() -> Self {
         Self {
             open_timeout: 30,
-            read_timeout: 30,
+            read_timeout: 300,
+            data_timeout: 600,
         }
     }
 }

@@ -40,7 +40,7 @@ import {
   UploadIcon,
 } from "lucide-react"
 import { toast } from "sonner"
-import { CopyButton, formatDate, PageHeader } from "@/components/shared"
+import { ConfirmDialog, CopyButton, formatDate, PageHeader } from "@/components/shared"
 import { EmptyState } from "@/components/empty-state"
 import { FormDialog } from "@/components/form-dialog"
 import { DataExportDialog, type ExportColumn } from "@/components/data-export-dialog"
@@ -116,6 +116,10 @@ import {
 import { StatusPill } from "@/components/status-pill"
 import { SAMPLE_BODY } from "./layout-blocks"
 import { useOrgParams } from "@/lib/params"
+
+/// Outgoing statuses the server sends again on request (mirrors the API's
+/// RETRYABLE_OUTBOUND_STATUSES).
+const RETRYABLE_STATUSES = ["Pending", "SoftFail", "HardFail"]
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
@@ -1281,7 +1285,22 @@ export function MessageDetailPage({
   // only feeds the header (subject, addresses, status, date).
   const message = useQuery({ queryKey: ["sapi-message", id], queryFn: () => api.message(id) })
   const [sharing, setSharing] = useState(false)
+  const [confirmRetry, setConfirmRetry] = useState(false)
+  const queryClient = useQueryClient()
   const m = message.data?.message
+  const canRetry = !!m && m.scope === "outgoing" && RETRYABLE_STATUSES.includes(m.status ?? "")
+  const retry = useMutation({
+    mutationFn: () => api.retry(id),
+    onSuccess: () => {
+      toast.success("Queued for delivery now")
+      queryClient.invalidateQueries({ queryKey: ["sapi-message", id] })
+      queryClient.invalidateQueries({ queryKey: ["sapi-deliveries", id] })
+    },
+    onError: (err) => errorToast(err, "Retry failed"),
+  })
+  // A message given up on was refused or timed out for days; sending it
+  // again is a deliberate step. One still in the queue just goes now.
+  const startRetry = () => (m?.status === "HardFail" ? setConfirmRetry(true) : retry.mutate())
 
   return (
     <Page
@@ -1300,9 +1319,16 @@ export function MessageDetailPage({
             </span>
           }
           action={
-            <Button variant="outline" size="sm" onClick={() => setSharing(true)}>
-              <Share2Icon className="size-4" /> Share email
-            </Button>
+            <div className="flex gap-2">
+              {canRetry && (
+                <Button variant="outline" size="sm" onClick={startRetry} disabled={retry.isPending}>
+                  <RefreshCwIcon className="size-4" /> {retry.isPending ? "Retrying…" : "Retry now"}
+                </Button>
+              )}
+              <Button variant="outline" size="sm" onClick={() => setSharing(true)}>
+                <Share2Icon className="size-4" /> Share email
+              </Button>
+            </div>
           }
         />
       }
@@ -1310,6 +1336,17 @@ export function MessageDetailPage({
       <MessageDetailBody api={api} id={id} org={org} server={server} />
 
       {sharing && <ShareDialog api={api} id={id} onClose={() => setSharing(false)} />}
+      <ConfirmDialog
+        open={confirmRetry}
+        onOpenChange={setConfirmRetry}
+        title="Send this message again?"
+        description="Delivery of this message failed and was given up. It goes back into the queue and is attempted again right away, with a fresh count of attempts."
+        confirmLabel="Send again"
+        onConfirm={() => retry.mutateAsync().then(
+          () => undefined,
+          () => undefined, // already shown by onError
+        )}
+      />
     </Page>
   )
 }

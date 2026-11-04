@@ -428,6 +428,30 @@ Sends without an idempotency header retain the normal behavior: submitting the
 same request again queues another message. Use a unique operation key whenever
 the caller may retry an uncertain result.
 
+### Retries and sending again
+
+A temporary failure (a 4xx reply, a connection or read timeout) leaves the
+message in the queue with status `SoftFail`. The worker tries again after 2,
+4, 8 minutes and so on, doubling up to 1,024 minutes (about 17 hours)
+between attempts, and gives up after
+`camelmailer.default_maximum_delivery_attempts` attempts (18 by default,
+about a week); the message is then `HardFail`.
+
+To send a message again without waiting for its next attempt, use **Retry**
+on the message in the dashboard, or:
+
+```bash
+curl -X POST https://camelmailer.example/api/v2/server/messages/42/retry \
+  -H "X-Server-API-Key: $KEY"
+```
+
+A message waiting for its next attempt (`Pending`, `SoftFail`) is due at once
+and keeps its attempt count, so the give-up limit still applies. A message
+that was given up on (`HardFail`) goes back into the queue with a fresh
+count. A delivered, bounced or held message answers `409
+MessageNotRetryable`; a message whose content data retention already
+removed answers `409 MessageContentPurged`.
+
 ### Local development without a worker
 
 In a local stack that runs only the web and SMTP processes, sends succeed

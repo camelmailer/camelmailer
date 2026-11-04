@@ -131,6 +131,8 @@ pub struct SmtpSender {
     relays: Vec<Endpoint>,
     helo_hostname: String,
     timeout: Duration,
+    read_timeout: Duration,
+    data_timeout: Duration,
 }
 
 impl SmtpSender {
@@ -161,6 +163,8 @@ impl SmtpSender {
             relays,
             helo_hostname,
             timeout: Duration::from_secs(config.smtp_client.open_timeout as u64),
+            read_timeout: Duration::from_secs(config.smtp_client.read_timeout as u64),
+            data_timeout: Duration::from_secs(config.smtp_client.data_timeout as u64),
         }
     }
 
@@ -230,6 +234,8 @@ impl SmtpSender {
                 mail_from: mail_from.to_string(),
                 rcpt_to: rcpt_to.to_string(),
                 timeout: self.timeout,
+                read_timeout: self.read_timeout,
+                data_timeout: self.data_timeout,
                 tls_mode: endpoint.tls_mode,
                 security: endpoint.security,
                 auth: endpoint.auth.clone(),

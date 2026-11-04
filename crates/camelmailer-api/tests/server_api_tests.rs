@@ -1421,6 +1421,77 @@ async fn inbound_bypass_and_retry_requeue_the_message() {
 }
 
 #[tokio::test]
+async fn an_outgoing_message_is_sent_again_on_request() {
+    let (app, token, token_b, store) = build_two_with_domains().await;
+    let out = send_one(
+        &app,
+        &token,
+        "news@alpha.example",
+        "y@dest.example",
+        "Invoice",
+        "t",
+    )
+    .await;
+
+    // waiting for its next attempt, or given up on: back to Pending
+    for status in ["SoftFail", "HardFail"] {
+        store.set_message_status(out, status);
+        let (code, body) = post_json(
+            &app,
+            &format!("/api/v2/server/messages/{out}/retry"),
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{status}: {body}");
+        assert_eq!(body["data"]["requeued"], true);
+        assert_eq!(body["data"]["message"]["status"], "Pending");
+    }
+
+    // delivered, bounced and held messages are not sent again
+    for status in ["Sent", "Bounced", "Held"] {
+        store.set_message_status(out, status);
+        let (code, body) = post_json(
+            &app,
+            &format!("/api/v2/server/messages/{out}/retry"),
+            &token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT, "{status}");
+        assert_eq!(body["error"]["code"], "MessageNotRetryable");
+    }
+
+    // another server's key does not reach it, and an incoming message is
+    // retried through the inbound endpoint only
+    store.set_message_status(out, "SoftFail");
+    let (code, _) = post_json(
+        &app,
+        &format!("/api/v2/server/messages/{out}/retry"),
+        &token_b,
+        json!({}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    let server_id = store
+        .server_for_api_token(&token)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let incoming = seed_incoming(&store, server_id, "support@alpha.example", "Ticket");
+    store.set_message_status(incoming, "HardFail");
+    let (code, _) = post_json(
+        &app,
+        &format!("/api/v2/server/messages/{incoming}/retry"),
+        &token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn inbound_is_tenant_scoped() {
     let (app, token_a, token_b, store) = build_two_with_domains().await;
     let server_a = store

@@ -10,8 +10,8 @@ use camelmailer_core::{
     AdminStore, CredentialType, DomainOwner, IdempotencyRequest, ImportClick, ImportDelivery,
     ImportEvent, ImportMessage, MessageFilter, MessageScope, NewOrgEmailDomain,
     NewOrgSsoConnection, NewOrganization, NewRoute, NewServer, NewWebhook, OrgSsoConnectionUpdate,
-    OrgSsoStore, QueuedMessage, Role, RouteMode, SendPlanItem, ServerMode, ServerStore, SsoKind,
-    Store, StoreSendOutcome, TrackingStore, TrackingTarget,
+    OrgSsoStore, OutboundRetry, QueuedMessage, Role, RouteMode, SendPlanItem, ServerMode,
+    ServerStore, SsoKind, Store, StoreSendOutcome, TrackingStore, TrackingTarget,
 };
 use camelmailer_db::{PgMessageSink, PgStore};
 use rand::RngExt;
@@ -6955,5 +6955,203 @@ async fn worker_scope_permalinks_resolve_or_fail_loudly() {
         camelmailer_db::resolve_server_permalinks(&pool, &["no-slash".to_string()])
             .await
             .is_err()
+    );
+}
+
+/// Change a message row inside its server's RLS context (`set` is the SET
+/// clause; test-only, the values are literals of the test).
+async fn set_message(pool: &PgPool, server_id: camelmailer_core::Id, id: i64, set: &str) {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('camelmailer.server_id', $1, true)")
+        .bind(server_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let changed = sqlx::query(&format!("UPDATE messages SET {set} WHERE id = $1"))
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(changed, 1, "{set}");
+    tx.commit().await.unwrap();
+}
+
+/// A row of the delivery queue for a message: attempts, whether it is due,
+/// and whether it counts as bulk. `None` when the message is not queued.
+async fn queue_row(pool: &PgPool, message_id: i64) -> Option<(i32, bool, bool)> {
+    sqlx::query(
+        "SELECT attempts, (retry_after IS NULL OR retry_after <= now()) AS due, bulk
+         FROM queued_messages WHERE message_id = $1",
+    )
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+    .map(|row| (row.get("attempts"), row.get("due"), row.get("bulk")))
+}
+
+#[tokio::test]
+async fn an_outgoing_message_is_sent_again_on_request() {
+    use camelmailer_core::NewStream;
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let broadcast = ServerStore::create_stream(
+        &f.store,
+        NewStream {
+            server_id: f.server.id,
+            name: "Broadcast".into(),
+            permalink: "broadcast".into(),
+            stream_type: "broadcast".into(),
+            ip_pool_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let mut outgoing = message_for(f.server.id, "rainer@dest.example");
+    outgoing.scope = MessageScope::Outgoing;
+    let id = sink.insert_message(&outgoing).await.unwrap();
+
+    // Waiting for its next attempt: due at once, the attempt count stays.
+    sqlx::query(
+        "UPDATE queued_messages SET attempts = 7, retry_after = now() + interval '8 hours'
+         WHERE message_id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    set_message(&pool, f.server.id, id, "status = 'SoftFail'").await;
+    let OutboundRetry::Requeued(record) = f
+        .store
+        .retry_outbound_message(f.server.id, id)
+        .await
+        .unwrap()
+    else {
+        panic!("a soft-failed message must be requeued");
+    };
+    assert_eq!(record.status, "Pending");
+    assert_eq!(queue_row(&pool, id).await, Some((7, true, false)));
+
+    // A row a worker holds right now is left to it.
+    sqlx::query(
+        "UPDATE queued_messages SET locked_by = 'worker-1', locked_at = now(),
+                retry_after = now() + interval '1 hour' WHERE message_id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        f.store
+            .retry_outbound_message(f.server.id, id)
+            .await
+            .unwrap(),
+        OutboundRetry::Requeued(_)
+    ));
+    let locked: (Option<String>, bool) = sqlx::query_as(
+        "SELECT locked_by, retry_after > now() FROM queued_messages WHERE message_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(locked, (Some("worker-1".into()), true));
+
+    // Given up on: no queue row left; it goes back with a fresh count, and a
+    // broadcast-stream message as bulk.
+    sqlx::query("DELETE FROM queued_messages WHERE message_id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    set_message(
+        &pool,
+        f.server.id,
+        id,
+        &format!("status = 'HardFail', stream_id = {}", broadcast.id),
+    )
+    .await;
+    assert!(matches!(
+        f.store
+            .retry_outbound_message(f.server.id, id)
+            .await
+            .unwrap(),
+        OutboundRetry::Requeued(_)
+    ));
+    assert_eq!(queue_row(&pool, id).await, Some((0, true, true)));
+    let domain: String =
+        sqlx::query_scalar("SELECT domain FROM queued_messages WHERE message_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(domain, "dest.example");
+
+    // Delivered, bounced or held: refused, nothing queued.
+    for status in ["Sent", "Bounced", "Held"] {
+        sqlx::query("DELETE FROM queued_messages WHERE message_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_message(&pool, f.server.id, id, &format!("status = '{status}'")).await;
+        assert_eq!(
+            f.store
+                .retry_outbound_message(f.server.id, id)
+                .await
+                .unwrap(),
+            OutboundRetry::NotRetryable {
+                status: status.into()
+            }
+        );
+        assert_eq!(queue_row(&pool, id).await, None);
+    }
+
+    // Content removed by retention: nothing to send.
+    set_message(
+        &pool,
+        f.server.id,
+        id,
+        "status = 'HardFail', raw_message = ''::bytea, content_purged_at = now()",
+    )
+    .await;
+    assert_eq!(
+        f.store
+            .retry_outbound_message(f.server.id, id)
+            .await
+            .unwrap(),
+        OutboundRetry::ContentPurged
+    );
+    assert_eq!(queue_row(&pool, id).await, None);
+
+    // Another server cannot reach it, and an incoming message is not an
+    // outgoing one.
+    let other = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Other".into(),
+            permalink: "other-retry".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store.retry_outbound_message(other.id, id).await.unwrap(),
+        OutboundRetry::NotFound
+    );
+    let incoming = sink
+        .insert_message(&message_for(f.server.id, "support@tenant-a.example"))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store
+            .retry_outbound_message(f.server.id, incoming)
+            .await
+            .unwrap(),
+        OutboundRetry::NotFound
     );
 }

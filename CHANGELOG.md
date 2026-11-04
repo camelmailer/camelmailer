@@ -15,6 +15,35 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Send an outgoing message again.** `POST /api/v2/server/messages/{id}/retry`
+  and a **Retry now** button on the message page. A message waiting for its
+  next attempt (`Pending`, `SoftFail`) is due at once and keeps its attempt
+  count; one that was given up on (`HardFail`) goes back into the queue with
+  a fresh count, after a confirmation in the dashboard. A delivered, bounced
+  or held message answers `409 MessageNotRetryable`, a message whose content
+  data retention removed `409 MessageContentPurged`.
+
+### Changed
+
+- **SMTP client timeouts follow RFC 5321.** `smtp_client.read_timeout` was
+  read from the config but never used: every reply was waited for with
+  `open_timeout` (30 seconds). The greeting, TLS handshakes and replies now
+  use `read_timeout`, whose default rises from 30 to 300 seconds, and the
+  message body with the reply to its final dot uses the new
+  `smtp_client.data_timeout` (default 600). Receivers that hold the greeting
+  back for unknown senders (Hornetsecurity, for one) no longer fail every
+  attempt with `read timeout`. A config that sets `read_timeout: 30`
+  explicitly keeps the old wait.
+- **Remote address choice without an IP pool.** A server without an IP pool
+  now tries the remote host's IPv4 addresses before its IPv6 ones, and moves
+  on to the next address when a connection fails instead of failing the
+  attempt on the first. Before, a dual-stack worker sent from its own IPv6
+  address whenever the MX resolved IPv6-first, which Microsoft 365 refuses
+  when that address has no reverse DNS (error S820). A bound pool address
+  still pins the family, and now also tries each address of that family.
+
 ## [0.12.0] - 2026-10-31
 
 ### Added

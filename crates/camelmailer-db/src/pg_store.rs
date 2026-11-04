@@ -14,10 +14,11 @@ use camelmailer_core::{
     CampaignUpdate, Credential, CredentialType, DeliveryRecord, Domain, DomainOwner, Id,
     IdempotencyLookup, IdempotencyRequest, IpAddress, IpPool, MessageFilter, MessageRecord,
     MessageScope, MessageSink, NewCampaign, NewCredential, NewIpAddress, NewOrganization, NewRoute,
-    NewSenderAddress, NewServer, NewSuppression, NewUser, NewWebhook, Organization,
+    NewSenderAddress, NewServer, NewSuppression, NewUser, NewWebhook, Organization, OutboundRetry,
     QueueMessagesOutcome, QueuedMessage, ResolvedRoute, Route, RouteMode, SendOperationItem,
     SendOperationResult, SendPlanItem, SenderAddress, Server, ServerMode, Store, StoreError,
     StoreSendOutcome, StoredSendResult, Subscription, Suppression, TrackDomain, User, Webhook,
+    RETRYABLE_OUTBOUND_STATUSES,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
@@ -2334,6 +2335,17 @@ impl camelmailer_core::ServerStore for PgStore {
     ) -> Result<Option<MessageRecord>, StoreError> {
         PgMessageSink::new(self.clone())
             .requeue_inbound(server_id, message_id, false)
+            .await
+            .map_err(|e| StoreError::Other(e.to_string()))
+    }
+
+    async fn retry_outbound_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<OutboundRetry, StoreError> {
+        PgMessageSink::new(self.clone())
+            .requeue_outbound(server_id, message_id)
             .await
             .map_err(|e| StoreError::Other(e.to_string()))
     }
@@ -5169,6 +5181,91 @@ impl PgMessageSink {
         .await?;
         tx.commit().await?;
         Ok(Some(record))
+    }
+
+    /// Send an outgoing message again now (the dashboard's "Retry"). In one
+    /// tenant transaction, with the message row locked against the worker
+    /// and bounce correlation:
+    ///
+    /// - a message still in the queue (`Pending`, `SoftFail`) becomes due at
+    ///   once; its attempt count stays, so the give-up limit still holds;
+    /// - one that was given up on (`HardFail`) goes back into the queue with
+    ///   a fresh count, as transactional or bulk mail like when it was sent.
+    ///
+    /// A row a worker holds right now is left to that worker. Delivered,
+    /// bounced and held messages are refused, and so is a message whose
+    /// content retention already removed.
+    pub async fn requeue_outbound(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<OutboundRetry, sqlx::Error> {
+        let mut tx = self.store.pool.begin().await?;
+        set_tenant_context(&mut tx, server_id).await?;
+        let row = sqlx::query(
+            "SELECT status, content_purged_at IS NOT NULL AS purged FROM messages
+             WHERE id = $1 AND scope = 'outgoing' FOR UPDATE",
+        )
+        .bind(message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(OutboundRetry::NotFound);
+        };
+        let status: String = row.get("status");
+        if !RETRYABLE_OUTBOUND_STATUSES.contains(&status.as_str()) {
+            tx.commit().await?;
+            return Ok(OutboundRetry::NotRetryable { status });
+        }
+        if row.get::<bool, _>("purged") {
+            tx.commit().await?;
+            return Ok(OutboundRetry::ContentPurged);
+        }
+
+        let queued = sqlx::query(
+            "UPDATE queued_messages SET retry_after = NULL
+             WHERE message_id = $1 AND server_id = $2 AND locked_by IS NULL",
+        )
+        .bind(message_id)
+        .bind(server_id as i64)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let in_queue = queued > 0
+            || sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM queued_messages
+                                WHERE message_id = $1 AND server_id = $2)",
+            )
+            .bind(message_id)
+            .bind(server_id as i64)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !in_queue {
+            sqlx::query(
+                "INSERT INTO queued_messages (message_id, server_id, domain, bulk)
+                 SELECT m.id, $2, coalesce(split_part(m.rcpt_to, '@', 2), ''), coalesce(
+                     (SELECT stream_type = 'broadcast' FROM message_streams WHERE id = m.stream_id),
+                     false)
+                 FROM messages m WHERE m.id = $1",
+            )
+            .bind(message_id)
+            .bind(server_id as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let row = sqlx::query(
+            "UPDATE messages SET status = 'Pending', held = FALSE
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(message_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(OutboundRetry::Requeued(Box::new(message_record_from_row(
+            &row,
+        ))))
     }
 
     /// Delivery attempts (with timestamps) for a message, tenant-scoped.

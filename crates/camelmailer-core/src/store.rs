@@ -1318,6 +1318,36 @@ impl MemoryStore {
         Some(message.clone())
     }
 
+    /// Send an outgoing message again (test read model; `Pending` outgoing
+    /// messages stand in for the queue). Mirrors
+    /// `PgMessageSink::requeue_outbound`.
+    pub fn requeue_outbound(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> crate::server_store::OutboundRetry {
+        use crate::server_store::{OutboundRetry, RETRYABLE_OUTBOUND_STATUSES};
+        let mut inner = self.inner.write().unwrap();
+        let Some(message) = inner
+            .messages
+            .iter_mut()
+            .find(|m| m.id == message_id && m.server_id == server_id && m.scope == "outgoing")
+        else {
+            return OutboundRetry::NotFound;
+        };
+        if !RETRYABLE_OUTBOUND_STATUSES.contains(&message.status.as_str()) {
+            return OutboundRetry::NotRetryable {
+                status: message.status.clone(),
+            };
+        }
+        if message.raw_message.is_empty() {
+            return OutboundRetry::ContentPurged;
+        }
+        message.status = "Pending".into();
+        message.held = false;
+        OutboundRetry::Requeued(Box::new(message.clone()))
+    }
+
     /// One of a server's streams by permalink.
     pub fn find_stream(&self, server_id: Id, permalink: &str) -> Option<MessageStream> {
         self.inner
