@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-04
+
 ### Added
 
 - **Send an outgoing message again.** `POST /api/v2/server/messages/{id}/retry`
@@ -43,6 +45,10 @@ integration tests) is green.
   address whenever the MX resolved IPv6-first, which Microsoft 365 refuses
   when that address has no reverse DNS (error S820). A bound pool address
   still pins the family, and now also tries each address of that family.
+- **Dashboard toolchain.** The web image and CI run on Node 26, the current
+  LTS line; pnpm is installed through npm because Node 26 no longer ships
+  corepack. The dashboard is on TypeScript 6 and TanStack Table v9, with
+  React 19.3 and the other minor updates of the web dependencies.
 
 ## [0.12.0] - 2026-10-31
 
@@ -1351,7 +1357,9 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/camelmailer/camelmailer/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/camelmailer/camelmailer/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/camelmailer/camelmailer/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/camelmailer/camelmailer/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/camelmailer/camelmailer/compare/v0.10.2...v0.10.3
