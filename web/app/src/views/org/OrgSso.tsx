@@ -7,7 +7,6 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { PlusIcon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, CopyButton, PageHeader } from "@/components/shared"
@@ -22,7 +21,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { Page } from "@/components/page"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -136,7 +135,7 @@ function EmailDomains({ org }: { org: string }) {
 
   const rows = domains.data?.domains ?? []
 
-  const columns: ColumnDef<OrgSsoDomain>[] = [
+  const columns: DataTableColumn<OrgSsoDomain>[] = [
     {
       id: "domain",
       header: "Domain",
@@ -452,7 +451,7 @@ function Connections({ org }: { org: string }) {
 
   const rows = connections.data?.connections ?? []
 
-  const columns: ColumnDef<OrgSsoConnection>[] = [
+  const columns: DataTableColumn<OrgSsoConnection>[] = [
     {
       id: "name",
       header: "Name",

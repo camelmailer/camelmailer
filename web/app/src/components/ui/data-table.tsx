@@ -11,18 +11,16 @@
 
 import * as React from "react"
 import {
+  type CellData,
   type ColumnDef,
   type ColumnFiltersState,
   type Header,
   type RowData,
   type RowSelectionState,
   type SortingState,
+  type TableFeatures,
   flexRender,
-  getCoreRowModel,
-  getFilteredRowModel,
-  getPaginationRowModel,
-  getSortedRowModel,
-  useReactTable,
+  useTable,
 } from "@tanstack/react-table"
 import {
   ArrowDownIcon,
@@ -36,6 +34,11 @@ import {
 } from "lucide-react"
 
 import { cn } from "@/lib/utils"
+import {
+  type DataTableFeatures,
+  dataTableFeatures as features,
+  searchRows,
+} from "@/components/ui/data-table-features"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -59,12 +62,19 @@ import {
 // alignment is derived from the column id (only "actions" is right-aligned).
 declare module "@tanstack/react-table" {
   // The type parameters have to repeat the library's own signature for the
-  // declaration to merge, even though neither is used here.
+  // declaration to merge, even though none is used here.
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  interface ColumnMeta<TData extends RowData, TValue> {
+  interface ColumnMeta<TFeatures extends TableFeatures, TData extends RowData, TValue extends CellData = CellData> {
     align?: "left" | "right"
   }
 }
+
+/** A column of a {@link DataTable}. */
+export type DataTableColumn<TData extends RowData, TValue extends CellData = CellData> = ColumnDef<
+  DataTableFeatures,
+  TData,
+  TValue
+>
 
 export type DataTableFilter = {
   /** The column id to filter on (its value must match an option value). */
@@ -105,7 +115,7 @@ function SelectBox({
   )
 }
 
-export function DataTable<TData, TValue>({
+export function DataTable<TData extends RowData>({
   columns,
   data,
   searchPlaceholder = "Search…",
@@ -120,7 +130,7 @@ export function DataTable<TData, TValue>({
   getRowId,
   bulkActions,
 }: {
-  columns: ColumnDef<TData, TValue>[]
+  columns: DataTableColumn<TData>[]
   data: TData[]
   searchPlaceholder?: string
   /** Row fields the global search matches against (defaults to all string cells). */
@@ -148,16 +158,17 @@ export function DataTable<TData, TValue>({
   const [globalFilter, setGlobalFilter] = React.useState("")
   const [rowSelection, setRowSelection] = React.useState<RowSelectionState>({})
 
-  const allColumns = React.useMemo<ColumnDef<TData, TValue>[]>(() => {
+  const allColumns = React.useMemo<DataTableColumn<TData>[]>(() => {
     if (!bulkActions) return columns
-    const select: ColumnDef<TData, TValue> = {
+    const select: DataTableColumn<TData> = {
       id: "select",
       enableSorting: false,
       header: ({ table }) => (
         <SelectBox
           label="Select all rows on this page"
           checked={table.getIsAllPageRowsSelected()}
-          indeterminate={table.getIsSomePageRowsSelected()}
+          // v9: "some" means at least one, so a full page is not mixed.
+          indeterminate={table.getIsSomePageRowsSelected() && !table.getIsAllPageRowsSelected()}
           onChange={(checked) => table.toggleAllPageRowsSelected(checked)}
         />
       ),
@@ -172,7 +183,8 @@ export function DataTable<TData, TValue>({
     return [select, ...columns]
   }, [bulkActions, columns])
 
-  const table = useReactTable({
+  const table = useTable({
+    features,
     data,
     columns: allColumns,
     state: { sorting, columnFilters, globalFilter, rowSelection },
@@ -182,25 +194,13 @@ export function DataTable<TData, TValue>({
     onSortingChange: setSorting,
     onColumnFiltersChange: setColumnFilters,
     onGlobalFilterChange: setGlobalFilter,
-    globalFilterFn: (row, _columnId, value) => {
-      const needle = String(value).toLowerCase().trim()
-      if (!needle) return true
-      const keys = searchKeys ?? (Object.keys(row.original as object) as (keyof TData)[])
-      return keys.some((k) => {
-        const v = (row.original as TData)[k]
-        return typeof v === "string" && v.toLowerCase().includes(needle)
-      })
-    },
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    initialState: { pagination: { pageSize: initialPageSize } },
+    globalFilterFn: searchRows<TData>(searchKeys),
+    initialState: { pagination: { pageIndex: 0, pageSize: initialPageSize } },
   })
 
   const rows = table.getRowModel().rows
   const total = table.getFilteredRowModel().rows.length
-  const { pageIndex, pageSize } = table.getState().pagination
+  const { pageIndex, pageSize } = table.state.pagination
   const first = total === 0 ? 0 : pageIndex * pageSize + 1
   const last = Math.min((pageIndex + 1) * pageSize, total)
 
@@ -253,7 +253,7 @@ export function DataTable<TData, TValue>({
   }, [fillHeight, rows.length, allColumns.length, pageIndex, pageSize])
 
   // Shared cell renderers so header/body markup is identical in both modes.
-  const renderHeadCell = (header: Header<TData, unknown>) => {
+  const renderHeadCell = (header: Header<DataTableFeatures, TData, CellData>) => {
     const canSort = header.column.getCanSort()
     const sorted = header.column.getIsSorted()
     // Only the trailing actions column is right-aligned; data stays left.
@@ -320,7 +320,8 @@ export function DataTable<TData, TValue>({
         data-state={row.getIsSelected() ? "selected" : undefined}
         className="group"
       >
-        {row.getVisibleCells().map((cell) => (
+        {/* No column-visibility feature: every cell is visible. */}
+        {row.getAllCells().map((cell) => (
           <TableCell
             key={cell.id}
             className={cn(

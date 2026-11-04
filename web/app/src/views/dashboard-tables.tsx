@@ -6,10 +6,9 @@
 
 import Link from "next/link"
 import { useQueries, useQuery } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { Badge } from "@/components/ui/badge"
 import { StatusPill, type PillTone } from "@/components/status-pill"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { adminApi, type Server } from "@/lib/api"
 import { orgInitials, serverDotColor } from "@/lib/api-extras"
 
@@ -53,7 +52,7 @@ const DELIVERABILITY_FILTER = {
   ],
 }
 
-function serverColumns(showOrg: boolean): ColumnDef<ServerRow>[] {
+function serverColumns(showOrg: boolean): DataTableColumn<ServerRow>[] {
   return [
   {
     id: "server",
@@ -90,7 +89,7 @@ function serverColumns(showOrg: boolean): ColumnDef<ServerRow>[] {
               {row.original.orgName}
             </Link>
           ),
-        } satisfies ColumnDef<ServerRow>,
+        } satisfies DataTableColumn<ServerRow>,
       ]
     : []),
   {
@@ -217,7 +216,7 @@ type OrgRow = {
   serverCount: number | null
 }
 
-function orgColumns(onNavigate?: () => void): ColumnDef<OrgRow>[] {
+function orgColumns(onNavigate?: () => void): DataTableColumn<OrgRow>[] {
   return [
     {
       id: "organization",

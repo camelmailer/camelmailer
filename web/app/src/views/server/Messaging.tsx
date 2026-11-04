@@ -16,7 +16,6 @@ import {
 } from "react"
 import Link from "next/link"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { useRouter } from "next/navigation"
 import {
   ChevronRightIcon,
@@ -75,7 +74,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { Page } from "@/components/page"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
@@ -1438,7 +1437,7 @@ export function Messages({ api }: { api: Api }) {
     { key: "created_at", label: "Time", accessor: (m) => m.created_at },
   ]
 
-  const columns: ColumnDef<Message>[] = [
+  const columns: DataTableColumn<Message>[] = [
     {
       id: "event",
       header: "Event",
@@ -1698,7 +1697,7 @@ export function LogsView() {
     { key: "created_at", label: "Time", accessor: (e) => e.created_at },
   ]
 
-  const columns: ColumnDef<ApiRequestEntry>[] = [
+  const columns: DataTableColumn<ApiRequestEntry>[] = [
     {
       id: "method",
       header: "Method",
@@ -1881,7 +1880,7 @@ export function InboundQueue({ api }: { api: Api }) {
     { key: "created_at", label: "Time", accessor: (m) => m.created_at },
   ]
 
-  const columns: ColumnDef<Message>[] = [
+  const columns: DataTableColumn<Message>[] = [
     {
       id: "id",
       header: "#",
@@ -2023,7 +2022,7 @@ export function StatsView({ api }: { api: Api }) {
   const bounces = useQuery({ queryKey: ["sapi-bounces"], queryFn: api.bounces })
   const s = stats.data?.stats
 
-  const bounceColumns: ColumnDef<Message>[] = [
+  const bounceColumns: DataTableColumn<Message>[] = [
     {
       id: "to",
       header: "To",
@@ -2130,7 +2129,7 @@ export function Streams({ api }: { api: Api }) {
     onError: (err) => errorToast(err, "Could not create the stream"),
   })
 
-  const columns: ColumnDef<Stream>[] = [
+  const columns: DataTableColumn<Stream>[] = [
     {
       id: "name",
       header: "Name",
@@ -2608,7 +2607,7 @@ export function StreamDetail({
   ].filter((d) => d.value > 0)
 
   const messageHref = (id: number) => `/orgs/${org}/servers/${server}/messaging/${id}`
-  const messageColumns: ColumnDef<Message>[] = [
+  const messageColumns: DataTableColumn<Message>[] = [
     {
       id: "event",
       header: "Event",
@@ -2671,7 +2670,7 @@ export function StreamDetail({
     },
   ]
 
-  const subscriberColumns: ColumnDef<Subscription>[] = [
+  const subscriberColumns: DataTableColumn<Subscription>[] = [
     {
       id: "address",
       header: "Address",
@@ -2730,7 +2729,7 @@ export function StreamDetail({
     },
   ]
 
-  const campaignColumns: ColumnDef<CampaignWithStream>[] = [
+  const campaignColumns: DataTableColumn<CampaignWithStream>[] = [
     {
       id: "subject",
       header: "Subject",

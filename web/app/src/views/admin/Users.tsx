@@ -4,13 +4,12 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, PageHeader } from "@/components/shared"
 import { Page } from "@/components/page"
 import { Button } from "@/components/ui/button"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import {
   Dialog,
   DialogContent,
@@ -67,7 +66,7 @@ export default function Users() {
     name: `${user.first_name} ${user.last_name}`.trim(),
   }))
 
-  const columns: ColumnDef<UserRow>[] = [
+  const columns: DataTableColumn<UserRow>[] = [
     {
       id: "name",
       header: "Name",

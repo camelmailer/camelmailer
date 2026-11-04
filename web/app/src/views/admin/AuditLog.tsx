@@ -3,11 +3,10 @@
 // Instance admin: the authentication audit trail.
 
 import { useQuery } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { formatDate, PageHeader } from "@/components/shared"
 import { Page } from "@/components/page"
 import { Badge } from "@/components/ui/badge"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { adminApi, type AuthEvent } from "@/lib/api"
 
 function eventVariant(event: string): "default" | "secondary" | "destructive" | "outline" {
@@ -30,7 +29,7 @@ export default function AuditLog() {
     refetchInterval: 30_000,
   })
 
-  const columns: ColumnDef<AuthEvent>[] = [
+  const columns: DataTableColumn<AuthEvent>[] = [
     {
       id: "time",
       header: "Time",

@@ -9,7 +9,6 @@ import { useState } from "react"
 import Link from "next/link"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useRouter } from "next/navigation"
-import { type ColumnDef } from "@tanstack/react-table"
 import { ExternalLinkIcon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, formatDate, PageHeader } from "@/components/shared"
@@ -17,7 +16,7 @@ import { Page } from "@/components/page"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { Skeleton } from "@/components/ui/skeleton"
 import { StatusPill } from "@/components/status-pill"
 import { relativeTime } from "@/lib/api-p1"
@@ -158,7 +157,7 @@ export default function OrganizationDetail({ org }: { org: string }) {
   const found = organization ? flags(organization) : []
   const missing = overview.error instanceof ApiError && overview.error.code === "NotFound"
 
-  const serverColumns: ColumnDef<ServerVolume>[] = [
+  const serverColumns: DataTableColumn<ServerVolume>[] = [
     {
       id: "server",
       header: "Server",
@@ -198,7 +197,7 @@ export default function OrganizationDetail({ org }: { org: string }) {
         ),
     },
     ...WINDOWS.map(
-      (w): ColumnDef<ServerVolume> => ({
+      (w): DataTableColumn<ServerVolume> => ({
         id: `outgoing_${w.value}`,
         header: `Outgoing ${w.label}`,
         accessorFn: (r) => r[w.value].outgoing,
@@ -270,7 +269,7 @@ export default function OrganizationDetail({ org }: { org: string }) {
     },
   ]
 
-  const memberColumns: ColumnDef<Membership>[] = [
+  const memberColumns: DataTableColumn<Membership>[] = [
     {
       id: "name",
       header: "Name",

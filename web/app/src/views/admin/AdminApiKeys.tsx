@@ -4,13 +4,12 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, PageHeader, SecretReveal } from "@/components/shared"
 import { Page } from "@/components/page"
 import { Button } from "@/components/ui/button"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import {
   Dialog,
   DialogContent,
@@ -43,7 +42,7 @@ export default function AdminApiKeys() {
       toast.error(err instanceof ApiError ? err.message : "Could not create the key"),
   })
 
-  const columns: ColumnDef<AdminApiKey>[] = [
+  const columns: DataTableColumn<AdminApiKey>[] = [
     {
       id: "name",
       header: "Name",
