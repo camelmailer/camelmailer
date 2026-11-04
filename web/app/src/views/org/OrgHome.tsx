@@ -5,7 +5,6 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
@@ -35,7 +34,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import {
   Dialog,
   DialogContent,
@@ -323,7 +322,7 @@ export function Members({ org }: { org: string }) {
       })),
   ]
 
-  const columns: ColumnDef<MemberRow>[] = [
+  const columns: DataTableColumn<MemberRow>[] = [
     {
       id: "member",
       header: "Member",
@@ -636,7 +635,7 @@ export function Invitations({ org }: { org: string }) {
   })
 
   type Invite = NonNullable<typeof invitations.data>["invitations"][number]
-  const inviteColumns: ColumnDef<Invite>[] = [
+  const inviteColumns: DataTableColumn<Invite>[] = [
     {
       id: "email",
       header: "Email",

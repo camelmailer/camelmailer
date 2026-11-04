@@ -4,7 +4,6 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { PlusIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, EmptyState, PageHeader } from "@/components/shared"
@@ -17,7 +16,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import {
   Dialog,
   DialogContent,
@@ -70,7 +69,7 @@ function PoolCard({ pool }: { pool: IpPool }) {
     onError: (err) => errorToast(err, "Could not add the address"),
   })
 
-  const columns: ColumnDef<IpAddress>[] = [
+  const columns: DataTableColumn<IpAddress>[] = [
     {
       id: "ipv4",
       header: "IPv4",

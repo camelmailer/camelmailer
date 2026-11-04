@@ -7,7 +7,6 @@
 
 import { useMemo, useState, type ReactNode } from "react"
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { CheckCircle2Icon, InboxIcon, RefreshCwIcon } from "lucide-react"
 import { toast } from "sonner"
 import { Area, AreaChart, CartesianGrid, XAxis } from "recharts"
@@ -36,7 +35,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { Skeleton } from "@/components/ui/skeleton"
 import { cn } from "@/lib/utils"
 import {
@@ -249,7 +248,7 @@ function HealthCheckCard({
   )
 }
 
-const sourceColumns: ColumnDef<SourceRow>[] = [
+const sourceColumns: DataTableColumn<SourceRow>[] = [
   {
     id: "provider",
     header: "Sending source",
@@ -314,7 +313,7 @@ const sourceColumns: ColumnDef<SourceRow>[] = [
   },
 ]
 
-const reportColumns: ColumnDef<DmarcReport>[] = [
+const reportColumns: DataTableColumn<DmarcReport>[] = [
   {
     id: "reporter",
     header: "Reporter",

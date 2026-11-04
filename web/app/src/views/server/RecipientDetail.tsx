@@ -10,7 +10,6 @@ import { useMemo, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useQuery } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -26,7 +25,7 @@ import { MessagePill, messageStatus, statusDotClass } from "@/components/status-
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { cn } from "@/lib/utils"
 import { serverApi, type Message } from "@/lib/api"
 import { relativeTime } from "@/lib/api-p1"
@@ -297,7 +296,7 @@ export function RecipientsList({ org, server }: { org: string; server: string })
     return [...map.values()].sort((a, b) => b.last.localeCompare(a.last))
   }, [messagesQuery.data])
 
-  const columns: ColumnDef<RecipientRow>[] = [
+  const columns: DataTableColumn<RecipientRow>[] = [
     {
       id: "address",
       header: "Recipient",

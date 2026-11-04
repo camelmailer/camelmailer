@@ -7,7 +7,6 @@ import { useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import {
   AtSignIcon,
   BanIcon,
@@ -56,7 +55,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { Page } from "@/components/page"
 import {
   adminApi,
@@ -131,7 +130,7 @@ export function Domains({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not add the domain"),
   })
 
-  const columns: ColumnDef<Domain>[] = [
+  const columns: DataTableColumn<Domain>[] = [
     {
       id: "domain",
       header: "Domain",
@@ -479,7 +478,7 @@ export function Credentials({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not create the credential"),
   })
 
-  const columns: ColumnDef<CredentialWithUsage>[] = [
+  const columns: DataTableColumn<CredentialWithUsage>[] = [
     {
       id: "name",
       header: "Name",
@@ -797,7 +796,7 @@ export function Routes({ org, server }: Scope) {
     { key: "endpoint_url", label: "Endpoint URL", example: "https://app.acme.com/inbound" },
   ]
 
-  const columns: ColumnDef<Route>[] = [
+  const columns: DataTableColumn<Route>[] = [
     {
       id: "address",
       header: "Address",
@@ -1236,7 +1235,7 @@ export function Webhooks({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not create the webhook"),
   })
 
-  const columns: ColumnDef<Webhook>[] = [
+  const columns: DataTableColumn<Webhook>[] = [
     {
       id: "name",
       header: "Name",
@@ -1885,7 +1884,7 @@ export function Suppressions({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not add the suppression"),
   })
 
-  const columns: ColumnDef<SuppressionWithDate>[] = [
+  const columns: DataTableColumn<SuppressionWithDate>[] = [
     {
       id: "address",
       header: "Address",
@@ -2111,7 +2110,7 @@ export function SenderAddresses({ org, server }: Scope) {
     onError: (err) => errorToast(err, "Could not add the sender address"),
   })
 
-  const columns: ColumnDef<SenderAddress>[] = [
+  const columns: DataTableColumn<SenderAddress>[] = [
     {
       id: "email",
       header: "Email address",

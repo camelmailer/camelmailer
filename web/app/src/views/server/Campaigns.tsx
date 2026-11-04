@@ -10,7 +10,6 @@ import { useMemo, useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { Cell, Pie, PieChart } from "recharts"
 import {
   ChevronRightIcon,
@@ -26,7 +25,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { ChartContainer, type ChartConfig } from "@/components/ui/chart"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -126,7 +125,7 @@ export function CampaignsList({ org, server }: { org: string; server: string }) 
   })
   const rows = campaignsQuery.data?.campaigns ?? []
 
-  const columns: ColumnDef<CampaignWithStream>[] = [
+  const columns: DataTableColumn<CampaignWithStream>[] = [
     {
       id: "subject",
       header: "Subject",
@@ -866,7 +865,7 @@ export function CampaignDetailPage({
     `/orgs/${org}/servers/${server}/messaging/${messageId}`
 
   // Recipients: address + delivery status + timestamp for each message.
-  const recipientColumns: ColumnDef<Message>[] = [
+  const recipientColumns: DataTableColumn<Message>[] = [
     {
       id: "recipient",
       header: "Recipient",
@@ -904,7 +903,7 @@ export function CampaignDetailPage({
 
   // Messages: the individual messages of this campaign, mirroring the
   // messaging activity table's columns.
-  const messageColumns: ColumnDef<Message>[] = [
+  const messageColumns: DataTableColumn<Message>[] = [
     {
       id: "event",
       header: "Event",

@@ -8,14 +8,13 @@
 import { useState } from "react"
 import Link from "next/link"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { type ColumnDef } from "@tanstack/react-table"
 import { TriangleAlertIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 import { ConfirmDialog, PageHeader } from "@/components/shared"
 import { Page } from "@/components/page"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { DataTable } from "@/components/ui/data-table"
+import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
 import { Skeleton } from "@/components/ui/skeleton"
 import { StatusPill } from "@/components/status-pill"
 import { relativeTime } from "@/lib/api-p1"
@@ -173,7 +172,7 @@ export default function Organizations() {
     if (failed.length > 0) toast.error(`Could not delete ${failed.join(", ")}.`)
   }
 
-  const columns: ColumnDef<OrganizationVolume>[] = [
+  const columns: DataTableColumn<OrganizationVolume>[] = [
     {
       id: "name",
       header: "Organization",
