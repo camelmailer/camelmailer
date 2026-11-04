@@ -13,8 +13,9 @@
 
 FROM node:26-alpine AS build
 WORKDIR /app
-RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# Node 25+ ships without corepack: install the pnpm that package.json pins.
+RUN npm install -g "$(node -p 'require("./package.json").packageManager')"
 RUN pnpm install --frozen-lockfile
 COPY . .
 ARG API_PROXY_URL=http://web:5000
@@ -24,8 +25,8 @@ RUN pnpm run build
 FROM node:26-alpine
 WORKDIR /app
 ENV NODE_ENV=production
-RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN npm install -g "$(node -p 'require("./package.json").packageManager')"
 RUN pnpm install --frozen-lockfile --prod
 COPY --from=build /app/.next ./.next
 COPY --from=build /app/public ./public
