@@ -15,6 +15,17 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Large messages over TLS reach slow receivers.** The SMTP client never
+  flushed what it wrote. A TLS stream keeps encrypted records until it is
+  flushed, so once the socket pushed back under a receiver that takes its
+  data slowly, the tail of a large message and its final dot could stay in
+  the client: the receiver waited for the end of the message until its own
+  timeout (`421 4.4.2 timeout exceeded`, Hornetsecurity for one) while the
+  worker waited for its reply (`read timeout`). Every command and the
+  message body are now flushed.
+
 ## [0.13.0] - 2026-11-04
 
 ### Added
