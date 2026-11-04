@@ -272,6 +272,27 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Success" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /api/v2/server/messages/{id}/retry:
+    post:
+      tags: [Messages]
+      summary: Send an outgoing message again now
+      description: |
+        A message waiting for its next attempt (`Pending`, `SoftFail`) is due
+        at once and keeps its attempt count. A message that was given up on
+        (`HardFail`) goes back into the queue with a fresh count. Returns
+        `{ message, requeued: true }`.
+      security: [{ ServerApiKey: [] }]
+      parameters: [{ $ref: "#/components/parameters/MessageId" }]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            `MessageNotRetryable` for a delivered, bounced or held message;
+            `MessageContentPurged` when data retention removed its content.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
   /api/v2/server/messages/{id}/opens:
     get:
       tags: [Messages]

@@ -1244,6 +1244,9 @@ export function serverApi(key: string) {
       api.post<MessageShare>(`/api/v2/server/messages/${id}/share`, { expires_in_hours }, h),
     insights: (id: number) =>
       api.get<MessageInsights>(`/api/v2/server/messages/${id}/insights`, h),
+    // Send an outgoing message again now (Pending / SoftFail / HardFail).
+    retry: (id: number) =>
+      api.post<{ message: Message; requeued: boolean }>(`/api/v2/server/messages/${id}/retry`, {}, h),
     // inbound queue management — the endpoint returns the rows under the
     // "inbound" key (not "messages"), matching the server API contract.
     inbound: (params = "") =>

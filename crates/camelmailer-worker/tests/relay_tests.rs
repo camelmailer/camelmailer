@@ -166,6 +166,8 @@ fn params(port: u16, security: ConnectionSecurity, auth: Option<SmtpAuth>) -> Se
         mail_from: "sender@org.example".into(),
         rcpt_to: "user@elsewhere.example".into(),
         timeout: Duration::from_secs(5),
+        read_timeout: Duration::from_secs(5),
+        data_timeout: Duration::from_secs(5),
         // Self-signed mock certificates: verification must be off, but the
         // *security* requirement below still forces TLS where demanded.
         tls_mode: TlsMode::AcceptAny,
@@ -377,4 +379,85 @@ async fn relay_verify_rejects_untrusted_cert_but_accept_any_succeeds() {
         matches!(accepted, SendOutcome::Sent { tls: true, .. }),
         "AcceptAny must deliver over TLS, got {accepted:?}"
     );
+}
+
+/// A receiver that holds its greeting back for `delay`, as Hornetsecurity
+/// does for a sender it does not know yet, then accepts the message.
+async fn slow_greeting_mx(delay: Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if stream
+                    .write_all(b"220 slow.example ESMTP\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let mut buffer = Vec::new();
+                let mut in_data = false;
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    while let Some(end) = buffer.windows(2).position(|w| w == b"\r\n") {
+                        let line: Vec<u8> = buffer.drain(..end + 2).collect();
+                        let line = String::from_utf8_lossy(&line[..end]).to_string();
+                        let reply: &[u8] = if in_data {
+                            if line != "." {
+                                continue;
+                            }
+                            in_data = false;
+                            b"250 queued\r\n"
+                        } else if line.starts_with("DATA") {
+                            in_data = true;
+                            b"354 go ahead\r\n"
+                        } else if line.starts_with("QUIT") {
+                            b"221 bye\r\n"
+                        } else {
+                            b"250 ok\r\n"
+                        };
+                        if stream.write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_back_greeting_is_waited_for_with_the_read_timeout() {
+    let port = slow_greeting_mx(Duration::from_millis(1500)).await;
+    let mut slow = params(port, ConnectionSecurity::Opportunistic, None);
+    slow.tls_mode = TlsMode::Disabled;
+    // The connect timeout is shorter than the delay; the greeting is read
+    // with the read timeout, so the message still goes out.
+    slow.timeout = Duration::from_millis(500);
+    slow.read_timeout = Duration::from_secs(5);
+    let outcome = send_message(&slow, MESSAGE).await;
+    assert!(
+        matches!(outcome, SendOutcome::Sent { .. }),
+        "held-back greeting must be waited for: {outcome:?}"
+    );
+
+    // A read timeout shorter than the delay fails the attempt retryably and
+    // says so in the delivery log.
+    slow.read_timeout = Duration::from_millis(500);
+    match send_message(&slow, MESSAGE).await {
+        SendOutcome::SoftFail { response } => {
+            assert!(response.contains("read timeout"), "{response}")
+        }
+        other => panic!("expected a soft failure, got {other:?}"),
+    }
 }

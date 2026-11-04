@@ -99,7 +99,17 @@ pub struct SendParams {
     pub helo_hostname: String,
     pub mail_from: String,
     pub rcpt_to: String,
+    /// How long to wait for the TCP connection, per remote address
+    /// (`smtp_client.open_timeout`).
     pub timeout: Duration,
+    /// How long to wait for the greeting, a TLS handshake and each reply
+    /// (`smtp_client.read_timeout`). RFC 5321 4.5.3.2 asks for five minutes:
+    /// receivers such as Hornetsecurity hold the greeting back on purpose
+    /// for a sender they do not know yet.
+    pub read_timeout: Duration,
+    /// How long to wait while the message body is sent and for the reply to
+    /// its final dot (`smtp_client.data_timeout`, RFC 5321: ten minutes).
+    pub data_timeout: Duration,
     pub tls_mode: TlsMode,
     pub security: ConnectionSecurity,
     /// Relay credentials (AUTH PLAIN), if any.
@@ -117,6 +127,18 @@ fn classify(code: u16, response: String, tls: bool) -> SendOutcome {
 }
 
 type Stream = Box<dyn AsyncStream>;
+
+/// Run `future` for at most `limit`; running out is an `io::ErrorKind::TimedOut`
+/// named after `what`, which the delivery log shows.
+async fn within<T>(
+    limit: Duration,
+    what: &str,
+    future: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    tokio::time::timeout(limit, future)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{what} timeout")))?
+}
 
 trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
@@ -154,7 +176,12 @@ impl SmtpConnection {
             let mut chunk = [0u8; 2048];
             let read = tokio::time::timeout(self.timeout, self.stream.read(&mut chunk))
                 .await
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout"))??;
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("read timeout after {}s", self.timeout.as_secs()),
+                    )
+                })??;
             if read == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -242,57 +269,85 @@ fn tls_connector(mode: TlsMode) -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
-/// The remote address to connect to. A bound source address pins the
+/// The remote addresses to try, in order. A bound source address pins the
 /// address family: an IPv4 source can never reach an AAAA-only candidate
 /// (the connect fails with EAFNOSUPPORT), so the resolved addresses are
-/// filtered to the source's family. Without a source the first resolved
-/// address wins, as before.
-fn pick_remote_address(
+/// filtered to the source's family.
+///
+/// Without a bound source the operating system picks the local address, and
+/// on a dual-stack host that is the host's own IPv6 address for an AAAA
+/// candidate. That address rarely has the reverse DNS and SPF coverage a
+/// mail server's IPv4 address has, and large receivers (Microsoft 365, error
+/// S820) refuse IPv6 senders without a PTR, so IPv4 candidates go first.
+/// The resolver's order is kept within each family.
+fn remote_addresses(
     addresses: impl Iterator<Item = SocketAddr>,
     source_ip: Option<std::net::IpAddr>,
     host: &str,
-) -> std::io::Result<SocketAddr> {
-    let mut addresses = addresses.peekable();
-    if addresses.peek().is_none() {
+) -> std::io::Result<Vec<SocketAddr>> {
+    let addresses: Vec<SocketAddr> = addresses.collect();
+    if addresses.is_empty() {
         return Err(std::io::Error::other(format!("no address for {host}")));
     }
-    match source_ip {
+    let candidates: Vec<SocketAddr> = match source_ip {
         Some(source_ip) => addresses
-            .find(|address| address.is_ipv4() == source_ip.is_ipv4())
-            .ok_or_else(|| {
-                std::io::Error::other(format!(
-                    "no {} address for {host} (required by the bound source address)",
-                    if source_ip.is_ipv4() { "IPv4" } else { "IPv6" },
-                ))
-            }),
-        None => Ok(addresses.next().expect("peeked non-empty")),
-    }
-}
-
-async fn connect(params: &SendParams) -> std::io::Result<TcpStream> {
-    let addresses = tokio::net::lookup_host((params.host.as_str(), params.port)).await?;
-    let address = pick_remote_address(addresses, params.source_ip, &params.host)?;
-    let connect_future = match params.source_ip {
-        Some(source_ip) => {
-            let socket = if source_ip.is_ipv4() {
-                TcpSocket::new_v4()?
-            } else {
-                TcpSocket::new_v6()?
-            };
-            socket.bind(SocketAddr::new(source_ip, 0))?;
-            socket.connect(address)
-        }
+            .into_iter()
+            .filter(|address| address.is_ipv4() == source_ip.is_ipv4())
+            .collect(),
         None => {
-            return tokio::time::timeout(params.timeout, TcpStream::connect(address))
-                .await
-                .map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout")
-                })?
+            let (v4, v6): (Vec<_>, Vec<_>) = addresses.into_iter().partition(SocketAddr::is_ipv4);
+            v4.into_iter().chain(v6).collect()
         }
     };
-    tokio::time::timeout(params.timeout, connect_future)
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?
+    if candidates.is_empty() {
+        let family = match source_ip {
+            Some(ip) if ip.is_ipv4() => "IPv4",
+            _ => "IPv6",
+        };
+        return Err(std::io::Error::other(format!(
+            "no {family} address for {host} (required by the bound source address)"
+        )));
+    }
+    Ok(candidates)
+}
+
+/// Connect to one of the host's addresses: each candidate in turn (see
+/// [`remote_addresses`]), so one unreachable address of a host with several
+/// does not fail the attempt. The last connection error is returned when
+/// none answers.
+async fn connect(params: &SendParams) -> std::io::Result<TcpStream> {
+    let addresses = tokio::net::lookup_host((params.host.as_str(), params.port)).await?;
+    let candidates = remote_addresses(addresses, params.source_ip, &params.host)?;
+    let mut last_error = None;
+    for address in candidates {
+        match connect_to(address, params).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                tracing::debug!(%address, host = %params.host, %error, "connect failed, trying the next address");
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| std::io::Error::other(format!("no address for {}", params.host))))
+}
+
+async fn connect_to(address: SocketAddr, params: &SendParams) -> std::io::Result<TcpStream> {
+    let connect = async {
+        match params.source_ip {
+            Some(source_ip) => {
+                let socket = if source_ip.is_ipv4() {
+                    TcpSocket::new_v4()?
+                } else {
+                    TcpSocket::new_v6()?
+                };
+                socket.bind(SocketAddr::new(source_ip, 0))?;
+                socket.connect(address).await
+            }
+            None => TcpStream::connect(address).await,
+        }
+    };
+    within(params.timeout, "connect", connect).await
 }
 
 /// Outcome of a single connection attempt: either a fully classified
@@ -357,13 +412,20 @@ async fn try_send(
         let server_name = rustls::pki_types::ServerName::try_from(params.host.clone())
             .map_err(|_| std::io::Error::other("invalid server name for TLS"))?;
         tls = true;
-        Box::new(connector.connect(server_name, tcp).await?)
+        Box::new(
+            within(
+                params.read_timeout,
+                "TLS handshake",
+                connector.connect(server_name, tcp),
+            )
+            .await?,
+        )
     } else {
         Box::new(tcp)
     };
     let mut connection = SmtpConnection {
         stream,
-        timeout: params.timeout,
+        timeout: params.read_timeout,
         buffer: Vec::new(),
     };
 
@@ -477,8 +539,17 @@ async fn try_send(
         body.extend_from_slice(line);
         body.extend_from_slice(b"\r\n");
     }
-    connection.stream.write_all(&body).await?;
+    // The body and the reply to its final dot get the data timeout: the
+    // receiver may scan the whole message before it answers.
+    within(
+        params.data_timeout,
+        "data",
+        connection.stream.write_all(&body),
+    )
+    .await?;
+    connection.timeout = params.data_timeout;
     let (code, response) = connection.command(".").await?;
+    connection.timeout = params.read_timeout;
     let outcome = classify(code, response, tls);
 
     let _ = connection.send_line("QUIT").await;
@@ -512,7 +583,12 @@ async fn upgrade(
     let connector = tls_connector(effective_tls_mode(params));
     let server_name = rustls::pki_types::ServerName::try_from(params.host.clone())
         .map_err(|_| std::io::Error::other("invalid server name for TLS"))?;
-    let tls_stream = connector.connect(server_name, stream).await?;
+    let tls_stream = within(
+        timeout,
+        "TLS handshake",
+        connector.connect(server_name, stream),
+    )
+    .await?;
     Ok(SmtpConnection {
         stream: Box::new(tls_stream),
         timeout,
@@ -532,35 +608,48 @@ mod tests {
     }
 
     #[test]
-    fn remote_address_follows_the_bound_source_family() {
+    fn remote_addresses_follow_the_bound_source_family() {
         let v6: SocketAddr = "[2001:db8::1]:25".parse().unwrap();
         let v4: SocketAddr = "192.0.2.10:25".parse().unwrap();
         let source_v4: std::net::IpAddr = "198.51.100.5".parse().unwrap();
         let source_v6: std::net::IpAddr = "2001:db8::5".parse().unwrap();
 
         // an IPv4 source skips a leading AAAA candidate (MX hosts often
-        // resolve IPv6-first) and picks the A record
-        let picked =
-            pick_remote_address([v6, v4].into_iter(), Some(source_v4), "mx.example").unwrap();
-        assert_eq!(picked, v4);
+        // resolve IPv6-first) and keeps only the A record
+        let picked = remote_addresses([v6, v4].into_iter(), Some(source_v4), "mx.example").unwrap();
+        assert_eq!(picked, vec![v4]);
 
-        // an IPv6 source picks the AAAA candidate
-        let picked =
-            pick_remote_address([v4, v6].into_iter(), Some(source_v6), "mx.example").unwrap();
-        assert_eq!(picked, v6);
+        // an IPv6 source keeps only the AAAA candidate
+        let picked = remote_addresses([v4, v6].into_iter(), Some(source_v6), "mx.example").unwrap();
+        assert_eq!(picked, vec![v6]);
 
         // no candidate in the source's family is a clear error, not EAFNOSUPPORT
-        let error = pick_remote_address([v6].into_iter(), Some(source_v4), "mx.example")
+        let error = remote_addresses([v6].into_iter(), Some(source_v4), "mx.example")
             .expect_err("family mismatch must error");
         assert!(error.to_string().contains("no IPv4 address"));
-
-        // without a source the first resolved address wins (previous behaviour)
-        let picked = pick_remote_address([v6, v4].into_iter(), None, "mx.example").unwrap();
-        assert_eq!(picked, v6);
+        let error = remote_addresses([v4].into_iter(), Some(source_v6), "mx.example")
+            .expect_err("family mismatch must error");
+        assert!(error.to_string().contains("no IPv6 address"));
 
         // an empty resolution is still "no address"
-        let error = pick_remote_address(std::iter::empty(), None, "mx.example")
+        let error = remote_addresses(std::iter::empty(), None, "mx.example")
             .expect_err("empty resolution must error");
         assert!(error.to_string().contains("no address"));
+    }
+
+    #[test]
+    fn without_a_source_ipv4_goes_first_and_every_address_is_kept() {
+        let v6a: SocketAddr = "[2001:db8::1]:25".parse().unwrap();
+        let v6b: SocketAddr = "[2001:db8::2]:25".parse().unwrap();
+        let v4a: SocketAddr = "192.0.2.10:25".parse().unwrap();
+        let v4b: SocketAddr = "192.0.2.11:25".parse().unwrap();
+
+        let picked =
+            remote_addresses([v6a, v4a, v6b, v4b].into_iter(), None, "mx.example").unwrap();
+        assert_eq!(picked, vec![v4a, v4b, v6a, v6b]);
+
+        // an IPv6-only host is still reachable
+        let picked = remote_addresses([v6a].into_iter(), None, "mx.example").unwrap();
+        assert_eq!(picked, vec![v6a]);
     }
 }

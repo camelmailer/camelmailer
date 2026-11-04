@@ -19,6 +19,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerContext(pub Id);
 
+/// The statuses of an outgoing message a person may send again: still queued
+/// (`Pending`), waiting for its next attempt (`SoftFail`), or given up on
+/// (`HardFail`). A delivered, bounced or held message is not retried.
+pub const RETRYABLE_OUTBOUND_STATUSES: [&str; 3] = ["Pending", "SoftFail", "HardFail"];
+
+/// What asking to send an outgoing message again did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutboundRetry {
+    /// Back in the queue for an attempt now; the record shows it `Pending`.
+    Requeued(Box<MessageRecord>),
+    /// Not the server's outgoing message.
+    NotFound,
+    /// Its status does not allow a retry (delivered, bounced, held).
+    NotRetryable { status: String },
+    /// Retention already removed its content, so there is nothing to send.
+    ContentPurged,
+}
+
 /// Filter for listing messages (all fields optional). Pagination is applied
 /// by the handler; this only narrows the result set.
 #[derive(Debug, Clone, Default)]
@@ -681,6 +699,16 @@ pub trait ServerStore: Send + Sync {
         message_id: i64,
     ) -> Result<Option<MessageRecord>, StoreError>;
 
+    /// Send an outgoing message again now: a message waiting for its next
+    /// attempt is due at once (its attempt count stays), one that was given
+    /// up on goes back into the queue with a fresh count. See
+    /// [`RETRYABLE_OUTBOUND_STATUSES`].
+    async fn retry_outbound_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<OutboundRetry, StoreError>;
+
     // templates (config; server-scoped)
     async fn list_templates(&self, server_id: Id) -> Result<Vec<Template>, StoreError>;
     async fn template_by_permalink(
@@ -1189,6 +1217,14 @@ impl ServerStore for crate::store::MemoryStore {
         message_id: i64,
     ) -> Result<Option<MessageRecord>, StoreError> {
         Ok(self.requeue_inbound(server_id, message_id, false))
+    }
+
+    async fn retry_outbound_message(
+        &self,
+        server_id: Id,
+        message_id: i64,
+    ) -> Result<OutboundRetry, StoreError> {
+        Ok(self.requeue_outbound(server_id, message_id))
     }
 
     async fn list_templates(&self, server_id: Id) -> Result<Vec<Template>, StoreError> {

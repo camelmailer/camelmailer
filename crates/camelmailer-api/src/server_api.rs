@@ -22,8 +22,9 @@ use camelmailer_core::mime::{self, Address, Attachment, BuildParams};
 use camelmailer_core::{
     ActivityEvent, Campaign, CampaignStats, DeliveryRecord, IdempotencyLookup, IdempotencyRequest,
     MessageFilter, MessageRecord, MessageScope, MessageStream, NewCampaign, NewStream, NewTemplate,
-    PendingUnsubscribeToken, QueuedMessage, SendOperationItem, SendOperationResult, SendPlanItem,
-    SendPlanMessage, Server, ServerContext, StoreSendOutcome, StoredSendResult, Template,
+    OutboundRetry, PendingUnsubscribeToken, QueuedMessage, SendOperationItem, SendOperationResult,
+    SendPlanItem, SendPlanMessage, Server, ServerContext, StoreSendOutcome, StoredSendResult,
+    Template, RETRYABLE_OUTBOUND_STATUSES,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1023,6 +1024,50 @@ async fn message_show(
         }),
     )
     .into_response()
+}
+
+/// `POST /api/v2/server/messages/{id}/retry` — send an outgoing message
+/// again now. A message waiting for its next attempt is due at once; one that
+/// was given up on goes back into the queue. Delivered, bounced and held
+/// messages answer 409 `MessageNotRetryable`, a message whose content
+/// retention removed 409 `MessageContentPurged`.
+async fn message_retry(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    server: axum::Extension<Server>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match server_store(&state) {
+        Some(store) => store,
+        None => return storage_unconfigured(&start.0),
+    };
+    match store.retry_outbound_message(server.0.id, id).await {
+        Ok(OutboundRetry::Requeued(message)) => render_success(
+            Some(&start.0),
+            StatusCode::OK,
+            json!({ "message": message_json(&message), "requeued": true }),
+        )
+        .into_response(),
+        Ok(OutboundRetry::NotFound) => not_found(&start.0),
+        Ok(OutboundRetry::NotRetryable { status }) => render_error(
+            Some(&start.0),
+            StatusCode::CONFLICT,
+            "MessageNotRetryable",
+            &format!(
+                "a message with status {status} is not sent again; only {} messages are",
+                RETRYABLE_OUTBOUND_STATUSES.join(", ")
+            ),
+        )
+        .into_response(),
+        Ok(OutboundRetry::ContentPurged) => render_error(
+            Some(&start.0),
+            StatusCode::CONFLICT,
+            "MessageContentPurged",
+            "the message content was removed by data retention, so it cannot be sent again",
+        )
+        .into_response(),
+        Err(error) => internal_error(&start.0, &error.to_string()),
+    }
 }
 
 /// `GET /api/v2/server/messages/{id}/deliveries`.
@@ -4059,6 +4104,7 @@ pub fn build_server_router(state: Arc<ApiState>) -> Router {
         )
         .route("/messages/{id}", get(message_show))
         .route("/messages/{id}/deliveries", get(message_deliveries))
+        .route("/messages/{id}/retry", post(message_retry))
         .route("/messages/{id}/opens", get(message_opens))
         .route("/messages/{id}/clicks", get(message_clicks))
         .route("/messages/{id}/raw", get(message_raw))

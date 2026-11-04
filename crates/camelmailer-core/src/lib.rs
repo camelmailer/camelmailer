@@ -60,9 +60,10 @@ pub use server_store::{
     CampaignUpdate, DeliveryRecord, DeliveryStats, IdempotencyLookup, IdempotencyRequest,
     ImportClick, ImportDelivery, ImportEvent, ImportMessage, MessageFilter, MessageShare,
     MessageStats, MessageVolume, NewApiRequest, NewLayout, NewMessageShare, NewStream, NewTemplate,
-    PendingUnsubscribeToken, QueuedDomain, SendOperationItem, SendOperationResult, SendPlanItem,
-    SendPlanMessage, ServerContext, ServerStore, StatsFilter, StoreSendOutcome, StoredSendResult,
-    TagCount, VolumeCounters, VolumeWindows, DELIVERY_STATUSES,
+    OutboundRetry, PendingUnsubscribeToken, QueuedDomain, SendOperationItem, SendOperationResult,
+    SendPlanItem, SendPlanMessage, ServerContext, ServerStore, StatsFilter, StoreSendOutcome,
+    StoredSendResult, TagCount, VolumeCounters, VolumeWindows, DELIVERY_STATUSES,
+    RETRYABLE_OUTBOUND_STATUSES,
 };
 pub use spf::{
     evaluate as evaluate_spf, evaluate_verifiable as evaluate_spf_verifiable, received_spf_header,

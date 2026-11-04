@@ -346,6 +346,28 @@ services:
 Any number of workers, scoped or not, work on the same queue safely; a
 message is handed to exactly one of them.
 
+### `smtp_client:` outgoing connections
+
+```yaml
+smtp_client:
+  open_timeout: 30    # seconds for the TCP connection, per remote address
+  read_timeout: 300   # seconds for the greeting, a TLS handshake and each reply
+  data_timeout: 600   # seconds to send the body and get the reply to its final dot
+```
+
+The defaults follow RFC 5321 4.5.3.2. Keep `read_timeout` at minutes, not
+seconds: receivers such as Hornetsecurity hold the greeting back on purpose
+for a sender they do not know yet, and a worker that gives up after 30
+seconds then fails every attempt with `read timeout`.
+
+A server with an IP pool sends from the pool's address, and only to remote
+addresses of the same family. A server without one leaves the local address
+to the operating system; the worker then tries the remote host's IPv4
+addresses first and its IPv6 addresses after, and moves on to the next
+address when a connection fails. On a dual-stack host, give the host's IPv6
+address a PTR record and an SPF entry before relying on it: Microsoft 365
+refuses IPv6 senders without reverse DNS (error S820).
+
 ### `lifecycle_webhooks:` installation events
 
 Forwards installation-wide events to outside systems such as a billing or
