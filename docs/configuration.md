@@ -120,6 +120,25 @@ a modification time moves, so an ACME renewal reaches a running server
 without a restart. A file caught mid-write keeps the previous certificate in
 service and is retried on the next handshake.
 
+#### Behind a TCP load balancer (`proxy_protocol`)
+
+With `proxy_protocol: true` every listener expects a PROXY protocol v1 line
+(`PROXY TCP4 <client> <proxy> <client-port> <proxy-port>`) as the first thing
+on each connection, and takes the client IP from it. Inbound SPF and IP-based
+relay credentials then see the real client instead of the load balancer.
+Without it, every client looks like the balancer's address.
+
+On `smtp` listeners the line comes before the banner. On `smtps` listeners
+the balancer sends it in the clear in front of the client's TLS handshake;
+the server reads exactly that line from the raw socket, then starts TLS and
+sends the banner over the encrypted stream. A connection without a valid
+header is closed, on every listener, so do not expose a `proxy_protocol`
+listener to clients that bypass the balancer: they cannot connect, and
+nothing lets them claim another address.
+
+The switch applies to all listeners of the process. To serve some clients
+directly, run a second `smtp-server` without it.
+
 #### Turning TLS on for an installation that already authenticates
 
 AUTH is advertised, and accepted, only on a TLS-protected session. An

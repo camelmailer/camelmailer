@@ -162,6 +162,15 @@ async fn start_server_with_mode(
     sink: Arc<MemorySink>,
     mode: SmtpListenerMode,
 ) -> u16 {
+    start_server_with(fixtures, sink, mode, false).await
+}
+
+async fn start_server_with(
+    fixtures: &Fixtures,
+    sink: Arc<MemorySink>,
+    mode: SmtpListenerMode,
+    proxy_protocol: bool,
+) -> u16 {
     // Every server gets its own certificate directory: the tests in this
     // file run concurrently in one process, and a shared path let one test
     // overwrite another's cert/key mid-write, producing a mismatched pair
@@ -180,6 +189,7 @@ async fn start_server_with_mode(
     config.smtp_server.tls_enabled = true;
     config.smtp_server.tls_certificate_path = cert_path;
     config.smtp_server.tls_private_key_path = key_path;
+    config.smtp_server.proxy_protocol = proxy_protocol;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -460,4 +470,88 @@ async fn auth_stays_available_in_the_clear_while_auth_requires_tls_is_off() {
         "unprotected AUTH must still be accepted, got {:?}",
         reply
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtps_behind_a_proxy_reads_the_proxy_line_before_the_handshake() {
+    let fixtures = Fixtures::new();
+    fixtures.verified_server_domain("org.example");
+    let credential = fixtures.credential(CredentialType::Smtp, "smtps-proxy-key");
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_with(&fixtures, sink.clone(), SmtpListenerMode::Smtps, true).await;
+
+    // A load balancer writes the PROXY line in the clear, then the client's
+    // TLS handshake follows on the same connection.
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp.write_all(b"PROXY TCP4 203.0.113.7 10.0.70.5 40000 465\r\n")
+        .await
+        .unwrap();
+    let connector = tls_connector();
+    let server_name = rustls::pki_types::ServerName::try_from("postal.example.com").unwrap();
+    let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+    let mut client = SmtpTestClient::new(tls_stream);
+
+    // The banner comes over TLS, once.
+    let banner = client.read_line().await;
+    assert!(banner.starts_with("220 postal.example.com ESMTP Camelmailer/"));
+    let reply = client.command("EHLO client.example").await;
+    assert!(reply.iter().any(|l| l == "250 AUTH PLAIN LOGIN"));
+
+    use base64::Engine;
+    let auth =
+        base64::engine::general_purpose::STANDARD.encode(format!("\0XX\0{}", credential.key));
+    let reply = client.command(&format!("AUTH PLAIN {auth}")).await;
+    assert!(reply[0].starts_with("235 Granted for"));
+    assert_eq!(
+        client.command("MAIL FROM:<sender@org.example>").await,
+        vec!["250 OK"]
+    );
+    assert_eq!(
+        client.command("RCPT TO:<user@elsewhere.example>").await,
+        vec!["250 OK"]
+    );
+    assert_eq!(client.command("DATA").await, vec!["354 Go ahead"]);
+    client.send("From: sender@org.example").await;
+    client.send("Subject: Behind a proxy").await;
+    client.send("").await;
+    client.send("Hello.").await;
+    assert_eq!(client.command(".").await, vec!["250 OK"]);
+    client.command("QUIT").await;
+
+    // The client IP is the one from the PROXY line, not the socket peer.
+    let messages = sink.messages();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].received_with_ssl);
+    let raw = String::from_utf8_lossy(&messages[0].raw_message);
+    assert!(
+        raw.contains("203.0.113.7"),
+        "Received header carries the proxied IP: {raw}"
+    );
+    assert!(!raw.contains("127.0.0.1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtps_behind_a_proxy_closes_a_connection_without_a_valid_header() {
+    let fixtures = Fixtures::new();
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_with(&fixtures, sink.clone(), SmtpListenerMode::Smtps, true).await;
+    let server_name = rustls::pki_types::ServerName::try_from("postal.example.com").unwrap();
+
+    // A client that starts TLS directly, bypassing the load balancer.
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let direct = tls_connector().connect(server_name.clone(), tcp).await;
+    assert!(
+        direct.is_err(),
+        "a handshake without a PROXY line must not succeed"
+    );
+
+    // A malformed PROXY line.
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp.write_all(b"PROXY nonsense\r\n").await.unwrap();
+    let malformed = tls_connector().connect(server_name, tcp).await;
+    assert!(
+        malformed.is_err(),
+        "an invalid PROXY line must not reach TLS"
+    );
+    assert!(sink.messages().is_empty());
 }

@@ -20,6 +20,40 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
+/// The longest PROXY protocol v1 header, `\r\n` included (spec section 2.1).
+const PROXY_V1_MAX_LENGTH: usize = 107;
+
+/// How long an implicit-TLS connection may take to send its PROXY header.
+const PROXY_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read a PROXY protocol v1 header from the raw socket, one byte at a time
+/// so not a single byte of the TLS handshake that follows is consumed.
+/// Returns the line without its `\n` (a trailing `\r` is kept, as the session
+/// expects), or `None` when the connection closes, the line grows past the v1
+/// limit, or it does not arrive within [`PROXY_HEADER_TIMEOUT`].
+async fn read_proxy_header(stream: &mut TcpStream) -> std::io::Result<Option<String>> {
+    let read = async {
+        let mut line = Vec::with_capacity(PROXY_V1_MAX_LENGTH);
+        loop {
+            let mut byte = [0u8; 1];
+            if stream.read(&mut byte).await? == 0 {
+                return Ok(None);
+            }
+            if byte[0] == b'\n' {
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            line.push(byte[0]);
+            if line.len() >= PROXY_V1_MAX_LENGTH {
+                return Ok(None);
+            }
+        }
+    };
+    match tokio::time::timeout(PROXY_HEADER_TIMEOUT, read).await {
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
+}
+
 /// A line-oriented reader/writer over any stream, kept upgradeable: unlike
 /// a `BufReader` split, the inner stream can be taken back out for the TLS
 /// handshake after STARTTLS.
@@ -373,12 +407,29 @@ impl SmtpServer {
                 // is unreachable, kept as a defensive close.
                 return Ok(());
             };
+            let mut stream = stream;
+            if !send_banner {
+                // proxy_protocol: the load balancer sends its PROXY line in
+                // the clear before the client's TLS handshake. Take the
+                // client IP from it, then hand the untouched socket to TLS.
+                // A connection without a valid header is closed: there is no
+                // way to answer a TLS client in plain text.
+                let Some(header) = read_proxy_header(&mut stream).await? else {
+                    tracing::debug!(%peer, "smtps connection without a PROXY header closed");
+                    return Ok(());
+                };
+                session.handle(&header);
+                if session.ip_address().is_none() {
+                    tracing::debug!(%peer, "smtps connection with an invalid PROXY header closed");
+                    return Ok(());
+                }
+            }
             let tls_stream = tls_acceptor.acceptor().await.accept(stream).await?;
             session.set_tls(true);
             let mut lines = LineStream::new(tls_stream);
-            if send_banner {
-                lines.write_line(&session.banner()).await?;
-            }
+            // With proxy_protocol the banner was held back until now: it
+            // must go over TLS, not in front of the handshake.
+            lines.write_line(&session.banner()).await?;
             drive_session(&mut session, &mut lines, spf.as_ref()).await?;
             lines.stream.shutdown().await.ok();
             return Ok(());
