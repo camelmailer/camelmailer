@@ -15,6 +15,34 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Delivery leases in seconds, with a heartbeat.** New
+  `camelmailer.queued_message_lock_stale_seconds` replaces the lease in days
+  when set (minimum 90). A worker refreshes the locks of the rows it works on
+  every 30 seconds, so a live worker never loses a row however long a
+  delivery takes, and only the rows of a worker that died are taken over.
+  Applies to the delivery queue, the webhook queue and the lifecycle outbox.
+- **Graceful worker shutdown.** On SIGTERM or SIGINT the worker stops taking
+  new work, waits `worker.shutdown_grace_seconds` (default 25) for what is in
+  flight, and hands the rest back to the queue without counting an attempt.
+
+### Fixed
+
+- **A restarted worker no longer strands its deliveries for a day.** The
+  worker installed no signal handler, so in a container without an init it
+  ignored SIGTERM and was killed after the stop timeout, leaving up to
+  `worker.threads` messages and one webhook locked until the one-day stale
+  window ran out. The compose file now runs the worker with `init: true` and
+  `stop_grace_period: 30s`.
+
+### Changed
+
+- A worker loop that ends unexpectedly (a panic) now stops the whole worker
+  with an error, after handing back its rows, so the process manager restarts
+  it. Before, the loop disappeared silently and the worker ran on with fewer
+  delivery loops.
+
 ## [0.13.1] - 2026-11-05
 
 ### Fixed

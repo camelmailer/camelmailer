@@ -3938,3 +3938,160 @@ async fn deleting_a_user_anonymises_their_audit_events() {
     assert_eq!(user_id, None);
     assert_eq!(email, None);
 }
+
+/// Start `worker.run_until` in the background with a shutdown it controls.
+fn run_in_background(
+    worker: Worker,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), sqlx::Error>>,
+) {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(Arc::new(worker).run_until(async move {
+        let _ = stopped.await;
+    }));
+    (stop, handle)
+}
+
+async fn queue_row_state(pool: &PgPool) -> Option<(Option<String>, i32)> {
+    sqlx::query_as::<_, (Option<String>, i32)>("SELECT locked_by, attempts FROM queued_messages")
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_hands_an_unfinished_delivery_back_without_an_attempt() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = paused_mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_shutdown_grace(std::time::Duration::from_millis(300));
+    let worker_id = worker.worker_id().to_string();
+    let (stop, handle) = run_in_background(worker);
+
+    // The remote holds its reply, so the delivery is in flight.
+    smtp.final_response_ready.notified().await;
+    assert_eq!(
+        queue_row_state(&pool).await,
+        Some((Some(worker_id), 0)),
+        "the delivery holds its row"
+    );
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("the worker stops within its grace period")
+        .unwrap()
+        .unwrap();
+
+    // Unlocked, no attempt counted, no backoff: the next worker takes it now.
+    assert_eq!(queue_row_state(&pool).await, Some((None, 0)));
+    let retry_after: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT retry_after FROM queued_messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(retry_after.is_none());
+    smtp.final_response_release.notify_one();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_lets_a_delivery_finish_within_the_grace_period() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = paused_mock_smtp("250 Accepted").await;
+    let message_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_shutdown_grace(std::time::Duration::from_secs(10));
+    let (stop, handle) = run_in_background(worker);
+
+    smtp.final_response_ready.notified().await;
+    stop.send(()).unwrap();
+    // The remote answers only after the shutdown was requested.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    smtp.final_response_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+        .await
+        .expect("the worker stops")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_heartbeat_keeps_a_long_delivery_from_being_taken_over() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = paused_mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.queued_message_lock_stale_seconds = Some(300);
+    let worker = Worker::new(&config, s.store.clone())
+        .with_heartbeat_interval(std::time::Duration::from_millis(100))
+        .with_shutdown_grace(std::time::Duration::from_millis(300));
+    let (stop, handle) = run_in_background(worker);
+
+    smtp.final_response_ready.notified().await;
+    // Pretend the delivery has run for an hour, far past the lease.
+    sqlx::query("UPDATE queued_messages SET locked_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let age_seconds: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM now() - locked_at)::float8 FROM queued_messages",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        age_seconds < 5.0,
+        "the heartbeat refreshed the lock ({age_seconds} s old)"
+    );
+    let other = PgQueue::with_stale_lock_seconds(pool.clone(), 300);
+    assert!(
+        other.dequeue("another-host").await.unwrap().is_none(),
+        "a live delivery is not taken over"
+    );
+
+    stop.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+    smtp.final_response_release.notify_one();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_in_seconds_replaces_the_one_in_days() {
+    let mut config = camelmailer_config::Config::default();
+    assert_eq!(config.camelmailer.queue_lock_lease_seconds(), 86_400);
+    config.camelmailer.queued_message_lock_stale_seconds = Some(300);
+    assert_eq!(config.camelmailer.queue_lock_lease_seconds(), 300);
+    config.camelmailer.queued_message_lock_stale_seconds = Some(10);
+    assert_eq!(config.camelmailer.queue_lock_lease_seconds(), 90);
+}

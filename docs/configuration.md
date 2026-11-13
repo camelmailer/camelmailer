@@ -346,6 +346,36 @@ services:
 Any number of workers, scoped or not, work on the same queue safely; a
 message is handed to exactly one of them.
 
+#### Locks, heartbeats and shutdown
+
+A worker locks the row it works on. While the delivery runs it refreshes
+that lock every 30 seconds, so a slow receiver never makes another worker
+take the row over. A row whose lock has not been refreshed for the lease is
+treated as abandoned by a worker that died, and the next worker takes it.
+
+```yaml
+camelmailer:
+  queued_message_lock_stale_seconds: 300   # lease; unset = queued_message_lock_stale_days
+worker:
+  shutdown_grace_seconds: 25
+```
+
+The lease defaults to `queued_message_lock_stale_days` (one day). Set
+`queued_message_lock_stale_seconds` to get mail held by a crashed worker or a
+lost host moving again within minutes; values below 90 are raised to 90. The
+same lease applies to the webhook queue and the lifecycle outbox.
+
+On SIGTERM or SIGINT the worker stops taking new work and gives the
+deliveries in flight `shutdown_grace_seconds` to finish. Whatever is still
+running then is stopped and handed back to the queue without counting an
+attempt, so the next worker sends it straight away. Give the process manager
+a stop timeout above the grace period (Docker: `stop_grace_period: 30s`).
+
+Delivery stays at-least-once: a worker that dies between the receiver's
+`250` and recording it leaves a message that is sent again once its lease
+runs out. A short lease does not make that more likely, because a live
+worker keeps its locks fresh.
+
 ### `smtp_client:` outgoing connections
 
 ```yaml

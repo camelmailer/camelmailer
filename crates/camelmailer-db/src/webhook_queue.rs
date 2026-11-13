@@ -60,23 +60,19 @@ fn log_entry_from_row(row: &PgRow) -> WebhookLogEntry {
     }
 }
 
-/// Default stale-lock window (days) when a caller does not configure one.
-/// Matches `camelmailer.queued_message_lock_stale_days`'s default.
-const DEFAULT_STALE_LOCK_DAYS: i32 = 1;
-
 #[derive(Clone)]
 pub struct PgWebhookQueue {
     pool: PgPool,
-    /// A request locked (`locked_by` set) longer ago than this is treated as
+    /// A request whose lock is older than this many seconds is treated as
     /// abandoned by a crashed worker and re-dequeued.
-    stale_lock_days: i32,
+    stale_lock_seconds: i64,
 }
 
 impl PgWebhookQueue {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            stale_lock_days: DEFAULT_STALE_LOCK_DAYS,
+            stale_lock_seconds: crate::queue::DEFAULT_STALE_LOCK_SECONDS,
         }
     }
 
@@ -86,8 +82,27 @@ impl PgWebhookQueue {
     pub fn with_stale_lock_days(pool: PgPool, stale_lock_days: i32) -> Self {
         Self {
             pool,
-            stale_lock_days: stale_lock_days.max(1),
+            stale_lock_seconds: crate::queue::days_to_lease_seconds(stale_lock_days),
         }
+    }
+
+    /// Like [`PgWebhookQueue::new`] with the stale-lock window in seconds.
+    /// Values below 90 are raised to 90.
+    pub fn with_stale_lock_seconds(pool: PgPool, stale_lock_seconds: i64) -> Self {
+        Self {
+            pool,
+            stale_lock_seconds: crate::queue::clamp_lease_seconds(stale_lock_seconds),
+        }
+    }
+
+    /// Keep the locks `worker_id` holds on `ids` fresh.
+    pub async fn heartbeat(&self, worker_id: &str, ids: &[i64]) -> Result<u64, sqlx::Error> {
+        crate::queue::heartbeat_rows(&self.pool, "webhook_requests", worker_id, ids).await
+    }
+
+    /// Hand back every request `worker_id` holds without counting an attempt.
+    pub async fn release_all(&self, worker_id: &str) -> Result<u64, sqlx::Error> {
+        crate::queue::release_rows(&self.pool, "webhook_requests", worker_id).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -122,7 +137,7 @@ impl PgWebhookQueue {
     }
 
     /// Lock and return the next ready webhook request, if any. Reclaims stale
-    /// locks (held since before `now() - queued_message_lock_stale_days`) so a
+    /// locks (not refreshed within the lease) so a
     /// crash mid-delivery does not strand a request permanently.
     pub async fn dequeue(&self, worker_id: &str) -> Result<Option<WebhookRequestRow>, sqlx::Error> {
         let row = sqlx::query(
@@ -130,7 +145,7 @@ impl PgWebhookQueue {
              WHERE id = (
                  SELECT id FROM webhook_requests
                  WHERE (locked_by IS NULL
-                        OR locked_at < now() - make_interval(days => $2::int))
+                        OR locked_at < now() - make_interval(secs => $2::bigint))
                    AND (retry_after IS NULL OR retry_after <= now())
                  ORDER BY id
                  LIMIT 1
@@ -139,7 +154,7 @@ impl PgWebhookQueue {
              RETURNING *",
         )
         .bind(worker_id)
-        .bind(self.stale_lock_days)
+        .bind(self.stale_lock_seconds)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.as_ref().map(request_from_row))

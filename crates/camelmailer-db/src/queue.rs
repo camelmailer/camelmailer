@@ -162,9 +162,63 @@ pub(crate) async fn retry_message<'e>(
     Ok(())
 }
 
-/// Default stale-lock window (days) when a caller does not configure one.
-/// Matches `camelmailer.queued_message_lock_stale_days`'s default.
-const DEFAULT_STALE_LOCK_DAYS: i32 = 1;
+/// Default stale-lock window (one day, in seconds) when a caller does not
+/// configure one. Matches `camelmailer.queued_message_lock_stale_days`'s
+/// default.
+pub(crate) const DEFAULT_STALE_LOCK_SECONDS: i64 = 86_400;
+
+/// The shortest lease the queues accept, so a short setting can never take a
+/// row from a worker whose heartbeat is merely late. Matches
+/// `camelmailer_config::MIN_QUEUE_LOCK_LEASE_SECONDS`.
+pub(crate) const MIN_STALE_LOCK_SECONDS: i64 = 90;
+
+/// A stale-lock window in days, as the seconds the queries use (at least one
+/// day, as before).
+pub(crate) fn days_to_lease_seconds(days: i32) -> i64 {
+    i64::from(days.max(1)) * 86_400
+}
+
+/// A stale-lock window in seconds, raised to [`MIN_STALE_LOCK_SECONDS`].
+pub(crate) fn clamp_lease_seconds(seconds: i64) -> i64 {
+    seconds.max(MIN_STALE_LOCK_SECONDS)
+}
+
+/// Refresh `locked_at` of the rows `worker_id` holds among `ids`, in `table`
+/// (`queued_messages`, `webhook_requests` or `lifecycle_events`). Rows another
+/// worker has taken over are left alone.
+pub(crate) async fn heartbeat_rows(
+    pool: &PgPool,
+    table: &str,
+    worker_id: &str,
+    ids: &[i64],
+) -> Result<u64, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!("UPDATE {table} SET locked_at = now() WHERE locked_by = $1 AND id = ANY($2)");
+    Ok(sqlx::query(&sql)
+        .bind(worker_id)
+        .bind(ids)
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
+
+/// Unlock every row `worker_id` holds in `table` without touching its attempt
+/// count or backoff, so another worker picks it up straight away. Used on a
+/// graceful shutdown.
+pub(crate) async fn release_rows(
+    pool: &PgPool,
+    table: &str,
+    worker_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let sql = format!("UPDATE {table} SET locked_by = NULL, locked_at = NULL WHERE locked_by = $1");
+    Ok(sqlx::query(&sql)
+        .bind(worker_id)
+        .execute(pool)
+        .await?
+        .rows_affected())
+}
 
 /// When this queue last served each server, as a turn number. Shared by the
 /// clones of one queue, so the delivery loops of one worker take turns
@@ -226,9 +280,10 @@ fn turn_order(
 #[derive(Clone)]
 pub struct PgQueue {
     pool: PgPool,
-    /// A message locked (`locked_by` set) longer ago than this is treated as
-    /// abandoned by a crashed worker and re-dequeued.
-    stale_lock_days: i32,
+    /// A message whose lock (`locked_at`) is older than this many seconds is
+    /// treated as abandoned by a crashed worker and re-dequeued. A live worker
+    /// keeps its locks fresh with [`PgQueue::heartbeat`].
+    stale_lock_seconds: i64,
     filter: QueueFilter,
     turns: Arc<Turns>,
 }
@@ -237,7 +292,7 @@ impl PgQueue {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            stale_lock_days: DEFAULT_STALE_LOCK_DAYS,
+            stale_lock_seconds: DEFAULT_STALE_LOCK_SECONDS,
             filter: QueueFilter::default(),
             turns: Arc::default(),
         }
@@ -254,12 +309,36 @@ impl PgQueue {
     /// clamped to 1 day so a misconfiguration can never reclaim actively
     /// locked messages.
     pub fn with_stale_lock_days(pool: PgPool, stale_lock_days: i32) -> Self {
+        Self::with_stale_lock_seconds_unclamped(pool, days_to_lease_seconds(stale_lock_days))
+    }
+
+    /// Like [`PgQueue::new`] with the stale-lock window in seconds (from
+    /// `camelmailer.queued_message_lock_stale_seconds`). Values below 90 are
+    /// raised to 90, three worker heartbeats.
+    pub fn with_stale_lock_seconds(pool: PgPool, stale_lock_seconds: i64) -> Self {
+        Self::with_stale_lock_seconds_unclamped(pool, clamp_lease_seconds(stale_lock_seconds))
+    }
+
+    fn with_stale_lock_seconds_unclamped(pool: PgPool, stale_lock_seconds: i64) -> Self {
         Self {
             pool,
-            stale_lock_days: stale_lock_days.max(1),
+            stale_lock_seconds,
             filter: QueueFilter::default(),
             turns: Arc::default(),
         }
+    }
+
+    /// Keep the locks `worker_id` holds on `ids` fresh, so no other worker
+    /// takes them over while the delivery runs. Returns how many rows were
+    /// refreshed.
+    pub async fn heartbeat(&self, worker_id: &str, ids: &[i64]) -> Result<u64, sqlx::Error> {
+        heartbeat_rows(&self.pool, "queued_messages", worker_id, ids).await
+    }
+
+    /// Hand back every message `worker_id` holds, without counting an attempt
+    /// or adding backoff. Returns how many rows were released.
+    pub async fn release_all(&self, worker_id: &str) -> Result<u64, sqlx::Error> {
+        release_rows(&self.pool, "queued_messages", worker_id).await
     }
 
     pub async fn enqueue(
@@ -295,9 +374,9 @@ impl PgQueue {
 
     /// Lock and return the next ready queued message, if any.
     ///
-    /// A row is ready when it is unlocked, *or* when its lock is stale — held
-    /// since before `now() - queued_message_lock_stale_days`, i.e. by a worker
-    /// that crashed mid-delivery. Without the stale branch such a row would
+    /// A row is ready when it is unlocked, *or* when its lock is stale — not
+    /// refreshed for longer than the lease, i.e. held by a worker that
+    /// crashed mid-delivery. Without the stale branch such a row would
     /// stay "sending" forever; with it, a surviving worker reclaims it.
     ///
     /// Two steps: list the servers with ready mail (within the filter), then
@@ -311,11 +390,11 @@ impl PgQueue {
              LEFT JOIN (
                  SELECT server_id, count(*) AS n FROM queued_messages
                  WHERE locked_by IS NOT NULL
-                   AND locked_at >= now() - make_interval(days => $1::int)
+                   AND locked_at >= now() - make_interval(secs => $1::bigint)
                  GROUP BY server_id
              ) f ON f.server_id = q.server_id
              WHERE (q.locked_by IS NULL
-                    OR q.locked_at < now() - make_interval(days => $1::int))
+                    OR q.locked_at < now() - make_interval(secs => $1::bigint))
                AND (q.retry_after IS NULL OR q.retry_after <= now())
                AND ($2::bigint[] IS NULL OR q.server_id = ANY($2))
                AND NOT (q.server_id = ANY($3))
@@ -324,7 +403,7 @@ impl PgQueue {
              ORDER BY in_flight, oldest
              LIMIT 1000",
         )
-        .bind(self.stale_lock_days)
+        .bind(self.stale_lock_seconds)
         .bind(self.filter.servers_param())
         .bind(self.filter.exclude_param())
         .bind(self.filter.bulk_param())
@@ -346,7 +425,7 @@ impl PgQueue {
                      SELECT id FROM queued_messages
                      WHERE server_id = $2
                        AND (locked_by IS NULL
-                            OR locked_at < now() - make_interval(days => $3::int))
+                            OR locked_at < now() - make_interval(secs => $3::bigint))
                        AND (retry_after IS NULL OR retry_after <= now())
                        AND ($4::boolean IS NULL OR bulk = $4)
                      ORDER BY bulk, id
@@ -357,7 +436,7 @@ impl PgQueue {
             )
             .bind(worker_id)
             .bind(server_id)
-            .bind(self.stale_lock_days)
+            .bind(self.stale_lock_seconds)
             .bind(self.filter.bulk_param())
             .fetch_optional(&self.pool)
             .await?;

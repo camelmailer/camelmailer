@@ -15,4 +15,6 @@ pub mod worker;
 pub use sender::SmtpSender;
 pub use signer::Signer;
 pub use smtp_client::SendOutcome;
-pub use worker::{ProcessOutcome, WebhookOutcome, Worker};
+pub use worker::{
+    shutdown_signal, ProcessOutcome, Released, WebhookOutcome, Worker, HEARTBEAT_INTERVAL,
+};

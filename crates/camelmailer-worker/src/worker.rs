@@ -22,7 +22,9 @@ use camelmailer_db::{
     PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, QueueFilter, StoredMessage,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Webhook deliveries are retried this many times before giving up
@@ -31,6 +33,97 @@ const WEBHOOK_MAX_ATTEMPTS: i32 = 10;
 
 /// How often the worker loop runs housekeeping.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How often a worker refreshes the locks of the rows it is working on. The
+/// shortest lease the queues accept is three of these.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The ids of the rows this process is working on right now, per queue. A
+/// row is in here from its dequeue until its processing returns, whatever
+/// the outcome, so the heartbeat only keeps alive what is really in flight.
+/// A row whose processing failed half way drops out and is taken over by
+/// another worker once its lease runs out.
+#[derive(Default)]
+struct InFlight {
+    messages: Mutex<HashSet<i64>>,
+    webhooks: Mutex<HashSet<i64>>,
+    lifecycle: Mutex<HashSet<i64>>,
+}
+
+impl InFlight {
+    fn snapshot(set: &Mutex<HashSet<i64>>) -> Vec<i64> {
+        set.lock()
+            .expect("in-flight lock")
+            .iter()
+            .copied()
+            .collect()
+    }
+}
+
+/// Marks one row as in flight for as long as it lives.
+struct Held<'a> {
+    set: &'a Mutex<HashSet<i64>>,
+    id: i64,
+}
+
+impl<'a> Held<'a> {
+    fn new(set: &'a Mutex<HashSet<i64>>, id: i64) -> Self {
+        set.lock().expect("in-flight lock").insert(id);
+        Self { set, id }
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.id);
+        }
+    }
+}
+
+/// Rows a worker handed back to the queue on shutdown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Released {
+    pub messages: u64,
+    pub webhooks: u64,
+    pub lifecycle_events: u64,
+}
+
+/// Resolves on SIGTERM or SIGINT (Ctrl-C). Installing the handler also makes
+/// the worker stoppable when it runs as PID 1 in a container without an init.
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = terminate.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not listen for SIGTERM; only SIGINT stops the worker gracefully");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Sleep for `duration`, or less when `stop` turns true.
+async fn pause(stop: &mut tokio::sync::watch::Receiver<bool>, duration: Duration) {
+    if *stop.borrow() {
+        return;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => {}
+        _ = stop.changed() => {}
+    }
+}
 
 const UNMATCHED_BOUNCE_DETAILS: &str = "This message was a bounce but we couldn't link it with any outgoing message and there was no route for it.";
 
@@ -158,12 +251,18 @@ pub struct Worker {
     worker_id: String,
     /// Delivery loops of this process (`worker.threads`).
     threads: u32,
+    /// Rows this process is working on, kept fresh by the heartbeat.
+    in_flight: InFlight,
+    /// How often the heartbeat refreshes the in-flight locks.
+    heartbeat_interval: Duration,
+    /// `worker.shutdown_grace_seconds`.
+    shutdown_grace: Duration,
 }
 
 impl Worker {
     pub fn new(config: &camelmailer_config::Config, store: PgStore) -> Self {
-        let stale_lock_days = config.camelmailer.queued_message_lock_stale_days as i32;
-        let queue = PgQueue::with_stale_lock_days(store.pool().clone(), stale_lock_days);
+        let lease_seconds = i64::from(config.camelmailer.queue_lock_lease_seconds());
+        let queue = PgQueue::with_stale_lock_seconds(store.pool().clone(), lease_seconds);
         let sink = PgMessageSink::new(store.clone());
         let sender = SmtpSender::new(config);
         let http = reqwest::Client::builder()
@@ -176,7 +275,7 @@ impl Worker {
                 None
             });
         let webhook_queue =
-            PgWebhookQueue::with_stale_lock_days(store.pool().clone(), stale_lock_days);
+            PgWebhookQueue::with_stale_lock_seconds(store.pool().clone(), lease_seconds);
         let rspamd = config
             .rspamd
             .enabled
@@ -196,7 +295,8 @@ impl Worker {
                 "dns.return_path_domain is empty, invalid, or reserved; preserving submitted envelope senders"
             );
         }
-        let lifecycle_queue = PgLifecycleQueue::new(store.pool().clone(), stale_lock_days);
+        let lifecycle_queue =
+            PgLifecycleQueue::with_stale_lock_seconds(store.pool().clone(), lease_seconds);
         Self {
             store,
             sink,
@@ -231,7 +331,58 @@ impl Worker {
             return_path_domain,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
             threads: config.worker.threads.max(1),
+            in_flight: InFlight::default(),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            shutdown_grace: Duration::from_secs(u64::from(config.worker.shutdown_grace_seconds)),
         }
+    }
+
+    /// The id this process locks rows with (`locked_by`).
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
+    /// Override how often the heartbeat runs (tests; the default is
+    /// [`HEARTBEAT_INTERVAL`]).
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Override `worker.shutdown_grace_seconds`.
+    pub fn with_shutdown_grace(mut self, grace: Duration) -> Self {
+        self.shutdown_grace = grace;
+        self
+    }
+
+    /// Refresh the locks of every row this process is working on, so no
+    /// other worker takes them over mid-delivery. Runs every
+    /// [`HEARTBEAT_INTERVAL`] from [`Worker::run`].
+    pub async fn heartbeat(&self) -> Result<u64, sqlx::Error> {
+        let messages = InFlight::snapshot(&self.in_flight.messages);
+        let webhooks = InFlight::snapshot(&self.in_flight.webhooks);
+        let lifecycle = InFlight::snapshot(&self.in_flight.lifecycle);
+        let mut refreshed = self.queue.heartbeat(&self.worker_id, &messages).await?;
+        refreshed += self
+            .webhook_queue
+            .heartbeat(&self.worker_id, &webhooks)
+            .await?;
+        refreshed += self
+            .lifecycle_queue
+            .heartbeat(&self.worker_id, &lifecycle)
+            .await?;
+        Ok(refreshed)
+    }
+
+    /// Hand every row this process holds back to the queue, without counting
+    /// an attempt, so another worker can take it at once. Called on shutdown
+    /// once the in-flight work has finished or was stopped.
+    pub async fn release_held(&self) -> Result<Released, sqlx::Error> {
+        Ok(Released {
+            messages: self.queue.release_all(&self.worker_id).await?,
+            webhooks: self.webhook_queue.release_all(&self.worker_id).await?,
+            lifecycle_events: self.lifecycle_queue.release_all(&self.worker_id).await?,
+        })
     }
 
     /// Scope the delivery to part of the queue and set how many messages
@@ -249,6 +400,7 @@ impl Worker {
         let Some(queued) = self.queue.dequeue(&self.worker_id).await? else {
             return Ok(None);
         };
+        let _held = Held::new(&self.in_flight.messages, queued.id);
 
         let loaded = if self.return_path_domain.is_some() {
             self.sink
@@ -1051,6 +1203,7 @@ impl Worker {
         let Some(request) = self.webhook_queue.dequeue(&self.worker_id).await? else {
             return Ok(None);
         };
+        let _held = Held::new(&self.in_flight.webhooks, request.id);
 
         // SSRF guard: never fetch a webhook URL that resolves to a non-global
         // address (would otherwise leak up to 2 KB of the reply into the
@@ -1151,6 +1304,7 @@ impl Worker {
         let Some(event) = self.lifecycle_queue.dequeue(&self.worker_id).await? else {
             return Ok(None);
         };
+        let _held = Held::new(&self.in_flight.lifecycle, event.id);
         let secret = self.lifecycle_webhooks.secret.clone().unwrap_or_default();
         let mut failures = Vec::new();
         for url in &self.lifecycle_webhooks.urls {
@@ -1331,33 +1485,26 @@ impl Worker {
     }
 
     /// An extra delivery loop: deliver queued messages, poll when there are
-    /// none. Never returns.
-    async fn deliver_loop(&self) {
-        loop {
+    /// none. Returns once `stop` turns true and the current message is done.
+    async fn deliver_loop(&self, mut stop: tokio::sync::watch::Receiver<bool>) {
+        while !*stop.borrow() {
             match self.process_next().await {
                 Ok(Some(outcome)) => tracing::debug!(?outcome, "processed queued message"),
-                Ok(None) => tokio::time::sleep(Duration::from_secs(1)).await,
+                Ok(None) => pause(&mut stop, Duration::from_secs(1)).await,
                 Err(error) => {
                     tracing::error!(%error, "queue processing error");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    pause(&mut stop, Duration::from_secs(5)).await;
                 }
             }
         }
     }
 
-    /// The long-running worker loop: drain the queue, then poll. Runs
-    /// housekeeping once at startup and then hourly. With `threads` above 1,
-    /// further loops deliver queued messages alongside; webhooks, lifecycle
-    /// events and housekeeping stay on this one.
-    pub async fn run(self: Arc<Self>) -> Result<(), sqlx::Error> {
-        let mut delivery = tokio::task::JoinSet::new();
-        for _ in 1..self.threads {
-            let worker = Arc::clone(&self);
-            delivery.spawn(async move { worker.deliver_loop().await });
-        }
-        tracing::info!(worker_id = %self.worker_id, threads = self.threads, "camelmailer worker started");
+    /// The main loop: housekeeping once at startup and then hourly, one
+    /// message, one webhook, one lifecycle event per round. Returns once
+    /// `stop` turns true and the current round is done.
+    async fn main_loop(&self, mut stop: tokio::sync::watch::Receiver<bool>) {
         let mut last_housekeeping: Option<std::time::Instant> = None;
-        loop {
+        while !*stop.borrow() {
             if last_housekeeping.is_none_or(|at| at.elapsed() >= HOUSEKEEPING_INTERVAL) {
                 last_housekeeping = Some(std::time::Instant::now());
                 match self.housekeep().await {
@@ -1394,8 +1541,101 @@ impl Worker {
                 Err(error) => tracing::error!(%error, "lifecycle event processing error"),
             }
             if idle {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                pause(&mut stop, Duration::from_secs(5)).await;
             }
+        }
+    }
+
+    /// Refresh the in-flight locks every `heartbeat_interval` until aborted.
+    async fn heartbeat_loop(&self) {
+        let mut ticker = tokio::time::interval(self.heartbeat_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = self.heartbeat().await {
+                tracing::warn!(%error, "could not refresh the locks of in-flight rows");
+            }
+        }
+    }
+
+    /// The long-running worker: runs until SIGTERM or SIGINT, then shuts
+    /// down gracefully (see [`Worker::run_until`]).
+    pub async fn run(self: Arc<Self>) -> Result<(), sqlx::Error> {
+        self.run_until(shutdown_signal()).await
+    }
+
+    /// The long-running worker loop, until `shutdown` resolves. Runs
+    /// housekeeping once at startup and then hourly. With `threads` above 1,
+    /// further loops deliver queued messages alongside; webhooks, lifecycle
+    /// events and housekeeping stay on the main loop. A heartbeat keeps the
+    /// locks of in-flight rows fresh.
+    ///
+    /// On shutdown the loops stop taking new work, and the worker waits up to
+    /// `worker.shutdown_grace_seconds` for what is in flight. Whatever is
+    /// still running then is stopped, and every row this process holds goes
+    /// back to the queue without an attempt being counted. A loop that ends
+    /// on its own (a panic) shuts the worker down the same way and returns an
+    /// error, so the process manager restarts it.
+    pub async fn run_until(
+        self: Arc<Self>,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<(), sqlx::Error> {
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let mut loops = tokio::task::JoinSet::new();
+        {
+            let worker = Arc::clone(&self);
+            let stop = stop_rx.clone();
+            loops.spawn(async move { worker.main_loop(stop).await });
+        }
+        for _ in 1..self.threads {
+            let worker = Arc::clone(&self);
+            let stop = stop_rx.clone();
+            loops.spawn(async move { worker.deliver_loop(stop).await });
+        }
+        let heartbeat = {
+            let worker = Arc::clone(&self);
+            tokio::spawn(async move { worker.heartbeat_loop().await })
+        };
+        tracing::info!(worker_id = %self.worker_id, threads = self.threads, "camelmailer worker started");
+
+        let mut failure = None;
+        tokio::select! {
+            _ = shutdown => {
+                tracing::info!(grace = ?self.shutdown_grace, "shutdown requested; finishing in-flight work");
+            }
+            Some(ended) = loops.join_next() => {
+                let detail = match ended {
+                    Ok(()) => "a worker loop ended".to_string(),
+                    Err(error) => format!("a worker loop failed: {error}"),
+                };
+                tracing::error!(%detail, "stopping the worker");
+                failure = Some(detail);
+            }
+        }
+        let _ = stop_tx.send(true);
+
+        let drained = tokio::time::timeout(self.shutdown_grace, async {
+            while loops.join_next().await.is_some() {}
+        })
+        .await
+        .is_ok();
+        if !drained {
+            tracing::warn!("in-flight work did not finish within the grace period; stopping it");
+            loops.abort_all();
+            while loops.join_next().await.is_some() {}
+        }
+        heartbeat.abort();
+        let _ = heartbeat.await;
+
+        match self.release_held().await {
+            Ok(released) => tracing::info!(?released, "worker stopped; held rows released"),
+            Err(error) => {
+                tracing::error!(%error, "could not release held rows; they return after the lock lease")
+            }
+        }
+        match failure {
+            Some(detail) => Err(sqlx::Error::Protocol(detail)),
+            None => Ok(()),
         }
     }
 }

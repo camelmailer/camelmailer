@@ -23,15 +23,34 @@ pub struct LifecycleEventRow {
 #[derive(Clone)]
 pub struct PgLifecycleQueue {
     pool: PgPool,
-    stale_lock_days: i32,
+    stale_lock_seconds: i64,
 }
 
 impl PgLifecycleQueue {
+    /// A queue whose stale-lock window is `stale_lock_days` (at least one).
     pub fn new(pool: PgPool, stale_lock_days: i32) -> Self {
         Self {
             pool,
-            stale_lock_days: stale_lock_days.max(1),
+            stale_lock_seconds: crate::queue::days_to_lease_seconds(stale_lock_days),
         }
+    }
+
+    /// A queue whose stale-lock window is in seconds (at least 90).
+    pub fn with_stale_lock_seconds(pool: PgPool, stale_lock_seconds: i64) -> Self {
+        Self {
+            pool,
+            stale_lock_seconds: crate::queue::clamp_lease_seconds(stale_lock_seconds),
+        }
+    }
+
+    /// Keep the locks `worker_id` holds on `ids` fresh.
+    pub async fn heartbeat(&self, worker_id: &str, ids: &[i64]) -> Result<u64, sqlx::Error> {
+        crate::queue::heartbeat_rows(&self.pool, "lifecycle_events", worker_id, ids).await
+    }
+
+    /// Hand back every event `worker_id` holds without counting an attempt.
+    pub async fn release_all(&self, worker_id: &str) -> Result<u64, sqlx::Error> {
+        crate::queue::release_rows(&self.pool, "lifecycle_events", worker_id).await
     }
 
     /// Lock and return the next ready event, reclaiming stale locks.
@@ -41,7 +60,7 @@ impl PgLifecycleQueue {
              WHERE id = (
                  SELECT id FROM lifecycle_events
                  WHERE (locked_by IS NULL
-                        OR locked_at < now() - make_interval(days => $2::int))
+                        OR locked_at < now() - make_interval(secs => $2::bigint))
                    AND (retry_after IS NULL OR retry_after <= now())
                  ORDER BY id
                  LIMIT 1
@@ -50,7 +69,7 @@ impl PgLifecycleQueue {
              RETURNING id, uuid, event, payload, attempts",
         )
         .bind(worker_id)
-        .bind(self.stale_lock_days)
+        .bind(self.stale_lock_seconds)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|row| LifecycleEventRow {

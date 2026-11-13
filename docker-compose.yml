@@ -84,6 +84,11 @@ services:
   worker:
     <<: *app
     command: worker
+    # The worker finishes or hands back its in-flight deliveries on SIGTERM
+    # within worker.shutdown_grace_seconds (25 s); give it a little longer
+    # than that before Docker kills it.
+    init: true
+    stop_grace_period: 30s
     depends_on:
       migrate:
         condition: service_completed_successfully
