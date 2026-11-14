@@ -39,6 +39,6 @@
     "playwright": "^1.65.0",
     "tailwindcss": "^4",
     "typescript": "^6",
-    "vitest": "^4.1.10"
+    "vitest": "^5.1.0"
   }
 }
