@@ -8039,6 +8039,8 @@ async fn warmup_reservations_settings_and_state_on_postgres() {
         .await
         .unwrap();
     assert_eq!(removed, 2 + 1);
+}
+
 /// The Postgres feedback store in lockstep with `MemoryStore`
 /// (`camelmailer_core::feedback` tests).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

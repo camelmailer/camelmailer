@@ -362,6 +362,19 @@ reason:
   its allowance is halved (`step_back`), never below the mode's first day.
   After the pause it holds for one day before it grows again.
 
+Provider feedback counts too, when it is configured
+([Provider feedback](provider-feedback.md)). For each warming address and
+provider the nightly judgement reads the newest readings of the last three
+days: Microsoft SNDS for that address (filter result, complaint rate, trap
+hits), Google Postmaster Tools for the sending domains (spam rate against
+Google's 0.1 % and 0.3 % lines, authentication, delivery errors; Google
+retired the domain and IP reputation figures in Postmaster Tools v2), the
+feedback-loop counts and the seed placement tests. A `bad` reading (SNDS red,
+spam rate at 0.3 %, a seed test in the spam folder) brakes that provider, a
+`warn` reading (SNDS yellow, spam rate at 0.1 %) slows it, and `ok` readings
+let a healthy day advance and are named in the reason. Readings without a
+verdict are ignored.
+
 Policy refusals also brake **during the day**: as soon as the day's refusals
 from an address to a provider reach the brake limits, that provider is paused
 at once, without waiting for midnight. Policy refusals are the replies that

@@ -5663,3 +5663,66 @@ async fn policy_refusals_brake_the_warmup_during_the_day() {
     let log = s.store.warmup_log(Some(address.id), 10).await.unwrap();
     assert_eq!(log[0].decision, "brake");
 }
+
+/// Provider feedback reaches the nightly warm-up decision: a red SNDS
+/// reading for the address brakes it for Microsoft and the log says why;
+/// Google, without a signal and with a quiet day, only holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_feedback_brakes_the_warmup_for_that_provider() {
+    use camelmailer_core::{
+        FeedbackStore, NewFeedbackSnapshot, ProviderGroup, Verdict, WarmupMode, WarmupProfile,
+        WarmupState, WarmupStatus, WarmupStore,
+    };
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let address = warmup_pool(&s).await;
+    s.store
+        .set_address_warmup(address.id, Some(WarmupMode::Normal), None)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let yesterday = now.date_naive() - chrono::Duration::days(1);
+    for provider in [ProviderGroup::Microsoft, ProviderGroup::Google] {
+        let initial = WarmupState::initial(address.id, provider, &WarmupProfile::NORMAL);
+        assert!(s
+            .store
+            .try_reserve_warmup(address.id, provider, yesterday, &initial, now)
+            .await
+            .unwrap());
+    }
+    s.store
+        .upsert_feedback_snapshots(&[NewFeedbackSnapshot {
+            source: "snds".into(),
+            provider: "microsoft".into(),
+            subject_kind: "ip".into(),
+            subject: "127.0.0.1".into(),
+            data_date: yesterday,
+            verdict: Verdict::Bad,
+            detail: "filter result RED".into(),
+            metrics: serde_json::json!({}),
+        }])
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(25), s.store.clone());
+    assert_eq!(worker.evaluate_warmup(now).await.unwrap(), 2);
+    let states = s.store.warmup_states().await.unwrap();
+    let microsoft = states
+        .iter()
+        .find(|s| s.provider == ProviderGroup::Microsoft)
+        .unwrap();
+    assert_eq!(microsoft.status, WarmupStatus::Paused);
+    assert!(microsoft
+        .last_reason
+        .contains("snds: ip 127.0.0.1: filter result RED"));
+    let google = states
+        .iter()
+        .find(|s| s.provider == ProviderGroup::Google)
+        .unwrap();
+    assert_eq!(google.status, WarmupStatus::Holding);
+    let log = s.store.warmup_log(Some(address.id), 10).await.unwrap();
+    assert!(log
+        .iter()
+        .any(|e| e.decision == "brake" && e.reason.contains("snds")));
+}
