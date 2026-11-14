@@ -299,3 +299,12 @@ warmup:
   pause_hours: 24               # how long a brake pauses the provider
   step_back: 0.5                # allowance factor after a brake
   defer_seconds: 900            # wait when no address of the pool has room
+
+# Receiving provider groups for IP metrics and warm-up. Built in: microsoft,
+# google, yahoo (incl. AOL), apple (iCloud), united_internet (GMX, WEB.DE,
+# mail.com, 1&1/IONOS), t_online; the rest is "other". Same name replaces a
+# built-in group, a new name adds one.
+# provider_groups:
+#   - name: seznam
+#     domains: [seznam.cz, email.cz]   # exact, or brand.* for any TLD
+#     mx_patterns: [seznam.cz]         # the host and every host under it

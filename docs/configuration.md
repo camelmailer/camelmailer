@@ -574,10 +574,42 @@ warmup:
   defer_seconds: 900            # wait when no address of the pool has room
 ```
 
+The built-in profiles (`slow`, `normal`, `fast`) can be changed, per
+provider group too, including groups added in `provider_groups`:
+
+```yaml
+warmup:
+  profiles:
+    normal:
+      growth: 1.4                       # all groups of this profile
+      groups:
+        microsoft: { start: 80, cap: 30000 }
+        seznam: { start: 80, cap: 25000 }
+```
+
 Every value is checked at start: rates between 0 and 1, the warning levels
 not above the brake levels, `step_back` between 0.1 and 1, `defer_seconds` at
 least 60. How the modes and the brake work is described in
 [deliverability.md](deliverability.md#adaptive-ip-warm-up).
+
+### `provider_groups:` receiving providers
+
+The IP metrics (and the warm-up) count every delivery per receiving provider
+group. Built in: `microsoft` (Outlook.com, Hotmail, Live, Microsoft 365),
+`google` (Gmail, Workspace), `yahoo` (incl. AOL), `apple` (iCloud),
+`united_internet` (GMX, WEB.DE, mail.com, 1&1 and IONOS) and `t_online`;
+everyone else is `other`. A recipient domain is matched against `domains`
+first, then the domain's lowest MX host against `mx_patterns`.
+
+```yaml
+provider_groups:
+  - name: seznam                     # [a-z0-9_], at most 40 characters
+    domains: [seznam.cz, email.cz]   # exact, or brand.* for any TLD
+    mx_patterns: [seznam.cz]         # the host and every host under it
+```
+
+An entry with a built-in name replaces that group; any other name adds one,
+tried after the built-in groups. `other` cannot be configured.
 
 ### `lifecycle_webhooks:` installation events
 

@@ -29,6 +29,7 @@ mod ip_metrics;
 mod ip_warmup;
 mod lifecycle;
 mod quota;
+pub mod warmup_config;
 
 pub use app::{build_app, build_assets_router, build_router, ApiState};
 pub use auth_api::build_auth_router;

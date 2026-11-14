@@ -42,7 +42,7 @@ pub use auth_store::AuthStore;
 pub use bounce::BounceCategory;
 pub use delivery_stats::{
     is_policy_block, DeliveryKind, DeliveryStatsStore, IpComplaint, IpDeliveryRecord,
-    IpDeliveryStat, ProviderGroup, DEFAULT_SOURCE,
+    IpDeliveryStat, ProviderGroup, ProviderGroupRule, ProviderGroups, DEFAULT_SOURCE,
 };
 pub use dmarc::{
     DmarcFilter, DmarcRecordRow, DmarcReport, DmarcSourceStat, DmarcSummary, NewDmarcRecord,
@@ -85,6 +85,7 @@ pub use template::{
     render as render_template, render_in_layout, wrapper_has_raw_content, RenderError,
 };
 pub use warmup::{
-    SignalVerdict, WarmupAddress, WarmupDecision, WarmupLogEntry, WarmupMode, WarmupProfile,
-    WarmupSignal, WarmupState, WarmupStatus, WarmupStore, WarmupThresholds,
+    GroupLimits, Ramp, SignalVerdict, WarmupAddress, WarmupDecision, WarmupLogEntry, WarmupMode,
+    WarmupProfile, WarmupProfiles, WarmupSignal, WarmupState, WarmupStatus, WarmupStore,
+    WarmupThresholds,
 };

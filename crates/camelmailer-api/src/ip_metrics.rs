@@ -145,7 +145,11 @@ fn summarize(
         if stat.day == today {
             entry.today.add(stat);
         }
-        entry.providers.entry(stat.provider).or_default().add(stat);
+        entry
+            .providers
+            .entry(stat.provider.clone())
+            .or_default()
+            .add(stat);
         entry.daily.entry(stat.day).or_default().add(stat);
         if let Some(address) = known.get(&stat.source_ip) {
             pools
@@ -230,13 +234,13 @@ mod tests {
                 hostname: "out1.example.com".into(),
             },
         );
-        let mut complained = stat(today, "203.0.113.5", ProviderGroup::Google, 0, 0);
+        let mut complained = stat(today, "203.0.113.5", ProviderGroup::google(), 0, 0);
         complained.complaints = 1;
         let stats = vec![
-            stat(yesterday, "203.0.113.5", ProviderGroup::Microsoft, 90, 10),
-            stat(today, "203.0.113.5", ProviderGroup::Google, 100, 0),
+            stat(yesterday, "203.0.113.5", ProviderGroup::microsoft(), 90, 10),
+            stat(today, "203.0.113.5", ProviderGroup::google(), 100, 0),
             complained,
-            stat(today, "default", ProviderGroup::Other, 5, 0),
+            stat(today, "default", ProviderGroup::other(), 5, 0),
         ];
         let value = summarize(&stats, &known, yesterday, today, 2);
         let first = &value["addresses"][0];

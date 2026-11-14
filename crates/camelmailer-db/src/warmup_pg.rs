@@ -18,7 +18,7 @@ fn sqlx_error(error: sqlx::Error) -> StoreError {
 }
 
 fn provider_of(value: &str) -> ProviderGroup {
-    ProviderGroup::parse(value).unwrap_or(ProviderGroup::Other)
+    ProviderGroup::parse(value).unwrap_or_else(ProviderGroup::other)
 }
 
 fn profile_of(value: Option<serde_json::Value>) -> Option<WarmupProfile> {
@@ -54,7 +54,7 @@ async fn insert_log(
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(entry.ip_address_id as i64)
-    .bind(entry.provider.map(|p| p.as_str()))
+    .bind(entry.provider.as_ref().map(|p| p.as_str()))
     .bind(&entry.decision)
     .bind(&entry.reason)
     .bind(entry.allowance_before)

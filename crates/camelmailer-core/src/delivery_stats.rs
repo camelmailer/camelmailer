@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{Id, StoreError};
 
@@ -19,96 +19,270 @@ use crate::{Id, StoreError};
 /// operating system picked the local address.
 pub const DEFAULT_SOURCE: &str = "default";
 
-/// The receiving mailbox provider of a delivery, as far as reputation goes.
-/// Microsoft, Google and Yahoo keep their own reputation per sending IP, so
-/// each is judged separately; everybody else shares one bucket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProviderGroup {
-    Microsoft,
-    Google,
-    Yahoo,
-    Other,
-}
+/// The receiving mailbox provider group of a delivery, as far as
+/// reputation goes. The large providers keep their own reputation per
+/// sending IP, so each group is counted and warmed up separately; whoever
+/// matches no group is `other`.
+///
+/// Groups are names (`[a-z0-9_]`, at most 40 characters). The defaults are
+/// [`ProviderGroups::defaults`]; an installation adds or changes groups in
+/// the `provider_groups` config without a code change.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ProviderGroup(String);
 
 impl ProviderGroup {
-    pub const ALL: [ProviderGroup; 4] = [
-        ProviderGroup::Microsoft,
-        ProviderGroup::Google,
-        ProviderGroup::Yahoo,
-        ProviderGroup::Other,
-    ];
+    pub const OTHER: &'static str = "other";
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProviderGroup::Microsoft => "microsoft",
-            ProviderGroup::Google => "google",
-            ProviderGroup::Yahoo => "yahoo",
-            ProviderGroup::Other => "other",
-        }
-    }
-
+    /// A group name, if it is valid.
     pub fn parse(value: &str) -> Option<ProviderGroup> {
-        match value {
-            "microsoft" => Some(ProviderGroup::Microsoft),
-            "google" => Some(ProviderGroup::Google),
-            "yahoo" => Some(ProviderGroup::Yahoo),
-            "other" => Some(ProviderGroup::Other),
-            _ => None,
+        let valid = !value.is_empty()
+            && value.len() <= 40
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        valid.then(|| ProviderGroup(value.to_string()))
+    }
+
+    /// A group name known to be valid (the built-in names).
+    fn known(value: &str) -> ProviderGroup {
+        ProviderGroup(value.to_string())
+    }
+
+    pub fn other() -> ProviderGroup {
+        Self::known(Self::OTHER)
+    }
+    pub fn microsoft() -> ProviderGroup {
+        Self::known("microsoft")
+    }
+    pub fn google() -> ProviderGroup {
+        Self::known("google")
+    }
+    pub fn yahoo() -> ProviderGroup {
+        Self::known("yahoo")
+    }
+    pub fn apple() -> ProviderGroup {
+        Self::known("apple")
+    }
+    pub fn united_internet() -> ProviderGroup {
+        Self::known("united_internet")
+    }
+    pub fn t_online() -> ProviderGroup {
+        Self::known("t_online")
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_other(&self) -> bool {
+        self.0 == Self::OTHER
+    }
+}
+
+impl std::fmt::Display for ProviderGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for ProviderGroup {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        ProviderGroup::parse(&value).ok_or_else(|| format!("invalid provider group name {value:?}"))
+    }
+}
+
+impl From<ProviderGroup> for String {
+    fn from(group: ProviderGroup) -> String {
+        group.0
+    }
+}
+
+/// How one provider group is recognised.
+///
+/// `domains` are recipient domains of the provider's own mail service:
+/// `gmail.com` matches that domain exactly, `hotmail.*` the brand followed
+/// by any top-level domain (`hotmail.de`, `hotmail.co.uk`). `mx_patterns`
+/// are MX host names: `google.com` matches `google.com` and every host
+/// under it (`aspmx.l.google.com`), so a company domain hosted by the
+/// provider (Google Workspace, Microsoft 365, IONOS) counts towards it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderGroupRule {
+    pub name: ProviderGroup,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub mx_patterns: Vec<String>,
+}
+
+impl ProviderGroupRule {
+    fn new(name: ProviderGroup, domains: &[&str], mx_patterns: &[&str]) -> Self {
+        ProviderGroupRule {
+            name,
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+            mx_patterns: mx_patterns.iter().map(|m| m.to_string()).collect(),
         }
     }
 
-    /// The group of a recipient domain that belongs to a provider's own
-    /// consumer service (gmail.com, outlook.com, hotmail.de, yahoo.co.uk,
-    /// aol.com, …). `None` for any other domain, whose provider only its MX
-    /// records tell ([`ProviderGroup::from_mx_host`]).
-    pub fn from_recipient_domain(domain: &str) -> Option<ProviderGroup> {
+    fn matches_domain(&self, domain: &str, labels: &[&str]) -> bool {
+        // brand.* : the brand label followed by a top-level domain of one
+        // label (hotmail.de) or a country form of two (hotmail.co.uk).
+        let country_suffix = labels.len() == 2
+            || (labels.len() == 3
+                && matches!(labels[1], "co" | "com" | "net" | "org" | "ne" | "or"));
+        self.domains.iter().any(|pattern| {
+            let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+            match pattern.strip_suffix(".*") {
+                Some(brand) => country_suffix && labels[0] == brand,
+                None => pattern == domain,
+            }
+        })
+    }
+
+    fn matches_mx(&self, host: &str) -> bool {
+        self.mx_patterns.iter().any(|pattern| {
+            let pattern = pattern
+                .trim()
+                .trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            !pattern.is_empty() && (host == pattern || host.ends_with(&format!(".{pattern}")))
+        })
+    }
+}
+
+/// The provider groups of an installation, in the order they are tried.
+/// Whatever matches none is [`ProviderGroup::other`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderGroups {
+    rules: Vec<ProviderGroupRule>,
+}
+
+impl Default for ProviderGroups {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+impl ProviderGroups {
+    /// The built-in groups: Microsoft (Outlook.com, Hotmail, Live, Microsoft
+    /// 365), Google (Gmail, Workspace), Yahoo (incl. AOL), Apple (iCloud),
+    /// United Internet (GMX, WEB.DE, mail.com, 1&1 / IONOS) and T-Online.
+    pub fn defaults() -> Self {
+        ProviderGroups {
+            rules: vec![
+                ProviderGroupRule::new(
+                    ProviderGroup::microsoft(),
+                    &[
+                        "outlook.com",
+                        "msn.com",
+                        "passport.com",
+                        "windowslive.com",
+                        "hotmail.*",
+                        "live.*",
+                        "outlook.*",
+                    ],
+                    // *.mail.protection.outlook.com (Microsoft 365) and
+                    // *.olc.protection.outlook.com (Outlook.com).
+                    &["outlook.com", "hotmail.com", "microsoft.com"],
+                ),
+                ProviderGroupRule::new(
+                    ProviderGroup::google(),
+                    &["gmail.com", "googlemail.*"],
+                    &["google.com", "googlemail.com"],
+                ),
+                ProviderGroupRule::new(
+                    ProviderGroup::yahoo(),
+                    &["yahoo.*", "ymail.com", "rocketmail.com", "aol.*", "aim.com"],
+                    &["yahoodns.net", "yahoo.com", "aol.com"],
+                ),
+                ProviderGroupRule::new(
+                    ProviderGroup::apple(),
+                    &["icloud.com", "me.com", "mac.com"],
+                    &["icloud.com", "apple.com"],
+                ),
+                ProviderGroupRule::new(
+                    ProviderGroup::united_internet(),
+                    &[
+                        "gmx.*",
+                        "web.de",
+                        "mail.com",
+                        "online.de",
+                        "onlinehome.de",
+                        "1und1.de",
+                    ],
+                    &[
+                        "gmx.net",
+                        "gmx.com",
+                        "web.de",
+                        "mail.com",
+                        "kundenserver.de",
+                        "ionos.de",
+                        "ionos.com",
+                    ],
+                ),
+                ProviderGroupRule::new(
+                    ProviderGroup::t_online(),
+                    &["t-online.de", "magenta.de"],
+                    &["t-online.de"],
+                ),
+            ],
+        }
+    }
+
+    /// The defaults with `rules` merged in: a rule with the name of a
+    /// built-in group replaces it, any other is added (tried after the
+    /// built-in groups). A rule named `other` is ignored: `other` is what
+    /// matches nothing.
+    pub fn with_rules(rules: &[ProviderGroupRule]) -> Self {
+        let mut groups = Self::defaults();
+        for rule in rules {
+            if rule.name.is_other() {
+                continue;
+            }
+            match groups.rules.iter_mut().find(|r| r.name == rule.name) {
+                Some(existing) => *existing = rule.clone(),
+                None => groups.rules.push(rule.clone()),
+            }
+        }
+        groups
+    }
+
+    /// Every group name, `other` last.
+    pub fn names(&self) -> Vec<ProviderGroup> {
+        let mut names: Vec<ProviderGroup> = self.rules.iter().map(|r| r.name.clone()).collect();
+        names.push(ProviderGroup::other());
+        names
+    }
+
+    pub fn rules(&self) -> &[ProviderGroupRule] {
+        &self.rules
+    }
+
+    /// The group of a recipient domain that belongs to a provider's own mail
+    /// service. `None` for any other domain, whose provider only its MX
+    /// records tell ([`ProviderGroups::from_mx_host`]).
+    pub fn from_recipient_domain(&self, domain: &str) -> Option<ProviderGroup> {
         let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let labels: Vec<&str> = domain.split('.').collect();
         if labels.len() < 2 {
             return None;
         }
-        match domain.as_str() {
-            "gmail.com" | "googlemail.com" => return Some(ProviderGroup::Google),
-            "outlook.com" | "msn.com" | "passport.com" | "windowslive.com" => {
-                return Some(ProviderGroup::Microsoft)
-            }
-            "ymail.com" | "rocketmail.com" | "aol.com" | "aim.com" | "aol.de" | "aol.co.uk"
-            | "aol.fr" => return Some(ProviderGroup::Yahoo),
-            _ => {}
-        }
-        // hotmail.de, live.co.uk, outlook.de, yahoo.fr: the brand label
-        // followed by a top-level domain (one or two labels).
-        let country_suffix = labels.len() == 2
-            || (labels.len() == 3
-                && matches!(labels[1], "co" | "com" | "net" | "org" | "ne" | "or"));
-        if country_suffix {
-            match labels[0] {
-                "hotmail" | "live" | "outlook" => return Some(ProviderGroup::Microsoft),
-                "yahoo" => return Some(ProviderGroup::Yahoo),
-                "googlemail" => return Some(ProviderGroup::Google),
-                _ => {}
-            }
-        }
-        None
+        self.rules
+            .iter()
+            .find(|rule| rule.matches_domain(&domain, &labels))
+            .map(|rule| rule.name.clone())
     }
 
-    /// The group of the provider that runs an MX host: Google Workspace,
-    /// Microsoft 365 / Exchange Online and Yahoo/AOL mail hosts.
-    pub fn from_mx_host(host: &str) -> ProviderGroup {
+    /// The group of the provider that runs an MX host.
+    pub fn from_mx_host(&self, host: &str) -> ProviderGroup {
         let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-        let under = |suffix: &str| host == suffix || host.ends_with(&format!(".{suffix}"));
-        if under("google.com") || under("googlemail.com") {
-            ProviderGroup::Google
-        } else if under("outlook.com") || under("hotmail.com") || under("microsoft.com") {
-            // *.mail.protection.outlook.com (Microsoft 365) and
-            // *.olc.protection.outlook.com (Outlook.com) both end here.
-            ProviderGroup::Microsoft
-        } else if under("yahoodns.net") || under("yahoo.com") || under("aol.com") {
-            ProviderGroup::Yahoo
-        } else {
-            ProviderGroup::Other
-        }
+        self.rules
+            .iter()
+            .find(|rule| rule.matches_mx(&host))
+            .map(|rule| rule.name.clone())
+            .unwrap_or_else(ProviderGroup::other)
     }
 }
 
@@ -240,21 +414,30 @@ mod tests {
 
     #[test]
     fn consumer_domains_map_to_their_provider() {
+        let groups = ProviderGroups::defaults();
         for (domain, group) in [
-            ("gmail.com", ProviderGroup::Google),
-            ("GoogleMail.com", ProviderGroup::Google),
-            ("outlook.com", ProviderGroup::Microsoft),
-            ("hotmail.de", ProviderGroup::Microsoft),
-            ("live.co.uk", ProviderGroup::Microsoft),
-            ("msn.com", ProviderGroup::Microsoft),
-            ("yahoo.com", ProviderGroup::Yahoo),
-            ("yahoo.co.jp", ProviderGroup::Yahoo),
-            ("aol.com", ProviderGroup::Yahoo),
-            ("ymail.com", ProviderGroup::Yahoo),
+            ("gmail.com", "google"),
+            ("GoogleMail.com", "google"),
+            ("outlook.com", "microsoft"),
+            ("hotmail.de", "microsoft"),
+            ("live.co.uk", "microsoft"),
+            ("msn.com", "microsoft"),
+            ("yahoo.com", "yahoo"),
+            ("yahoo.co.jp", "yahoo"),
+            ("aol.com", "yahoo"),
+            ("aol.de", "yahoo"),
+            ("ymail.com", "yahoo"),
+            ("icloud.com", "apple"),
+            ("me.com", "apple"),
+            ("gmx.de", "united_internet"),
+            ("gmx.net", "united_internet"),
+            ("web.de", "united_internet"),
+            ("mail.com", "united_internet"),
+            ("t-online.de", "t_online"),
         ] {
             assert_eq!(
-                ProviderGroup::from_recipient_domain(domain),
-                Some(group),
+                groups.from_recipient_domain(domain).map(|g| g.to_string()),
+                Some(group.to_string()),
                 "{domain}"
             );
         }
@@ -264,33 +447,78 @@ mod tests {
             "mail.yahoo.example.org",
             "com",
         ] {
-            assert_eq!(
-                ProviderGroup::from_recipient_domain(domain),
-                None,
-                "{domain}"
-            );
+            assert_eq!(groups.from_recipient_domain(domain), None, "{domain}");
         }
     }
 
     #[test]
     fn mx_hosts_map_to_the_provider_running_them() {
+        let groups = ProviderGroups::defaults();
         for (host, group) in [
-            ("aspmx.l.google.com.", ProviderGroup::Google),
-            ("alt1.gmr-smtp-in.l.google.com", ProviderGroup::Google),
-            (
-                "example-com.mail.protection.outlook.com",
-                ProviderGroup::Microsoft,
-            ),
-            (
-                "hotmail-com.olc.protection.outlook.com",
-                ProviderGroup::Microsoft,
-            ),
-            ("mta5.am0.yahoodns.net", ProviderGroup::Yahoo),
-            ("mx.example.net", ProviderGroup::Other),
-            ("notgoogle.com", ProviderGroup::Other),
+            ("aspmx.l.google.com.", "google"),
+            ("alt1.gmr-smtp-in.l.google.com", "google"),
+            ("example-com.mail.protection.outlook.com", "microsoft"),
+            ("hotmail-com.olc.protection.outlook.com", "microsoft"),
+            ("mta5.am0.yahoodns.net", "yahoo"),
+            ("mx01.mail.icloud.com", "apple"),
+            ("mx00.emig.gmx.net", "united_internet"),
+            ("mx00.ionos.de", "united_internet"),
+            ("mx01.kundenserver.de", "united_internet"),
+            ("mx00.t-online.de", "t_online"),
+            ("mx.example.net", "other"),
+            ("notgoogle.com", "other"),
         ] {
-            assert_eq!(ProviderGroup::from_mx_host(host), group, "{host}");
+            assert_eq!(groups.from_mx_host(host).as_str(), group, "{host}");
         }
+    }
+
+    #[test]
+    fn configured_rules_replace_or_add_groups() {
+        let groups = ProviderGroups::with_rules(&[
+            ProviderGroupRule {
+                name: ProviderGroup::parse("seznam").unwrap(),
+                domains: vec!["seznam.cz".into(), "email.cz".into()],
+                mx_patterns: vec!["*.seznam.cz".into()],
+            },
+            ProviderGroupRule {
+                name: ProviderGroup::t_online(),
+                domains: vec!["t-online.de".into()],
+                mx_patterns: vec!["t-online.de".into(), "telekom.de".into()],
+            },
+            ProviderGroupRule {
+                name: ProviderGroup::other(),
+                domains: vec!["example.com".into()],
+                mx_patterns: vec![],
+            },
+        ]);
+        assert_eq!(
+            groups.from_recipient_domain("email.cz").unwrap().as_str(),
+            "seznam"
+        );
+        assert_eq!(groups.from_mx_host("mx1.seznam.cz").as_str(), "seznam");
+        assert_eq!(groups.from_mx_host("mx.telekom.de").as_str(), "t_online");
+        assert_eq!(groups.from_recipient_domain("magenta.de"), None, "replaced");
+        assert_eq!(
+            groups.from_recipient_domain("example.com"),
+            None,
+            "other is never a rule"
+        );
+        let names: Vec<String> = groups.names().iter().map(|g| g.to_string()).collect();
+        assert_eq!(names.first().unwrap(), "microsoft");
+        assert_eq!(names[names.len() - 2], "seznam");
+        assert_eq!(names.last().unwrap(), "other");
+    }
+
+    #[test]
+    fn provider_group_names_are_checked() {
+        assert!(ProviderGroup::parse("united_internet").is_some());
+        assert!(ProviderGroup::parse("").is_none());
+        assert!(ProviderGroup::parse("Google").is_none());
+        assert!(ProviderGroup::parse("a-b").is_none());
+        assert!(ProviderGroup::parse(&"x".repeat(41)).is_none());
+        let json = serde_json::to_string(&ProviderGroup::google()).unwrap();
+        assert_eq!(json, "\"google\"");
+        assert!(serde_json::from_str::<ProviderGroup>("\"No\"").is_err());
     }
 
     #[test]
@@ -315,14 +543,6 @@ mod tests {
             assert!(!is_policy_block(reply), "{reply}");
         }
     }
-
-    #[test]
-    fn provider_names_round_trip() {
-        for group in ProviderGroup::ALL {
-            assert_eq!(ProviderGroup::parse(group.as_str()), Some(group));
-        }
-        assert_eq!(ProviderGroup::parse("aol"), None);
-    }
 }
 
 #[async_trait]
@@ -331,12 +551,16 @@ impl DeliveryStatsStore for crate::MemoryStore {
         let mut inner = self.inner.write().unwrap();
         let stat = inner
             .ip_delivery_stats
-            .entry((record.day, record.source_ip.clone(), record.provider))
+            .entry((
+                record.day,
+                record.source_ip.clone(),
+                record.provider.clone(),
+            ))
             .or_insert_with(|| IpDeliveryStat {
                 day: record.day,
                 source_ip: record.source_ip.clone(),
                 ip_address_id: record.ip_address_id,
-                provider: record.provider,
+                provider: record.provider.clone(),
                 sent: 0,
                 deferred: 0,
                 bounced: 0,
@@ -359,7 +583,7 @@ impl DeliveryStatsStore for crate::MemoryStore {
                     IpComplaint {
                         source_ip: record.source_ip.clone(),
                         ip_address_id: record.ip_address_id,
-                        provider: record.provider,
+                        provider: record.provider.clone(),
                     },
                     Utc::now(),
                 ),
@@ -380,12 +604,12 @@ impl DeliveryStatsStore for crate::MemoryStore {
         let day = at.date_naive();
         let stat = inner
             .ip_delivery_stats
-            .entry((day, source.source_ip.clone(), source.provider))
+            .entry((day, source.source_ip.clone(), source.provider.clone()))
             .or_insert_with(|| IpDeliveryStat {
                 day,
                 source_ip: source.source_ip.clone(),
                 ip_address_id: source.ip_address_id,
-                provider: source.provider,
+                provider: source.provider.clone(),
                 sent: 0,
                 deferred: 0,
                 bounced: 0,
@@ -433,7 +657,7 @@ mod memory_tests {
             day: NaiveDate::from_ymd_opt(2026, 11, 14).unwrap(),
             source_ip: "203.0.113.5".into(),
             ip_address_id: Some(3),
-            provider: ProviderGroup::Microsoft,
+            provider: ProviderGroup::microsoft(),
             kind,
             policy_block: false,
             server_id: 1,
@@ -460,14 +684,14 @@ mod memory_tests {
             .await
             .unwrap();
         let mut google = record(DeliveryKind::Sent, 5);
-        google.provider = ProviderGroup::Google;
+        google.provider = ProviderGroup::google();
         store.record_ip_delivery(&google).await.unwrap();
 
         let at = DateTime::parse_from_rfc3339("2026-11-15T08:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let credited = store.record_ip_complaint(2, at).await.unwrap().unwrap();
-        assert_eq!(credited.provider, ProviderGroup::Microsoft);
+        assert_eq!(credited.provider, ProviderGroup::microsoft());
         assert!(
             store.record_ip_complaint(3, at).await.unwrap().is_none(),
             "not accepted"
@@ -480,7 +704,7 @@ mod memory_tests {
         assert_eq!(stats.len(), 3);
         let ms = stats
             .iter()
-            .find(|s| s.provider == ProviderGroup::Microsoft && s.day.to_string() == "2026-11-14")
+            .find(|s| s.provider == ProviderGroup::microsoft() && s.day.to_string() == "2026-11-14")
             .unwrap();
         assert_eq!(
             (ms.sent, ms.deferred, ms.bounced, ms.policy_blocks),

@@ -1458,6 +1458,25 @@ pub struct Config {
     pub rspamd: Rspamd,
     pub clamav: Clamav,
     pub warmup: Warmup,
+    /// Receiving provider groups for the IP metrics and the warm-up, merged
+    /// into the built-in ones (microsoft, google, yahoo, apple,
+    /// united_internet, t_online): an entry with a built-in name replaces
+    /// that group, any other name adds one. Whatever matches no group is
+    /// `other`.
+    pub provider_groups: Vec<ProviderGroupConfig>,
+}
+
+/// One receiving provider group (`provider_groups`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderGroupConfig {
+    /// `[a-z0-9_]`, at most 40 characters.
+    pub name: String,
+    /// Recipient domains of the provider's own mail service: `example.com`
+    /// exactly, or `brand.*` for the brand under any top-level domain.
+    pub domains: Vec<String>,
+    /// MX hosts: `example.net` matches it and every host under it.
+    pub mx_patterns: Vec<String>,
 }
 
 /// Adaptive IP warm-up (`warmup`). Warm-up itself is off until a pool or a
@@ -1492,6 +1511,29 @@ pub struct Warmup {
     /// How long a message waits when no address of its pool has room left
     /// today. No attempt is counted.
     pub defer_seconds: u32,
+    /// Changes to the built-in profiles `slow`, `normal` and `fast`: the base
+    /// ramp (used by `other` and by groups the profile does not name) and the
+    /// first day's allowance and cap per provider group.
+    pub profiles: std::collections::BTreeMap<String, WarmupProfileConfig>,
+}
+
+/// Changes to one built-in warm-up profile (`warmup.profiles.<name>`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WarmupProfileConfig {
+    pub start: Option<i64>,
+    pub growth: Option<f64>,
+    pub cap: Option<i64>,
+    /// Per provider group: `{ start, cap }`.
+    pub groups: std::collections::BTreeMap<String, WarmupGroupLimits>,
+}
+
+/// The first day's allowance and the cap of one provider group.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WarmupGroupLimits {
+    pub start: i64,
+    pub cap: i64,
 }
 
 impl Warmup {
@@ -1528,6 +1570,37 @@ impl Warmup {
                 self.step_back
             )));
         }
+        for (name, profile) in &self.profiles {
+            if !matches!(name.as_str(), "slow" | "normal" | "fast") {
+                return Err(ConfigError::Invalid(format!(
+                    "warmup.profiles: {name:?} is not a built-in profile (slow, normal, fast)"
+                )));
+            }
+            if profile.start.is_some_and(|v| !(1..=1_000_000).contains(&v))
+                || profile.growth.is_some_and(|v| !(1.05..=3.0).contains(&v))
+                || profile.cap.is_some_and(|v| !(2..=10_000_000).contains(&v))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "warmup.profiles.{name}: start 1 to 1000000, growth 1.05 to 3.0, cap up to 10000000"
+                )));
+            }
+            for (group, limits) in &profile.groups {
+                let valid_name = !group.is_empty()
+                    && group.len() <= 40
+                    && group
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                if !valid_name
+                    || limits.start < 1
+                    || limits.cap <= limits.start
+                    || limits.cap > 10_000_000
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "warmup.profiles.{name}.groups.{group}: needs a valid group name, start >= 1 and cap above start"
+                    )));
+                }
+            }
+        }
         if self.pause_hours < 1 || self.policy_blocks_brake < 1 || self.defer_seconds < 60 {
             return Err(ConfigError::Invalid(
                 "warmup.pause_hours and warmup.policy_blocks_brake must be at least 1, \
@@ -1555,6 +1628,19 @@ mod warmup_tests {
         assert_eq!(config.warmup.advance_fraction, 0.9);
         assert!(config.validate().is_ok());
         assert!(Config::from_yaml("warmup:\n  unknown: 1\n").is_err());
+        let config = Config::from_yaml(
+            "warmup:\n  profiles:\n    normal:\n      growth: 1.4\n      groups:\n        seznam: { start: 80, cap: 25000 }\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.warmup.profiles["normal"].groups["seznam"].cap, 25000);
+        for bad in [
+            "warmup:\n  profiles:\n    turbo: { start: 10 }\n",
+            "warmup:\n  profiles:\n    slow: { growth: 5 }\n",
+            "warmup:\n  profiles:\n    slow:\n      groups:\n        x: { start: 10, cap: 5 }\n",
+        ] {
+            assert!(Config::from_yaml(bad).unwrap().validate().is_err(), "{bad}");
+        }
     }
 }
 
@@ -1572,6 +1658,7 @@ impl Default for Warmup {
             pause_hours: 24,
             step_back: 0.5,
             defer_seconds: 900,
+            profiles: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1688,6 +1775,26 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.worker.validate()?;
         self.warmup.validate()?;
+        for group in &self.provider_groups {
+            let valid = !group.name.is_empty()
+                && group.name.len() <= 40
+                && group
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if !valid || group.name == "other" {
+                return Err(ConfigError::Invalid(format!(
+                    "provider_groups: {:?} is not a valid group name ([a-z0-9_], at most 40 characters, not \"other\")",
+                    group.name
+                )));
+            }
+            if group.domains.is_empty() && group.mx_patterns.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "provider_groups: {} needs domains or mx_patterns",
+                    group.name
+                )));
+            }
+        }
         if !matches!(self.camelmailer.web_protocol.as_str(), "http" | "https") {
             return Err(ConfigError::Invalid(format!(
                 "camelmailer.web_protocol must be http or https (got {:?})",
@@ -2735,5 +2842,27 @@ smtp_server:
         );
         assert!(feedback.fbl.suppress_complainants);
         assert!(Config::from_yaml("deliverability_feedback:\n  snds:\n    key: x\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod provider_group_tests {
+    use super::*;
+
+    #[test]
+    fn provider_groups_are_read_and_checked() {
+        let config = Config::from_yaml(
+            "provider_groups:\n  - name: seznam\n    domains: [seznam.cz]\n    mx_patterns: [seznam.cz]\n",
+        )
+        .unwrap();
+        assert_eq!(config.provider_groups[0].name, "seznam");
+        assert!(config.validate().is_ok());
+        for bad in [
+            "provider_groups:\n  - name: Seznam\n    domains: [seznam.cz]\n",
+            "provider_groups:\n  - name: other\n    domains: [x.cz]\n",
+            "provider_groups:\n  - name: empty\n",
+        ] {
+            assert!(Config::from_yaml(bad).unwrap().validate().is_err(), "{bad}");
+        }
     }
 }

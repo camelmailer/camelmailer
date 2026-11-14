@@ -3151,7 +3151,7 @@ paths:
                                   - $ref: "#/components/schemas/IpMetricTotals"
                                   - type: object
                                     properties:
-                                      provider: { type: string, enum: [microsoft, google, yahoo, other] }
+                                      provider: { type: string, description: "Provider group (built-in: microsoft, google, yahoo, apple, united_internet, t_online, other; more via provider_groups)" }
                             daily:
                               type: array
                               items:
@@ -3199,6 +3199,10 @@ paths:
                         type: object
                         additionalProperties: { $ref: "#/components/schemas/WarmupProfile" }
                       thresholds: { type: object, additionalProperties: true }
+                      provider_groups: { type: array, items: { type: string } }
+                      storage_incidents:
+                        type: array
+                        items: { $ref: "#/components/schemas/WarmupLogEntry" }
                       addresses:
                         type: array
                         items: { $ref: "#/components/schemas/WarmupAddress" }
@@ -3477,6 +3481,14 @@ components:
         start: { type: integer }
         growth: { type: number }
         cap: { type: integer }
+        groups:
+          type: object
+          description: Per provider group, the first day's allowance and the cap.
+          additionalProperties:
+            type: object
+            properties:
+              start: { type: integer }
+              cap: { type: integer }
     SetWarmup:
       type: object
       required: [mode]
@@ -3487,8 +3499,8 @@ components:
       type: object
       properties:
         ip_address_id: { type: integer }
-        provider: { type: string, nullable: true, enum: [microsoft, google, yahoo, other] }
-        decision: { type: string, enum: [advance, hold, slow, brake, warm, mode] }
+        provider: { type: string, nullable: true }
+        decision: { type: string, enum: [advance, hold, slow, brake, warm, mode, storage] }
         reason: { type: string }
         allowance_before: { type: integer, nullable: true }
         allowance_after: { type: integer, nullable: true }
@@ -3518,7 +3530,7 @@ components:
           items:
             type: object
             properties:
-              provider: { type: string, enum: [microsoft, google, yahoo, other] }
+              provider: { type: string }
               allowance: { type: integer, nullable: true }
               used_today: { type: integer }
               status:
