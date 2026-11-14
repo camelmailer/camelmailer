@@ -3,9 +3,12 @@
 
 use async_trait::async_trait;
 use camelmailer_core::feedback::{
-    fbl_detail, newest_per_subject, source, subject_kind, FeedbackSnapshot, FeedbackSourceStatus,
-    FeedbackStore, NewFeedbackSnapshot, ProviderSignal, Verdict,
+    fbl_detail, newest_per_subject, placement_summary, source, subject_kind, FeedbackSnapshot,
+    FeedbackSourceStatus, FeedbackStore, NewFeedbackSnapshot, NewPlacementTest, PlacementFilter,
+    PlacementResult, PlacementRound, PlacementTest, ProviderSignal, Verdict,
+    PLACEMENT_SIGNAL_HOURS,
 };
+use camelmailer_core::Id;
 use camelmailer_core::StoreError;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::postgres::PgRow;
@@ -40,6 +43,42 @@ fn status_from_row(row: &PgRow) -> FeedbackSourceStatus {
         last_error: row.get("last_error"),
         consecutive_failures: row.get("consecutive_failures"),
         next_attempt_at: row.get("next_attempt_at"),
+    }
+}
+
+fn round_from_row(row: &PgRow) -> PlacementRound {
+    PlacementRound {
+        id: row.get("id"),
+        trigger: row.get("trigger"),
+        requested_at: row.get("requested_at"),
+        started_at: row.get("started_at"),
+    }
+}
+
+fn test_from_row(row: &PgRow) -> PlacementTest {
+    PlacementTest {
+        id: row.get("id"),
+        round_id: row.get("round_id"),
+        token: row.get("token"),
+        server_id: row.get::<i64, _>("server_id") as Id,
+        message_id: row.get("message_id"),
+        ip_pool_id: row.get::<i64, _>("ip_pool_id") as Id,
+        ip_address_id: row.get::<i64, _>("ip_address_id") as Id,
+        ip: row.get("ip"),
+        seed_address: row.get("seed_address"),
+        seed_provider: row.get("seed_provider"),
+        provider: row.get("provider"),
+        status: row.get("status"),
+        folder: row.get("folder"),
+        spf: row.get("spf"),
+        dkim: row.get("dkim"),
+        dmarc: row.get("dmarc"),
+        received_ip: row.get("received_ip"),
+        helo: row.get("helo"),
+        detail: row.get("detail"),
+        checks: row.get("checks"),
+        created_at: row.get("created_at"),
+        checked_at: row.get("checked_at"),
     }
 }
 
@@ -83,6 +122,11 @@ impl FeedbackStore for PgStore {
         &self,
         source: &str,
     ) -> Result<Vec<FeedbackSnapshot>, StoreError> {
+        if source == source::PLACEMENT {
+            let since = chrono::Utc::now() - chrono::Duration::hours(PLACEMENT_SIGNAL_HOURS);
+            let tests = self.placement_results_since(since, None, None).await?;
+            return Ok(newest_per_subject(placement_summary(&tests)));
+        }
         let rows = sqlx::query(&format!(
             "{NEWEST} WHERE source = $1
              ORDER BY provider, subject_kind, subject, data_date DESC"
@@ -215,7 +259,7 @@ impl FeedbackStore for PgStore {
     ) -> Result<Vec<ProviderSignal>, StoreError> {
         let rows = sqlx::query(&format!(
             "{NEWEST}
-             WHERE provider = $2
+             WHERE provider = $2 AND source <> 'placement'
                AND ((subject_kind = 'ip' AND subject = $1)
                     OR subject_kind IN ('domain', 'provider'))
              ORDER BY provider, subject_kind, subject, data_date DESC"
@@ -225,24 +269,240 @@ impl FeedbackStore for PgStore {
         .fetch_all(self.pool())
         .await
         .map_err(sqlx_error)?;
-        Ok(
-            newest_per_subject(rows.iter().map(snapshot_from_row).collect())
-                .into_iter()
-                .map(ProviderSignal::from)
-                .collect(),
-        )
+        let mut snapshots: Vec<FeedbackSnapshot> = rows.iter().map(snapshot_from_row).collect();
+        let since = chrono::Utc::now() - chrono::Duration::hours(PLACEMENT_SIGNAL_HOURS);
+        let tests = self
+            .placement_results_since(since, Some(ip), Some(provider))
+            .await?;
+        snapshots.extend(placement_summary(&tests));
+        Ok(newest_per_subject(snapshots)
+            .into_iter()
+            .map(ProviderSignal::from)
+            .collect())
     }
 
     async fn prune_feedback_snapshots(&self, days: u32) -> Result<u64, StoreError> {
-        let done = sqlx::query(
+        let snapshots = sqlx::query(
             "DELETE FROM feedback_snapshots
              WHERE data_date < (now() AT TIME ZONE 'UTC')::date - $1::int",
         )
         .bind(days as i32)
         .execute(self.pool())
         .await
+        .map_err(sqlx_error)?
+        .rows_affected();
+        // The placement history goes with its rounds (ON DELETE CASCADE).
+        let tests: i64 = sqlx::query_scalar(
+            "WITH old AS (
+                 DELETE FROM placement_rounds
+                 WHERE requested_at < now() - make_interval(days => $1::int)
+                 RETURNING id)
+             SELECT count(*) FROM placement_tests WHERE round_id IN (SELECT id FROM old)",
+        )
+        .bind(days as i32)
+        .fetch_one(self.pool())
+        .await
         .map_err(sqlx_error)?;
-        Ok(done.rows_affected())
+        Ok(snapshots + tests as u64)
+    }
+
+    async fn request_placement_round(
+        &self,
+        trigger: &str,
+        min_interval_seconds: i64,
+    ) -> Result<Option<PlacementRound>, StoreError> {
+        let mut tx = self.pool().begin().await.map_err(sqlx_error)?;
+        // Serialise concurrent requests so the rate limit holds.
+        sqlx::query("LOCK TABLE placement_rounds IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_error)?;
+        let recent: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM placement_rounds
+                 WHERE requested_at > now() - make_interval(secs => $1::bigint))",
+        )
+        .bind(min_interval_seconds)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(sqlx_error)?;
+        if recent {
+            tx.commit().await.map_err(sqlx_error)?;
+            return Ok(None);
+        }
+        let row = sqlx::query("INSERT INTO placement_rounds (trigger) VALUES ($1) RETURNING *")
+            .bind(trigger)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_error)?;
+        tx.commit().await.map_err(sqlx_error)?;
+        Ok(Some(round_from_row(&row)))
+    }
+
+    async fn last_placement_round(&self) -> Result<Option<PlacementRound>, StoreError> {
+        let row = sqlx::query("SELECT * FROM placement_rounds ORDER BY id DESC LIMIT 1")
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        Ok(row.as_ref().map(round_from_row))
+    }
+
+    async fn start_placement_round(&self) -> Result<Option<PlacementRound>, StoreError> {
+        let row = sqlx::query(
+            "UPDATE placement_rounds SET started_at = now()
+             WHERE id = (SELECT id FROM placement_rounds WHERE started_at IS NULL
+                         ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+             RETURNING *",
+        )
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(row.as_ref().map(round_from_row))
+    }
+
+    async fn create_placement_tests(
+        &self,
+        tests: &[NewPlacementTest],
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let mut tx = self.pool().begin().await.map_err(sqlx_error)?;
+        let mut created = Vec::new();
+        for new in tests {
+            let row = sqlx::query(
+                "INSERT INTO placement_tests
+                     (round_id, token, server_id, ip_pool_id, ip_address_id, ip,
+                      seed_address, seed_provider, provider, check_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *",
+            )
+            .bind(new.round_id)
+            .bind(&new.token)
+            .bind(new.server_id as i64)
+            .bind(new.ip_pool_id as i64)
+            .bind(new.ip_address_id as i64)
+            .bind(&new.ip)
+            .bind(&new.seed_address)
+            .bind(&new.seed_provider)
+            .bind(&new.provider)
+            .bind(new.check_at)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_error)?;
+            created.push(test_from_row(&row));
+        }
+        tx.commit().await.map_err(sqlx_error)?;
+        Ok(created)
+    }
+
+    async fn set_placement_message(&self, id: i64, message_id: i64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE placement_tests SET message_id = $2 WHERE id = $1")
+            .bind(id)
+            .bind(message_id)
+            .execute(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        Ok(())
+    }
+
+    async fn placement_test_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<PlacementTest>, StoreError> {
+        let row = sqlx::query("SELECT * FROM placement_tests WHERE token = $1")
+            .bind(token)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(sqlx_error)?;
+        Ok(row.as_ref().map(test_from_row))
+    }
+
+    async fn claim_due_placement_tests(
+        &self,
+        limit: i64,
+        lease_seconds: i64,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let rows = sqlx::query(
+            "UPDATE placement_tests
+             SET claimed_until = now() + make_interval(secs => $2::bigint)
+             WHERE id IN (SELECT id FROM placement_tests
+                          WHERE status = 'pending' AND check_at <= now()
+                            AND (claimed_until IS NULL OR claimed_until < now())
+                          ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED)
+             RETURNING *",
+        )
+        .bind(limit)
+        .bind(lease_seconds)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        let mut tests: Vec<PlacementTest> = rows.iter().map(test_from_row).collect();
+        tests.sort_by_key(|t| t.id);
+        Ok(tests)
+    }
+
+    async fn record_placement_result(
+        &self,
+        id: i64,
+        result: &PlacementResult,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE placement_tests
+             SET status = $2, folder = $3, spf = $4, dkim = $5, dmarc = $6,
+                 received_ip = $7, helo = $8, detail = $9, checks = checks + 1,
+                 checked_at = now(), claimed_until = NULL,
+                 check_at = COALESCE($10, check_at)
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(&result.status)
+        .bind(&result.folder)
+        .bind(&result.spf)
+        .bind(&result.dkim)
+        .bind(&result.dmarc)
+        .bind(&result.received_ip)
+        .bind(&result.helo)
+        .bind(&result.detail)
+        .bind(result.check_again_at)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(())
+    }
+
+    async fn list_placement_tests(
+        &self,
+        filter: &PlacementFilter,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM placement_tests
+             WHERE ($1::text IS NULL OR ip = $1) AND ($2::text IS NULL OR provider = $2)
+             ORDER BY id DESC LIMIT $3",
+        )
+        .bind(filter.ip.as_deref())
+        .bind(filter.provider.as_deref())
+        .bind(filter.limit)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(rows.iter().map(test_from_row).collect())
+    }
+
+    async fn placement_results_since(
+        &self,
+        since: DateTime<Utc>,
+        ip: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM placement_tests
+             WHERE status IN ('inbox', 'spam', 'missing') AND checked_at >= $1
+               AND ($2::text IS NULL OR ip = $2) AND ($3::text IS NULL OR provider = $3)
+             ORDER BY id",
+        )
+        .bind(since)
+        .bind(ip)
+        .bind(provider)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(rows.iter().map(test_from_row).collect())
     }
 
     async fn server_complaint_suppression(

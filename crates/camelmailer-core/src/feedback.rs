@@ -29,8 +29,10 @@ pub mod source {
     pub const POSTMASTER_TOOLS: &str = "postmaster_tools";
     pub const SNDS: &str = "snds";
     pub const FBL: &str = "fbl";
+    /// Seed inbox placement tests.
+    pub const PLACEMENT: &str = "placement";
     /// Every source, in display order.
-    pub const ALL: [&str; 3] = [POSTMASTER_TOOLS, SNDS, FBL];
+    pub const ALL: [&str; 4] = [POSTMASTER_TOOLS, SNDS, FBL, PLACEMENT];
 }
 
 /// Provider group names, shared with the IP metrics and the warm-up.
@@ -142,6 +144,120 @@ pub struct ProviderSignal {
     pub observed_at: DateTime<Utc>,
 }
 
+/// Placement test states as stored.
+pub mod placement_status {
+    /// Sent or about to be; not looked up conclusively yet.
+    pub const PENDING: &str = "pending";
+    pub const INBOX: &str = "inbox";
+    pub const SPAM: &str = "spam";
+    /// Not found after the last lookup.
+    pub const MISSING: &str = "missing";
+    /// The test could not be sent or looked up (see `detail`).
+    pub const ERROR: &str = "error";
+}
+
+/// One round of placement tests: one message per sending IP to every seed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlacementRound {
+    pub id: i64,
+    /// `schedule` or `manual`.
+    pub trigger: String,
+    pub requested_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewPlacementTest {
+    pub round_id: i64,
+    /// The random id in the test's `X-Camelmailer-Placement-Test` header.
+    pub token: String,
+    /// The mail server that sends the test.
+    pub server_id: crate::model::Id,
+    pub ip_pool_id: crate::model::Id,
+    pub ip_address_id: crate::model::Id,
+    pub ip: String,
+    pub seed_address: String,
+    /// `gmail`, `outlook`, `yahoo` or `imap`.
+    pub seed_provider: String,
+    /// The provider group: `google`, `microsoft`, `yahoo` or `other`.
+    pub provider: String,
+    /// When to look for it first.
+    pub check_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlacementTest {
+    pub id: i64,
+    pub round_id: i64,
+    #[serde(skip_serializing)]
+    pub token: String,
+    pub server_id: crate::model::Id,
+    pub message_id: Option<i64>,
+    pub ip_pool_id: crate::model::Id,
+    pub ip_address_id: crate::model::Id,
+    pub ip: String,
+    pub seed_address: String,
+    pub seed_provider: String,
+    pub provider: String,
+    pub status: String,
+    /// The folder it was found in.
+    pub folder: Option<String>,
+    /// `Authentication-Results` verdicts the seed's provider recorded.
+    pub spf: Option<String>,
+    pub dkim: Option<String>,
+    pub dmarc: Option<String>,
+    /// The connecting IP and EHLO name in the provider's `Received` line.
+    pub received_ip: Option<String>,
+    pub helo: Option<String>,
+    pub detail: String,
+    pub checks: i32,
+    pub created_at: DateTime<Utc>,
+    pub checked_at: Option<DateTime<Utc>>,
+}
+
+/// The outcome of one lookup.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlacementResult {
+    pub status: String,
+    pub folder: Option<String>,
+    pub spf: Option<String>,
+    pub dkim: Option<String>,
+    pub dmarc: Option<String>,
+    pub received_ip: Option<String>,
+    pub helo: Option<String>,
+    pub detail: String,
+    /// When `status` is pending: when to look again.
+    pub check_again_at: Option<DateTime<Utc>>,
+}
+
+/// Which placement tests to list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementFilter {
+    pub ip: Option<String>,
+    pub provider: Option<String>,
+    pub limit: i64,
+}
+
+impl Default for PlacementFilter {
+    fn default() -> Self {
+        Self {
+            ip: None,
+            provider: None,
+            limit: 200,
+        }
+    }
+}
+
+impl PlacementFilter {
+    pub fn matches(&self, test: &PlacementTest) -> bool {
+        self.ip.as_deref().is_none_or(|ip| test.ip == ip)
+            && self.provider.as_deref().is_none_or(|p| test.provider == p)
+    }
+}
+
+/// How far back the placement signal looks.
+pub const PLACEMENT_SIGNAL_HOURS: i64 = 24;
+
 /// Storage for provider feedback. Implemented in lockstep by `MemoryStore`
 /// and the Postgres store.
 #[async_trait]
@@ -208,6 +324,68 @@ pub trait FeedbackStore: Send + Sync {
     /// Delete snapshots whose data is older than `days` days. Returns how
     /// many were deleted.
     async fn prune_feedback_snapshots(&self, days: u32) -> Result<u64, StoreError>;
+
+    // -- seed placement
+
+    /// Request a placement round. `None` when the last round was requested
+    /// less than `min_interval_seconds` ago (the rate limit).
+    async fn request_placement_round(
+        &self,
+        trigger: &str,
+        min_interval_seconds: i64,
+    ) -> Result<Option<PlacementRound>, StoreError>;
+
+    /// The newest round, started or not.
+    async fn last_placement_round(&self) -> Result<Option<PlacementRound>, StoreError>;
+
+    /// Take the oldest requested round that no worker started yet and mark
+    /// it started. Exactly one worker gets each round.
+    async fn start_placement_round(&self) -> Result<Option<PlacementRound>, StoreError>;
+
+    async fn create_placement_tests(
+        &self,
+        tests: &[NewPlacementTest],
+    ) -> Result<Vec<PlacementTest>, StoreError>;
+
+    /// Link a test to the message that carries it.
+    async fn set_placement_message(&self, id: i64, message_id: i64) -> Result<(), StoreError>;
+
+    /// The test with this header token, if any.
+    async fn placement_test_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<PlacementTest>, StoreError>;
+
+    /// Claim up to `limit` pending tests whose lookup is due, for
+    /// `lease_seconds`, so two workers never look up the same test.
+    async fn claim_due_placement_tests(
+        &self,
+        limit: i64,
+        lease_seconds: i64,
+    ) -> Result<Vec<PlacementTest>, StoreError>;
+
+    /// Record a lookup. Every test row stays as the placement history.
+    async fn record_placement_result(
+        &self,
+        id: i64,
+        result: &PlacementResult,
+    ) -> Result<(), StoreError>;
+
+    /// The newest tests matching `filter`, newest first: the placement
+    /// history.
+    async fn list_placement_tests(
+        &self,
+        filter: &PlacementFilter,
+    ) -> Result<Vec<PlacementTest>, StoreError>;
+
+    /// Final placement results (inbox, spam, missing) checked since `since`,
+    /// optionally for one IP and provider group.
+    async fn placement_results_since(
+        &self,
+        since: DateTime<Utc>,
+        ip: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<Vec<PlacementTest>, StoreError>;
 
     // -- complaint handling per mail server
 
@@ -294,6 +472,10 @@ type Lease = Option<(String, DateTime<Utc>)>;
 pub struct MemoryFeedback {
     snapshots: Vec<FeedbackSnapshot>,
     statuses: Vec<(FeedbackSourceStatus, Lease)>,
+    rounds: Vec<PlacementRound>,
+    /// Tests with their next lookup time and claim.
+    tests: Vec<(PlacementTest, DateTime<Utc>, Option<DateTime<Utc>>)>,
+    next_id: i64,
     server_settings: std::collections::HashMap<crate::model::Id, bool>,
     /// (server, message, received at)
     reports: Vec<(crate::model::Id, i64, DateTime<Utc>)>,
@@ -356,6 +538,11 @@ impl FeedbackStore for MemoryStore {
         &self,
         source: &str,
     ) -> Result<Vec<FeedbackSnapshot>, StoreError> {
+        if source == source::PLACEMENT {
+            let since = Utc::now() - chrono::Duration::hours(PLACEMENT_SIGNAL_HOURS);
+            let tests = self.placement_results_since(since, None, None).await?;
+            return Ok(newest_per_subject(placement_summary(&tests)));
+        }
         let inner = self.inner.read().unwrap();
         let rows = inner
             .feedback
@@ -478,14 +665,19 @@ impl FeedbackStore for MemoryStore {
         ip: &str,
         provider: &str,
     ) -> Result<Vec<ProviderSignal>, StoreError> {
+        let since = Utc::now() - chrono::Duration::hours(PLACEMENT_SIGNAL_HOURS);
+        let tests = self
+            .placement_results_since(since, Some(ip), Some(provider))
+            .await?;
         let inner = self.inner.read().unwrap();
-        let rows = inner
+        let mut rows: Vec<FeedbackSnapshot> = inner
             .feedback
             .snapshots
             .iter()
-            .filter(|s| applies_to(s, ip, provider))
+            .filter(|s| s.source != source::PLACEMENT && applies_to(s, ip, provider))
             .cloned()
             .collect();
+        rows.extend(placement_summary(&tests));
         Ok(newest_per_subject(rows)
             .into_iter()
             .map(ProviderSignal::from)
@@ -495,9 +687,204 @@ impl FeedbackStore for MemoryStore {
     async fn prune_feedback_snapshots(&self, days: u32) -> Result<u64, StoreError> {
         let mut inner = self.inner.write().unwrap();
         let cutoff = Utc::now().date_naive() - chrono::Duration::days(i64::from(days));
-        let before = inner.feedback.snapshots.len();
+        let before = inner.feedback.snapshots.len() + inner.feedback.tests.len();
         inner.feedback.snapshots.retain(|s| s.data_date >= cutoff);
-        Ok((before - inner.feedback.snapshots.len()) as u64)
+        inner
+            .feedback
+            .tests
+            .retain(|(t, _, _)| t.created_at.date_naive() >= cutoff);
+        Ok((before - inner.feedback.snapshots.len() - inner.feedback.tests.len()) as u64)
+    }
+
+    async fn request_placement_round(
+        &self,
+        trigger: &str,
+        min_interval_seconds: i64,
+    ) -> Result<Option<PlacementRound>, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let now = Utc::now();
+        let feedback = &mut inner.feedback;
+        if feedback.rounds.last().is_some_and(|last| {
+            now - last.requested_at < chrono::Duration::seconds(min_interval_seconds)
+        }) {
+            return Ok(None);
+        }
+        feedback.next_id += 1;
+        let round = PlacementRound {
+            id: feedback.next_id,
+            trigger: trigger.to_string(),
+            requested_at: now,
+            started_at: None,
+        };
+        feedback.rounds.push(round.clone());
+        Ok(Some(round))
+    }
+
+    async fn last_placement_round(&self) -> Result<Option<PlacementRound>, StoreError> {
+        Ok(self.inner.read().unwrap().feedback.rounds.last().cloned())
+    }
+
+    async fn start_placement_round(&self) -> Result<Option<PlacementRound>, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let round = inner
+            .feedback
+            .rounds
+            .iter_mut()
+            .find(|r| r.started_at.is_none());
+        Ok(round.map(|round| {
+            round.started_at = Some(Utc::now());
+            round.clone()
+        }))
+    }
+
+    async fn create_placement_tests(
+        &self,
+        tests: &[NewPlacementTest],
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let feedback = &mut inner.feedback;
+        let mut created = Vec::new();
+        for new in tests {
+            feedback.next_id += 1;
+            let test = PlacementTest {
+                id: feedback.next_id,
+                round_id: new.round_id,
+                token: new.token.clone(),
+                server_id: new.server_id,
+                message_id: None,
+                ip_pool_id: new.ip_pool_id,
+                ip_address_id: new.ip_address_id,
+                ip: new.ip.clone(),
+                seed_address: new.seed_address.clone(),
+                seed_provider: new.seed_provider.clone(),
+                provider: new.provider.clone(),
+                status: placement_status::PENDING.into(),
+                folder: None,
+                spf: None,
+                dkim: None,
+                dmarc: None,
+                received_ip: None,
+                helo: None,
+                detail: String::new(),
+                checks: 0,
+                created_at: Utc::now(),
+                checked_at: None,
+            };
+            feedback.tests.push((test.clone(), new.check_at, None));
+            created.push(test);
+        }
+        Ok(created)
+    }
+
+    async fn set_placement_message(&self, id: i64, message_id: i64) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some((test, _, _)) = inner.feedback.tests.iter_mut().find(|(t, _, _)| t.id == id) {
+            test.message_id = Some(message_id);
+        }
+        Ok(())
+    }
+
+    async fn placement_test_by_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<PlacementTest>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        Ok(inner
+            .feedback
+            .tests
+            .iter()
+            .find(|(t, _, _)| t.token == token)
+            .map(|(t, _, _)| t.clone()))
+    }
+
+    async fn claim_due_placement_tests(
+        &self,
+        limit: i64,
+        lease_seconds: i64,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let now = Utc::now();
+        let mut claimed = Vec::new();
+        for (test, check_at, lease) in inner.feedback.tests.iter_mut() {
+            if claimed.len() as i64 >= limit {
+                break;
+            }
+            if test.status == placement_status::PENDING
+                && *check_at <= now
+                && lease.is_none_or(|until| until < now)
+            {
+                *lease = Some(now + chrono::Duration::seconds(lease_seconds));
+                claimed.push(test.clone());
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn record_placement_result(
+        &self,
+        id: i64,
+        result: &PlacementResult,
+    ) -> Result<(), StoreError> {
+        {
+            let mut inner = self.inner.write().unwrap();
+            let Some((test, check_at, lease)) =
+                inner.feedback.tests.iter_mut().find(|(t, _, _)| t.id == id)
+            else {
+                return Ok(());
+            };
+            test.status = result.status.clone();
+            test.folder = result.folder.clone();
+            test.spf = result.spf.clone();
+            test.dkim = result.dkim.clone();
+            test.dmarc = result.dmarc.clone();
+            test.received_ip = result.received_ip.clone();
+            test.helo = result.helo.clone();
+            test.detail = result.detail.clone();
+            test.checks += 1;
+            test.checked_at = Some(Utc::now());
+            *lease = None;
+            if let Some(at) = result.check_again_at {
+                *check_at = at;
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_placement_tests(
+        &self,
+        filter: &PlacementFilter,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let mut tests: Vec<PlacementTest> = inner
+            .feedback
+            .tests
+            .iter()
+            .map(|(t, _, _)| t.clone())
+            .filter(|t| filter.matches(t))
+            .collect();
+        tests.sort_by_key(|t| std::cmp::Reverse(t.id));
+        tests.truncate(filter.limit.max(0) as usize);
+        Ok(tests)
+    }
+
+    async fn placement_results_since(
+        &self,
+        since: DateTime<Utc>,
+        ip: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        Ok(inner
+            .feedback
+            .tests
+            .iter()
+            .map(|(t, _, _)| t)
+            .filter(|t| placement_verdict(&t.status).is_some())
+            .filter(|t| t.checked_at.is_some_and(|at| at >= since))
+            .filter(|t| ip.is_none_or(|ip| t.ip == ip))
+            .filter(|t| provider.is_none_or(|p| t.provider == p))
+            .cloned()
+            .collect())
     }
 
     async fn server_complaint_suppression(
@@ -546,6 +933,73 @@ impl FeedbackStore for MemoryStore {
         }
         Ok(())
     }
+}
+
+/// The verdict of a final placement result: inbox is ok; spam and missing
+/// (filtered before the mailbox, or rejected) are bad. `None` while pending
+/// or after an error.
+pub fn placement_verdict(status: &str) -> Option<Verdict> {
+    match status {
+        placement_status::INBOX => Some(Verdict::Ok),
+        placement_status::SPAM | placement_status::MISSING => Some(Verdict::Bad),
+        _ => None,
+    }
+}
+
+/// One `placement` signal per (provider group, IP) from final results: the
+/// WORST result counts, so a single test in the spam folder brakes that
+/// provider even when another seed of the group saw the inbox.
+pub fn placement_summary(tests: &[PlacementTest]) -> Vec<FeedbackSnapshot> {
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<&PlacementTest>> =
+        Default::default();
+    for test in tests {
+        if placement_verdict(&test.status).is_some() {
+            groups
+                .entry((test.provider.clone(), test.ip.clone()))
+                .or_default()
+                .push(test);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|((provider, ip), tests)| {
+            let count = |status: &str| tests.iter().filter(|t| t.status == status).count();
+            let (inbox, spam, missing) = (
+                count(placement_status::INBOX),
+                count(placement_status::SPAM),
+                count(placement_status::MISSING),
+            );
+            let verdict = tests
+                .iter()
+                .filter_map(|t| placement_verdict(&t.status))
+                .max()
+                .unwrap_or(Verdict::Unknown);
+            let newest = tests
+                .iter()
+                .filter_map(|t| t.checked_at)
+                .max()
+                .unwrap_or_else(Utc::now);
+            let worst_seed = tests
+                .iter()
+                .filter(|t| placement_verdict(&t.status) == Some(verdict))
+                .max_by_key(|t| t.checked_at)
+                .map(|t| format!(", worst at {} ({})", t.seed_address, t.status))
+                .unwrap_or_default();
+            FeedbackSnapshot {
+                source: source::PLACEMENT.into(),
+                provider,
+                subject_kind: subject_kind::IP.into(),
+                subject: ip,
+                data_date: newest.date_naive(),
+                verdict,
+                detail: format!(
+                    "last {PLACEMENT_SIGNAL_HOURS} h: {inbox} inbox, {spam} spam, {missing} missing{worst_seed}"
+                ),
+                metrics: serde_json::json!({ "inbox": inbox, "spam": spam, "missing": missing }),
+                fetched_at: newest,
+            }
+        })
+        .collect()
 }
 
 /// The detail line of a feedback-loop count.
@@ -695,6 +1149,190 @@ mod tests {
             .unwrap();
         assert_eq!(google.len(), 1);
         assert_eq!(google[0].verdict, Verdict::Bad);
+    }
+
+    #[tokio::test]
+    async fn placement_rounds_are_rate_limited_started_once_and_results_become_signals() {
+        let store = MemoryStore::new();
+        let round = store
+            .request_placement_round("manual", 3600)
+            .await
+            .unwrap()
+            .expect("first round");
+        assert!(store
+            .request_placement_round("manual", 3600)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.start_placement_round().await.unwrap().unwrap().id,
+            round.id
+        );
+        assert!(store.start_placement_round().await.unwrap().is_none());
+
+        let new = |token: &str, provider: &str| NewPlacementTest {
+            round_id: round.id,
+            token: token.into(),
+            server_id: 1,
+            ip_pool_id: 1,
+            ip_address_id: 2,
+            ip: "192.0.2.1".into(),
+            seed_address: format!("seed@{provider}.example"),
+            seed_provider: "imap".into(),
+            provider: provider.into(),
+            check_at: Utc::now() - chrono::Duration::seconds(1),
+        };
+        let tests = store
+            .create_placement_tests(&[new("t1", "google"), new("t2", "microsoft")])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .placement_test_by_token("t2")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            tests[1].id
+        );
+        let due = store.claim_due_placement_tests(10, 300).await.unwrap();
+        assert_eq!(due.len(), 2);
+        assert!(store
+            .claim_due_placement_tests(10, 300)
+            .await
+            .unwrap()
+            .is_empty());
+
+        store
+            .record_placement_result(
+                tests[0].id,
+                &PlacementResult {
+                    status: placement_status::SPAM.into(),
+                    folder: Some("[Gmail]/Spam".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_placement_result(
+                tests[1].id,
+                &PlacementResult {
+                    status: placement_status::PENDING.into(),
+                    detail: "not found yet".into(),
+                    check_again_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let listed = store
+            .list_placement_tests(&PlacementFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed[0].checks, 1);
+        assert_eq!(listed[1].status, "spam");
+        // the pending one is due again; the spam one is final
+        let due = store.claim_due_placement_tests(10, 300).await.unwrap();
+        assert_eq!(
+            due.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![tests[1].id]
+        );
+
+        let google = store
+            .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+            .await
+            .unwrap();
+        assert_eq!(google.len(), 1);
+        assert_eq!(google[0].source, "placement");
+        assert_eq!(google[0].verdict, Verdict::Bad);
+
+        // A later inbox result of the same provider does not hide the spam
+        // result of the last 24 hours, and the history keeps both.
+        let more = store
+            .create_placement_tests(&[new("t3", "google")])
+            .await
+            .unwrap();
+        store
+            .record_placement_result(
+                more[0].id,
+                &PlacementResult {
+                    status: placement_status::INBOX.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let google = store
+            .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+            .await
+            .unwrap();
+        assert_eq!(google[0].verdict, Verdict::Bad);
+        let history = store
+            .list_placement_tests(&PlacementFilter {
+                provider: Some("google".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(store
+            .latest_provider_signals("192.0.2.1", provider::MICROSOFT)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn the_worst_placement_result_wins_per_provider_and_ip() {
+        let test = |id: i64, provider: &str, ip: &str, status: &str| PlacementTest {
+            id,
+            round_id: 1,
+            token: format!("t{id}"),
+            server_id: 1,
+            message_id: None,
+            ip_pool_id: 1,
+            ip_address_id: 1,
+            ip: ip.into(),
+            seed_address: format!("seed{id}@x.example"),
+            seed_provider: "imap".into(),
+            provider: provider.into(),
+            status: status.into(),
+            folder: None,
+            spf: None,
+            dkim: None,
+            dmarc: None,
+            received_ip: None,
+            helo: None,
+            detail: String::new(),
+            checks: 1,
+            created_at: Utc::now(),
+            checked_at: Some(Utc::now()),
+        };
+        let summary = placement_summary(&[
+            test(1, "google", "192.0.2.1", "inbox"),
+            test(2, "google", "192.0.2.1", "spam"),
+            test(3, "microsoft", "192.0.2.1", "inbox"),
+            test(4, "united_internet", "192.0.2.1", "missing"),
+            test(5, "yahoo", "192.0.2.1", "pending"),
+        ]);
+        let verdicts: Vec<(&str, Verdict)> = summary
+            .iter()
+            .map(|s| (s.provider.as_str(), s.verdict))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                ("google", Verdict::Bad),
+                ("microsoft", Verdict::Ok),
+                ("united_internet", Verdict::Bad)
+            ]
+        );
+        assert!(summary[0].detail.contains("1 inbox, 1 spam, 0 missing"));
+        assert!(summary[0].detail.contains("seed2@x.example (spam)"));
     }
 
     #[tokio::test]
