@@ -3516,7 +3516,12 @@ async fn arf_reports_without_an_engine_unsubscribe_token_still_fire_message_comp
         .insert_message(&outgoing_message(s.server.id, "r@dest.example"))
         .await
         .unwrap();
-    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    // With per-server suppression switched off the sender keeps opt-out for
+    // its own List-Unsubscribe (the default suppresses; see
+    // feedback_loop_reports_are_counted_per_provider_and_suppress_as_the_server_chooses).
+    let mut config = worker_config(smtp.port);
+    config.deliverability_feedback.fbl.suppress_complainants = false;
+    let worker = Worker::new(&config, s.store.clone());
     assert!(matches!(
         worker.process_next().await.unwrap().unwrap(),
         ProcessOutcome::Delivered { .. }
@@ -3567,8 +3572,8 @@ async fn arf_reports_without_an_engine_unsubscribe_token_still_fire_message_comp
         assert_eq!(hook["payload"]["user_agent"], "ISP-FBL/1.0");
     }
 
-    // The sender owns opt-out for its own List-Unsubscribe: no suppression,
-    // and the original keeps its delivery status.
+    // Suppression off: no suppression, and the original keeps its delivery
+    // status.
     assert!(
         !ServerStore::address_suppressed(&s.store, s.server.id, "r@dest.example", None)
             .await
@@ -3589,7 +3594,7 @@ async fn arf_reports_without_an_engine_unsubscribe_token_still_fire_message_comp
 /// transactional message is suppressed for that message's stream. Off by
 /// default: transactional mail to the complainant keeps flowing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn feedback_loop_reports_are_counted_per_provider_and_suppress_only_when_asked() {
+async fn feedback_loop_reports_are_counted_per_provider_and_suppress_as_the_server_chooses() {
     use camelmailer_core::feedback::{provider, source};
     use camelmailer_core::{FeedbackStore, ServerStore};
 
@@ -3597,9 +3602,19 @@ async fn feedback_loop_reports_are_counted_per_provider_and_suppress_only_when_a
     let pool = test_pool(&base).await;
     let s = setup(pool).await;
     let smtp = mock_smtp("250 Accepted").await;
-    for (suppress, rcpt) in [(false, "keep@dest.example"), (true, "stop@dest.example")] {
+    // (installation default, the server's own choice, suppressed?)
+    for (default, choice, suppress, rcpt) in [
+        (true, None, true, "default@dest.example"),
+        (true, Some(false), false, "keep@dest.example"),
+        (false, Some(true), true, "stop@dest.example"),
+        (false, None, false, "off@dest.example"),
+    ] {
         let mut config = worker_config(smtp.port);
-        config.deliverability_feedback.fbl.suppress_complainants = suppress;
+        config.deliverability_feedback.fbl.suppress_complainants = default;
+        s.store
+            .set_server_complaint_suppression(s.server.id, choice)
+            .await
+            .unwrap();
         let worker = Worker::new(&config, s.store.clone());
         let original_id = s
             .sink
@@ -3645,8 +3660,43 @@ async fn feedback_loop_reports_are_counted_per_provider_and_suppress_only_when_a
         .unwrap();
     assert_eq!(counts.len(), 1);
     assert_eq!(counts[0].provider, provider::MICROSOFT);
-    assert_eq!(counts[0].metrics["complaints"], 2);
-    assert_eq!(counts[0].detail, "2 complaints reported");
+    assert_eq!(counts[0].metrics["complaints"], 4);
+    assert_eq!(counts[0].detail, "4 complaints reported");
+
+    // The raw reports carry recipient data: retention empties them and
+    // keeps the counts.
+    let pool = s.store.pool().clone();
+    let reports: i64 = sqlx::query_scalar("SELECT count(*) FROM feedback_reports")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reports, 4);
+    assert_eq!(
+        s.store
+            .purge_feedback_reports(chrono::Utc::now() - chrono::Duration::days(1), 100)
+            .await
+            .unwrap(),
+        0,
+        "nothing older than the cutoff yet"
+    );
+    assert_eq!(
+        s.store
+            .purge_feedback_reports(chrono::Utc::now() + chrono::Duration::seconds(1), 3)
+            .await
+            .unwrap(),
+        4
+    );
+    let reports: i64 = sqlx::query_scalar("SELECT count(*) FROM feedback_reports")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reports, 0);
+    let counts = s
+        .store
+        .latest_feedback_snapshots(source::FBL)
+        .await
+        .unwrap();
+    assert_eq!(counts[0].metrics["complaints"], 4);
 }
 
 // ------------------------------------------------ lifecycle webhooks

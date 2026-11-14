@@ -149,16 +149,28 @@ receives it, so use the server whose mail the reports are about.
 ### Suppressing complainants
 
 A complaint about broadcast mail always suppresses the recipient for that
-stream. For transactional mail Camelmailer records the complaint, fires
-`MessageComplained` and leaves the decision to the sender, because a password
-reset or an invoice is often still wanted. To suppress transactional
-complainants as well (for the stream of the complained-about message):
+stream. A complaint about transactional mail suppresses the recipient for
+the stream of the complained-about message too, by default: someone who
+marks your mail as spam should not receive more of it, and providers judge a
+sender by whether it keeps mailing complainers.
+
+Each mail server can choose otherwise under **Settings → Spam complaints**
+(or `PATCH …/servers/{server}/complaint_settings` with
+`{"suppress_complainants": false}`), for example a server that only sends
+password resets and invoices, which recipients still need. Then the complaint
+is recorded and `MessageComplained` fires, and the sender decides. The
+installation default is:
 
 ```yaml
 deliverability_feedback:
   fbl:
-    suppress_complainants: true
+    suppress_complainants: true      # the default; a server's own choice wins
 ```
+
+Complaint suppressions appear on the server's **Suppressions** page with the
+type `complaint` and the reason "Spam complaint (feedback loop)". Filter by
+type to see them; **Reactivate** removes one, after which the server mails
+the address again.
 
 ## Privacy of complaint reports
 
@@ -166,14 +178,17 @@ An ARF report contains the complaining recipient's address and usually the
 headers or the full text of the original message. Camelmailer handles it as
 follows:
 
-- The report is stored as an inbound message of the server that received it,
-  so it falls under that server's retention settings
-  ([Retention](retention.md)): `retention.message_content_days` removes its
-  raw content, `retention.message_metadata_days` the message row.
+- The report is stored as an inbound message of the server that received it.
+  Its raw content (the address and the quoted original) is removed after
+  `retention.feedback_report_days` (30 by default; `0` keeps it as long as
+  other message content), or earlier when `retention.message_content_days`
+  is shorter. `retention.message_metadata_days` removes the message row
+  ([Retention](retention.md)).
 - The complaint itself becomes a `MessageComplained` webhook to the sender
-  and, for broadcast mail (or with `suppress_complainants`), a suppression.
-  Suppressions keep the address so that it is never mailed again on that
-  stream; deleting a suppression removes it.
+  and a suppression (always for broadcast mail; for transactional mail unless
+  the server switched it off). A suppression keeps the address, which is its
+  purpose: the address is never mailed again on that stream. Removing the
+  suppression in the dashboard removes the address.
 - The provider counts on the Provider feedback page hold numbers only, never
   an address.
 - Microsoft and Yahoo may redact the recipient in their reports. Camelmailer

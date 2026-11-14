@@ -456,6 +456,14 @@ export type SourceAddressCheck = {
   checked_by: string
   checked_at: string
 }
+/** Whether a feedback-loop complaint about a server's transactional mail
+ *  suppresses the recipient. `suppress_complainants` null follows the
+ *  installation default. */
+export type ComplaintSettings = {
+  suppress_complainants: boolean | null
+  installation_default: boolean
+  effective: boolean
+}
 export type FeedbackVerdict = "unknown" | "ok" | "warn" | "bad"
 export type FeedbackSnapshot = {
   source: string
@@ -1077,6 +1085,15 @@ export const adminApi = {
     unsuspend: (server: string) =>
       api.post<{ server: Server }>(
         `/api/v2/admin/organizations/${org}/servers/${server}/unsuspend`,
+      ),
+    complaintSettings: (server: string) =>
+      api.get<{ complaint_settings: ComplaintSettings }>(
+        `/api/v2/admin/organizations/${org}/servers/${server}/complaint_settings`,
+      ),
+    updateComplaintSettings: (server: string, suppress_complainants: boolean | null) =>
+      api.patch<{ complaint_settings: ComplaintSettings }>(
+        `/api/v2/admin/organizations/${org}/servers/${server}/complaint_settings`,
+        { suppress_complainants },
       ),
     setIpPool: (server: string, ip_pool_id: number | null) =>
       api.post<{ server: Server }>(

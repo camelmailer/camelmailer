@@ -30,6 +30,8 @@ pub struct RetentionReport {
     pub auth_events_deleted: u64,
     pub api_requests_deleted: u64,
     pub expired_tokens_deleted: u64,
+    /// Raw ARF feedback reports emptied (`retention.feedback_report_days`).
+    pub feedback_reports_purged: u64,
 }
 
 impl RetentionReport {
@@ -95,6 +97,61 @@ impl PgStore {
             tx.commit().await?;
             total += purged;
             if (purged as i64) < batch {
+                return Ok(total);
+            }
+        }
+    }
+
+    /// Empty the raw content of ARF feedback reports received before
+    /// `cutoff`, in batches per server, and forget them. A report holds the
+    /// complaining recipient's address and usually the original message;
+    /// the complaint itself, its suppression and the provider counts stay.
+    pub async fn purge_feedback_reports(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let mut total = 0;
+        loop {
+            let rows = sqlx::query(
+                "SELECT server_id, message_id FROM feedback_reports
+                 WHERE received_at < $1 ORDER BY received_at LIMIT $2",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .fetch_all(self.pool())
+            .await?;
+            if rows.is_empty() {
+                return Ok(total);
+            }
+            let mut by_server: std::collections::BTreeMap<i64, Vec<i64>> = Default::default();
+            for row in &rows {
+                by_server
+                    .entry(row.get("server_id"))
+                    .or_default()
+                    .push(row.get("message_id"));
+            }
+            for (server_id, ids) in by_server {
+                let mut tx = self.pool().begin().await?;
+                set_tenant_context(&mut tx, server_id as Id).await?;
+                total += sqlx::query(
+                    "UPDATE messages SET raw_message = ''::bytea, content_purged_at = now()
+                     WHERE id = ANY($1) AND content_purged_at IS NULL",
+                )
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                sqlx::query(
+                    "DELETE FROM feedback_reports WHERE server_id = $1 AND message_id = ANY($2)",
+                )
+                .bind(server_id)
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+            }
+            if (rows.len() as i64) < batch {
                 return Ok(total);
             }
         }

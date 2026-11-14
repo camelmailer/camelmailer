@@ -5,9 +5,13 @@
 //! installation. The data is fetched by the worker
 //! (`camelmailer_worker::feedback`); this endpoint only reads it.
 
-use crate::app::{render_store_error, render_success, ApiResponse, ApiState, RequestStart};
-use axum::extract::State;
+use crate::app::{
+    find_server, render_not_found, render_store_error, render_success, render_validation_error,
+    ApiResponse, ApiState, RequestStart,
+};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::Json;
 use camelmailer_core::feedback::source;
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -64,4 +68,89 @@ pub(crate) async fn feedback_index(
         }));
     }
     render_success(Some(&start), StatusCode::OK, json!({ "sources": sources }))
+}
+
+/// The complaint setting of one server as the API shows it.
+fn complaint_settings_json(own: Option<bool>, default: bool) -> Value {
+    json!({
+        "suppress_complainants": own,
+        "installation_default": default,
+        "effective": own.unwrap_or(default),
+    })
+}
+
+/// `GET /api/v2/admin/organizations/{org}/servers/{server}/complaint_settings`:
+/// whether a feedback-loop complaint about this server's transactional mail
+/// suppresses the recipient. `suppress_complainants` is the server's own
+/// choice (`null` follows the installation default).
+pub(crate) async fn complaint_settings_show(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server)): Path<(String, String)>,
+) -> ApiResponse {
+    let server = match find_server(&state, &org, &server).await {
+        Ok(Some(server)) => server,
+        Ok(None) => return render_not_found(Some(&start)),
+        Err(error) => return render_store_error(Some(&start), error),
+    };
+    let default = state
+        .config
+        .deliverability_feedback
+        .fbl
+        .suppress_complainants;
+    let own = match state.feedback_store.as_ref() {
+        Some(store) => match store.server_complaint_suppression(server.id).await {
+            Ok(own) => own,
+            Err(error) => return render_store_error(Some(&start), error),
+        },
+        None => None,
+    };
+    render_success(
+        Some(&start),
+        StatusCode::OK,
+        json!({ "complaint_settings": complaint_settings_json(own, default) }),
+    )
+}
+
+/// `PATCH …/complaint_settings` with `{"suppress_complainants": true | false | null}`.
+pub(crate) async fn complaint_settings_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path((org, server)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> ApiResponse {
+    let own = match body.get("suppress_complainants") {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::Null) => None,
+        _ => {
+            return render_validation_error(
+                Some(&start),
+                "suppress_complainants must be true, false or null",
+            )
+        }
+    };
+    let server = match find_server(&state, &org, &server).await {
+        Ok(Some(server)) => server,
+        Ok(None) => return render_not_found(Some(&start)),
+        Err(error) => return render_store_error(Some(&start), error),
+    };
+    let Some(store) = state.feedback_store.as_ref() else {
+        return render_validation_error(
+            Some(&start),
+            "This installation keeps no complaint settings",
+        );
+    };
+    if let Err(error) = store.set_server_complaint_suppression(server.id, own).await {
+        return render_store_error(Some(&start), error);
+    }
+    let default = state
+        .config
+        .deliverability_feedback
+        .fbl
+        .suppress_complainants;
+    render_success(
+        Some(&start),
+        StatusCode::OK,
+        json!({ "complaint_settings": complaint_settings_json(own, default) }),
+    )
 }
