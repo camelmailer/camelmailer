@@ -101,6 +101,7 @@ smtp_server:
   tls_certificate_path: $config-file-root/smtp.cert
   tls_private_key_path: $config-file-root/smtp.key
   proxy_protocol: false       # enable behind HAProxy/NLB
+  shutdown_grace_seconds: 30  # default; env SMTP_SERVER_SHUTDOWN_GRACE_SECONDS
   listeners:                  # additional ports (default: none)
     - { port: 587, mode: smtp }
     - { port: 465, mode: smtps }
@@ -178,6 +179,32 @@ disabled.
 
 The server logs a warning at startup for as long as the window is open, so an
 installation cannot forget it is in this state.
+
+#### Graceful shutdown of the web and SMTP servers
+
+On SIGTERM or SIGINT both servers stop accepting connections and finish
+what is in flight before they stop, then mark their entry in the cluster
+topology stopped (see `cluster:` below):
+
+| | Grace period | What happens |
+|---|---|---|
+| SMTP | `smtp_server.shutdown_grace_seconds` (30; env `SMTP_SERVER_SHUTDOWN_GRACE_SECONDS`) | New connections are refused. A session in the middle of a transaction (from `MAIL FROM` to the end of `DATA`) finishes it; once its message is accepted or refused it gets `421 4.3.2 <smtp_hostname> Service shutting down, closing transmission channel` and is closed. When the grace period is over, every session still open gets the same `421` at once and is closed. |
+| Web | `web_server.shutdown_grace_seconds` (30; env `WEB_SERVER_SHUTDOWN_GRACE_SECONDS`) | New connections are refused, idle keep-alive connections are closed, requests in flight finish. When the grace period is over the server stops. |
+
+No accepted message is lost: the SMTP server queues a message before it
+answers `250`, so a message cut off by the grace period was never
+acknowledged and the client sends it again (to another node behind the load
+balancer, or later). The server stops as soon as nothing is left open, so
+the grace period is an upper bound, not a wait.
+
+The process manager's stop timeout must stay above the grace period, or the
+process is killed before it finishes. The compose file runs both servers
+with `init: true` and `stop_grace_period: 40s`; for systemd the default
+`TimeoutStopSec` of 90 seconds is enough. Docker without a
+`stop_grace_period` kills after 10 seconds: lower the grace periods or set
+one. Behind a load balancer, take the node out of the pool (or let its
+health check fail) before stopping it, so no new connections are routed to
+it while it drains.
 
 ### `dns:` — the records you publish
 
@@ -551,10 +578,9 @@ refreshes its entry every `heartbeat_interval_seconds`. The infrastructure
 dashboard and `GET /api/v2/admin/cluster` show the result: each process with
 its node name, role, version and last heartbeat, and for a worker the queue
 rows it holds (its lock id is its registration id). An entry not refreshed
-for `node_stale_seconds` shows as stale; a worker that shuts down
-gracefully marks its entry stopped. The web and SMTP servers have no
-graceful shutdown of their own, so their entries go stale when the process
-ends. Entries not seen for seven days are removed. A failed registration is
+for `node_stale_seconds` shows as stale; a process that shuts down
+gracefully (SIGTERM or SIGINT) marks its entry stopped, so only a process
+that was killed or crashed goes stale. Entries not seen for seven days are removed. A failed registration is
 logged and retried on the next heartbeat; it never stops a process.
 
 ```yaml
