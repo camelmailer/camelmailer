@@ -16,6 +16,6 @@ pub use sender::SmtpSender;
 pub use signer::Signer;
 pub use smtp_client::SendOutcome;
 pub use worker::{
-    shutdown_signal, LoopFailed, ProcessOutcome, Released, WebhookOutcome, Worker,
-    HEARTBEAT_INTERVAL,
+    choose_source_address, shutdown_signal, LoopFailed, ProcessOutcome, Released, WebhookOutcome,
+    Worker, HEARTBEAT_INTERVAL,
 };

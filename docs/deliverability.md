@@ -66,6 +66,56 @@ IP. When no pool resolves to an address, `source_ip` is `None` and the
 worker sends from the host's default outbound address (the operating
 system picks the source IP as it would for any outbound connection).
 
+### Several worker hosts sharing a pool
+
+With `worker.host_aware_pools: true` each worker only uses the pool
+addresses its own host holds, so workers on several hosts can share one pool
+and all send at the same time, each from its own IP.
+
+```yaml
+worker:
+  host_aware_pools: true
+  source_addresses: []            # empty: the addresses on this host's interfaces
+  foreign_pool_delay_seconds: 30
+```
+
+- **Which addresses are local.** Without a list the worker reads the
+  addresses configured on the host's network interfaces and rereads them
+  every 30 seconds, so an address that moves to this host (a floating IP
+  taken over by keepalived after a failure) is picked up without a restart.
+  It does not probe by binding, which `net.ipv4.ip_nonlocal_bind=1` or
+  `IP_FREEBIND` would make succeed for every address. The worker needs to see
+  the host's interfaces (host networking in Docker). List the addresses in
+  `source_addresses` (or `WORKER_SOURCE_ADDRESSES`) on a host where an
+  address is configured on the interface but routed somewhere else.
+- **Which one is used.** Among the local addresses, the lowest `priority`
+  number wins. Ties go by a stable hash of the recipient domain, so one
+  receiving domain keeps seeing the same IP from a host, which helps
+  reputation and greylisting.
+- **A pool with no address here.** Outgoing mail records its pool when it is
+  queued, and the worker does not dequeue mail of pools its host holds no
+  address of. Mail queued before that is handed back without counting an
+  attempt, with its pool recorded, and looked at again after
+  `foreign_pool_delay_seconds` (env `WORKER_FOREIGN_POOL_DELAY_SECONDS`, at
+  least 1). The worker logs each such pool once, and again if the host held
+  one of its addresses in between.
+- **A pool that changed.** When a pool is deleted, or a server or stream moves
+  to another pool, the pool recorded for its queued mail is stale. Every
+  worker takes such mail, resolves the current pool, and sends or hands it
+  back with the current pool recorded. One case stays on the old pool: the
+  server moved but one of its streams still uses the old pool; that mail goes
+  to a host holding the old pool, which hands it on.
+- **The pool cannot be read** (a database error). The message goes back
+  without an attempt and is retried after `foreign_pool_delay_seconds`
+  rather than staying locked.
+- **No pool at all.** The host's default address, as before. On several hosts
+  that means several different source addresses, each of which needs SPF and
+  reverse DNS; put every server on a pool before running more than one host.
+
+Without the option every worker uses the pool's first address, exactly as
+described above. Mail whose pool no running host holds an address of waits
+in the queue without counting attempts, so watch the queue age.
+
 ## Why isolation matters
 
 Mailbox providers score reputation per sending IP. A marketing blast that

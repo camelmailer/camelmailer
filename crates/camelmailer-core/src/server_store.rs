@@ -10,7 +10,9 @@
 use crate::admin_store::{AdminStore, NewSuppression, StoreError};
 use crate::dmarc::{DmarcFilter, DmarcRecordRow, DmarcReport, NewDmarcReport};
 use crate::message::{MessageRecord, QueuedMessage, SentMessage};
-use crate::model::{Campaign, Id, MessageStream, NewCampaign, Server, Subscription, Template};
+use crate::model::{
+    Campaign, Id, IpAddress, MessageStream, NewCampaign, Server, Subscription, Template,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -665,6 +667,17 @@ pub trait ServerStore: Send + Sync {
         stream_id: Option<Id>,
     ) -> Result<Option<String>, StoreError>;
 
+    /// Every address of the pool a message on `stream_id` sends from (the
+    /// stream's pool when it sets one, else the server's), lowest priority
+    /// number first, ties by id. Empty when neither has a pool. The same
+    /// resolution as [`ServerStore::source_ip_for`] without its `LIMIT 1`,
+    /// for workers that choose among the addresses their host holds.
+    async fn source_addresses_for(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+    ) -> Result<Vec<IpAddress>, StoreError>;
+
     // inbound message management (scope = incoming)
     /// Incoming messages matching `filter` (scope is always forced to
     /// incoming), newest first.
@@ -1179,6 +1192,30 @@ impl ServerStore for crate::store::MemoryStore {
             .filter(|a| a.ip_pool_id == pool_id)
             .min_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)))
             .map(|a| a.ipv4.clone()))
+    }
+
+    async fn source_addresses_for(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+    ) -> Result<Vec<IpAddress>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let pool_id = stream_id
+            .and_then(|id| inner.message_streams.get(&id))
+            .filter(|s| s.server_id == server_id)
+            .and_then(|s| s.ip_pool_id)
+            .or_else(|| inner.servers.get(&server_id).and_then(|s| s.ip_pool_id));
+        let Some(pool_id) = pool_id else {
+            return Ok(Vec::new());
+        };
+        let mut addresses: Vec<IpAddress> = inner
+            .ip_addresses
+            .values()
+            .filter(|a| a.ip_pool_id == pool_id)
+            .cloned()
+            .collect();
+        addresses.sort_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)));
+        Ok(addresses)
     }
 
     async fn inbound_messages(
@@ -2579,6 +2616,30 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        // All of a pool's addresses, lowest priority number first: the stream
+        // pool when set, else the server pool, else none.
+        let ips = |addresses: Vec<IpAddress>| -> Vec<String> {
+            addresses.into_iter().map(|a| a.ipv4).collect()
+        };
+        assert_eq!(
+            ips(ServerStore::source_addresses_for(&*store, server_id, None)
+                .await
+                .unwrap()),
+            vec!["10.0.0.1".to_string(), "10.0.0.9".to_string()]
+        );
+        assert_eq!(
+            ips(
+                ServerStore::source_addresses_for(&*store, server_id, Some(with_pool.id))
+                    .await
+                    .unwrap()
+            ),
+            vec!["10.0.0.2".to_string()]
+        );
+        assert!(ServerStore::source_addresses_for(&*store, 999_999, None)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

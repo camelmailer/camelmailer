@@ -22,10 +22,11 @@ use camelmailer_db::{
     PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, QueueFilter, StoredMessage,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Webhook deliveries are retried this many times before giving up
 /// (mirrors Postal's webhook retry schedule length).
@@ -33,6 +34,203 @@ const WEBHOOK_MAX_ATTEMPTS: i32 = 10;
 
 /// How often the worker loop runs housekeeping.
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How long a host-aware worker trusts its view of which pool addresses it
+/// holds, and of which pools have one.
+const LOCAL_ADDRESS_TTL: Duration = Duration::from_secs(30);
+
+/// FNV-1a over the lowercased recipient domain: a hash that stays the same
+/// across processes, hosts and releases, so one receiving domain keeps
+/// seeing the same address of a host.
+fn domain_hash(domain: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in domain.trim().to_ascii_lowercase().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// Pick the source among the pool addresses this host holds: the lowest
+/// priority number, ties spread by the recipient domain. `addresses` must be
+/// ordered by priority, then id (as the store returns them).
+pub fn choose_source_address<'a>(
+    addresses: &[&'a camelmailer_core::IpAddress],
+    recipient_domain: &str,
+) -> Option<&'a camelmailer_core::IpAddress> {
+    let best = addresses.iter().map(|a| a.priority).min()?;
+    let tied: Vec<&camelmailer_core::IpAddress> = addresses
+        .iter()
+        .copied()
+        .filter(|a| a.priority == best)
+        .collect();
+    let index = (domain_hash(recipient_domain) % tied.len() as u64) as usize;
+    Some(tied[index])
+}
+
+/// The IP addresses configured on this host's network interfaces.
+///
+/// Read from the interface list rather than by trying to bind each address:
+/// with `net.ipv4.ip_nonlocal_bind=1` (common with keepalived and floating
+/// IPs) or `IP_FREEBIND` every bind succeeds, so a bind probe would call every
+/// pool address local.
+#[cfg(unix)]
+fn interface_addresses() -> std::io::Result<HashSet<IpAddr>> {
+    let addresses = nix::ifaddrs::getifaddrs().map_err(std::io::Error::from)?;
+    Ok(addresses
+        .filter_map(|interface| interface.address)
+        .filter_map(|address| {
+            if let Some(v4) = address.as_sockaddr_in() {
+                Some(IpAddr::V4(v4.ip()))
+            } else {
+                address.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
+            }
+        })
+        .collect())
+}
+
+/// Without an interface list on this platform, nothing counts as local:
+/// list the addresses in `worker.source_addresses` instead.
+#[cfg(not(unix))]
+fn interface_addresses() -> std::io::Result<HashSet<IpAddr>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no interface list on this platform; set worker.source_addresses",
+    ))
+}
+
+/// Which pool addresses this host may send from (`worker.host_aware_pools`).
+struct SourceSelection {
+    /// `worker.source_addresses`; `None` takes the interface addresses.
+    explicit: Option<HashSet<IpAddr>>,
+    /// The interface addresses, with when they were read.
+    discovered: Mutex<Option<(Arc<HashSet<IpAddr>>, Instant)>>,
+    /// When the queue's pool filter was last refreshed.
+    pools_refreshed: Mutex<Option<Instant>>,
+    /// Pools reported as having no address here. Cleared for a pool once the
+    /// host holds one of its addresses again, so a later loss is logged too.
+    reported: Mutex<HashSet<camelmailer_core::Id>>,
+    foreign_pool_delay_seconds: i64,
+}
+
+impl SourceSelection {
+    fn new(settings: &camelmailer_config::Worker) -> Self {
+        let explicit = (!settings.source_addresses.is_empty()).then(|| {
+            settings
+                .source_addresses
+                .iter()
+                .filter_map(|address| address.parse().ok())
+                .collect()
+        });
+        Self {
+            explicit,
+            discovered: Mutex::default(),
+            pools_refreshed: Mutex::default(),
+            reported: Mutex::default(),
+            foreign_pool_delay_seconds: i64::from(settings.foreign_pool_delay_seconds.max(1)),
+        }
+    }
+
+    /// The interface addresses, re-read at most every 30 s. The lock is not
+    /// held while the list is read.
+    fn discovered(&self) -> Arc<HashSet<IpAddr>> {
+        if let Some((addresses, at)) = &*self.discovered.lock().expect("address lock") {
+            if at.elapsed() < LOCAL_ADDRESS_TTL {
+                return Arc::clone(addresses);
+            }
+        }
+        let addresses = Arc::new(interface_addresses().unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not read the interface addresses");
+            HashSet::new()
+        }));
+        *self.discovered.lock().expect("address lock") =
+            Some((Arc::clone(&addresses), Instant::now()));
+        addresses
+    }
+
+    /// A check for "this host can send from that address": listed in
+    /// `worker.source_addresses`, or (without a list) configured on one of
+    /// this host's interfaces. Take it once per batch of lookups.
+    fn local_check(&self) -> impl Fn(&str) -> bool + '_ {
+        let discovered = self.explicit.is_none().then(|| self.discovered());
+        move |address: &str| {
+            let Ok(ip) = address.trim().parse::<IpAddr>() else {
+                return false;
+            };
+            match (&self.explicit, &discovered) {
+                (Some(explicit), _) => explicit.contains(&ip),
+                (None, Some(discovered)) => discovered.contains(&ip),
+                (None, None) => false,
+            }
+        }
+    }
+
+    /// Log once per pool that this host holds none of its addresses.
+    fn report_foreign(&self, pool_id: camelmailer_core::Id) {
+        if self.reported.lock().expect("report lock").insert(pool_id) {
+            tracing::info!(
+                pool_id,
+                "this host holds no address of IP pool; leaving its mail to the hosts that do"
+            );
+        }
+    }
+
+    /// Forget the reports of pools this host holds an address of again.
+    fn clear_reports(&self, local_pools: &[i64]) {
+        self.reported
+            .lock()
+            .expect("report lock")
+            .retain(|pool| !local_pools.contains(&(*pool as i64)));
+    }
+}
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+
+    #[test]
+    fn the_loopback_address_is_an_interface_address() {
+        let addresses = interface_addresses().unwrap();
+        assert!(
+            addresses.contains(&IpAddr::from([127, 0, 0, 1])),
+            "{addresses:?}"
+        );
+    }
+
+    /// A bind probe calls an address local when the bind succeeds, which it
+    /// always does for the unspecified address (and, with
+    /// `ip_nonlocal_bind`, for every address). The interface list does not.
+    #[test]
+    fn a_bindable_address_that_is_on_no_interface_is_not_local() {
+        assert!(std::net::UdpSocket::bind("0.0.0.0:0").is_ok());
+        let selection = SourceSelection::new(&camelmailer_config::Worker::default());
+        let is_local = selection.local_check();
+        assert!(!is_local("0.0.0.0"));
+        assert!(!is_local("192.0.2.1"));
+        assert!(is_local("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_listed_address_replaces_the_interface_list() {
+        let settings = camelmailer_config::Worker {
+            source_addresses: vec!["198.51.100.7".into()],
+            ..Default::default()
+        };
+        let selection = SourceSelection::new(&settings);
+        let is_local = selection.local_check();
+        assert!(is_local("198.51.100.7"));
+        assert!(!is_local("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_pool_is_reported_again_after_the_host_held_it_in_between() {
+        let selection = SourceSelection::new(&camelmailer_config::Worker::default());
+        selection.report_foreign(7);
+        assert!(selection.reported.lock().unwrap().contains(&7));
+        selection.clear_reports(&[7]);
+        assert!(!selection.reported.lock().unwrap().contains(&7));
+    }
+}
 
 /// How often a worker refreshes the locks of the rows it is working on. The
 /// shortest lease the queues accept is three of these.
@@ -296,6 +494,14 @@ pub enum ProcessOutcome {
     NothingToDo,
     /// The queued message no longer exists.
     MessageMissing,
+    /// The message's IP pool has no address on this host
+    /// (`worker.host_aware_pools`). It went back to the queue without an
+    /// attempt, for a host that holds one.
+    ForeignPool,
+    /// The message's IP pool could not be read (`worker.host_aware_pools`).
+    /// It went back to the queue without an attempt and is retried after
+    /// `worker.foreign_pool_delay_seconds`.
+    PoolUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +550,8 @@ pub struct Worker {
     worker_id: String,
     /// Delivery loops of this process (`worker.threads`).
     threads: u32,
+    /// Host-aware source selection; `None` uses each pool's first address.
+    source_selection: Option<SourceSelection>,
     /// Rows this process is working on, kept fresh by the heartbeat.
     in_flight: InFlight,
     /// How often the heartbeat refreshes the in-flight locks.
@@ -424,6 +632,10 @@ impl Worker {
             return_path_domain,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
             threads: config.worker.threads.max(1),
+            source_selection: config
+                .worker
+                .host_aware_pools
+                .then(|| SourceSelection::new(&config.worker)),
             in_flight: InFlight::default(),
             heartbeat_interval: HEARTBEAT_INTERVAL,
             shutdown_grace: Duration::from_secs(u64::from(config.worker.shutdown_grace_seconds)),
@@ -576,6 +788,54 @@ impl Worker {
         }
     }
 
+    /// Apply `worker.host_aware_pools`, `worker.source_addresses` and
+    /// `worker.foreign_pool_delay_seconds` from `settings` (the worker
+    /// settings with their environment overrides).
+    pub fn with_source_selection(mut self, settings: &camelmailer_config::Worker) -> Self {
+        self.source_selection = settings
+            .host_aware_pools
+            .then(|| SourceSelection::new(settings));
+        if self.source_selection.is_none() {
+            self.queue.set_source_pools(None);
+        }
+        self
+    }
+
+    /// Host-aware workers: tell the queue which pools this host holds an
+    /// address of, so it skips the others' mail. At most every 30 s.
+    async fn refresh_source_pools(&self) -> Result<(), sqlx::Error> {
+        let Some(selection) = &self.source_selection else {
+            return Ok(());
+        };
+        {
+            let mut refreshed = selection.pools_refreshed.lock().expect("refresh lock");
+            if refreshed.is_some_and(|at| at.elapsed() < LOCAL_ADDRESS_TTL) {
+                return Ok(());
+            }
+            *refreshed = Some(Instant::now());
+        }
+        // Through the storage traits: every pool, then its addresses. Pools
+        // are few; this runs at most every 30 s per process.
+        let store_error = |e: camelmailer_core::StoreError| sqlx::Error::Protocol(e.to_string());
+        let is_local = selection.local_check();
+        let mut pools: Vec<i64> = Vec::new();
+        for pool in camelmailer_core::AdminStore::list_ip_pools(&self.store)
+            .await
+            .map_err(store_error)?
+        {
+            let addresses = camelmailer_core::AdminStore::list_ip_addresses(&self.store, pool.id)
+                .await
+                .map_err(store_error)?;
+            if addresses.iter().any(|address| is_local(&address.ipv4)) {
+                pools.push(pool.id as i64);
+            }
+        }
+        pools.sort_unstable();
+        selection.clear_reports(&pools);
+        self.queue.set_source_pools(Some(pools));
+        Ok(())
+    }
+
     /// Scope the delivery to part of the queue and set how many messages
     /// this process delivers at once. The filter comes from `worker.servers`,
     /// `worker.exclude_servers` and `worker.deliver`, resolved to server ids.
@@ -588,6 +848,9 @@ impl Worker {
     /// Process one queued message, if any is ready. Returns `None` when the
     /// queue is empty.
     pub async fn process_next(&self) -> Result<Option<ProcessOutcome>, sqlx::Error> {
+        if let Err(error) = self.refresh_source_pools().await {
+            tracing::warn!(%error, "could not refresh the local IP pools");
+        }
         let Some(queued) = self.queue.dequeue(&self.worker_id).await? else {
             return Ok(None);
         };
@@ -711,17 +974,73 @@ impl Worker {
         };
 
         // Source-address selection: send from the message stream's IP pool if
-        // it sets one, else the server's pool (highest-priority IPv4). A
-        // stream without a pool resolves to the server pool exactly as before.
-        let source_ip = camelmailer_core::ServerStore::source_ip_for(
-            &self.store,
-            message.server_id,
-            message.stream_id,
-        )
-        .await
-        .ok()
-        .flatten()
-        .and_then(|ip| ip.parse().ok());
+        // it sets one, else the server's pool. A stream without a pool
+        // resolves to the server pool exactly as before.
+        let source_ip = if let Some(selection) = &self.source_selection {
+            // Host-aware: only the pool addresses this host holds. A pool
+            // with none here goes back to the queue for a host that has one;
+            // no pool at all keeps the OS default address.
+            let addresses = match camelmailer_core::ServerStore::source_addresses_for(
+                &self.store,
+                message.server_id,
+                message.stream_id,
+            )
+            .await
+            {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    // The row is locked: hand it back without an attempt
+                    // instead of leaving it locked until the stale-lock
+                    // reclaim. Sending from an address the pool may not
+                    // hold would be worse than a short wait.
+                    tracing::warn!(
+                        message_id = message.id,
+                        %error,
+                        "could not read the IP pool; handing the message back"
+                    );
+                    self.queue
+                        .defer(queued.id, selection.foreign_pool_delay_seconds, None)
+                        .await?;
+                    return Ok(ProcessOutcome::PoolUnavailable);
+                }
+            };
+            if addresses.is_empty() {
+                None
+            } else {
+                let is_local = selection.local_check();
+                let local: Vec<&camelmailer_core::IpAddress> =
+                    addresses.iter().filter(|a| is_local(&a.ipv4)).collect();
+                match choose_source_address(&local, &queued.domain) {
+                    Some(address) => address.ipv4.parse().ok(),
+                    None => {
+                        let pool_id = addresses[0].ip_pool_id;
+                        selection.report_foreign(pool_id);
+                        // Record the pool as resolved now, so the queue
+                        // filter of the hosts without an address of it skips
+                        // the row from here on (rows queued before the
+                        // column, or after the pool changed).
+                        self.queue
+                            .defer(
+                                queued.id,
+                                selection.foreign_pool_delay_seconds,
+                                Some(pool_id as i64),
+                            )
+                            .await?;
+                        return Ok(ProcessOutcome::ForeignPool);
+                    }
+                }
+            }
+        } else {
+            camelmailer_core::ServerStore::source_ip_for(
+                &self.store,
+                message.server_id,
+                message.stream_id,
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|ip| ip.parse().ok())
+        };
 
         self.in_flight.messages.sending(queued.id);
         let outcome = self
@@ -1931,5 +2250,59 @@ mod tests {
         assert_eq!(all, vec![1, 2]);
         drop(preparing);
         assert!(tracked.unstarted().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod source_selection_tests {
+    use super::choose_source_address;
+    use camelmailer_core::IpAddress;
+
+    fn address(id: u64, ipv4: &str, priority: i32) -> IpAddress {
+        IpAddress {
+            id: id as camelmailer_core::Id,
+            uuid: format!("u{id}"),
+            ip_pool_id: 1,
+            ipv4: ipv4.into(),
+            ipv6: None,
+            hostname: format!("out{id}.example"),
+            priority,
+        }
+    }
+
+    #[test]
+    fn the_lowest_priority_number_wins() {
+        let a = address(1, "203.0.113.1", 20);
+        let b = address(2, "203.0.113.2", 10);
+        let chosen = choose_source_address(&[&b, &a], "gmail.com").unwrap();
+        assert_eq!(chosen.ipv4, "203.0.113.2");
+    }
+
+    #[test]
+    fn ties_spread_by_recipient_domain_and_stay_stable() {
+        let a = address(1, "203.0.113.1", 10);
+        let b = address(2, "203.0.113.2", 10);
+        let local = [&a, &b];
+        let mut seen = std::collections::HashSet::new();
+        for domain in [
+            "gmail.com",
+            "outlook.com",
+            "web.de",
+            "gmx.de",
+            "t-online.de",
+            "yahoo.com",
+        ] {
+            let first = choose_source_address(&local, domain).unwrap().ipv4.clone();
+            // Same domain, same address, whatever the case.
+            let again = choose_source_address(&local, &domain.to_uppercase()).unwrap();
+            assert_eq!(first, again.ipv4);
+            seen.insert(first);
+        }
+        assert_eq!(seen.len(), 2, "both tied addresses get used");
+    }
+
+    #[test]
+    fn no_local_address_chooses_nothing() {
+        assert!(choose_source_address(&[], "gmail.com").is_none());
     }
 }
