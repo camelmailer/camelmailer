@@ -2896,6 +2896,72 @@ async fn delivery_binds_the_ip_pool_source_address() {
     assert!(seen.iter().any(|l| l == "RCPT TO:<user@dest.example>"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pool_address_family_decides_which_pool_values_are_bound() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+
+    // ipv4 127.0.0.1 (the relay's family) and ipv6 ::1
+    let ip_pool = s.store.create_ip_pool("pool", false).await.unwrap();
+    s.store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: ip_pool.id,
+            ipv4: "127.0.0.1".into(),
+            ipv6: Some("::1".into()),
+            hostname: "mx.example".into(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    s.store
+        .set_server_ip_pool(s.server.id, Some(ip_pool.id))
+        .await
+        .unwrap();
+    let set_family = |family: &str| camelmailer_core::IpPool {
+        address_family: Some(family.into()),
+        ..ip_pool.clone()
+    };
+
+    // ipv6_only: the relay at 127.0.0.1 has no IPv6 address, so the attempt
+    // fails softly and says why, without connecting.
+    s.store
+        .update_ip_pool(set_family("ipv6_only"))
+        .await
+        .unwrap();
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "first@dest.example"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    match worker.process_next().await.unwrap().unwrap() {
+        ProcessOutcome::Delayed { response } => assert!(
+            response.contains("no IPv6 address for 127.0.0.1 (address family ipv6_only)"),
+            "{response}"
+        ),
+        other => panic!("expected a soft failure, got {other:?}"),
+    }
+    assert!(smtp.received.lock().unwrap().is_empty());
+
+    // dual_stack: the IPv4 value is bound for the IPv4 relay and delivers.
+    s.store
+        .update_ip_pool(set_family("dual_stack"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE queued_messages SET retry_after = NULL")
+        .execute(s.store.pool())
+        .await
+        .unwrap();
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+    let seen = smtp.received.lock().unwrap().clone();
+    assert!(seen.iter().any(|l| l == "RCPT TO:<first@dest.example>"));
+}
+
 // -------------------------------------- HTTP send end-to-end (P2)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

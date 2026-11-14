@@ -295,6 +295,18 @@ pub trait AdminStore: Send + Sync {
     async fn create_ip_address(&self, new: NewIpAddress) -> Result<IpAddress, StoreError>;
     async fn delete_ip_address(&self, id: Id) -> Result<bool, StoreError>;
 
+    /// Store the results of one reverse-DNS check run of a worker: each
+    /// check replaces the previous result for its address. Pool results for
+    /// addresses that are no longer in any pool (absent from `checks`) and
+    /// results older than seven days are removed.
+    async fn record_source_address_checks(
+        &self,
+        checks: &[SourceAddressCheck],
+    ) -> Result<(), StoreError>;
+    /// The latest reverse-DNS check of every source address, failures
+    /// first, then by address.
+    async fn list_source_address_checks(&self) -> Result<Vec<SourceAddressCheck>, StoreError>;
+
     /// Assign (or clear) a server's outbound IP pool.
     async fn set_server_ip_pool(
         &self,
@@ -1263,6 +1275,7 @@ impl AdminStore for crate::store::MemoryStore {
             uuid: crate::token::generate_uuid(),
             name: name.into(),
             default,
+            address_family: None,
         };
         self.inner
             .write()
@@ -1342,6 +1355,43 @@ impl AdminStore for crate::store::MemoryStore {
             .is_some())
     }
 
+    async fn record_source_address_checks(
+        &self,
+        checks: &[SourceAddressCheck],
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let stored = &mut inner.source_address_checks;
+        for check in checks {
+            stored.insert(check.address.clone(), check.clone());
+        }
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+        stored.retain(|address, check| {
+            check.checked_at >= cutoff
+                && (check.origin != "pool"
+                    || checks
+                        .iter()
+                        .any(|c| c.origin == "pool" && &c.address == address))
+        });
+        Ok(())
+    }
+
+    async fn list_source_address_checks(&self) -> Result<Vec<SourceAddressCheck>, StoreError> {
+        let mut checks: Vec<SourceAddressCheck> = self
+            .inner
+            .read()
+            .unwrap()
+            .source_address_checks
+            .values()
+            .cloned()
+            .collect();
+        checks.sort_by(|a, b| {
+            source_check_rank(&a.status)
+                .cmp(&source_check_rank(&b.status))
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        Ok(checks)
+    }
+
     async fn set_server_ip_pool(
         &self,
         server_id: Id,
@@ -1352,6 +1402,16 @@ impl AdminStore for crate::store::MemoryStore {
             server.ip_pool_id = ip_pool_id;
         }
         Ok(())
+    }
+}
+
+/// Sort order of reverse-DNS results: failures first, then the ones that
+/// could not be decided, passes last.
+pub fn source_check_rank(status: &str) -> u8 {
+    match status {
+        "no_ptr" | "mismatch" => 0,
+        "lookup_failed" | "not_public" => 1,
+        _ => 2,
     }
 }
 

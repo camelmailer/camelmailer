@@ -173,7 +173,7 @@ fn params(port: u16, security: ConnectionSecurity, auth: Option<SmtpAuth>) -> Se
         tls_mode: TlsMode::AcceptAny,
         security,
         auth,
-        source_ip: None,
+        source: Default::default(),
     }
 }
 

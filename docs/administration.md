@@ -21,7 +21,7 @@ installation-wide pages:
 |---|---|
 | Organizations | Every tenant with its traffic, the flags worth a look, and the drill-down per organization |
 | Users | Every account on the installation, the admin flag, and account deletion |
-| IP pools | Sending addresses and their pools, see [Deliverability](deliverability.md) |
+| IP pools | Sending addresses, their pools and address families, and the reverse DNS of every source address, see [Deliverability](deliverability.md) |
 | Admin API keys | Machine credentials for `/api/v2/admin`, listable and revocable |
 | Audit log | Authentication events across the installation |
 
@@ -231,6 +231,50 @@ message and is never pruned, so it stays correct when message retention
 deletes old messages. Reaching 80 % and 100 % of the limit raises an
 [`organization.usage_threshold` lifecycle event](webhooks.md#installation-lifecycle-events)
 once each per month.
+
+## Source address reverse DNS
+
+Receivers judge a sender by the reverse DNS of the address it connects
+from, and Microsoft 365 refuses IPv6 senders without it (`S820`). Every
+worker therefore checks the addresses it may send from, at start and every
+`smtp_client.reverse_dns_check_interval` seconds: each IP pool address
+(`ipv4` and `ipv6`), and the IPv4 and IPv6 address of its host, which
+servers without a pool send from. The **IP pools** page lists the latest
+result per address, failures first, and the same list is available as:
+
+```
+GET /api/v2/admin/source_addresses
+```
+
+```json
+{
+  "failing": 1,
+  "source_addresses": [
+    {
+      "address": "2001:db8::25",
+      "family": "ipv6",
+      "origin": "host",
+      "status": "no_ptr",
+      "ptr": [],
+      "detail": "2001:db8::25 has no PTR record; receivers such as Microsoft 365 refuse mail from it (S820)",
+      "checked_by": "worker-1",
+      "checked_at": "2026-11-14T10:00:00Z"
+    }
+  ]
+}
+```
+
+| `status` | Meaning | What to do |
+|---|---|---|
+| `pass` | A PTR name resolves back to the address | Nothing |
+| `no_ptr` | No PTR record | Set one at the provider of the address, or move off that family with `smtp_client.address_family` or the pool's `address_family` |
+| `mismatch` | A PTR record whose name does not resolve back | Add the A or AAAA record for the PTR name, or correct the PTR |
+| `lookup_failed` | A DNS lookup failed | Decided at the next check; persistent failures point at the worker's resolver |
+| `not_public` | A private address | The NAT or load balancer in front of the host needs the PTR; the worker cannot see that address |
+
+A pool result disappears once the address leaves every pool, and any result
+not refreshed for seven days is removed. Failures are also logged by each
+worker as a warning at every check.
 
 ## What this view does not do
 

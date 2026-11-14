@@ -384,7 +384,14 @@ impl Worker {
                 &return_path,
                 &message.rcpt_to,
                 &raw_message,
-                source_ip,
+                crate::outbound::source_for(
+                    &self.store,
+                    &self.sender,
+                    message.server_id,
+                    message.stream_id,
+                    source_ip,
+                )
+                .await,
             )
             .await;
 

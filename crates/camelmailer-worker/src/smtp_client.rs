@@ -18,12 +18,14 @@
 //! first byte (`smtps://`, port 465), and can authenticate with AUTH PLAIN
 //! once the connection is at its negotiated security level.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio_rustls::TlsConnector;
+
+pub use camelmailer_config::AddressFamily;
 
 /// The outcome of a delivery attempt, classified like Postal's
 /// Sent / SoftFail / HardFail statuses.
@@ -114,8 +116,76 @@ pub struct SendParams {
     pub security: ConnectionSecurity,
     /// Relay credentials (AUTH PLAIN), if any.
     pub auth: Option<SmtpAuth>,
-    /// Local address to bind for the outgoing connection (IP pool source).
-    pub source_ip: Option<IpAddr>,
+    /// Where the connection comes from: the address families to use and,
+    /// for an IP pool, the local addresses to bind.
+    pub source: OutboundSource,
+}
+
+/// Where an outgoing connection comes from.
+///
+/// Without an IP pool ([`OutboundSource::system`]) the operating system
+/// picks the local address and `family` alone decides which remote
+/// addresses are tried, in which order. With a pool
+/// ([`OutboundSource::pool`]) the connection binds the pool address of the
+/// remote address's family, and a family the pool address has no local
+/// address for is never tried: an IPv4 source cannot reach an IPv6 remote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutboundSource {
+    pub family: AddressFamily,
+    /// The IPv4 address to bind, for an IP pool.
+    pub ipv4: Option<Ipv4Addr>,
+    /// The IPv6 address to bind, for an IP pool.
+    pub ipv6: Option<Ipv6Addr>,
+    /// Only families with a bound address are tried (an IP pool).
+    pub pinned: bool,
+}
+
+impl OutboundSource {
+    /// The operating system picks the local address.
+    pub fn system(family: AddressFamily) -> Self {
+        Self {
+            family,
+            ipv4: None,
+            ipv6: None,
+            pinned: false,
+        }
+    }
+
+    /// Bind the given pool addresses; families without one are not tried.
+    pub fn pool(family: AddressFamily, ipv4: Option<Ipv4Addr>, ipv6: Option<Ipv6Addr>) -> Self {
+        Self {
+            family,
+            ipv4,
+            ipv6,
+            pinned: true,
+        }
+    }
+
+    /// Bind one address, the way an IP pool without an address family of
+    /// its own sends: from its IPv4 address, to IPv4 remotes only.
+    pub fn bound(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Self::pool(AddressFamily::Ipv4Only, Some(v4), None),
+            IpAddr::V6(v6) => Self::pool(AddressFamily::Ipv6Only, None, Some(v6)),
+        }
+    }
+
+    fn uses_ipv4(&self) -> bool {
+        self.family.allows_ipv4() && (!self.pinned || self.ipv4.is_some())
+    }
+
+    fn uses_ipv6(&self) -> bool {
+        self.family.allows_ipv6() && (!self.pinned || self.ipv6.is_some())
+    }
+
+    /// The local address to bind for a connection to `remote`, if any.
+    fn local_for(&self, remote: &SocketAddr) -> Option<IpAddr> {
+        if remote.is_ipv4() {
+            self.ipv4.map(IpAddr::V4)
+        } else {
+            self.ipv6.map(IpAddr::V6)
+        }
+    }
 }
 
 fn classify(code: u16, response: String, tls: bool) -> SendOutcome {
@@ -312,46 +382,73 @@ fn tls_connector(mode: TlsMode) -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
-/// The remote addresses to try, in order. A bound source address pins the
-/// address family: an IPv4 source can never reach an AAAA-only candidate
-/// (the connect fails with EAFNOSUPPORT), so the resolved addresses are
-/// filtered to the source's family.
+/// The remote addresses to try, in order (see [`OutboundSource`]).
 ///
-/// Without a bound source the operating system picks the local address, and
-/// on a dual-stack host that is the host's own IPv6 address for an AAAA
-/// candidate. That address rarely has the reverse DNS and SPF coverage a
-/// mail server's IPv4 address has, and large receivers (Microsoft 365, error
-/// S820) refuse IPv6 senders without a PTR, so IPv4 candidates go first.
-/// The resolver's order is kept within each family.
+/// The resolver's order is kept within each family. Across families:
+///
+/// - `dual_stack` starts with IPv6 and alternates with IPv4 (RFC 8305
+///   section 4), so a host whose IPv6 path is broken loses one connection
+///   timeout before it reaches IPv4, not one per AAAA record;
+/// - `prefer_ipv4` tries every IPv4 address before the first IPv6 one;
+/// - `ipv4_only` and `ipv6_only` drop the other family.
+///
+/// A pinned source (an IP pool) further drops each family it has no local
+/// address for.
 fn remote_addresses(
     addresses: impl Iterator<Item = SocketAddr>,
-    source_ip: Option<std::net::IpAddr>,
+    source: &OutboundSource,
     host: &str,
 ) -> std::io::Result<Vec<SocketAddr>> {
     let addresses: Vec<SocketAddr> = addresses.collect();
     if addresses.is_empty() {
         return Err(std::io::Error::other(format!("no address for {host}")));
     }
-    let candidates: Vec<SocketAddr> = match source_ip {
-        Some(source_ip) => addresses
-            .into_iter()
-            .filter(|address| address.is_ipv4() == source_ip.is_ipv4())
-            .collect(),
-        None => {
-            let (v4, v6): (Vec<_>, Vec<_>) = addresses.into_iter().partition(SocketAddr::is_ipv4);
-            v4.into_iter().chain(v6).collect()
-        }
-    };
-    if candidates.is_empty() {
-        let family = match source_ip {
-            Some(ip) if ip.is_ipv4() => "IPv4",
-            _ => "IPv6",
+    let (use_v4, use_v6) = (source.uses_ipv4(), source.uses_ipv6());
+    if !use_v4 && !use_v6 {
+        let family = if source.family.allows_ipv6() {
+            "IPv6"
+        } else {
+            "IPv4"
         };
         return Err(std::io::Error::other(format!(
-            "no {family} address for {host} (required by the bound source address)"
+            "the IP pool address has no {family} address to send from \
+             (address family {})",
+            source.family
+        )));
+    }
+    let (v4, v6): (Vec<_>, Vec<_>) = addresses.into_iter().partition(SocketAddr::is_ipv4);
+    let v4 = if use_v4 { v4 } else { Vec::new() };
+    let v6 = if use_v6 { v6 } else { Vec::new() };
+    let candidates: Vec<SocketAddr> = match source.family {
+        AddressFamily::PreferIpv4 => v4.into_iter().chain(v6).collect(),
+        _ => interleave(v6, v4),
+    };
+    if candidates.is_empty() {
+        let family = if use_v4 { "IPv4" } else { "IPv6" };
+        let reason = if source.pinned && source.family.allows_ipv4() && source.family.allows_ipv6()
+        {
+            "required by the bound source address".to_string()
+        } else {
+            format!("address family {}", source.family)
+        };
+        return Err(std::io::Error::other(format!(
+            "no {family} address for {host} ({reason})"
         )));
     }
     Ok(candidates)
+}
+
+/// `first[0], second[0], first[1], second[1], …`, then the rest of the
+/// longer one.
+fn interleave(first: Vec<SocketAddr>, second: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut out = Vec::with_capacity(first.len() + second.len());
+    let (mut first, mut second) = (first.into_iter(), second.into_iter());
+    loop {
+        match (first.next(), second.next()) {
+            (None, None) => return out,
+            (a, b) => out.extend(a.into_iter().chain(b)),
+        }
+    }
 }
 
 /// Connect to one of the host's addresses: each candidate in turn (see
@@ -360,7 +457,7 @@ fn remote_addresses(
 /// none answers.
 async fn connect(params: &SendParams) -> std::io::Result<TcpStream> {
     let addresses = tokio::net::lookup_host((params.host.as_str(), params.port)).await?;
-    let candidates = remote_addresses(addresses, params.source_ip, &params.host)?;
+    let candidates = remote_addresses(addresses, &params.source, &params.host)?;
     let mut last_error = None;
     for address in candidates {
         match connect_to(address, params).await {
@@ -377,7 +474,7 @@ async fn connect(params: &SendParams) -> std::io::Result<TcpStream> {
 
 async fn connect_to(address: SocketAddr, params: &SendParams) -> std::io::Result<TcpStream> {
     let connect = async {
-        match params.source_ip {
+        match params.source.local_for(&address) {
             Some(source_ip) => {
                 let socket = if source_ip.is_ipv4() {
                     TcpSocket::new_v4()?
@@ -752,49 +849,202 @@ mod tests {
         assert_eq!(TlsMode::from_verify_mode("peer", false), TlsMode::Disabled);
     }
 
-    #[test]
-    fn remote_addresses_follow_the_bound_source_family() {
-        let v6: SocketAddr = "[2001:db8::1]:25".parse().unwrap();
-        let v4: SocketAddr = "192.0.2.10:25".parse().unwrap();
-        let source_v4: std::net::IpAddr = "198.51.100.5".parse().unwrap();
-        let source_v6: std::net::IpAddr = "2001:db8::5".parse().unwrap();
+    fn v4(last: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)), 25)
+    }
 
+    fn v6(last: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last)),
+            25,
+        )
+    }
+
+    fn system(family: AddressFamily) -> OutboundSource {
+        OutboundSource::system(family)
+    }
+
+    #[test]
+    fn a_bound_ipv4_source_keeps_only_ipv4_remotes() {
+        let source = OutboundSource::bound("198.51.100.5".parse().unwrap());
         // an IPv4 source skips a leading AAAA candidate (MX hosts often
         // resolve IPv6-first) and keeps only the A record
-        let picked = remote_addresses([v6, v4].into_iter(), Some(source_v4), "mx.example").unwrap();
-        assert_eq!(picked, vec![v4]);
-
-        // an IPv6 source keeps only the AAAA candidate
-        let picked = remote_addresses([v4, v6].into_iter(), Some(source_v6), "mx.example").unwrap();
-        assert_eq!(picked, vec![v6]);
+        let picked = remote_addresses([v6(1), v4(10)].into_iter(), &source, "mx.example").unwrap();
+        assert_eq!(picked, vec![v4(10)]);
+        assert_eq!(
+            source.local_for(&v4(10)),
+            Some("198.51.100.5".parse().unwrap())
+        );
 
         // no candidate in the source's family is a clear error, not EAFNOSUPPORT
-        let error = remote_addresses([v6].into_iter(), Some(source_v4), "mx.example")
+        let error = remote_addresses([v6(1)].into_iter(), &source, "mx.example")
             .expect_err("family mismatch must error");
-        assert!(error.to_string().contains("no IPv4 address"));
-        let error = remote_addresses([v4].into_iter(), Some(source_v6), "mx.example")
-            .expect_err("family mismatch must error");
-        assert!(error.to_string().contains("no IPv6 address"));
+        assert!(error.to_string().contains("no IPv4 address"), "{error}");
+    }
 
-        // an empty resolution is still "no address"
-        let error = remote_addresses(std::iter::empty(), None, "mx.example")
-            .expect_err("empty resolution must error");
+    #[test]
+    fn a_bound_ipv6_source_keeps_only_ipv6_remotes() {
+        let source = OutboundSource::bound("2001:db8::5".parse().unwrap());
+        let picked = remote_addresses([v4(10), v6(1)].into_iter(), &source, "mx.example").unwrap();
+        assert_eq!(picked, vec![v6(1)]);
+        let error = remote_addresses([v4(10)].into_iter(), &source, "mx.example")
+            .expect_err("family mismatch must error");
+        assert!(error.to_string().contains("no IPv6 address"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_resolution_is_no_address() {
+        let error = remote_addresses(
+            std::iter::empty(),
+            &system(AddressFamily::DualStack),
+            "mx.example",
+        )
+        .expect_err("empty resolution must error");
         assert!(error.to_string().contains("no address"));
     }
 
     #[test]
-    fn without_a_source_ipv4_goes_first_and_every_address_is_kept() {
-        let v6a: SocketAddr = "[2001:db8::1]:25".parse().unwrap();
-        let v6b: SocketAddr = "[2001:db8::2]:25".parse().unwrap();
-        let v4a: SocketAddr = "192.0.2.10:25".parse().unwrap();
-        let v4b: SocketAddr = "192.0.2.11:25".parse().unwrap();
+    fn dual_stack_starts_with_ipv6_and_alternates_families() {
+        let source = system(AddressFamily::DualStack);
+        let picked = remote_addresses(
+            [v4(10), v6(1), v4(11), v6(2), v6(3)].into_iter(),
+            &source,
+            "mx.example",
+        )
+        .unwrap();
+        assert_eq!(picked, vec![v6(1), v4(10), v6(2), v4(11), v6(3)]);
 
-        let picked =
-            remote_addresses([v6a, v4a, v6b, v4b].into_iter(), None, "mx.example").unwrap();
-        assert_eq!(picked, vec![v4a, v4b, v6a, v6b]);
+        // a single-stack remote is reached either way
+        let picked = remote_addresses([v4(10), v4(11)].into_iter(), &source, "mx.example").unwrap();
+        assert_eq!(picked, vec![v4(10), v4(11)]);
+        let picked = remote_addresses([v6(1)].into_iter(), &source, "mx.example").unwrap();
+        assert_eq!(picked, vec![v6(1)]);
+        assert_eq!(source.local_for(&v6(1)), None, "the OS picks the address");
+    }
+
+    #[test]
+    fn prefer_ipv4_tries_every_ipv4_address_first() {
+        let picked = remote_addresses(
+            [v6(1), v4(10), v6(2), v4(11)].into_iter(),
+            &system(AddressFamily::PreferIpv4),
+            "mx.example",
+        )
+        .unwrap();
+        assert_eq!(picked, vec![v4(10), v4(11), v6(1), v6(2)]);
 
         // an IPv6-only host is still reachable
-        let picked = remote_addresses([v6a].into_iter(), None, "mx.example").unwrap();
-        assert_eq!(picked, vec![v6a]);
+        let picked = remote_addresses(
+            [v6(1)].into_iter(),
+            &system(AddressFamily::PreferIpv4),
+            "mx.example",
+        )
+        .unwrap();
+        assert_eq!(picked, vec![v6(1)]);
+    }
+
+    #[test]
+    fn ipv4_only_and_ipv6_only_drop_the_other_family() {
+        let resolved = [v6(1), v4(10), v6(2), v4(11)];
+        let picked = remote_addresses(
+            resolved.into_iter(),
+            &system(AddressFamily::Ipv4Only),
+            "mx.example",
+        )
+        .unwrap();
+        assert_eq!(picked, vec![v4(10), v4(11)]);
+        let picked = remote_addresses(
+            resolved.into_iter(),
+            &system(AddressFamily::Ipv6Only),
+            "mx.example",
+        )
+        .unwrap();
+        assert_eq!(picked, vec![v6(1), v6(2)]);
+
+        let error = remote_addresses(
+            [v6(1)].into_iter(),
+            &system(AddressFamily::Ipv4Only),
+            "mx.example",
+        )
+        .expect_err("no IPv4 remote");
+        assert!(
+            error
+                .to_string()
+                .contains("no IPv4 address for mx.example (address family ipv4_only)"),
+            "{error}"
+        );
+        let error = remote_addresses(
+            [v4(10)].into_iter(),
+            &system(AddressFamily::Ipv6Only),
+            "mx.example",
+        )
+        .expect_err("no IPv6 remote");
+        assert!(error.to_string().contains("no IPv6 address"), "{error}");
+    }
+
+    #[test]
+    fn a_dual_stack_pool_binds_the_address_of_each_family() {
+        let source = OutboundSource::pool(
+            AddressFamily::DualStack,
+            Some("198.51.100.5".parse().unwrap()),
+            Some("2001:db8:1::5".parse().unwrap()),
+        );
+        let picked = remote_addresses([v4(10), v6(1)].into_iter(), &source, "mx.example").unwrap();
+        assert_eq!(picked, vec![v6(1), v4(10)]);
+        assert_eq!(
+            source.local_for(&v6(1)),
+            Some("2001:db8:1::5".parse().unwrap())
+        );
+        assert_eq!(
+            source.local_for(&v4(10)),
+            Some("198.51.100.5".parse().unwrap())
+        );
+
+        let source = OutboundSource {
+            family: AddressFamily::PreferIpv4,
+            ..source
+        };
+        let picked = remote_addresses([v6(1), v4(10)].into_iter(), &source, "mx.example").unwrap();
+        assert_eq!(picked, vec![v4(10), v6(1)]);
+    }
+
+    #[test]
+    fn a_pool_address_without_ipv6_stays_on_ipv4_whatever_the_family() {
+        let ipv4_only_address =
+            |family| OutboundSource::pool(family, Some("198.51.100.5".parse().unwrap()), None);
+        for family in [AddressFamily::DualStack, AddressFamily::PreferIpv4] {
+            let picked = remote_addresses(
+                [v6(1), v4(10)].into_iter(),
+                &ipv4_only_address(family),
+                "mx.example",
+            )
+            .unwrap();
+            assert_eq!(picked, vec![v4(10)], "{family}");
+            let error = remote_addresses(
+                [v6(1)].into_iter(),
+                &ipv4_only_address(family),
+                "mx.example",
+            )
+            .expect_err("pinned to IPv4");
+            assert!(
+                error
+                    .to_string()
+                    .contains("required by the bound source address"),
+                "{error}"
+            );
+        }
+
+        // ipv6_only on a pool address without IPv6 can never send
+        let error = remote_addresses(
+            [v6(1), v4(10)].into_iter(),
+            &ipv4_only_address(AddressFamily::Ipv6Only),
+            "mx.example",
+        )
+        .expect_err("no IPv6 source");
+        assert!(
+            error
+                .to_string()
+                .contains("the IP pool address has no IPv6 address to send from"),
+            "{error}"
+        );
     }
 }

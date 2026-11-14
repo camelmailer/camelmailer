@@ -15,6 +15,46 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Changed
+
+- **Behaviour change: servers without an IP pool use IPv6 first again.**
+  0.13.0 made such servers try the remote host's IPv4 addresses before its
+  IPv6 ones, to keep a dual-stack worker without IPv6 reverse DNS away from
+  Microsoft 365's S820 refusal. That went against the normal behaviour of a
+  dual-stack host and hid the actual problem, a missing PTR record. The new
+  setting `smtp_client.address_family` defaults to `dual_stack`: IPv6 first,
+  alternating with IPv4 (RFC 8305), so a broken IPv6 path costs one
+  connection timeout and not one per AAAA record. Moving on to the next
+  address when a connection fails stays.
+  **If you relied on IPv4 first** because your IPv6 address has no PTR
+  record, either give it one (and an SPF entry), or set
+  `smtp_client.address_family: prefer_ipv4` (the 0.13.0 order) or
+  `ipv4_only`. The reverse-DNS check below tells you which addresses need
+  it. Servers with an IP pool are unaffected.
+
+### Added
+
+- **`smtp_client.address_family`**: `dual_stack` (default), `prefer_ipv4`,
+  `ipv4_only` or `ipv6_only`, for providers that offer reverse DNS for one
+  family only. It applies to servers without an IP pool.
+- **Address family per IP pool** (`address_family` on
+  `POST`/`PATCH /api/v2/admin/ip_pools`, and a selector on the IP pools
+  page). Without one a pool sends from each address's IPv4 value to IPv4
+  remotes, as before. With one, IPv4 connections bind the address's `ipv4`
+  and IPv6 connections its `ipv6` value, which until now was stored for
+  reference only. A pool address without `ipv6` stays on IPv4 whatever the
+  family. Migration `0051`.
+- **Reverse-DNS check of the source addresses.** Each worker checks, at
+  start and every `smtp_client.reverse_dns_check_interval` seconds (3600;
+  `0` turns it off), that every address it may send from has a PTR record
+  whose name resolves back to it: both values of every pool address, and
+  the IPv4 and IPv6 address its host sends from for servers without a pool.
+  Failures are logged as warnings, listed failures-first by
+  `GET /api/v2/admin/source_addresses` and on the IP pools page.
+- **`smtp_client.skip_family_without_reverse_dns`** (default `false`):
+  `dual_stack` and `prefer_ipv4` leave out a family whose source address
+  failed the check while the other family's did not.
+
 ## [0.13.1] - 2026-11-05
 
 ### Fixed

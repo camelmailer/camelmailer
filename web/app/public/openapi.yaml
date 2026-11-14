@@ -2902,6 +2902,23 @@ paths:
       tags: [Instance]
       summary: Create an IP pool
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                default: { type: boolean }
+                address_family:
+                  type: string
+                  nullable: true
+                  enum: [dual_stack, prefer_ipv4, ipv4_only, ipv6_only]
+                  description: >-
+                    Which address families mail from this pool uses. Absent or null:
+                    each address's IPv4 value only, to IPv4 remotes. Set: IPv4
+                    connections bind the address's ipv4, IPv6 connections its ipv6.
       responses:
         "201": { $ref: "#/components/responses/Success" }
   /api/v2/admin/ip_pools/{id}:
@@ -2912,6 +2929,29 @@ paths:
       parameters: [{ $ref: "#/components/parameters/Id" }]
       responses:
         "200": { $ref: "#/components/responses/Success" }
+    patch:
+      tags: [Instance]
+      summary: Update an IP pool
+      description: >-
+        Changes the name, the default flag or the address family. An absent field is left
+        alone; `address_family: null` clears the pool's own family.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                default: { type: boolean }
+                address_family:
+                  type: string
+                  nullable: true
+                  enum: [dual_stack, prefer_ipv4, ipv4_only, ipv6_only]
+      responses:
+        "200": { $ref: "#/components/responses/Success" }
+        "422": { $ref: "#/components/responses/ValidationError" }
     delete:
       tags: [Instance]
       summary: Delete an IP pool
@@ -2955,6 +2995,46 @@ paths:
         - { $ref: "#/components/parameters/Id" }
       responses:
         "200": { $ref: "#/components/responses/Success" }
+  /api/v2/admin/source_addresses:
+    get:
+      tags: [Instance]
+      summary: Reverse DNS of the source addresses
+      description: >-
+        The latest forward-confirmed reverse-DNS check of every address the workers may send
+        from: both values of every IP pool address (origin `pool`) and the address each worker
+        host sends from for servers without a pool (origin `host`). Workers check at start and
+        every `smtp_client.reverse_dns_check_interval` seconds. Failures (`no_ptr`, `mismatch`)
+        come first; `failing` counts them. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200":
+          description: The results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      failing: { type: integer }
+                      source_addresses:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            address: { type: string }
+                            family: { type: string, enum: [ipv4, ipv6] }
+                            origin: { type: string, enum: [pool, host] }
+                            status:
+                              type: string
+                              enum: [pass, no_ptr, mismatch, lookup_failed, not_public]
+                            ptr: { type: array, items: { type: string } }
+                            detail: { type: string }
+                            checked_by: { type: string }
+                            checked_at: { type: string, format: date-time }
   /api/v2/admin/admin_api_keys:
     get:
       tags: [Instance]

@@ -21,8 +21,12 @@
 //! - `smtp://user:pass@host:587` — AUTH PLAIN after the TLS handshake
 //!   (special characters in user/pass can be percent-encoded)
 
-use crate::smtp_client::{self, ConnectionSecurity, SendOutcome, SendParams, SmtpAuth, TlsMode};
-use std::net::IpAddr;
+use crate::reverse_dns::ReverseDnsState;
+use crate::smtp_client::{
+    self, AddressFamily, ConnectionSecurity, OutboundSource, SendOutcome, SendParams, SmtpAuth,
+    TlsMode,
+};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +137,13 @@ pub struct SmtpSender {
     timeout: Duration,
     read_timeout: Duration,
     data_timeout: Duration,
+    /// `smtp_client.address_family`, for servers without an IP pool and
+    /// pools without a family of their own.
+    address_family: AddressFamily,
+    /// `smtp_client.skip_family_without_reverse_dns`.
+    skip_family_without_reverse_dns: bool,
+    /// The latest reverse-DNS results of the source addresses.
+    reverse_dns: Arc<ReverseDnsState>,
 }
 
 impl SmtpSender {
@@ -165,7 +176,32 @@ impl SmtpSender {
             timeout: Duration::from_secs(config.smtp_client.open_timeout as u64),
             read_timeout: Duration::from_secs(config.smtp_client.read_timeout as u64),
             data_timeout: Duration::from_secs(config.smtp_client.data_timeout as u64),
+            address_family: config.smtp_client.address_family,
+            skip_family_without_reverse_dns: config.smtp_client.skip_family_without_reverse_dns,
+            reverse_dns: ReverseDnsState::global(),
         }
+    }
+
+    /// The installation's address family (`smtp_client.address_family`).
+    pub fn address_family(&self) -> AddressFamily {
+        self.address_family
+    }
+
+    /// Read reverse-DNS results from `state` instead of the process-wide
+    /// one the worker's periodic check fills.
+    pub fn with_reverse_dns(mut self, state: Arc<ReverseDnsState>) -> Self {
+        self.reverse_dns = state;
+        self
+    }
+
+    /// `source`, without the family whose source address failed the
+    /// reverse-DNS check when `smtp_client.skip_family_without_reverse_dns`
+    /// is on (see [`ReverseDnsState::narrow`]).
+    pub fn effective_source(&self, source: OutboundSource) -> OutboundSource {
+        if !self.skip_family_without_reverse_dns {
+            return source;
+        }
+        self.reverse_dns.narrow(source)
     }
 
     /// Resolve the delivery endpoints for a destination domain.
@@ -212,16 +248,18 @@ impl SmtpSender {
     }
 
     /// Try each endpoint in order until one accepts (or hard-rejects) the
-    /// message. Soft failures fall through to the next endpoint. `source_ip`
-    /// binds the local socket for IP-pool-aware delivery.
+    /// message. Soft failures fall through to the next endpoint. `source`
+    /// says which address families to use and, for an IP pool, which local
+    /// addresses to bind.
     pub async fn send(
         &self,
         domain: &str,
         mail_from: &str,
         rcpt_to: &str,
         raw_message: &[u8],
-        source_ip: Option<IpAddr>,
+        source: OutboundSource,
     ) -> SendOutcome {
+        let source = self.effective_source(source);
         let endpoints = self.resolve_endpoints(domain).await;
         let mut last = SendOutcome::SoftFail {
             response: format!("no delivery endpoints for {domain}"),
@@ -239,7 +277,7 @@ impl SmtpSender {
                 tls_mode: endpoint.tls_mode,
                 security: endpoint.security,
                 auth: endpoint.auth.clone(),
-                source_ip,
+                source: source.clone(),
             };
             let outcome = smtp_client::send_message(&params, raw_message).await;
             match outcome {
@@ -267,6 +305,48 @@ fn to_ascii_domain(domain: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipping_a_family_without_reverse_dns_is_opt_in() {
+        use crate::reverse_dns::{AddressCheck, Origin, ReverseDnsStatus};
+        let state = ReverseDnsState::new();
+        let (v4, v6) = (
+            "203.0.113.10".parse().unwrap(),
+            "2001:db8::25".parse().unwrap(),
+        );
+        let check = |address, status| AddressCheck {
+            address,
+            origin: Origin::Host,
+            status,
+            ptr: Vec::new(),
+            detail: String::new(),
+        };
+        state.update(
+            &[
+                check(v4, ReverseDnsStatus::Pass),
+                check(v6, ReverseDnsStatus::NoPtr),
+            ],
+            Some(v4),
+            Some(v6),
+        );
+        let mut config = camelmailer_config::Config::default();
+        let source = OutboundSource::system(AddressFamily::DualStack);
+
+        let sender = SmtpSender::new(&config).with_reverse_dns(state.clone());
+        assert_eq!(sender.address_family(), AddressFamily::DualStack);
+        assert_eq!(
+            sender.effective_source(source.clone()),
+            source,
+            "off by default"
+        );
+
+        config.smtp_client.skip_family_without_reverse_dns = true;
+        let sender = SmtpSender::new(&config).with_reverse_dns(state);
+        assert_eq!(
+            sender.effective_source(source).family,
+            AddressFamily::Ipv4Only
+        );
+    }
 
     #[test]
     fn parses_relay_urls() {

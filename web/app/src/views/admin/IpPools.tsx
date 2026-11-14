@@ -26,11 +26,131 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
-import { adminApi, ApiError, type IpAddress, type IpPool } from "@/lib/api"
+import {
+  adminApi,
+  ApiError,
+  type AddressFamily,
+  type IpAddress,
+  type IpPool,
+  type SourceAddressCheck,
+} from "@/lib/api"
+import { relativeTime } from "@/lib/api-p1"
 
 function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
+}
+
+// "default" stands for a pool without a family of its own (null).
+const FAMILIES: { value: AddressFamily | "default"; label: string }[] = [
+  { value: "default", label: "IPv4 address only (default)" },
+  { value: "dual_stack", label: "Dual stack, IPv6 first" },
+  { value: "prefer_ipv4", label: "Both, IPv4 first" },
+  { value: "ipv4_only", label: "IPv4 only" },
+  { value: "ipv6_only", label: "IPv6 only" },
+]
+
+const STATUS: Record<
+  SourceAddressCheck["status"],
+  { label: string; variant: "default" | "secondary" | "destructive" | "outline" }
+> = {
+  pass: { label: "PTR ok", variant: "secondary" },
+  no_ptr: { label: "No PTR", variant: "destructive" },
+  mismatch: { label: "PTR mismatch", variant: "destructive" },
+  lookup_failed: { label: "Lookup failed", variant: "outline" },
+  not_public: { label: "Not public", variant: "outline" },
+}
+
+function ReverseDnsCard() {
+  const checks = useQuery({
+    queryKey: ["admin", "source-addresses"],
+    queryFn: adminApi.sourceAddresses.list,
+  })
+  const columns: DataTableColumn<SourceAddressCheck>[] = [
+    {
+      id: "address",
+      header: "Address",
+      accessorFn: (r) => r.address,
+      cell: ({ row }) => (
+        <span className="block truncate font-mono text-xs font-medium">{row.original.address}</span>
+      ),
+    },
+    {
+      id: "origin",
+      header: "Used by",
+      accessorFn: (r) => r.origin,
+      cell: ({ row }) => (
+        <span>{row.original.origin === "pool" ? "IP pool" : "Servers without a pool"}</span>
+      ),
+    },
+    {
+      id: "status",
+      header: "Reverse DNS",
+      accessorFn: (r) => r.status,
+      cell: ({ row }) => {
+        const status = STATUS[row.original.status] ?? { label: row.original.status, variant: "outline" }
+        return (
+          <Badge variant={status.variant} title={row.original.detail}>
+            {status.label}
+          </Badge>
+        )
+      },
+    },
+    {
+      id: "ptr",
+      header: "PTR",
+      accessorFn: (r) => r.ptr.join(", "),
+      cell: ({ row }) => (
+        <span className="font-mono text-xs text-muted-foreground">
+          {row.original.ptr.length ? row.original.ptr.join(", ") : "—"}
+        </span>
+      ),
+    },
+    {
+      id: "checked_at",
+      header: "Checked",
+      accessorFn: (r) => r.checked_at,
+      cell: ({ row }) => (
+        <span className="text-muted-foreground" title={row.original.checked_by}>
+          {relativeTime(row.original.checked_at)}
+        </span>
+      ),
+    },
+  ]
+  const failing = checks.data?.failing ?? 0
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          Reverse DNS of the source addresses
+          {failing > 0 && <Badge variant="destructive">{failing} failing</Badge>}
+        </CardTitle>
+        <p className="text-sm text-muted-foreground">
+          Each worker checks at start, and then hourly by default, that the addresses it sends from
+          have a PTR record that resolves back to them. Receivers such as Microsoft 365 refuse mail
+          from an address without one.
+        </p>
+      </CardHeader>
+      <CardContent>
+        <DataTable
+          columns={columns}
+          data={checks.data?.source_addresses ?? []}
+          loading={checks.isPending}
+          searchKeys={["address", "ptr"]}
+          searchPlaceholder="Search addresses…"
+          emptyText="No results yet. They appear once a worker has started."
+          initialPageSize={20}
+        />
+      </CardContent>
+    </Card>
+  )
 }
 
 function PoolCard({ pool }: { pool: IpPool }) {
@@ -50,6 +170,15 @@ function PoolCard({ pool }: { pool: IpPool }) {
     queryClient.invalidateQueries({ queryKey: ["admin", "ip-addresses", pool.id] })
     queryClient.invalidateQueries({ queryKey: ["admin", "ip-pools"] })
   }
+
+  const setFamily = useMutation({
+    mutationFn: (value: AddressFamily | "default") =>
+      adminApi.ipPools.update(pool.id, {
+        address_family: value === "default" ? null : value,
+      }),
+    onSuccess: () => invalidate(),
+    onError: (err) => errorToast(err, "Could not change the address family"),
+  })
 
   const addAddress = useMutation({
     mutationFn: () =>
@@ -134,6 +263,22 @@ function PoolCard({ pool }: { pool: IpPool }) {
           {pool.default && <Badge>default</Badge>}
         </CardTitle>
         <div className="flex gap-2">
+          <Select
+            value={pool.address_family ?? "default"}
+            onValueChange={(value) => setFamily.mutate(value as AddressFamily | "default")}
+            disabled={setFamily.isPending}
+          >
+            <SelectTrigger size="sm" aria-label="Address family" className="w-56">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {FAMILIES.map((family) => (
+                <SelectItem key={family.value} value={family.value}>
+                  {family.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
             <PlusIcon className="size-4" /> Address
           </Button>
@@ -251,6 +396,7 @@ export default function IpPools() {
       }
     >
       <div className="space-y-4">
+      <ReverseDnsCard />
       {pools.data?.ip_pools.length === 0 ? (
         <EmptyState>No IP pools. Without pools, outbound mail uses the host address.</EmptyState>
       ) : (

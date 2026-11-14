@@ -19,7 +19,7 @@ pool carries:
 | Field | Meaning |
 |---|---|
 | `ipv4` | The IPv4 source address. Required and validated as a real IPv4. |
-| `ipv6` | An optional IPv6 address. Stored for reference. |
+| `ipv6` | An optional IPv6 address. Bound for IPv6 connections when the pool sets an [address family](#address-family); stored for reference otherwise. |
 | `hostname` | The EHLO / reverse-DNS name you intend the address to present. |
 | `priority` | Selection order within the pool. A lower number wins; the default is `100`. |
 
@@ -60,7 +60,7 @@ per-stream pools existed.
 
 Within the chosen pool the worker takes the **highest-priority address**:
 lowest `priority` number first, ties broken by insertion order (`id`).
-Only the `ipv4` value is used, and the worker binds its outgoing SMTP
+Only the `ipv4` value is used (unless the pool sets an [address family](#address-family)), and the worker binds its outgoing SMTP
 socket to that address, so the connection reaches the recipient from that
 IP. When no pool resolves to an address, `source_ip` is `None` and the
 worker sends from the host's default outbound address (the operating
@@ -82,6 +82,51 @@ IPs, while [Broadcast streams](broadcast.md) send from a pool you can
 afford to expose to the volatility of marketing volume. Assigning a
 distinct pool to a broadcast stream is the single most effective isolation
 step Camelmailer offers.
+
+## Address family
+
+Which of a receiving host's addresses the worker connects to depends on the
+address family, set installation-wide in `smtp_client.address_family` (see
+[Configuration](configuration.md#address-family)) and per pool in the
+pool's `address_family`:
+
+| The message's pool | Remote addresses tried | Local address |
+|---|---|---|
+| None | `smtp_client.address_family` (default `dual_stack`: IPv6 first, alternating with IPv4) | The operating system's choice |
+| A pool without `address_family` (the default) | IPv4 only | The address's `ipv4` |
+| A pool with `address_family` | The pool's `address_family` | `ipv4` for IPv4 remotes, `ipv6` for IPv6 remotes |
+
+A pool address without an `ipv6` value never sends over IPv6, whatever the
+family: the bound address pins the family. A pool set to `ipv6_only` whose
+address has no `ipv6` value cannot send, and each attempt fails softly
+saying so. In every case the worker moves on to the next remote address
+when a connection fails.
+
+Set the family to match the reverse DNS you can publish. A pool whose
+addresses have PTR records for both families can use `dual_stack`; a pool
+on a provider without IPv6 reverse DNS stays on the default, or uses
+`prefer_ipv4` to keep IPv6 as a fallback for IPv6-only receivers.
+
+```
+PATCH /api/v2/admin/ip_pools/{id}
+{ "address_family": "dual_stack" }
+```
+
+`"address_family": null` returns the pool to the default.
+
+## Reverse DNS check
+
+Each worker checks every address it may send from, at start and every
+`smtp_client.reverse_dns_check_interval` seconds (an hour by default): both
+values of every pool address, and the IPv4 and IPv6 address its host sends
+from for servers without a pool. An address passes when it has a PTR record
+and one of the PTR names resolves back to it (forward-confirmed reverse
+DNS). Failures are logged as warnings, shown under **Admin → IP pools →
+Reverse DNS of the source addresses**, and listed by
+`GET /api/v2/admin/source_addresses`. With
+`smtp_client.skip_family_without_reverse_dns: true`, a `dual_stack` or
+`prefer_ipv4` connection leaves out the family whose source address failed
+while the other's did not.
 
 ## Managing IP pools (admin)
 
@@ -109,9 +154,10 @@ The full CRUD surface:
 | Method + path | Purpose |
 |---|---|
 | `GET/POST /api/v2/admin/ip_pools` | List and create pools |
-| `GET/DELETE /api/v2/admin/ip_pools/{id}` | Show and delete a pool |
+| `GET/PATCH/DELETE /api/v2/admin/ip_pools/{id}` | Show, update (`name`, `default`, `address_family`) and delete a pool |
 | `GET/POST /api/v2/admin/ip_pools/{pool_id}/ip_addresses` | List and add addresses |
 | `GET/DELETE /api/v2/admin/ip_pools/{pool_id}/ip_addresses/{id}` | Show and remove an address |
+| `GET /api/v2/admin/source_addresses` | The latest reverse-DNS check of every source address |
 
 ### Assign a pool to a server
 
@@ -210,9 +256,9 @@ dashboard does not by itself guarantee inbox placement.
 | Suppression gate before send; auto-suppress on bounce/complaint | Enforced |
 | Broadcast opt-in gate and one-click unsubscribe handling | Enforced |
 | SPF / DMARC record publication and alignment | Your DNS; Camelmailer checks and monitors |
-| Reverse DNS (PTR) for each pool IP | Your network provider; not verified by the product |
+| Reverse DNS (PTR) for each pool IP | Your network provider; checked by the workers (forward-confirmed), reported, and avoided only with `skip_family_without_reverse_dns` |
 | EHLO / HELO hostname | A single installation-level config value, not the per-address `hostname` field |
-| IPv6 source sending | The `ipv6` field is stored but source binding uses the `ipv4` value |
+| IPv6 source sending | Bound for IPv6 connections when the pool sets an `address_family`; otherwise only `ipv4` is bound |
 | Pool `default` flag | A label in the admin UI; source resolution reads a server's or stream's assigned pool, so assign a pool explicitly for it to take effect |
 | IP warmup pacing | Operational; you control volume ramp, the product does not throttle |
 

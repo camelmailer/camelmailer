@@ -437,7 +437,25 @@ export type Invitation = {
   invite_url?: string
 }
 
-export type IpPool = { id: number; uuid: string; name: string; default: boolean }
+export type AddressFamily = "dual_stack" | "prefer_ipv4" | "ipv4_only" | "ipv6_only"
+export type IpPool = {
+  id: number
+  uuid: string
+  name: string
+  default: boolean
+  /** null: the pool sends from each address's IPv4 value only. */
+  address_family: AddressFamily | null
+}
+export type SourceAddressCheck = {
+  address: string
+  family: "ipv4" | "ipv6"
+  origin: "pool" | "host"
+  status: "pass" | "no_ptr" | "mismatch" | "lookup_failed" | "not_public"
+  ptr: string[]
+  detail: string
+  checked_by: string
+  checked_at: string
+}
 export type IpAddress = {
   id: number
   uuid: string
@@ -1164,6 +1182,10 @@ export const adminApi = {
       api.get<{ ip_pools: IpPool[]; pagination: Pagination }>("/api/v2/admin/ip_pools?per_page=100"),
     create: (name: string, isDefault: boolean) =>
       api.post<{ ip_pool: IpPool }>("/api/v2/admin/ip_pools", { name, default: isDefault }),
+    update: (
+      id: number,
+      fields: { name?: string; default?: boolean; address_family?: AddressFamily | null },
+    ) => api.patch<{ ip_pool: IpPool }>(`/api/v2/admin/ip_pools/${id}`, fields),
     delete: (id: number) => api.delete<{ deleted: boolean }>(`/api/v2/admin/ip_pools/${id}`),
     addresses: (poolId: number) => ({
       list: () =>
@@ -1178,6 +1200,12 @@ export const adminApi = {
       delete: (id: number) =>
         api.delete<{ deleted: boolean }>(`/api/v2/admin/ip_pools/${poolId}/ip_addresses/${id}`),
     }),
+  },
+  sourceAddresses: {
+    list: () =>
+      api.get<{ source_addresses: SourceAddressCheck[]; failing: number }>(
+        "/api/v2/admin/source_addresses",
+      ),
   },
   adminApiKeys: {
     list: () =>

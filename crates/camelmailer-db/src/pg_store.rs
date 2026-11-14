@@ -436,6 +436,7 @@ fn ip_pool_from_row(row: &PgRow) -> IpPool {
         uuid: row.get("uuid"),
         name: row.get("name"),
         default: row.get("default"),
+        address_family: row.get("address_family"),
     }
 }
 
@@ -1782,17 +1783,21 @@ impl AdminStore for PgStore {
             uuid,
             name: name.into(),
             default,
+            address_family: None,
         })
     }
 
     async fn update_ip_pool(&self, pool: IpPool) -> Result<IpPool, StoreError> {
-        sqlx::query("UPDATE ip_pools SET name = $2, \"default\" = $3 WHERE id = $1")
-            .bind(pool.id as i64)
-            .bind(&pool.name)
-            .bind(pool.default)
-            .execute(&self.pool)
-            .await
-            .map_err(Self::sqlx_error)?;
+        sqlx::query(
+            "UPDATE ip_pools SET name = $2, \"default\" = $3, address_family = $4 WHERE id = $1",
+        )
+        .bind(pool.id as i64)
+        .bind(&pool.name)
+        .bind(pool.default)
+        .bind(&pool.address_family)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
         Ok(pool)
     }
 
@@ -1861,6 +1866,77 @@ impl AdminStore for PgStore {
             .await
             .map(|result| result.rows_affected() > 0)
             .map_err(Self::sqlx_error)
+    }
+
+    async fn record_source_address_checks(
+        &self,
+        checks: &[camelmailer_core::SourceAddressCheck],
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(Self::sqlx_error)?;
+        for check in checks {
+            sqlx::query(
+                "INSERT INTO source_address_checks
+                     (address, family, origin, status, ptr, detail, checked_by, checked_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (address) DO UPDATE SET
+                     family = EXCLUDED.family, origin = EXCLUDED.origin,
+                     status = EXCLUDED.status, ptr = EXCLUDED.ptr,
+                     detail = EXCLUDED.detail, checked_by = EXCLUDED.checked_by,
+                     checked_at = EXCLUDED.checked_at",
+            )
+            .bind(&check.address)
+            .bind(&check.family)
+            .bind(&check.origin)
+            .bind(&check.status)
+            .bind(&check.ptr)
+            .bind(&check.detail)
+            .bind(&check.checked_by)
+            .bind(check.checked_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(Self::sqlx_error)?;
+        }
+        let pool_addresses: Vec<&str> = checks
+            .iter()
+            .filter(|check| check.origin == "pool")
+            .map(|check| check.address.as_str())
+            .collect();
+        sqlx::query(
+            "DELETE FROM source_address_checks
+             WHERE checked_at < now() - interval '7 days'
+                OR (origin = 'pool' AND NOT (address = ANY($1)))",
+        )
+        .bind(&pool_addresses)
+        .execute(&mut *tx)
+        .await
+        .map_err(Self::sqlx_error)?;
+        tx.commit().await.map_err(Self::sqlx_error)
+    }
+
+    async fn list_source_address_checks(
+        &self,
+    ) -> Result<Vec<camelmailer_core::SourceAddressCheck>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM source_address_checks
+             ORDER BY CASE status WHEN 'no_ptr' THEN 0 WHEN 'mismatch' THEN 0
+                 WHEN 'lookup_failed' THEN 1 WHEN 'not_public' THEN 1 ELSE 2 END, address",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(rows
+            .iter()
+            .map(|row| camelmailer_core::SourceAddressCheck {
+                address: row.get("address"),
+                family: row.get("family"),
+                origin: row.get("origin"),
+                status: row.get("status"),
+                ptr: row.get("ptr"),
+                detail: row.get("detail"),
+                checked_by: row.get("checked_by"),
+                checked_at: row.get("checked_at"),
+            })
+            .collect())
     }
 
     async fn set_server_ip_pool(
@@ -2262,6 +2338,37 @@ impl camelmailer_core::ServerStore for PgStore {
         .await
         .map_err(Self::sqlx_error)?;
         Ok(stream)
+    }
+
+    async fn pool_source_for(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+        ipv4: &str,
+    ) -> Result<Option<camelmailer_core::PoolSource>, StoreError> {
+        // The same pool resolution as source_ip_for: the stream's pool first,
+        // then the server's.
+        let row = sqlx::query(
+            "SELECT p.address_family, a.ipv6 FROM ip_addresses a
+             JOIN ip_pools p ON p.id = a.ip_pool_id
+             WHERE a.ip_pool_id = COALESCE(
+                 (SELECT ms.ip_pool_id FROM message_streams ms
+                  WHERE ms.id = $2 AND ms.server_id = $1),
+                 (SELECT s.ip_pool_id FROM servers s WHERE s.id = $1))
+               AND a.ipv4 = $3
+             ORDER BY a.priority, a.id
+             LIMIT 1",
+        )
+        .bind(server_id as i64)
+        .bind(stream_id.map(|id| id as i64))
+        .bind(ipv4)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(row.map(|row| camelmailer_core::PoolSource {
+            address_family: row.get("address_family"),
+            ipv6: row.get("ipv6"),
+        }))
     }
 
     async fn source_ip_for(

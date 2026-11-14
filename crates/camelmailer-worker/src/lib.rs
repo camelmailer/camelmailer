@@ -5,6 +5,8 @@ pub mod arf;
 pub mod dkim;
 pub mod dmarc;
 pub mod inspection;
+pub mod outbound;
+pub mod reverse_dns;
 pub mod sender;
 pub mod signer;
 pub mod smtp_client;
