@@ -84,7 +84,17 @@ pub struct Camelmailer {
     pub smtp_relays: Vec<String>,
     /// IP addresses to trust for proxying requests (in addition to localhost)
     pub trusted_proxies: Vec<String>,
+    /// How long a queued message, webhook request or lifecycle event may
+    /// stay locked before another worker takes it over, in days. Superseded
+    /// by `queued_message_lock_stale_seconds` when that is set.
     pub queued_message_lock_stale_days: u32,
+    /// The same lock lease in seconds. When set it replaces
+    /// `queued_message_lock_stale_days`. A worker refreshes the locks it
+    /// holds every 30 seconds while it works, so a live worker never loses a
+    /// row however long its delivery takes; only the rows of a worker that
+    /// died are taken over once the lease runs out. Values below 90 are
+    /// raised to 90 (three heartbeats). Unset by default.
+    pub queued_message_lock_stale_seconds: Option<u32>,
     #[serde(default = "default_true")]
     pub batch_queued_messages: bool,
     pub batch_queued_messages_limit: u32,
@@ -111,6 +121,29 @@ pub struct Camelmailer {
     pub message_retention_days: u32,
 }
 
+/// Default `worker.shutdown_grace_seconds`: below Docker's default stop
+/// timeout of 10 s, so a worker without a configured `stop_grace_period`
+/// still finishes its shutdown before it is killed.
+pub const DEFAULT_SHUTDOWN_GRACE_SECONDS: u32 = 8;
+
+/// The shortest lock lease a worker accepts: three heartbeats.
+pub const MIN_QUEUE_LOCK_LEASE_SECONDS: u32 = 90;
+
+impl Camelmailer {
+    /// The effective lock lease in seconds: `queued_message_lock_stale_seconds`
+    /// when set (at least [`MIN_QUEUE_LOCK_LEASE_SECONDS`]), otherwise
+    /// `queued_message_lock_stale_days` (at least one day).
+    pub fn queue_lock_lease_seconds(&self) -> u32 {
+        match self.queued_message_lock_stale_seconds {
+            Some(seconds) => seconds.max(MIN_QUEUE_LOCK_LEASE_SECONDS),
+            None => self
+                .queued_message_lock_stale_days
+                .max(1)
+                .saturating_mul(86_400),
+        }
+    }
+}
+
 impl Default for Camelmailer {
     fn default() -> Self {
         Self {
@@ -131,6 +164,7 @@ impl Default for Camelmailer {
             smtp_relays: vec![],
             trusted_proxies: vec![],
             queued_message_lock_stale_days: 1,
+            queued_message_lock_stale_seconds: None,
             batch_queued_messages: true,
             batch_queued_messages_limit: 100,
             admin_api_key: None,
@@ -627,6 +661,15 @@ pub struct Worker {
     /// it again. No attempt is counted. At least 1 (env
     /// `WORKER_FOREIGN_POOL_DELAY_SECONDS`).
     pub foreign_pool_delay_seconds: u32,
+    /// On SIGTERM or SIGINT the worker stops taking new work and waits this
+    /// many seconds for the deliveries it has in flight. Whatever is still
+    /// running then is stopped: rows that had not reached a receiver go back
+    /// to the queue without counting an attempt, the rest keep their lock
+    /// until the lease runs out. Keep it below the stop timeout of the
+    /// process manager (Docker: `stop_grace_period`, default 10 s), which is
+    /// why the default is 8: the worker then finishes its shutdown before
+    /// Docker would kill it, even with no stop timeout configured.
+    pub shutdown_grace_seconds: u32,
 }
 
 impl Default for Worker {
@@ -641,6 +684,7 @@ impl Default for Worker {
             host_aware_pools: false,
             source_addresses: Vec::new(),
             foreign_pool_delay_seconds: 30,
+            shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
         }
     }
 }
@@ -1534,6 +1578,10 @@ mod tests {
         assert_eq!(config.worker.threads, 2);
         assert!(config.worker.servers.is_empty());
         assert_eq!(config.worker.deliver, WorkerDeliver::All);
+        // Below Docker's default stop timeout of 10 s, so the worker is not
+        // killed mid-shutdown when no stop_grace_period is configured.
+        assert_eq!(config.worker.shutdown_grace_seconds, 8);
+        assert!(config.worker.shutdown_grace_seconds < 10);
 
         assert_eq!(config.main_db.host, "localhost");
         assert_eq!(config.main_db.port, 3306);
