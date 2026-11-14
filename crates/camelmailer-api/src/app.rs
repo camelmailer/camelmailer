@@ -75,6 +75,10 @@ pub struct ApiState {
     /// Adaptive warm-up settings and state. `None` answers the warm-up
     /// endpoints with 503.
     pub warmup_store: Option<Arc<dyn camelmailer_core::WarmupStore>>,
+    /// Lookups for the infrastructure DNS checks; `None` uses hickory.
+    pub dns_check_resolver: Option<Arc<dyn crate::dns_checks::DnsCheckResolver>>,
+    /// The last full DNS check run, reused for a minute.
+    pub dns_checks_cache: Arc<crate::dns_checks::DnsChecksCache>,
 }
 
 impl ApiState {
@@ -108,6 +112,8 @@ impl ApiState {
             delivery_stats: None,
             warmup_store: None,
             spf_resolver: None,
+            dns_check_resolver: None,
+            dns_checks_cache: Arc::default(),
         })
     }
 
@@ -133,6 +139,8 @@ impl ApiState {
             delivery_stats: None,
             warmup_store: None,
             spf_resolver: None,
+            dns_check_resolver: None,
+            dns_checks_cache: Arc::default(),
         })
     }
 
@@ -303,6 +311,8 @@ impl ApiState {
             delivery_stats: None,
             warmup_store: None,
             spf_resolver: None,
+            dns_check_resolver: None,
+            dns_checks_cache: Arc::default(),
         })
     }
 
@@ -321,6 +331,17 @@ impl ApiState {
     /// sending domain's policy rather than compare its text. Same shape as
     /// [`ApiState::with_org_sso_store`]: the state is immutable behind an
     /// `Arc`, so this returns a fresh one.
+    /// Use `resolver` for the infrastructure DNS checks (tests).
+    pub fn with_dns_check_resolver(
+        self: Arc<Self>,
+        resolver: Arc<dyn crate::dns_checks::DnsCheckResolver>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.dns_check_resolver = Some(resolver);
+        state.dns_checks_cache = Arc::default();
+        Arc::new(state)
+    }
+
     pub fn with_spf_resolver(
         self: Arc<Self>,
         spf_resolver: Arc<dyn camelmailer_core::SpfResolver>,
@@ -2009,6 +2030,12 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/ip_warmup/pools/{id}",
             axum::routing::patch(crate::ip_warmup::ip_warmup_pool_update),
+        )
+        .route("/cluster", get(crate::cluster_api::cluster_show))
+        .route("/dns_checks", get(crate::dns_checks::dns_checks_index))
+        .route(
+            "/dns_checks/candidate",
+            get(crate::dns_checks::dns_checks_candidate),
         )
         .route(
             "/ip_pools/{pool_id}/ip_addresses",

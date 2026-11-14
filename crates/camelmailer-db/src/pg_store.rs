@@ -1948,6 +1948,108 @@ impl AdminStore for PgStore {
             .collect())
     }
 
+    async fn register_node(
+        &self,
+        node: &camelmailer_core::NodeRegistration,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO cluster_nodes (instance_id, role, node_name, version, details)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (instance_id, role) DO UPDATE SET
+                 node_name = EXCLUDED.node_name, version = EXCLUDED.version,
+                 details = EXCLUDED.details, last_seen_at = now(), stopped_at = NULL",
+        )
+        .bind(&node.instance_id)
+        .bind(&node.role)
+        .bind(&node.node_name)
+        .bind(&node.version)
+        .bind(&node.details)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(())
+    }
+
+    async fn mark_node_stopped(&self, instance_id: &str, role: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE cluster_nodes SET stopped_at = now() WHERE instance_id = $1 AND role = $2",
+        )
+        .bind(instance_id)
+        .bind(role)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(())
+    }
+
+    async fn list_cluster_nodes(&self) -> Result<Vec<camelmailer_core::ClusterNode>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM cluster_nodes ORDER BY node_name, role, started_at")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(Self::sqlx_error)?;
+        Ok(rows
+            .iter()
+            .map(|row| camelmailer_core::ClusterNode {
+                instance_id: row.get("instance_id"),
+                role: row.get("role"),
+                node_name: row.get("node_name"),
+                version: row.get("version"),
+                details: row.get("details"),
+                started_at: row.get("started_at"),
+                last_seen_at: row.get("last_seen_at"),
+                stopped_at: row.get("stopped_at"),
+            })
+            .collect())
+    }
+
+    async fn prune_cluster_nodes(&self, days: u32) -> Result<u64, StoreError> {
+        let done = sqlx::query(
+            "DELETE FROM cluster_nodes WHERE last_seen_at < now() - make_interval(days => $1)",
+        )
+        .bind(days as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(done.rows_affected())
+    }
+
+    async fn cluster_leases(&self) -> Result<Vec<camelmailer_core::NodeLeases>, StoreError> {
+        // queued_messages has no row-level security (only messages does), so
+        // the counts cover every server.
+        let rows = sqlx::query(
+            "SELECT locked_by,
+                    count(*) FILTER (WHERE queue = 'messages') AS queued_messages,
+                    count(*) FILTER (WHERE queue = 'webhooks') AS webhook_requests,
+                    count(*) FILTER (WHERE queue = 'lifecycle') AS lifecycle_events,
+                    min(locked_at) AS oldest_lock_at
+             FROM (
+                 SELECT 'messages' AS queue, locked_by, locked_at FROM queued_messages
+                     WHERE locked_by IS NOT NULL
+                 UNION ALL
+                 SELECT 'webhooks', locked_by, locked_at FROM webhook_requests
+                     WHERE locked_by IS NOT NULL
+                 UNION ALL
+                 SELECT 'lifecycle', locked_by, locked_at FROM lifecycle_events
+                     WHERE locked_by IS NOT NULL
+             ) locks
+             GROUP BY locked_by
+             ORDER BY locked_by",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(rows
+            .iter()
+            .map(|row| camelmailer_core::NodeLeases {
+                locked_by: row.get("locked_by"),
+                queued_messages: row.get("queued_messages"),
+                webhook_requests: row.get("webhook_requests"),
+                lifecycle_events: row.get("lifecycle_events"),
+                oldest_lock_at: row.get("oldest_lock_at"),
+            })
+            .collect())
+    }
+
     async fn set_server_ip_pool(
         &self,
         server_id: Id,

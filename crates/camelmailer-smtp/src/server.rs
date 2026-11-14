@@ -24,6 +24,94 @@ use tokio_rustls::TlsAcceptor;
 /// on every listener. A load balancer sends it right after connecting.
 const PROXY_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// After the grace period, how long sessions get to write their `421` and
+/// close before the server stops waiting for them.
+const SHUTDOWN_CLOSE_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Where a graceful shutdown stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    /// Accepting connections.
+    Running,
+    /// No new connections; open sessions finish their transaction.
+    Draining,
+    /// The grace period is over: every session still open is told `421`
+    /// and closed.
+    Expired,
+}
+
+/// The reply a session gets when the server closes it during a shutdown.
+/// RFC 5321 4.2.3 lists `421 <domain> Service not available, closing
+/// transmission channel`; RFC 3463 `4.3.2` is "system not accepting network
+/// messages", a temporary condition, so the client retries elsewhere or
+/// later. Nothing it was told `250` for is lost: a message is queued before
+/// its `250` is sent.
+fn shutdown_reply(hostname: &str) -> String {
+    format!("421 4.3.2 {hostname} Service shutting down, closing transmission channel")
+}
+
+/// The sessions open right now, so a shutdown can wait for them.
+#[derive(Default)]
+struct OpenSessions {
+    count: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl OpenSessions {
+    fn open(self: &Arc<Self>) -> OpenSession {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        OpenSession(self.clone())
+    }
+
+    fn len(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once no session is open.
+    async fn closed(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.len() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One open session; closing it (dropping the guard) wakes a waiting
+/// shutdown.
+struct OpenSession(Arc<OpenSessions>);
+
+impl Drop for OpenSession {
+    fn drop(&mut self) {
+        self.0
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
+}
+
+/// What a session needs to know about a shutdown in progress.
+#[derive(Clone)]
+struct ShutdownWatch {
+    drain: tokio::sync::watch::Receiver<Drain>,
+    reply: Arc<str>,
+}
+
+impl ShutdownWatch {
+    fn draining(&self) -> bool {
+        *self.drain.borrow() != Drain::Running
+    }
+
+    /// Resolves when the grace period is over (or the server is gone).
+    async fn expired(&mut self) {
+        let _ = self.drain.wait_for(|d| *d == Drain::Expired).await;
+    }
+}
+
 /// Why no PROXY header line came off the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProxyReadFailure {
@@ -303,6 +391,8 @@ pub struct SmtpServer {
     /// How long a `proxy_protocol` connection may take to send its PROXY
     /// header ([`PROXY_HEADER_TIMEOUT`]; tests shorten it).
     proxy_header_timeout: std::time::Duration,
+    /// `smtp_server.shutdown_grace_seconds`.
+    shutdown_grace: std::time::Duration,
 }
 
 impl SmtpServer {
@@ -312,12 +402,22 @@ impl SmtpServer {
         sink: Arc<dyn MessageSink>,
     ) -> Self {
         Self {
-            config,
             store,
             sink,
             spf_resolver: None,
             proxy_header_timeout: PROXY_HEADER_TIMEOUT,
+            shutdown_grace: std::time::Duration::from_secs(u64::from(
+                config.smtp_server.shutdown_grace_seconds,
+            )),
+            config,
         }
+    }
+
+    /// Override the grace period of a graceful shutdown
+    /// (`smtp_server.shutdown_grace_seconds`).
+    pub fn with_shutdown_grace(mut self, grace: std::time::Duration) -> Self {
+        self.shutdown_grace = grace;
+        self
     }
 
     /// Override how long a `proxy_protocol` connection may take to send its
@@ -336,7 +436,19 @@ impl SmtpServer {
         self
     }
 
-    pub async fn run(mut self) -> std::io::Result<()> {
+    /// Serve until the process ends.
+    pub async fn run(self) -> std::io::Result<()> {
+        self.run_until(std::future::pending()).await
+    }
+
+    /// Serve until `shutdown` resolves, then shut down gracefully: stop
+    /// accepting connections, let open sessions finish their transaction for
+    /// up to `smtp_server.shutdown_grace_seconds`, then tell the rest `421`
+    /// and close them.
+    pub async fn run_until(
+        mut self,
+        shutdown: impl std::future::Future<Output = ()> + Send,
+    ) -> std::io::Result<()> {
         // Enable inbound SPF in production: evaluate the envelope-From against
         // the client IP and record a Received-SPF header (never blocking).
         // Tests that call serve()/serve_listeners() directly leave it off.
@@ -372,7 +484,7 @@ impl SmtpServer {
                 "camelmailer SMTP server listening"
             );
         }
-        self.serve_listeners(listeners).await
+        self.serve_listeners_until(listeners, shutdown).await
     }
 
     /// Accept connections on an existing listener in plain-SMTP mode (used
@@ -388,6 +500,19 @@ impl SmtpServer {
     pub async fn serve_listeners(
         self,
         listeners: Vec<(TcpListener, SmtpListenerMode)>,
+    ) -> std::io::Result<()> {
+        self.serve_listeners_until(listeners, std::future::pending())
+            .await
+    }
+
+    /// Like [`SmtpServer::serve_listeners`], shutting down gracefully once
+    /// `shutdown` resolves (see [`SmtpServer::run_until`]). Returns when
+    /// every session has closed, or the grace period and a short close
+    /// margin are over.
+    pub async fn serve_listeners_until(
+        self,
+        listeners: Vec<(TcpListener, SmtpListenerMode)>,
+        shutdown: impl std::future::Future<Output = ()> + Send,
     ) -> std::io::Result<()> {
         let tls_acceptor = if self.config.smtp_server.tls_enabled {
             Some(Arc::new(TlsReloader::load(
@@ -409,19 +534,36 @@ impl SmtpServer {
             ));
         }
 
+        let grace = self.shutdown_grace;
+        let (drain_tx, drain_rx) = tokio::sync::watch::channel(Drain::Running);
+        let watch = ShutdownWatch {
+            drain: drain_rx,
+            reply: shutdown_reply(&self.config.camelmailer.smtp_hostname).into(),
+        };
+        let sessions = Arc::new(OpenSessions::default());
         let this = Arc::new(self);
         let mut accept_loops = tokio::task::JoinSet::new();
         for (listener, mode) in listeners {
             let this = this.clone();
             let tls_acceptor = tls_acceptor.clone();
+            let mut watch = watch.clone();
+            let sessions = sessions.clone();
             accept_loops.spawn(async move {
                 loop {
-                    let (stream, peer) = listener.accept().await?;
+                    let (stream, peer) = tokio::select! {
+                        // Draining: stop accepting. Dropping the listener
+                        // closes the socket, so new connections are refused.
+                        _ = watch.drain.wait_for(|d| *d != Drain::Running) => return Ok(()),
+                        accepted = listener.accept() => accepted?,
+                    };
                     let this = this.clone();
                     let tls_acceptor = tls_acceptor.clone();
+                    let watch = watch.clone();
+                    let open = sessions.open();
                     tokio::spawn(async move {
+                        let _open = open;
                         if let Err(error) = this
-                            .handle_connection(stream, peer, tls_acceptor, mode)
+                            .handle_connection(stream, peer, tls_acceptor, mode, watch)
                             .await
                         {
                             tracing::debug!(%peer, %error, "connection ended with error");
@@ -430,12 +572,47 @@ impl SmtpServer {
                 }
             });
         }
-        // The accept loops never return Ok; surface the first error.
-        match accept_loops.join_next().await {
-            Some(Ok(result)) => result,
-            Some(Err(join_error)) => Err(std::io::Error::other(join_error)),
-            None => Ok(()),
+
+        // Until the shutdown, the accept loops only end on an error.
+        tokio::pin!(shutdown);
+        tokio::select! {
+            _ = &mut shutdown => {}
+            ended = accept_loops.join_next() => {
+                return match ended {
+                    Some(Ok(result)) => result,
+                    Some(Err(join_error)) => Err(std::io::Error::other(join_error)),
+                    None => Ok(()),
+                };
+            }
         }
+
+        tracing::info!(
+            open_sessions = sessions.len(),
+            grace_seconds = grace.as_secs(),
+            "SMTP server shutting down: no new connections, open sessions finish their transaction"
+        );
+        let _ = drain_tx.send(Drain::Draining);
+        while accept_loops.join_next().await.is_some() {}
+        if tokio::time::timeout(grace, sessions.closed())
+            .await
+            .is_err()
+        {
+            tracing::info!(
+                open_sessions = sessions.len(),
+                "SMTP shutdown grace period over; closing the remaining sessions with 421"
+            );
+            let _ = drain_tx.send(Drain::Expired);
+            if tokio::time::timeout(SHUTDOWN_CLOSE_MARGIN, sessions.closed())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    open_sessions = sessions.len(),
+                    "SMTP sessions still open after the shutdown; they are dropped"
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn handle_connection(
@@ -444,6 +621,7 @@ impl SmtpServer {
         peer: SocketAddr,
         tls_acceptor: Option<Arc<TlsReloader>>,
         mode: SmtpListenerMode,
+        mut watch: ShutdownWatch,
     ) -> std::io::Result<()> {
         let session_config = SessionConfig::from(&self.config);
         // With proxy_protocol enabled the client IP comes from the PROXY
@@ -522,7 +700,7 @@ impl SmtpServer {
             session.set_tls(true);
             let mut lines = LineStream::new(tls_stream);
             lines.write_line(&session.banner()).await?;
-            drive_session(&mut session, &mut lines, spf.as_ref()).await?;
+            drive_session(&mut session, &mut lines, spf.as_ref(), &mut watch).await?;
             lines.stream.shutdown().await.ok();
             return Ok(());
         }
@@ -535,7 +713,7 @@ impl SmtpServer {
 
         // Plaintext phase: run until the connection ends or STARTTLS asks
         // for an upgrade.
-        let upgrade = drive_session(&mut session, &mut lines, spf.as_ref()).await?;
+        let upgrade = drive_session(&mut session, &mut lines, spf.as_ref(), &mut watch).await?;
         if !upgrade {
             return Ok(());
         }
@@ -556,7 +734,7 @@ impl SmtpServer {
             .await?;
         session.set_tls(true);
         let mut tls_lines = LineStream::new(tls_stream);
-        drive_session(&mut session, &mut tls_lines, spf.as_ref()).await?;
+        drive_session(&mut session, &mut tls_lines, spf.as_ref(), &mut watch).await?;
         tls_lines.stream.shutdown().await.ok();
         Ok(())
     }
@@ -607,16 +785,33 @@ async fn evaluate_inbound_spf(session: &mut Session, spf: &SpfContext) {
 /// Pump lines through the session until the client disconnects, the session
 /// finishes, or (in the plaintext phase) STARTTLS requests an upgrade.
 /// Returns `true` when a TLS upgrade is requested.
+///
+/// During a shutdown the session runs on until its open transaction ends
+/// (the message accepted, refused or reset), then gets `421` and is closed.
+/// Once the grace period is over, a session still open gets `421` at once,
+/// whatever it was doing; a message it had not been told `250` for is
+/// simply not accepted, and the client retries it.
 async fn drive_session<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Session,
     lines: &mut LineStream<S>,
     spf: Option<&SpfContext>,
+    watch: &mut ShutdownWatch,
 ) -> std::io::Result<bool> {
     let mut spf_evaluated = false;
     loop {
-        let Some(line) = lines.read_line().await? else {
+        // Reading a line is cancel safe: bytes already read stay in the
+        // buffer, so losing the race against the grace period drops nothing.
+        let line = tokio::select! {
+            line = lines.read_line() => line?,
+            _ = watch.expired() => {
+                lines.write_line(&watch.reply).await.ok();
+                return Ok(false);
+            }
+        };
+        let Some(line) = line else {
             return Ok(false);
         };
+        let in_transaction = session.in_transaction();
         // Right before the client sends DATA (envelope complete), evaluate SPF
         // once so the verdict can be prepended to the stored message. Skipped
         // when SPF is disabled or the transaction never reached RCPT TO.
@@ -632,6 +827,11 @@ async fn drive_session<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(true);
         }
         if session.finished() {
+            return Ok(false);
+        }
+        if watch.draining() && in_transaction && !session.in_transaction() {
+            // Shutting down and the transaction is over: close cleanly.
+            lines.write_line(&watch.reply).await.ok();
             return Ok(false);
         }
     }
