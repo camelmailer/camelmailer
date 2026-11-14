@@ -5110,3 +5110,216 @@ async fn a_result_for_a_row_the_worker_still_holds_is_recorded_as_before() {
         }
     }
 }
+
+/// A mock SMTP server that stops answering at one point of the conversation
+/// and signals `ready` when it gets there: `"GREETING"` holds the 220 banner,
+/// any other value holds the reply to the first command starting with it
+/// (`"EHLO"`, `"MAIL"`, `"RCPT"`, `"DATA"`). Every other command is answered
+/// as `mock_smtp` does. The lines it received are captured.
+async fn stalling_mock_smtp(
+    stall_at: &'static str,
+) -> (u16, Arc<Mutex<Vec<String>>>, Arc<tokio::sync::Notify>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let signal = ready.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let captured = captured.clone();
+            let signal = signal.clone();
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                if stall_at == "GREETING" {
+                    signal.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                write_half.write_all(b"220 mock ESMTP\r\n").await.ok();
+                let mut in_data = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let trimmed = line.trim_end().to_string();
+                    captured.lock().unwrap().push(trimmed.clone());
+                    if in_data {
+                        if trimmed == "." {
+                            in_data = false;
+                            write_half.write_all(b"250 Accepted\r\n").await.ok();
+                        }
+                        continue;
+                    }
+                    let upper = trimmed.to_ascii_uppercase();
+                    if upper.starts_with(stall_at) {
+                        signal.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    let reply: &str = if upper.starts_with("EHLO") {
+                        "250-mock\r\n250 OK"
+                    } else if upper.starts_with("DATA") {
+                        in_data = true;
+                        "354 Go ahead"
+                    } else if upper.starts_with("QUIT") {
+                        write_half.write_all(b"221 Bye\r\n").await.ok();
+                        return;
+                    } else {
+                        "250 OK"
+                    };
+                    write_half
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await
+                        .ok();
+                }
+            });
+        }
+    });
+    (port, received, ready)
+}
+
+/// Issue #82: a delivery stopped by a shutdown before its client sent `DATA`
+/// goes straight back to the queue with no attempt counted, wherever it was
+/// stopped (greeting, EHLO, MAIL FROM, RCPT TO); one stopped after `DATA`
+/// was sent keeps its lock for the lease. The receiver never sees `DATA` for
+/// a released row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_releases_a_delivery_stopped_before_data_and_keeps_one_after() {
+    for (stall_at, released) in [
+        ("GREETING", true),
+        ("EHLO", true),
+        ("MAIL", true),
+        ("RCPT", true),
+        ("DATA", false),
+    ] {
+        let base = require_db!();
+        let pool = test_pool_with_connections(&base, 6).await;
+        let s = setup(pool.clone()).await;
+        let (port, received, ready) = stalling_mock_smtp(stall_at).await;
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+
+        let mut config = worker_config(port);
+        config.smtp_client.read_timeout = 60;
+        let worker = Worker::new(&config, s.store.clone())
+            .with_shutdown_grace(std::time::Duration::from_millis(300));
+        let worker_id = worker.worker_id().to_string();
+        let (stop, handle) = run_in_background(worker);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), ready.notified())
+            .await
+            .unwrap_or_else(|_| panic!("the delivery reached {stall_at}"));
+        assert_eq!(
+            queue_row_state(&pool).await,
+            Some((Some(worker_id.clone()), 0)),
+            "{stall_at}: the delivery holds its row"
+        );
+
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("the worker stops within its grace period")
+            .unwrap()
+            .unwrap();
+
+        if released {
+            assert_eq!(
+                queue_row_state(&pool).await,
+                Some((None, 0)),
+                "{stall_at}: released without an attempt"
+            );
+            assert!(
+                PgQueue::new(pool.clone())
+                    .dequeue("another-worker")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{stall_at}: another worker takes it at once"
+            );
+            assert!(
+                !received.lock().unwrap().iter().any(|l| l == "DATA"),
+                "{stall_at}: no DATA for a released row"
+            );
+        } else {
+            assert_eq!(
+                queue_row_state(&pool).await,
+                Some((Some(worker_id.clone()), 0)),
+                "{stall_at}: kept for the lease"
+            );
+            assert!(PgQueue::new(pool.clone())
+                .dequeue("another-worker")
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+/// Issue #82: a closed data gate stops the client before `DATA`, and an open
+/// one changes nothing: the same conversation, the same outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_data_gate_only_observes_unless_it_is_closed() {
+    use camelmailer_worker::smtp_client::{DataGate, OutboundSource};
+    let smtp = mock_smtp("250 Accepted").await;
+    let sender = camelmailer_worker::SmtpSender::new(&worker_config(smtp.port));
+    let raw = b"Subject: x\r\n\r\nHello.\r\n";
+
+    let plain = sender
+        .send(
+            "dest.example",
+            "a@org.example",
+            "b@dest.example",
+            raw,
+            OutboundSource::default(),
+        )
+        .await;
+    let plain_lines = std::mem::take(&mut *smtp.received.lock().unwrap());
+
+    let gate = DataGate::default();
+    let gated = sender
+        .send_gated(
+            "dest.example",
+            "a@org.example",
+            "b@dest.example",
+            raw,
+            OutboundSource::default(),
+            None,
+            gate.clone(),
+        )
+        .await;
+    let gated_lines = std::mem::take(&mut *smtp.received.lock().unwrap());
+    assert_eq!(plain, gated);
+    // QUIT is written without waiting, so it may land in either capture.
+    let without_quit =
+        |lines: Vec<String>| -> Vec<String> { lines.into_iter().filter(|l| l != "QUIT").collect() };
+    assert_eq!(without_quit(plain_lines), without_quit(gated_lines));
+    assert!(gate.data_started());
+    assert!(!gate.close(), "a gate past DATA does not close");
+
+    let closed = DataGate::default();
+    assert!(closed.close());
+    let outcome = sender
+        .send_gated(
+            "dest.example",
+            "a@org.example",
+            "b@dest.example",
+            raw,
+            OutboundSource::default(),
+            None,
+            closed,
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        camelmailer_worker::SendOutcome::SoftFail { .. }
+    ));
+    let lines = smtp.received.lock().unwrap().clone();
+    assert!(lines.iter().any(|l| l.starts_with("RCPT TO")));
+    assert!(!lines.iter().any(|l| l == "DATA"));
+}
