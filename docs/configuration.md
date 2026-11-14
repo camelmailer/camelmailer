@@ -420,13 +420,19 @@ On SIGTERM or SIGINT the worker stops taking new work and gives the
 deliveries in flight `shutdown_grace_seconds` to finish. Whatever is still
 running then is stopped:
 
-- A row stopped before it reached a receiver (still loading or signing) goes
-  back to the queue without counting an attempt, and the next worker takes it
-  straight away.
-- A row stopped while talking to the receiver keeps its lock until the lease
-  runs out, as after a crash. The receiver may already have accepted it, so it
-  is not sent again early. With the default lease of one day that delivery
-  waits a day; set `queued_message_lock_stale_seconds` to shorten it.
+- A row stopped before its message started to go out goes back to the queue
+  without counting an attempt, and the next worker takes it straight away.
+  That covers loading and signing, and an SMTP delivery that has not sent
+  `DATA` yet: connecting, the greeting, EHLO, STARTTLS, `MAIL FROM` and
+  `RCPT TO`. No receiver can have the message at that point. The release and
+  the `DATA` command exclude each other, so a released delivery never sends
+  its message.
+- A row stopped after its client sent `DATA` (on any of the MX hosts tried)
+  keeps its lock until the lease runs out, as after a crash. The receiver may
+  already have accepted it, so it is not sent again early. With the default
+  lease of one day that delivery waits a day; set
+  `queued_message_lock_stale_seconds` to shorten it. Inbound routes and
+  webhook requests count as started as soon as the request begins.
 - A row whose processing failed half way (for example the database was gone
   after the receiver's `250`) also keeps its lock for the lease.
 
