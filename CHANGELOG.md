@@ -17,6 +17,30 @@ integration tests) is green.
 
 ### Changed
 
+- **Behaviour change: servers without an IP pool use IPv6 first again.**
+  0.13.0 made such servers try the remote host's IPv4 addresses before its
+  IPv6 ones, to keep a dual-stack worker without IPv6 reverse DNS away from
+  Microsoft 365's S820 refusal. That went against the normal behaviour of a
+  dual-stack host and hid the actual problem, a missing PTR record. The new
+  setting `smtp_client.address_family` defaults to `dual_stack`: IPv6 first,
+  alternating with IPv4 (RFC 8305). When the remote host has addresses of
+  both families, `dual_stack` races them (Happy Eyeballs): if an attempt
+  has not connected after `smtp_client.connection_attempt_delay_ms` (250),
+  the next address is started alongside it, and the first connection wins.
+  A black-holed IPv6 path therefore costs a quarter of a second, not a
+  connection timeout. Every attempt keeps its full `open_timeout`, a
+  refused attempt starts the next address at once, and every address is
+  still tried; `0` connects one address at a time. Moving on to the next
+  address when a connection fails stays.
+  **If you relied on IPv4 first** because your IPv6 address has no PTR
+  record, either give it one (and an SPF entry), or set
+  `smtp_client.address_family: prefer_ipv4` (the 0.13.0 order) or
+  `ipv4_only`. The reverse-DNS check below tells you which addresses need
+  it. Servers with an IP pool are unaffected, and so is delivery through
+  `smtp_relays`: a smarthost is reached in the 0.13 order (IPv4 first)
+  whatever the family. A server whose pool has no usable address (empty,
+  or an address that does not parse) also keeps the 0.13 order and never
+  falls back to `dual_stack`.
 - A panic while processing one queued message, webhook request or lifecycle
   event no longer takes a worker loop down. The row goes back with one
   attempt counted and waits its backoff, but at least the lock lease, so a
@@ -24,9 +48,32 @@ integration tests) is green.
   the lock heartbeat that ends on its own still stops the whole worker with
   an error, so the process manager restarts it. Before, a loop that ended
   disappeared silently and the worker ran on with fewer delivery loops.
+- `POST /api/v2/admin/ip_pools/{id}/ip_addresses` rejects a `hostname` that
+  is not a fully qualified host name (CR/LF, spaces, IP literals, a single
+  label, a trailing dot) with 422. Existing rows are not touched.
 
 ### Added
 
+- **`smtp_client.address_family`**: `dual_stack` (default), `prefer_ipv4`,
+  `ipv4_only` or `ipv6_only`, for providers that offer reverse DNS for one
+  family only. It applies to servers without an IP pool.
+- **Address family per IP pool** (`address_family` on
+  `POST`/`PATCH /api/v2/admin/ip_pools`, and a selector on the IP pools
+  page). Without one a pool sends from each address's IPv4 value to IPv4
+  remotes, as before. With one, IPv4 connections bind the address's `ipv4`
+  and IPv6 connections its `ipv6` value, which until now was stored for
+  reference only. A pool address without `ipv6` stays on IPv4 whatever the
+  family. Migration `0051`.
+- **Reverse-DNS check of the source addresses.** Each worker checks, at
+  start and every `smtp_client.reverse_dns_check_interval` seconds (3600;
+  `0` turns it off), that every address it may send from has a PTR record
+  whose name resolves back to it: both values of every pool address, and
+  the IPv4 and IPv6 address its host sends from for servers without a pool.
+  Failures are logged as warnings, listed failures-first by
+  `GET /api/v2/admin/source_addresses` and on the IP pools page.
+- **`smtp_client.skip_family_without_reverse_dns`** (default `false`):
+  `dual_stack` and `prefer_ipv4` leave out a family whose source address
+  failed the check while the other family's did not.
 - **EHLO from the pool address.** With `smtp_client.helo_from_ip_address:
   true` the worker greets with the `hostname` of the IP-pool address a
   delivery is bound to, so EHLO, PTR and A record agree per IP. Falls back to
@@ -95,12 +142,6 @@ integration tests) is green.
   same 107-byte cap and 10-second timeout to the header as `smtps`; it used
   to buffer an unterminated first line without limit and wait forever.
   Refused headers are logged as a rate-limited warning.
-
-### Changed
-
-- `POST /api/v2/admin/ip_pools/{id}/ip_addresses` rejects a `hostname` that
-  is not a fully qualified host name (CR/LF, spaces, IP literals, a single
-  label, a trailing dot) with 422. Existing rows are not touched.
 
 ## [0.13.1] - 2026-11-05
 

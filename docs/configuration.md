@@ -455,6 +455,10 @@ smtp_client:
   open_timeout: 30    # seconds for the TCP connection, per remote address
   read_timeout: 300   # seconds for the greeting, a TLS handshake and each reply
   data_timeout: 600   # seconds to send the body and get the reply to its final dot
+  address_family: dual_stack            # dual_stack | prefer_ipv4 | ipv4_only | ipv6_only
+  connection_attempt_delay_ms: 250      # dual_stack: start the next address after this; 0 = one at a time
+  reverse_dns_check_interval: 3600      # seconds between reverse-DNS checks; 0 turns them off
+  skip_family_without_reverse_dns: false
   helo_from_ip_address: false   # EHLO with the bound pool address's hostname
 ```
 
@@ -470,13 +474,75 @@ seconds: receivers such as Hornetsecurity hold the greeting back on purpose
 for a sender they do not know yet, and a worker that gives up after 30
 seconds then fails every attempt with `read timeout`.
 
-A server with an IP pool sends from the pool's address, and only to remote
-addresses of the same family. A server without one leaves the local address
-to the operating system; the worker then tries the remote host's IPv4
-addresses first and its IPv6 addresses after, and moves on to the next
-address when a connection fails. On a dual-stack host, give the host's IPv6
-address a PTR record and an SPF entry before relying on it: Microsoft 365
-refuses IPv6 senders without reverse DNS (error S820).
+#### Address family
+
+`address_family` decides which of the remote host's addresses the worker
+tries, and in which order. The resolver's order is kept within a family,
+and when a connection fails the worker moves on to the next address.
+
+| Value | Remote addresses tried |
+|---|---|
+| `dual_stack` (default) | Both families, IPv6 first, alternating with IPv4 (RFC 8305), raced (see below) |
+| `prefer_ipv4` | Both families, every IPv4 address before the first IPv6 one |
+| `ipv4_only` | IPv4 only |
+| `ipv6_only` | IPv6 only |
+
+With `dual_stack`, when the remote host has addresses of both families,
+the worker races them (Happy Eyeballs, RFC 8305 section 5): an attempt that
+has not connected after `connection_attempt_delay_ms` (default 250) gets
+the next address started alongside it, a refused attempt starts the next
+address at once, and the first connection wins while the others are
+closed. Each attempt keeps its full `open_timeout`, so every address starts
+no later than it would one at a time and is given as long to connect; a
+black-holed IPv6 path costs a quarter of a second instead of an
+`open_timeout`. `connection_attempt_delay_ms: 0` connects one address at a
+time. The other values always connect one address at a time.
+
+The setting applies to servers without an IP pool, where the operating
+system picks the local address. It does not apply to delivery through
+`smtp_relays`: the smarthost is reached in the 0.13 order (every IPv4
+address first, then IPv6), and the reverse-DNS skip below is not applied
+to it. A server or stream whose pool has no usable address (an empty pool,
+or an `ipv4` value that does not parse) sends from the host's address in
+the 0.13 order as well, never `dual_stack`. A server or stream with an IP pool follows
+the pool: a pool without an `address_family` of its own sends from each
+address's `ipv4` value, to IPv4 remotes only, as pools always have; a pool
+with one sends IPv4 connections from `ipv4` and IPv6 connections from
+`ipv6`, in the pool's order. See
+[Deliverability: address family](deliverability.md#address-family).
+
+Choose the family by the reverse DNS you can publish. Large receivers
+refuse a sender without a PTR record whose name resolves back to it
+(forward-confirmed reverse DNS); Microsoft 365 answers `S820` to IPv6
+senders without one. Give each address you send from a PTR record. Where
+your provider offers reverse DNS for one family only, use `prefer_ipv4` or
+`ipv4_only` (or `ipv6_only`) so mail leaves from the family that has it.
+
+#### Reverse-DNS check
+
+Each worker checks the addresses it may send from at start and every
+`reverse_dns_check_interval` seconds: both values of every IP pool
+address, and the IPv4 and IPv6 address the host sends from for servers
+without a pool. An address passes when it has a PTR record and one of the
+PTR names resolves back to it. A failing address is logged as a warning:
+
+```
+WARN 2001:db8::25 has no PTR record; receivers such as Microsoft 365 refuse mail from it (S820); this is the address servers without an IP pool send from; …
+```
+
+The results are listed by `GET /api/v2/admin/source_addresses` (global
+administrators) with the status `pass`, `no_ptr`, `mismatch` (a PTR name
+that does not resolve back), `lookup_failed` (decided at the next check) or
+`not_public` (a private address behind NAT, whose public address the
+worker cannot see). See
+[Administration](administration.md#source-address-reverse-dns).
+
+With `skip_family_without_reverse_dns: true`, `dual_stack` and
+`prefer_ipv4` leave out a family whose source address failed the check
+(`no_ptr` or `mismatch`) while the other family's did not. Nothing is left
+out when both fail, and `ipv4_only` and `ipv6_only` are never changed. It
+is off by default: the check runs once an hour, so a fixed PTR record takes
+effect at the next check, and a record that breaks is not noticed sooner.
 
 ### `lifecycle_webhooks:` installation events
 

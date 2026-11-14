@@ -655,6 +655,22 @@ pub trait ServerStore: Send + Sync {
     async fn create_stream(&self, new: NewStream) -> Result<MessageStream, StoreError>;
     async fn update_stream(&self, stream: MessageStream) -> Result<MessageStream, StoreError>;
 
+    /// The address family of the pool a message on `stream_id` sends from
+    /// (resolved like [`ServerStore::source_ip_for`]) and the IPv6 value of
+    /// that pool's address `ipv4`. `None` when the message has no pool, or
+    /// the pool has no such address.
+    ///
+    /// With `ipv4 = None` it only says whether the message has a pool:
+    /// `Some` (with the pool's family and no `ipv6`) when it does, so a
+    /// worker that found no usable pool address can tell a pool server
+    /// from one without a pool.
+    async fn pool_source_for(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+        ipv4: Option<&str>,
+    ) -> Result<Option<crate::model::PoolSource>, StoreError>;
+
     /// The source address for a message on `stream_id`: the highest-priority
     /// IPv4 (as a string) of the stream's IP pool when the stream sets one,
     /// else of the server's pool, else `None`. With `stream_id = None` (or a
@@ -1165,6 +1181,38 @@ impl ServerStore for crate::store::MemoryStore {
 
     async fn update_stream(&self, stream: MessageStream) -> Result<MessageStream, StoreError> {
         Ok(self.insert_stream(stream))
+    }
+
+    async fn pool_source_for(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+        ipv4: Option<&str>,
+    ) -> Result<Option<crate::model::PoolSource>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let pool_id = stream_id
+            .and_then(|id| inner.message_streams.get(&id))
+            .filter(|s| s.server_id == server_id)
+            .and_then(|s| s.ip_pool_id)
+            .or_else(|| inner.servers.get(&server_id).and_then(|s| s.ip_pool_id));
+        let Some(pool) = pool_id.and_then(|id| inner.ip_pools.get(&id)) else {
+            return Ok(None);
+        };
+        let Some(ipv4) = ipv4 else {
+            return Ok(Some(crate::model::PoolSource {
+                address_family: pool.address_family.clone(),
+                ipv6: None,
+            }));
+        };
+        Ok(inner
+            .ip_addresses
+            .values()
+            .filter(|a| a.ip_pool_id == pool.id && a.ipv4 == ipv4)
+            .min_by(|a, b| a.priority.cmp(&b.priority).then(a.id.cmp(&b.id)))
+            .map(|a| crate::model::PoolSource {
+                address_family: pool.address_family.clone(),
+                ipv6: a.ipv6.clone(),
+            }))
     }
 
     async fn source_ip_for(
@@ -2502,6 +2550,148 @@ mod tests {
             suppressions[0].reason.as_deref(),
             Some("Spam complaint (feedback loop)")
         );
+    }
+
+    #[tokio::test]
+    async fn pool_source_carries_the_pool_family_and_the_address_ipv6() {
+        use crate::admin_store::{AdminStore, NewIpAddress};
+
+        let fixtures = crate::testing::Fixtures::new();
+        let store = fixtures.store();
+        let server_id = fixtures.server_id();
+
+        // No pool: nothing to look up.
+        assert_eq!(
+            ServerStore::pool_source_for(&*store, server_id, None, Some("198.51.100.1"))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            ServerStore::pool_source_for(&*store, server_id, None, None)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let pool = store.create_ip_pool("dual", false).await.unwrap();
+        store
+            .create_ip_address(NewIpAddress {
+                ip_pool_id: pool.id,
+                ipv4: "198.51.100.1".into(),
+                ipv6: Some("2001:db8::1".into()),
+                hostname: "out1.example".into(),
+                priority: 10,
+            })
+            .await
+            .unwrap();
+        store
+            .set_server_ip_pool(server_id, Some(pool.id))
+            .await
+            .unwrap();
+
+        // A pool without a family of its own reports none.
+        let source = ServerStore::pool_source_for(&*store, server_id, None, Some("198.51.100.1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.address_family, None);
+        assert_eq!(source.ipv6.as_deref(), Some("2001:db8::1"));
+
+        store
+            .update_ip_pool(crate::model::IpPool {
+                address_family: Some("prefer_ipv4".into()),
+                ..pool.clone()
+            })
+            .await
+            .unwrap();
+        let source = ServerStore::pool_source_for(&*store, server_id, None, Some("198.51.100.1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.address_family.as_deref(), Some("prefer_ipv4"));
+
+        // An address that is not in the message's pool is not found.
+        assert_eq!(
+            ServerStore::pool_source_for(&*store, server_id, None, Some("203.0.113.9"))
+                .await
+                .unwrap(),
+            None
+        );
+        // Without an address: the message has a pool, and its family.
+        assert_eq!(
+            ServerStore::pool_source_for(&*store, server_id, None, None)
+                .await
+                .unwrap(),
+            Some(crate::model::PoolSource {
+                address_family: Some("prefer_ipv4".into()),
+                ipv6: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn source_address_checks_replace_and_prune() {
+        use crate::admin_store::AdminStore;
+        use crate::model::SourceAddressCheck;
+
+        let store = crate::store::MemoryStore::new();
+        let check = |address: &str, origin: &str, status: &str| SourceAddressCheck {
+            address: address.into(),
+            family: if address.contains(':') {
+                "ipv6"
+            } else {
+                "ipv4"
+            }
+            .into(),
+            origin: origin.into(),
+            status: status.into(),
+            ptr: Vec::new(),
+            detail: String::new(),
+            checked_by: "worker-host".into(),
+            checked_at: chrono::Utc::now(),
+        };
+        store
+            .record_source_address_checks(
+                &[
+                    check("198.51.100.1", "pool", "pass"),
+                    check("198.51.100.2", "pool", "pass"),
+                    check("2001:db8::9", "host", "no_ptr"),
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let listed = store.list_source_address_checks().await.unwrap();
+        // failures first
+        assert_eq!(listed[0].address, "2001:db8::9");
+        assert_eq!(listed.len(), 3);
+
+        // The next run no longer sees 198.51.100.2 in a pool, and fixes the PTR.
+        // A run that could not read every pool does not prune pool results.
+        store
+            .record_source_address_checks(&[check("2001:db8::9", "host", "no_ptr")], false)
+            .await
+            .unwrap();
+        assert_eq!(store.list_source_address_checks().await.unwrap().len(), 3);
+
+        let mut old_host = check("192.0.2.50", "host", "pass");
+        old_host.checked_at = chrono::Utc::now() - chrono::Duration::days(8);
+        store
+            .record_source_address_checks(
+                &[
+                    check("198.51.100.1", "pool", "mismatch"),
+                    check("2001:db8::9", "host", "pass"),
+                    old_host,
+                ],
+                true,
+            )
+            .await
+            .unwrap();
+        let listed = store.list_source_address_checks().await.unwrap();
+        let addresses: Vec<&str> = listed.iter().map(|c| c.address.as_str()).collect();
+        assert_eq!(addresses, vec!["198.51.100.1", "2001:db8::9"]);
+        assert_eq!(listed[0].status, "mismatch");
     }
 
     #[tokio::test]

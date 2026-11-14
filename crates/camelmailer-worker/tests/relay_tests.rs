@@ -173,7 +173,8 @@ fn params(port: u16, security: ConnectionSecurity, auth: Option<SmtpAuth>) -> Se
         tls_mode: TlsMode::AcceptAny,
         security,
         auth,
-        source_ip: None,
+        source: Default::default(),
+        connection_attempt_delay: Duration::ZERO,
     }
 }
 
@@ -459,5 +460,37 @@ async fn a_held_back_greeting_is_waited_for_with_the_read_timeout() {
             assert!(response.contains("read timeout"), "{response}")
         }
         other => panic!("expected a soft failure, got {other:?}"),
+    }
+}
+
+// End-to-end through the address-family code (#80): a normal message to a
+// receiver that holds its greeting back is still delivered under each
+// family, and with `dual_stack` racing on, a remote address that refuses the
+// connection (here `localhost`'s IPv6 address when the resolver returns one,
+// since the mock listens on 127.0.0.1 only) is passed over for the next one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_greeting_receiver_still_gets_the_message_under_every_family() {
+    use camelmailer_worker::smtp_client::{AddressFamily, OutboundSource};
+
+    let port = slow_greeting_mx(Duration::from_millis(1500)).await;
+    for family in [
+        AddressFamily::DualStack,
+        AddressFamily::PreferIpv4,
+        AddressFamily::Ipv4Only,
+    ] {
+        for delay in [Duration::ZERO, Duration::from_millis(250)] {
+            let mut slow = params(port, ConnectionSecurity::Opportunistic, None);
+            slow.host = "localhost".into();
+            slow.tls_mode = TlsMode::Disabled;
+            slow.timeout = Duration::from_millis(500);
+            slow.read_timeout = Duration::from_secs(5);
+            slow.source = OutboundSource::system(family);
+            slow.connection_attempt_delay = delay;
+            let outcome = send_message(&slow, MESSAGE).await;
+            assert!(
+                matches!(outcome, SendOutcome::Sent { .. }),
+                "{family}, delay {delay:?}: {outcome:?}"
+            );
+        }
     }
 }

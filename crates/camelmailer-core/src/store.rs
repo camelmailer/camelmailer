@@ -205,6 +205,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) users: HashMap<Id, User>,
     pub(crate) ip_pools: HashMap<Id, IpPool>,
     pub(crate) ip_addresses: HashMap<Id, IpAddress>,
+    /// Latest reverse-DNS check per source address.
+    pub(crate) source_address_checks: HashMap<String, SourceAddressCheck>,
     pub(crate) webhooks: HashMap<Id, Webhook>,
     /// Verified single sender addresses (per-address From authorization).
     pub(crate) sender_addresses: HashMap<Id, SenderAddress>,

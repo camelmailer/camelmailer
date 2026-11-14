@@ -977,6 +977,158 @@ async fn ip_pools_and_nested_addresses() {
     assert_eq!(status, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn ip_pool_address_family_is_set_validated_and_cleared() {
+    let (app, _) = build_app().await;
+
+    // Created without one: the pool sends from its IPv4 addresses only.
+    let (_, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/ip_pools",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Legacy" })),
+    )
+    .await;
+    assert_eq!(body["data"]["ip_pool"]["address_family"], Value::Null);
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/ip_pools",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Dual", "address_family": "dual_stack" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["ip_pool"]["address_family"], "dual_stack");
+    let pool_id = body["data"]["ip_pool"]["id"].as_u64().unwrap();
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/ip_pools",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Bad", "address_family": "ipv4_first" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let path = format!("/api/v2/admin/ip_pools/{pool_id}");
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &path,
+        Some(GLOBAL_KEY),
+        Some(json!({ "address_family": "ipv6_only" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["ip_pool"]["address_family"], "ipv6_only");
+    assert_eq!(body["data"]["ip_pool"]["name"], "Dual");
+
+    // An absent field leaves the family alone.
+    let (_, body) = request(
+        &app,
+        "PATCH",
+        &path,
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Renamed" })),
+    )
+    .await;
+    assert_eq!(body["data"]["ip_pool"]["address_family"], "ipv6_only");
+    assert_eq!(body["data"]["ip_pool"]["name"], "Renamed");
+
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &path,
+        Some(GLOBAL_KEY),
+        Some(json!({ "address_family": "both" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // null clears it.
+    let (_, body) = request(
+        &app,
+        "PATCH",
+        &path,
+        Some(GLOBAL_KEY),
+        Some(json!({ "address_family": null })),
+    )
+    .await;
+    assert_eq!(body["data"]["ip_pool"]["address_family"], Value::Null);
+}
+
+#[tokio::test]
+async fn source_addresses_list_the_reverse_dns_results_for_global_admins() {
+    let (app, state) = build_app().await;
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/source_addresses",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["source_addresses"], json!([]));
+    assert_eq!(body["data"]["failing"], 0);
+
+    let check = |address: &str, status: &str| camelmailer_core::SourceAddressCheck {
+        address: address.into(),
+        family: if address.contains(':') {
+            "ipv6"
+        } else {
+            "ipv4"
+        }
+        .into(),
+        origin: "host".into(),
+        status: status.into(),
+        ptr: if status == "pass" {
+            vec!["out.example.com".into()]
+        } else {
+            Vec::new()
+        },
+        detail: format!("{address} checked"),
+        checked_by: "worker-1".into(),
+        checked_at: chrono::Utc::now(),
+    };
+    state
+        .store
+        .record_source_address_checks(
+            &[
+                check("203.0.113.10", "pass"),
+                check("2001:db8::10", "no_ptr"),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/source_addresses",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    let listed = body["data"]["source_addresses"].as_array().unwrap();
+    assert_eq!(body["data"]["failing"], 1);
+    assert_eq!(listed[0]["address"], "2001:db8::10");
+    assert_eq!(listed[0]["status"], "no_ptr");
+    assert_eq!(listed[0]["family"], "ipv6");
+    assert_eq!(listed[1]["ptr"], json!(["out.example.com"]));
+    assert_eq!(listed[1]["checked_by"], "worker-1");
+
+    // Installation-wide information: not for scoped keys or without a key.
+    let (status, _) = request(&app, "GET", "/api/v2/admin/source_addresses", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 // ------------------------------------------------ P0: server config + keys
 
 #[tokio::test]

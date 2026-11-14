@@ -502,6 +502,7 @@ dependencies = [
 name = "camelmailer-worker"
 version = "0.13.1"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.23.1",
  "camelmailer-api",

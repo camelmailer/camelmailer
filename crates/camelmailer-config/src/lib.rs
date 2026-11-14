@@ -1102,9 +1102,100 @@ impl Default for Smtp {
     }
 }
 
+/// Which address families outgoing SMTP connections use
+/// (`smtp_client.address_family`, and per IP pool).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressFamily {
+    /// Both families, IPv6 first, alternating with IPv4 (RFC 8305), raced
+    /// with `connection_attempt_delay_ms` so a broken IPv6 path costs the
+    /// attempt delay and not a connection timeout. The normal behaviour of
+    /// a dual-stack host.
+    #[default]
+    DualStack,
+    /// Both families, every IPv4 address before the first IPv6 one.
+    PreferIpv4,
+    /// IPv4 only; IPv6 addresses of the remote host are never tried.
+    Ipv4Only,
+    /// IPv6 only; IPv4 addresses of the remote host are never tried.
+    Ipv6Only,
+}
+
+impl AddressFamily {
+    /// Every value, as written in the config and the API.
+    pub const ALL: [AddressFamily; 4] = [
+        AddressFamily::DualStack,
+        AddressFamily::PreferIpv4,
+        AddressFamily::Ipv4Only,
+        AddressFamily::Ipv6Only,
+    ];
+
+    /// The value as written in the config and the API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AddressFamily::DualStack => "dual_stack",
+            AddressFamily::PreferIpv4 => "prefer_ipv4",
+            AddressFamily::Ipv4Only => "ipv4_only",
+            AddressFamily::Ipv6Only => "ipv6_only",
+        }
+    }
+
+    /// Whether connections may use IPv4.
+    pub fn allows_ipv4(self) -> bool {
+        self != AddressFamily::Ipv6Only
+    }
+
+    /// Whether connections may use IPv6.
+    pub fn allows_ipv6(self) -> bool {
+        self != AddressFamily::Ipv4Only
+    }
+}
+
+impl std::fmt::Display for AddressFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AddressFamily {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        AddressFamily::ALL
+            .into_iter()
+            .find(|family| family.as_str() == value.trim())
+            .ok_or_else(|| {
+                format!(
+                    "address family must be dual_stack, prefer_ipv4, ipv4_only or ipv6_only \
+                     (got {value:?})"
+                )
+            })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SmtpClient {
+    /// Which address families outgoing connections use when the server has
+    /// no IP pool. A pool without an `address_family` of its own does not
+    /// inherit this: it stays on its addresses' IPv4 values. Default
+    /// `dual_stack`.
+    pub address_family: AddressFamily,
+    /// Milliseconds `dual_stack` waits for a connection attempt before it
+    /// starts the next remote address in parallel (RFC 8305 section 5,
+    /// "Connection Attempt Delay"). Each attempt keeps its own full
+    /// `open_timeout`, a failed attempt starts the next one at once, and the
+    /// first connection to succeed is used. `0` connects to one address at a
+    /// time. The other families always connect one address at a time.
+    /// Default `250`.
+    pub connection_attempt_delay_ms: u32,
+    /// Seconds between two reverse-DNS checks of the worker's source
+    /// addresses (the first runs at start). `0` turns the check off.
+    pub reverse_dns_check_interval: u32,
+    /// Leave out an address family whose source address failed the
+    /// reverse-DNS check, as long as the other family passed. Applies to
+    /// `dual_stack` and `prefer_ipv4` only. Default `false`.
+    pub skip_family_without_reverse_dns: bool,
     /// Seconds to wait for the TCP connection to a remote address.
     pub open_timeout: u32,
     /// Seconds to wait for the greeting, a TLS handshake and each reply.
@@ -1125,6 +1216,10 @@ pub struct SmtpClient {
 impl Default for SmtpClient {
     fn default() -> Self {
         Self {
+            address_family: AddressFamily::DualStack,
+            connection_attempt_delay_ms: 250,
+            reverse_dns_check_interval: 3600,
+            skip_family_without_reverse_dns: false,
             open_timeout: 30,
             read_timeout: 300,
             data_timeout: 600,
@@ -1558,6 +1653,32 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smtp_client_address_family_defaults_to_dual_stack_and_parses_every_value() {
+        let config = Config::from_yaml("").unwrap();
+        assert_eq!(config.smtp_client.address_family, AddressFamily::DualStack);
+        assert_eq!(config.smtp_client.reverse_dns_check_interval, 3600);
+        assert!(!config.smtp_client.skip_family_without_reverse_dns);
+        assert_eq!(config.smtp_client.connection_attempt_delay_ms, 250);
+        let config = Config::from_yaml("smtp_client:\n  connection_attempt_delay_ms: 0\n").unwrap();
+        assert_eq!(config.smtp_client.connection_attempt_delay_ms, 0);
+
+        for family in AddressFamily::ALL {
+            let config = Config::from_yaml(&format!(
+                "smtp_client:\n  address_family: {}\n  skip_family_without_reverse_dns: true\n",
+                family.as_str()
+            ))
+            .unwrap();
+            assert_eq!(config.smtp_client.address_family, family);
+            assert!(config.smtp_client.skip_family_without_reverse_dns);
+            assert_eq!(family.as_str().parse::<AddressFamily>(), Ok(family));
+        }
+        assert!(Config::from_yaml("smtp_client:\n  address_family: ipv4_first\n").is_err());
+        assert!("ipv4_first".parse::<AddressFamily>().is_err());
+        assert!(AddressFamily::Ipv4Only.allows_ipv4() && !AddressFamily::Ipv4Only.allows_ipv6());
+        assert!(AddressFamily::Ipv6Only.allows_ipv6() && !AddressFamily::Ipv6Only.allows_ipv4());
+    }
 
     #[test]
     fn defaults_match_the_ruby_schema() {

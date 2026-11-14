@@ -222,6 +222,10 @@ pub struct IpPool {
     pub uuid: String,
     pub name: String,
     pub default: bool,
+    /// Overrides `smtp_client.address_family` for mail sent from this pool
+    /// (`dual_stack`, `prefer_ipv4`, `ipv4_only`, `ipv6_only`). `None` sends
+    /// from each address's IPv4 value only, as pools always have.
+    pub address_family: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -233,6 +237,34 @@ pub struct IpAddress {
     pub ipv6: Option<String>,
     pub hostname: String,
     pub priority: i32,
+}
+
+/// What the worker needs besides the bound IPv4 to send from a pool address:
+/// the pool's address family and the address's IPv6 value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolSource {
+    pub address_family: Option<String>,
+    pub ipv6: Option<String>,
+}
+
+/// The latest reverse-DNS check of one address a worker may send from
+/// (`source_address_checks`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SourceAddressCheck {
+    pub address: String,
+    /// `ipv4` or `ipv6`.
+    pub family: String,
+    /// `pool` (an IP pool address) or `host` (what a worker host sends from
+    /// for servers without a pool).
+    pub origin: String,
+    /// `pass`, `no_ptr`, `mismatch`, `lookup_failed` or `not_public`.
+    pub status: String,
+    /// The PTR names found.
+    pub ptr: Vec<String>,
+    pub detail: String,
+    /// The host name of the worker that ran the check.
+    pub checked_by: String,
+    pub checked_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The webhook event names Camelmailer can fire (the worker for delivery,

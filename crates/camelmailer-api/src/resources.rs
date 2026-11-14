@@ -2806,7 +2806,28 @@ fn ip_pool_json(pool: &IpPool) -> Value {
         "uuid": pool.uuid,
         "name": pool.name,
         "default": pool.default,
+        "address_family": pool.address_family,
     })
+}
+
+/// A pool's `address_family`: one of the `smtp_client.address_family`
+/// values, or `null` for the pool's IPv4 addresses only.
+fn parse_address_family(
+    start: &RequestStart,
+    value: Option<String>,
+) -> Result<Option<String>, ApiResponse> {
+    match value {
+        None => Ok(None),
+        Some(value) => value
+            .parse::<camelmailer_config::AddressFamily>()
+            .map(|family| Some(family.as_str().to_string()))
+            .map_err(|_| {
+                render_validation_error(
+                    Some(start),
+                    "Address family must be dual_stack, prefer_ipv4, ipv4_only, ipv6_only or null",
+                )
+            }),
+    }
 }
 
 fn ip_address_json(address: &IpAddress) -> Value {
@@ -2841,6 +2862,7 @@ pub(crate) async fn ip_pools_index(
 pub(crate) struct CreateIpPool {
     name: Option<String>,
     default: Option<bool>,
+    address_family: Option<String>,
 }
 
 pub(crate) async fn ip_pools_create(
@@ -2854,13 +2876,82 @@ pub(crate) async fn ip_pools_create(
             "param is missing or the value is empty: name",
         );
     };
+    let address_family = match parse_address_family(&start, body.address_family) {
+        Ok(family) => family,
+        Err(response) => return response,
+    };
+    let pool = state
+        .store
+        .create_ip_pool_with_family(&name, body.default.unwrap_or(false), address_family)
+        .await;
+    from_result(&start, pool, |pool| {
+        created(&start, json!({ "ip_pool": ip_pool_json(&pool) }))
+    })
+}
+
+#[derive(Deserialize)]
+pub(crate) struct UpdateIpPool {
+    name: Option<String>,
+    default: Option<bool>,
+    /// `null` clears the pool's own family (IPv4 addresses only); an absent
+    /// field leaves it alone.
+    #[serde(default, deserialize_with = "crate::app::null_is_explicit")]
+    address_family: Option<Option<String>>,
+}
+
+pub(crate) async fn ip_pools_update(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+    Path(id): Path<u64>,
+    Json(body): Json<UpdateIpPool>,
+) -> ApiResponse {
+    let mut pool = match require_ip_pool(&state, &start, id).await {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    if let Some(name) = body.name {
+        if name.is_empty() {
+            return render_validation_error(Some(&start), "Name can't be blank");
+        }
+        pool.name = name;
+    }
+    if let Some(default) = body.default {
+        pool.default = default;
+    }
+    if let Some(address_family) = body.address_family {
+        pool.address_family = match parse_address_family(&start, address_family) {
+            Ok(family) => family,
+            Err(response) => return response,
+        };
+    }
+    from_result(&start, state.store.update_ip_pool(pool).await, |pool| {
+        ok(&start, json!({ "ip_pool": ip_pool_json(&pool) }))
+    })
+}
+
+/// `GET /api/v2/admin/source_addresses`: the latest reverse-DNS check of
+/// every address the workers may send from (see
+/// `camelmailer_worker::reverse_dns`), failures first.
+pub(crate) async fn source_addresses_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+) -> ApiResponse {
     from_result(
         &start,
-        state
-            .store
-            .create_ip_pool(&name, body.default.unwrap_or(false))
-            .await,
-        |pool| created(&start, json!({ "ip_pool": ip_pool_json(&pool) })),
+        state.store.list_source_address_checks().await,
+        |checks| {
+            let failing = checks
+                .iter()
+                .filter(|check| matches!(check.status.as_str(), "no_ptr" | "mismatch"))
+                .count();
+            ok(
+                &start,
+                json!({
+                    "source_addresses": checks,
+                    "failing": failing,
+                }),
+            )
+        },
     )
 }
 

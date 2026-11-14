@@ -283,7 +283,16 @@ pub trait AdminStore: Send + Sync {
     // IP pools (global) + nested addresses
     async fn list_ip_pools(&self) -> Result<Vec<IpPool>, StoreError>;
     async fn ip_pool_by_id(&self, id: Id) -> Result<Option<IpPool>, StoreError>;
-    async fn create_ip_pool(&self, name: &str, default: bool) -> Result<IpPool, StoreError>;
+    async fn create_ip_pool(&self, name: &str, default: bool) -> Result<IpPool, StoreError> {
+        self.create_ip_pool_with_family(name, default, None).await
+    }
+    /// Create a pool with its `address_family` in one write.
+    async fn create_ip_pool_with_family(
+        &self,
+        name: &str,
+        default: bool,
+        address_family: Option<String>,
+    ) -> Result<IpPool, StoreError>;
     async fn update_ip_pool(&self, pool: IpPool) -> Result<IpPool, StoreError>;
     async fn delete_ip_pool(&self, id: Id) -> Result<bool, StoreError>;
     async fn list_ip_addresses(&self, ip_pool_id: Id) -> Result<Vec<IpAddress>, StoreError>;
@@ -294,6 +303,21 @@ pub trait AdminStore: Send + Sync {
     ) -> Result<Option<IpAddress>, StoreError>;
     async fn create_ip_address(&self, new: NewIpAddress) -> Result<IpAddress, StoreError>;
     async fn delete_ip_address(&self, id: Id) -> Result<bool, StoreError>;
+
+    /// Store the results of one reverse-DNS check run of a worker: each
+    /// check replaces the previous result for its address. Results older
+    /// than seven days are removed. With `prune_pool_addresses`, pool
+    /// results for addresses that are no longer in any pool (absent from
+    /// `checks`) are removed too; a run that could not read every pool
+    /// passes `false`, so a transient storage error never wipes results.
+    async fn record_source_address_checks(
+        &self,
+        checks: &[SourceAddressCheck],
+        prune_pool_addresses: bool,
+    ) -> Result<(), StoreError>;
+    /// The latest reverse-DNS check of every source address, failures
+    /// first, then by address.
+    async fn list_source_address_checks(&self) -> Result<Vec<SourceAddressCheck>, StoreError>;
 
     /// Assign (or clear) a server's outbound IP pool.
     async fn set_server_ip_pool(
@@ -1257,12 +1281,18 @@ impl AdminStore for crate::store::MemoryStore {
         Ok(self.inner.read().unwrap().ip_pools.get(&id).cloned())
     }
 
-    async fn create_ip_pool(&self, name: &str, default: bool) -> Result<IpPool, StoreError> {
+    async fn create_ip_pool_with_family(
+        &self,
+        name: &str,
+        default: bool,
+        address_family: Option<String>,
+    ) -> Result<IpPool, StoreError> {
         let pool = IpPool {
             id: self.next_id(),
             uuid: crate::token::generate_uuid(),
             name: name.into(),
             default,
+            address_family,
         };
         self.inner
             .write()
@@ -1342,6 +1372,45 @@ impl AdminStore for crate::store::MemoryStore {
             .is_some())
     }
 
+    async fn record_source_address_checks(
+        &self,
+        checks: &[SourceAddressCheck],
+        prune_pool_addresses: bool,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let stored = &mut inner.source_address_checks;
+        for check in checks {
+            stored.insert(check.address.clone(), check.clone());
+        }
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+        stored.retain(|address, check| {
+            check.checked_at >= cutoff
+                && (!prune_pool_addresses
+                    || check.origin != "pool"
+                    || checks
+                        .iter()
+                        .any(|c| c.origin == "pool" && &c.address == address))
+        });
+        Ok(())
+    }
+
+    async fn list_source_address_checks(&self) -> Result<Vec<SourceAddressCheck>, StoreError> {
+        let mut checks: Vec<SourceAddressCheck> = self
+            .inner
+            .read()
+            .unwrap()
+            .source_address_checks
+            .values()
+            .cloned()
+            .collect();
+        checks.sort_by(|a, b| {
+            source_check_rank(&a.status)
+                .cmp(&source_check_rank(&b.status))
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        Ok(checks)
+    }
+
     async fn set_server_ip_pool(
         &self,
         server_id: Id,
@@ -1352,6 +1421,16 @@ impl AdminStore for crate::store::MemoryStore {
             server.ip_pool_id = ip_pool_id;
         }
         Ok(())
+    }
+}
+
+/// Sort order of reverse-DNS results: failures first, then the ones that
+/// could not be decided, passes last.
+pub fn source_check_rank(status: &str) -> u8 {
+    match status {
+        "no_ptr" | "mismatch" => 0,
+        "lookup_failed" | "not_public" => 1,
+        _ => 2,
     }
 }
 

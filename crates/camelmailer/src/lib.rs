@@ -412,6 +412,9 @@ pub async fn worker() -> std::io::Result<()> {
         .with_env_overrides()
         .map_err(std::io::Error::other)?;
     let store = connect_pg(&config).await?;
+    // Forward-confirmed reverse DNS of the source addresses, at start and
+    // every smtp_client.reverse_dns_check_interval seconds.
+    camelmailer_worker::reverse_dns::spawn(&config, Arc::new(store.clone()));
     let filter = worker_queue_filter(&store, &settings)
         .await
         .map_err(std::io::Error::other)?;

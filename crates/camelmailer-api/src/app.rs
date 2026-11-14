@@ -1957,7 +1957,13 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         )
         .route(
             "/ip_pools/{id}",
-            get(resources::ip_pools_show).delete(resources::ip_pools_destroy),
+            get(resources::ip_pools_show)
+                .patch(resources::ip_pools_update)
+                .delete(resources::ip_pools_destroy),
+        )
+        .route(
+            "/source_addresses",
+            get(resources::source_addresses_index),
         )
         .route(
             "/ip_pools/{pool_id}/ip_addresses",

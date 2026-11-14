@@ -1075,6 +1075,18 @@ impl Worker {
             .filter(|_| self.helo_from_ip_address && source_ip.is_some())
             .and_then(pool_helo_hostname);
 
+        // The address families to use and the local addresses to bind. Looked
+        // up before the row is marked as sending, so a shutdown during the
+        // lookup still hands the row back at once.
+        let outbound = crate::outbound::source_for(
+            &self.store,
+            &self.sender,
+            message.server_id,
+            message.stream_id,
+            source_ip,
+        )
+        .await;
+
         self.in_flight.messages.sending(queued.id);
         let outcome = self
             .sender
@@ -1083,7 +1095,7 @@ impl Worker {
                 &return_path,
                 &message.rcpt_to,
                 &raw_message,
-                source_ip,
+                outbound,
                 helo_hostname,
             )
             .await;

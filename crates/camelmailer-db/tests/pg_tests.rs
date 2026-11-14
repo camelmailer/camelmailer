@@ -2398,6 +2398,184 @@ async fn message_streams_default_crud_and_scoping() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ip_pool_address_family_and_pool_source_round_trip() {
+    use camelmailer_core::{IpPool, NewIpAddress, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    // Without a pool the lookup without an address finds none.
+    assert_eq!(
+        ServerStore::pool_source_for(&f.store, f.server.id, None, None)
+            .await
+            .unwrap(),
+        None
+    );
+    let ip_pool = f.store.create_ip_pool("dual", false).await.unwrap();
+    assert_eq!(ip_pool.address_family, None);
+    f.store
+        .create_ip_address(NewIpAddress {
+            ip_pool_id: ip_pool.id,
+            ipv4: "198.51.100.1".into(),
+            ipv6: Some("2001:db8::1".into()),
+            hostname: "out1.example".into(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    f.store
+        .set_server_ip_pool(f.server.id, Some(ip_pool.id))
+        .await
+        .unwrap();
+
+    let source = ServerStore::pool_source_for(&f.store, f.server.id, None, Some("198.51.100.1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.address_family, None);
+    assert_eq!(source.ipv6.as_deref(), Some("2001:db8::1"));
+
+    f.store
+        .update_ip_pool(IpPool {
+            address_family: Some("ipv6_only".into()),
+            ..ip_pool.clone()
+        })
+        .await
+        .unwrap();
+    let reread = f.store.ip_pool_by_id(ip_pool.id).await.unwrap().unwrap();
+    assert_eq!(reread.address_family.as_deref(), Some("ipv6_only"));
+    let source = ServerStore::pool_source_for(&f.store, f.server.id, None, Some("198.51.100.1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.address_family.as_deref(), Some("ipv6_only"));
+    assert_eq!(
+        ServerStore::pool_source_for(&f.store, f.server.id, None, Some("203.0.113.9"))
+            .await
+            .unwrap(),
+        None
+    );
+    // Without an address: the server has a pool, and its family.
+    assert_eq!(
+        ServerStore::pool_source_for(&f.store, f.server.id, None, None)
+            .await
+            .unwrap(),
+        Some(camelmailer_core::PoolSource {
+            address_family: Some("ipv6_only".into()),
+            ipv6: None,
+        })
+    );
+
+    // The column only takes the known values.
+    let invalid = f
+        .store
+        .update_ip_pool(IpPool {
+            address_family: Some("ipv4_first".into()),
+            ..ip_pool
+        })
+        .await;
+    assert!(invalid.is_err());
+
+    // A pool is created with its family in one write: a rejected family
+    // leaves no pool behind.
+    let created = f
+        .store
+        .create_ip_pool_with_family("v6", false, Some("dual_stack".into()))
+        .await
+        .unwrap();
+    assert_eq!(created.address_family.as_deref(), Some("dual_stack"));
+    let reread = f.store.ip_pool_by_id(created.id).await.unwrap().unwrap();
+    assert_eq!(reread, created);
+    let before = f.store.list_ip_pools().await.unwrap().len();
+    assert!(f
+        .store
+        .create_ip_pool_with_family("bad", false, Some("ipv4_first".into()))
+        .await
+        .is_err());
+    assert_eq!(f.store.list_ip_pools().await.unwrap().len(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_address_checks_are_replaced_and_pruned() {
+    use camelmailer_core::SourceAddressCheck;
+    use chrono::SubsecRound;
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool).await;
+
+    let now = chrono::Utc::now().trunc_subsecs(6);
+    let check = |address: &str, origin: &str, status: &str| SourceAddressCheck {
+        address: address.into(),
+        family: if address.contains(':') {
+            "ipv6"
+        } else {
+            "ipv4"
+        }
+        .into(),
+        origin: origin.into(),
+        status: status.into(),
+        ptr: vec!["out.example.com".into()],
+        detail: format!("{address} checked"),
+        checked_by: "worker-1".into(),
+        checked_at: now,
+    };
+    f.store
+        .record_source_address_checks(
+            &[
+                check("198.51.100.1", "pool", "pass"),
+                check("198.51.100.2", "pool", "pass"),
+                check("2001:db8::9", "host", "no_ptr"),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    let listed = f.store.list_source_address_checks().await.unwrap();
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed[0], check("2001:db8::9", "host", "no_ptr"));
+
+    // The status column only takes the known results.
+    assert!(f
+        .store
+        .record_source_address_checks(&[check("198.51.100.3", "pool", "ok")], true)
+        .await
+        .is_err());
+    assert_eq!(f.store.list_source_address_checks().await.unwrap().len(), 3);
+
+    // A run that could not read every pool does not prune pool results.
+    f.store
+        .record_source_address_checks(&[check("2001:db8::9", "host", "no_ptr")], false)
+        .await
+        .unwrap();
+    assert_eq!(f.store.list_source_address_checks().await.unwrap().len(), 3);
+
+    let mut old_host = check("192.0.2.50", "host", "pass");
+    old_host.checked_at = now - chrono::Duration::days(8);
+    f.store
+        .record_source_address_checks(
+            &[
+                check("198.51.100.1", "pool", "mismatch"),
+                check("2001:db8::9", "host", "pass"),
+                old_host,
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    let listed = f.store.list_source_address_checks().await.unwrap();
+    let summary: Vec<(&str, &str)> = listed
+        .iter()
+        .map(|c| (c.address.as_str(), c.status.as_str()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![("198.51.100.1", "mismatch"), ("2001:db8::9", "pass")]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_ip_pool_round_trips_and_resolves_source_ip() {
     use camelmailer_core::{NewIpAddress, NewStream, ServerStore};
 
