@@ -102,6 +102,21 @@ pub async fn stop(
     }
 }
 
+/// Run `process` registered in the cluster topology: register now and on
+/// every heartbeat while it runs, and mark the entry stopped once it
+/// returns (a graceful shutdown or an error).
+pub async fn registered<T>(
+    store: Arc<dyn AdminStore>,
+    node: NodeRegistration,
+    interval: Duration,
+    process: impl std::future::Future<Output = T>,
+) -> T {
+    let heartbeat = spawn_heartbeat(store.clone(), node.clone(), interval);
+    let output = process.await;
+    stop(store.as_ref(), heartbeat, &node).await;
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +155,36 @@ mod tests {
         stop(store.as_ref(), handle, &node).await;
         let stopped = store.list_cluster_nodes().await.unwrap();
         assert!(stopped[0].stopped_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_registered_process_is_marked_stopped_when_it_returns() {
+        let store: Arc<dyn AdminStore> = Arc::new(MemoryStore::new());
+        let node = registration(
+            &camelmailer_config::Cluster::default(),
+            "smtp-abc".into(),
+            "smtp",
+            serde_json::json!({}),
+        );
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let watched = store.clone();
+        let task = tokio::spawn(registered(
+            store.clone(),
+            node,
+            Duration::from_millis(20),
+            async move {
+                let _ = stop_rx.await;
+                42
+            },
+        ));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let running = watched.list_cluster_nodes().await.unwrap();
+        assert_eq!(running.len(), 1);
+        assert!(running[0].stopped_at.is_none(), "live while it runs");
+        stop_tx.send(()).unwrap();
+        assert_eq!(task.await.unwrap(), 42);
+        let stopped = watched.list_cluster_nodes().await.unwrap();
+        assert!(stopped[0].stopped_at.is_some(), "stopped once it returned");
     }
 
     #[test]
