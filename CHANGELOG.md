@@ -15,6 +15,23 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-11-14
+
+### Fixed
+
+- **DNS checks no longer trust the host's own resolver** (#99). Domain
+  verification, the domain health check, the infrastructure DNS checks and
+  the workers' reverse-DNS check ask the public resolvers in the new
+  `dns.check_resolvers` (default `1.1.1.1` and `9.9.9.9`; IP or IP:port),
+  with no system configuration, hosts file or search domains. A container's
+  resolver answered the PTR query for the host's IPv6 address with the host
+  name, and the checks passed an address that has no public PTR record.
+  Delivery and the SPF check of inbound mail keep the system resolver.
+- A PTR name without a dot, or under `.local`, `.localdomain`, `.internal`,
+  `.lan` or `.home.arpa`, no longer counts as a PTR record; the checks fail
+  and name the reason. With `smtp_client.skip_family_without_reverse_dns:
+  true` (off by default) such an address now counts as failing.
+
 ## [0.15.0] - 2026-11-14
 
 ### Changed
@@ -1593,7 +1610,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/camelmailer/camelmailer/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/camelmailer/camelmailer/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/camelmailer/camelmailer/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/camelmailer/camelmailer/compare/v0.13.0...v0.13.1
