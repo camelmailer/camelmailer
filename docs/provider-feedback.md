@@ -286,6 +286,29 @@ follows:
 Tell your recipients in your privacy policy that spam complaints are
 processed to stop further mail to them.
 
+### The IMAP client
+
+Camelmailer reads the seeds with a small IMAP client of its own instead of
+the `async-imap` crate: every `async-imap` release depends on `pin-utils`,
+which RustSec lists as unmaintained (RUSTSEC-2026-0441, no fixed release),
+and the project's dependency policy (`cargo deny`) admits no exception for
+it. The client needs only a read-only command set, so it stays small:
+
+- `LOGIN` or `AUTHENTICATE XOAUTH2`, `LIST`, `EXAMINE`,
+  `UID SEARCH HEADER`, `UID FETCH (BODY.PEEK[HEADER])` and `LOGOUT`. It has
+  no command that could store flags, copy, move, delete or expunge.
+- It treats every server answer as untrusted: a line is read up to 1 MiB, a
+  response with its literals up to 4 MiB (a literal's announced size is
+  checked before anything is allocated), a command accepts up to 100,000
+  untagged lines, and every read times out after 30 seconds. Anything beyond
+  that ends the lookup with an error; the test is retried at the next check.
+- Invalid UTF-8 and NUL bytes are replaced or ignored, never trusted.
+
+Its tests feed it crafted and generated hostile responses (huge and
+overflowing literal sizes, unterminated quotes, deep nesting, invalid UTF-8,
+split line ends, missing tags, endless lines, NUL bytes) and require that it
+neither panics nor hangs.
+
 ### Placement history
 
 Every test is kept with its result and the time it was checked, until
