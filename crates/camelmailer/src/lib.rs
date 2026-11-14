@@ -32,6 +32,8 @@ use camelmailer_worker::Worker;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+pub mod cluster;
+
 pub use camelmailer_api;
 pub use camelmailer_config;
 pub use camelmailer_core;
@@ -116,13 +118,24 @@ fn run_async(future: impl std::future::Future<Output = std::io::Result<()>>) -> 
 }
 
 fn load_config() -> camelmailer_config::Config {
-    match camelmailer_config::Config::load_from_env() {
+    let loaded = camelmailer_config::Config::load_from_env().and_then(|mut config| {
+        // CAMELMAILER_NODE_NAME and CAMELMAILER_PUBLIC_ADDRESSES, so one
+        // config file can serve several hosts.
+        config.cluster = config.cluster.with_env_overrides()?;
+        Ok(config)
+    });
+    match loaded {
         Ok(config) => config,
         Err(error) => {
             eprintln!("configuration error: {error}");
             std::process::exit(1);
         }
     }
+}
+
+/// The heartbeat interval of the cluster registration.
+fn heartbeat_interval(config: &camelmailer_config::Config) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(config.cluster.heartbeat_interval_seconds))
 }
 
 fn postgres_enabled(config: &camelmailer_config::Config) -> bool {
@@ -378,6 +391,7 @@ pub async fn web_server_with(extensions: Extensions) -> std::io::Result<()> {
     tokio::spawn(run_campaign_scheduler(state.clone()));
 
     let mut router = build_app(state.clone(), tracking);
+    let cluster_state = state.clone();
     if let Some(routes) = &extensions.routes {
         router = router.merge(routes(state.clone()));
     }
@@ -397,6 +411,18 @@ pub async fn web_server_with(extensions: Extensions) -> std::io::Result<()> {
 
     let listener = tokio::net::TcpListener::bind((bind_address.as_str(), port)).await?;
     tracing::info!(%bind_address, port, "camelmailer web server listening");
+    // The web server has no graceful shutdown of its own; its entry goes
+    // stale after cluster.node_stale_seconds once the process is gone.
+    cluster::spawn_heartbeat(
+        cluster_state.store.clone(),
+        cluster::registration(
+            &config.cluster,
+            cluster::instance_id("web"),
+            "web",
+            serde_json::json!({ "port": port }),
+        ),
+        heartbeat_interval(&config),
+    );
     axum::serve(listener, router).await
 }
 
@@ -426,14 +452,28 @@ pub async fn worker() -> std::io::Result<()> {
         source_addresses = ?settings.source_addresses,
         "worker delivery scope"
     );
-    Arc::new(
-        Worker::new(&config, store)
-            .with_delivery(filter, settings.threads)
-            .with_source_selection(&settings),
-    )
-    .run()
-    .await
-    .map_err(std::io::Error::other)
+    let worker = Worker::new(&config, store.clone())
+        .with_delivery(filter, settings.threads)
+        .with_source_selection(&settings);
+    // The worker registers under its queue lock id, so the dashboard can
+    // tell which node holds which leases.
+    let node = cluster::registration(
+        &config.cluster,
+        worker.worker_id().to_string(),
+        "worker",
+        serde_json::json!({
+            "threads": settings.threads,
+            "host_aware_pools": settings.host_aware_pools,
+            "source_addresses": settings.source_addresses,
+            "shutdown_grace_seconds": settings.shutdown_grace_seconds,
+        }),
+    );
+    let admin: Arc<dyn AdminStore> = Arc::new(store);
+    let heartbeat =
+        cluster::spawn_heartbeat(admin.clone(), node.clone(), heartbeat_interval(&config));
+    let result = Arc::new(worker).run().await;
+    cluster::stop(admin.as_ref(), heartbeat, &node).await;
+    result.map_err(std::io::Error::other)
 }
 
 /// The part of the queue this worker serves, from `worker.servers`,
@@ -466,13 +506,48 @@ async fn worker_queue_filter(
 
 pub async fn smtp_server() -> std::io::Result<()> {
     let config = load_config();
-    let (store, sink): (Arc<dyn Store>, Arc<dyn MessageSink>) = if postgres_enabled(&config) {
-        let store = connect_pg(&config).await?;
-        (Arc::new(store.clone()), Arc::new(PgMessageSink::new(store)))
-    } else {
-        tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
-        (Arc::new(MemoryStore::new()), Arc::new(MemorySink::new()))
-    };
+    let (store, sink, admin): (Arc<dyn Store>, Arc<dyn MessageSink>, Arc<dyn AdminStore>) =
+        if postgres_enabled(&config) {
+            let store = connect_pg(&config).await?;
+            (
+                Arc::new(store.clone()),
+                Arc::new(PgMessageSink::new(store.clone())),
+                Arc::new(store),
+            )
+        } else {
+            tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
+            let memory = Arc::new(MemoryStore::new());
+            (memory.clone(), Arc::new(MemorySink::new()), memory)
+        };
+    let mut listeners = vec![serde_json::json!({
+        "port": config.smtp_server.default_port,
+        "mode": "smtp",
+    })];
+    listeners.extend(config.smtp_server.listeners.iter().map(|listener| {
+        serde_json::json!({
+            "port": listener.port,
+            "mode": match listener.mode {
+                camelmailer_config::SmtpListenerMode::Smtp => "smtp",
+                camelmailer_config::SmtpListenerMode::Smtps => "smtps",
+            },
+        })
+    }));
+    // Like the web server, the SMTP server has no graceful shutdown; its
+    // entry goes stale once the process is gone.
+    cluster::spawn_heartbeat(
+        admin,
+        cluster::registration(
+            &config.cluster,
+            cluster::instance_id("smtp"),
+            "smtp",
+            serde_json::json!({
+                "listeners": listeners,
+                "proxy_protocol": config.smtp_server.proxy_protocol,
+                "tls_enabled": config.smtp_server.tls_enabled,
+            }),
+        ),
+        heartbeat_interval(&config),
+    );
     if config.smtp_server.tls_enabled && !config.smtp_server.auth_requires_tls {
         // Say it on every boot. The setting is a migration window, and a
         // window nobody is reminded of stays open.

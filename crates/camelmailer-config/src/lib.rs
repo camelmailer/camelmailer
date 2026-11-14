@@ -689,6 +689,174 @@ impl Default for Worker {
     }
 }
 
+/// How this process appears in the cluster topology (`cluster`): every
+/// web, SMTP and worker process registers itself under `node_name` and
+/// refreshes its entry every `heartbeat_interval_seconds`. The other values
+/// describe the installation for the infrastructure dashboard and its DNS
+/// checks; nothing here changes how mail is received or delivered.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cluster {
+    /// The name this host appears under. Empty takes the host name (env
+    /// `CAMELMAILER_NODE_NAME`).
+    pub node_name: String,
+    /// The public address of the load balancer in front of the SMTP and
+    /// web nodes, if there is one (for example `2.31.154.200`).
+    pub load_balancer_address: Option<String>,
+    /// The host name MX records point at, whose A/AAAA records lead to the
+    /// load balancer (or to the SMTP nodes without one), for example
+    /// `mail.example.com`.
+    pub inbound_hostname: Option<String>,
+    /// This host's public addresses, the ones receivers see for servers
+    /// without an IP pool. Listed, they replace the addresses the worker
+    /// detects for the reverse-DNS check, per family (a family not listed is
+    /// still detected). Needed where the process only sees a private address,
+    /// such as `172.18.0.5` inside a Docker network (env
+    /// `CAMELMAILER_PUBLIC_ADDRESSES`, comma separated).
+    pub public_addresses: Vec<String>,
+    /// How often a process refreshes its entry. At least 5.
+    pub heartbeat_interval_seconds: u32,
+    /// An entry not refreshed for this long shows as stale. At least twice
+    /// the heartbeat interval.
+    pub node_stale_seconds: u32,
+}
+
+impl Default for Cluster {
+    fn default() -> Self {
+        Self {
+            node_name: String::new(),
+            load_balancer_address: None,
+            inbound_hostname: None,
+            public_addresses: Vec::new(),
+            heartbeat_interval_seconds: 30,
+            node_stale_seconds: 90,
+        }
+    }
+}
+
+impl Cluster {
+    /// The cluster settings with `CAMELMAILER_NODE_NAME` and
+    /// `CAMELMAILER_PUBLIC_ADDRESSES` applied, so one config file can serve
+    /// several hosts.
+    pub fn with_env_overrides(&self) -> Result<Self, ConfigError> {
+        self.with_overrides(|name| std::env::var(name).ok())
+    }
+
+    fn with_overrides(&self, var: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut cluster = self.clone();
+        if let Some(value) = var("CAMELMAILER_NODE_NAME") {
+            cluster.node_name = value.trim().to_string();
+        }
+        if let Some(value) = var("CAMELMAILER_PUBLIC_ADDRESSES") {
+            cluster.public_addresses = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(String::from)
+                .collect();
+        }
+        cluster.validate()?;
+        Ok(cluster)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for address in &self.public_addresses {
+            if address.parse::<std::net::IpAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.public_addresses takes IP addresses (got {address:?})"
+                )));
+            }
+        }
+        if let Some(address) = self.load_balancer_address.as_deref() {
+            if !address.is_empty() && address.parse::<std::net::IpAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.load_balancer_address takes an IP address (got {address:?})"
+                )));
+            }
+        }
+        if let Some(name) = self.inbound_hostname.as_deref() {
+            if !name.is_empty() && !is_host_name(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.inbound_hostname must be a fully qualified host name (got {name:?})"
+                )));
+            }
+        }
+        if self.heartbeat_interval_seconds < 5 {
+            return Err(ConfigError::Invalid(
+                "cluster.heartbeat_interval_seconds must be at least 5".into(),
+            ));
+        }
+        if self.node_stale_seconds < self.heartbeat_interval_seconds.saturating_mul(2) {
+            return Err(ConfigError::Invalid(
+                "cluster.node_stale_seconds must be at least twice cluster.heartbeat_interval_seconds".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The parsed `public_addresses`.
+    pub fn public_ips(&self) -> Vec<std::net::IpAddr> {
+        self.public_addresses
+            .iter()
+            .filter_map(|address| address.trim().parse().ok())
+            .collect()
+    }
+
+    /// `node_name`, or the host name when it is empty.
+    pub fn effective_node_name(&self) -> String {
+        if !self.node_name.trim().is_empty() {
+            return self.node_name.trim().to_string();
+        }
+        std::env::var("HOSTNAME")
+            .ok()
+            .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "camelmailer".into())
+    }
+
+    /// `load_balancer_address` when set and not empty.
+    pub fn load_balancer(&self) -> Option<&str> {
+        self.load_balancer_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    /// `inbound_hostname` when set and not empty, lower-cased.
+    pub fn inbound_host(&self) -> Option<String> {
+        self.inbound_hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+    }
+}
+
+/// A fully qualified host name (the same rule as
+/// `camelmailer_core::dns::is_valid_helo_hostname`, which this crate cannot
+/// depend on): at least two labels of letters, digits and
+/// hyphens, no trailing dot, no IP literal.
+fn is_host_name(name: &str) -> bool {
+    if name.len() > 253 || name.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && !labels
+            .last()
+            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Which mail a worker delivers (`worker.deliver`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1355,6 +1523,7 @@ pub struct Config {
     pub smtp_client: SmtpClient,
     pub rspamd: Rspamd,
     pub clamav: Clamav,
+    pub cluster: Cluster,
 }
 
 impl Config {
@@ -1468,6 +1637,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.worker.validate()?;
+        self.cluster.validate()?;
         if !matches!(self.camelmailer.web_protocol.as_str(), "http" | "https") {
             return Err(ConfigError::Invalid(format!(
                 "camelmailer.web_protocol must be http or https (got {:?})",
@@ -2422,6 +2592,57 @@ smtp_server:
             .unwrap();
         assert!(both.validate().is_err());
         assert!(Config::from_yaml("worker:\n  deliver: newsletters\n").is_err());
+    }
+
+    #[test]
+    fn cluster_defaults_and_validation() {
+        let config = Config::from_yaml("").unwrap();
+        assert_eq!(config.cluster.heartbeat_interval_seconds, 30);
+        assert_eq!(config.cluster.node_stale_seconds, 90);
+        assert!(config.cluster.public_addresses.is_empty());
+        assert!(config.validate().is_ok());
+
+        let config = Config::from_yaml(
+            "cluster:\n  node_name: mail-1\n  load_balancer_address: 2.31.154.200\n  inbound_hostname: Mail.Example.com\n  public_addresses: [\"49.13.35.233\", \"2a01:4f8::1\"]\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.cluster.effective_node_name(), "mail-1");
+        assert_eq!(config.cluster.load_balancer(), Some("2.31.154.200"));
+        assert_eq!(
+            config.cluster.inbound_host().as_deref(),
+            Some("mail.example.com")
+        );
+        assert_eq!(config.cluster.public_ips().len(), 2);
+
+        for bad in [
+            "cluster:\n  public_addresses: [\"172.18.0.x\"]\n",
+            "cluster:\n  load_balancer_address: lb.example.com\n",
+            "cluster:\n  inbound_hostname: \"mail\"\n",
+            "cluster:\n  inbound_hostname: \"mail.example.com.\"\n",
+            "cluster:\n  heartbeat_interval_seconds: 2\n",
+            "cluster:\n  heartbeat_interval_seconds: 30\n  node_stale_seconds: 40\n",
+        ] {
+            let config = Config::from_yaml(bad).unwrap();
+            assert!(config.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cluster_env_overrides_replace_the_file_values() {
+        let env = |name: &str| match name {
+            "CAMELMAILER_NODE_NAME" => Some(" mail-2 ".to_string()),
+            "CAMELMAILER_PUBLIC_ADDRESSES" => Some("167.233.167.89, 2a01:4f8:1c18:aa2d::1".into()),
+            _ => None,
+        };
+        let cluster = Cluster::default().with_overrides(env).unwrap();
+        assert_eq!(cluster.node_name, "mail-2");
+        assert_eq!(
+            cluster.public_addresses,
+            vec!["167.233.167.89", "2a01:4f8:1c18:aa2d::1"]
+        );
+        let bad = |name: &str| (name == "CAMELMAILER_PUBLIC_ADDRESSES").then(|| "nope".to_string());
+        assert!(Cluster::default().with_overrides(bad).is_err());
     }
 
     #[test]

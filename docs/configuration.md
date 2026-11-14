@@ -550,6 +550,39 @@ out when both fail, and `ipv4_only` and `ipv6_only` are never changed. It
 is off by default: the check runs once an hour, so a fixed PTR record takes
 effect at the next check, and a record that breaks is not noticed sooner.
 
+### `cluster:` topology and public addresses
+
+Every web, SMTP and worker process registers itself in the database and
+refreshes its entry every `heartbeat_interval_seconds`. The infrastructure
+dashboard and `GET /api/v2/admin/cluster` show the result: each process with
+its node name, role, version and last heartbeat, and for a worker the queue
+rows it holds (its lock id is its registration id). An entry not refreshed
+for `node_stale_seconds` shows as stale; a worker that shuts down
+gracefully marks its entry stopped. The web and SMTP servers have no
+graceful shutdown of their own, so their entries go stale when the process
+ends. Entries not seen for seven days are removed. A failed registration is
+logged and retried on the next heartbeat; it never stops a process.
+
+```yaml
+cluster:
+  node_name: mail-1                  # default: the host name; env CAMELMAILER_NODE_NAME
+  load_balancer_address: 203.0.113.5 # the public address in front of the nodes
+  inbound_hostname: mail.example.com # MX target, A/AAAA on the load balancer
+  public_addresses: [203.0.113.10, "2001:db8::10"]   # env CAMELMAILER_PUBLIC_ADDRESSES
+  heartbeat_interval_seconds: 30     # at least 5
+  node_stale_seconds: 90             # at least twice the heartbeat interval
+```
+
+`load_balancer_address` and `inbound_hostname` describe the installation for
+the dashboard and its DNS checks. `public_addresses` lists the addresses
+receivers see for servers without an IP pool. Set it where the process only
+sees a private address, for example inside a Docker network, where the
+worker would otherwise check the reverse DNS of `172.18.0.5`. The reverse-DNS
+check then uses the listed address of each family instead of the detected
+one; a family that is not listed is still detected. With
+`smtp_client.skip_family_without_reverse_dns: true` the family decision
+follows the listed address too, which is the address the receiver judges.
+
 ### `lifecycle_webhooks:` installation events
 
 Forwards installation-wide events to outside systems such as a billing or

@@ -1129,6 +1129,71 @@ async fn source_addresses_list_the_reverse_dns_results_for_global_admins() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn cluster_shows_the_registered_processes_and_pools_for_global_admins() {
+    let (app, state) = build_app().await;
+    let (status, body) =
+        request(&app, "GET", "/api/v2/admin/cluster", Some(GLOBAL_KEY), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["nodes"], json!([]));
+    assert_eq!(body["data"]["mixed_versions"], false);
+    assert_eq!(
+        body["data"]["cluster"]["load_balancer_address"],
+        Value::Null
+    );
+
+    for (id, role, version) in [
+        ("worker-a", "worker", "0.15.0"),
+        ("smtp-a", "smtp", "0.14.0"),
+    ] {
+        state
+            .store
+            .register_node(&camelmailer_core::NodeRegistration {
+                instance_id: id.into(),
+                role: role.into(),
+                node_name: "mail-1".into(),
+                version: version.into(),
+                details: json!({ "public_addresses": ["49.13.35.233"] }),
+            })
+            .await
+            .unwrap();
+    }
+    state
+        .store
+        .mark_node_stopped("smtp-a", "smtp")
+        .await
+        .unwrap();
+    let pool = state.store.create_ip_pool("Outbound", true).await.unwrap();
+    state
+        .store
+        .create_ip_address(camelmailer_core::admin_store::NewIpAddress {
+            ip_pool_id: pool.id,
+            ipv4: "49.13.35.233".into(),
+            ipv6: None,
+            hostname: "out1.mail.example.com".into(),
+            priority: 100,
+        })
+        .await
+        .unwrap();
+
+    let (_, body) = request(&app, "GET", "/api/v2/admin/cluster", Some(GLOBAL_KEY), None).await;
+    let nodes = body["data"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    let smtp = nodes.iter().find(|n| n["role"] == "smtp").unwrap();
+    let worker = nodes.iter().find(|n| n["role"] == "worker").unwrap();
+    assert_eq!(smtp["status"], "stopped");
+    assert_eq!(worker["status"], "live");
+    assert_eq!(worker["leases"]["queued_messages"], 0);
+    assert_eq!(worker["details"]["public_addresses"][0], "49.13.35.233");
+    // Only one live version: the stopped SMTP process does not count.
+    assert_eq!(body["data"]["mixed_versions"], false);
+    let addresses = &body["data"]["ip_pools"][0]["addresses"];
+    assert_eq!(addresses[0]["hostname"], "out1.mail.example.com");
+
+    let (status, _) = request(&app, "GET", "/api/v2/admin/cluster", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 // ------------------------------------------------ P0: server config + keys
 
 #[tokio::test]
