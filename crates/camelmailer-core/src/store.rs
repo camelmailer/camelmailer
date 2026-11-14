@@ -290,6 +290,26 @@ pub(crate) struct MemoryStoreInner {
         ),
         crate::delivery_stats::IpDeliveryStat,
     >,
+    /// Warm-up mode and profile set on an address / a pool.
+    pub(crate) warmup_address_settings: HashMap<
+        Id,
+        (
+            crate::warmup::WarmupMode,
+            Option<crate::warmup::WarmupProfile>,
+        ),
+    >,
+    pub(crate) warmup_pool_settings: HashMap<
+        Id,
+        (
+            crate::warmup::WarmupMode,
+            Option<crate::warmup::WarmupProfile>,
+        ),
+    >,
+    pub(crate) warmup_states:
+        HashMap<(Id, crate::delivery_stats::ProviderGroup), crate::warmup::WarmupState>,
+    pub(crate) warmup_usage:
+        HashMap<(chrono::NaiveDate, Id, crate::delivery_stats::ProviderGroup), i64>,
+    pub(crate) warmup_log: Vec<crate::warmup::WarmupLogEntry>,
     /// The address that sent each accepted message, and when.
     pub(crate) message_sources: HashMap<
         i64,

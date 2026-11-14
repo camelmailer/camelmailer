@@ -260,6 +260,9 @@ mod interface_tests {
 /// warm-up history).
 const DELIVERY_STATS_DAYS: i64 = 400;
 
+/// How long the daily warm-up usage is kept.
+const WARMUP_USAGE_DAYS: i64 = 30;
+
 /// How long the worker remembers which address sent an accepted message, so
 /// a feedback-loop complaint can be counted against it. Feedback loops
 /// report within hours to a few days.
@@ -588,6 +591,14 @@ pub enum ProcessOutcome {
     /// the row is gone. Nothing was recorded; the row belongs to its new
     /// owner.
     NotOwner,
+    /// Warm-up: no address of the message's pool has room left today for
+    /// its receiving provider. It went back to the queue without an attempt
+    /// and is looked at again after `warmup.defer_seconds`.
+    WarmupDeferred,
+    /// Warm-up: the warm-up storage could not be read and the message would
+    /// have gone out from an address not known to be warm. It went back to
+    /// the queue without an attempt and is tried again a minute later.
+    WarmupStorageUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -648,6 +659,8 @@ pub struct Worker {
     shutdown_grace: Duration,
     /// Classifies recipient domains by mailbox provider for the counters.
     providers: crate::provider::ProviderClassifier,
+    /// Adaptive warm-up (inactive until an address warms up).
+    warmup: crate::warmup::WarmupGate,
 }
 
 impl Worker {
@@ -733,6 +746,7 @@ impl Worker {
             providers: crate::provider::ProviderClassifier::default().with_groups(
                 crate::provider::ProviderClassifier::groups_from_config(&config.provider_groups),
             ),
+            warmup: crate::warmup::WarmupGate::new(&config.warmup),
         }
     }
 
@@ -850,7 +864,7 @@ impl Worker {
                 .map(|address| address.ipv4.clone())
                 .unwrap_or_else(|| camelmailer_core::DEFAULT_SOURCE.to_string()),
             ip_address_id: source.map(|address| address.id),
-            provider,
+            provider: provider.clone(),
             kind,
             policy_block: kind != DeliveryKind::Sent && camelmailer_core::is_policy_block(response),
             server_id: message.server_id,
@@ -858,7 +872,69 @@ impl Worker {
         };
         if let Err(error) = DeliveryStatsStore::record_ip_delivery(&self.store, &record).await {
             tracing::warn!(%error, message_id = message.id, "could not count the delivery");
+            return;
         }
+        // Warm-up: a run of policy refusals today brakes the address for
+        // this provider at once.
+        if let (true, Some(address)) = (record.policy_block, source) {
+            if self.warmup.profile(address.id).is_some() {
+                self.brake_if_blocked(address, &provider, record.day).await;
+            }
+        }
+    }
+
+    async fn brake_if_blocked(
+        &self,
+        address: &camelmailer_core::IpAddress,
+        provider: &camelmailer_core::ProviderGroup,
+        day: chrono::NaiveDate,
+    ) {
+        let today = match DeliveryStatsStore::ip_delivery_stats(&self.store, day).await {
+            Ok(stats) => stats
+                .into_iter()
+                .find(|s| s.day == day && &s.provider == provider && s.source_ip == address.ipv4),
+            Err(error) => {
+                tracing::warn!(%error, "could not read today's counters for the warm-up brake");
+                return;
+            }
+        };
+        let Some(today) = today else { return };
+        if let Err(error) = self
+            .warmup
+            .brake_if_blocked(
+                &self.store,
+                address.id,
+                provider,
+                &today,
+                chrono::Utc::now(),
+            )
+            .await
+        {
+            tracing::warn!(%error, "could not apply the warm-up brake");
+        }
+    }
+
+    /// Warm-up: judge yesterday for every warming address (once; several
+    /// workers may try, the first to save wins). Runs from housekeeping.
+    pub async fn evaluate_warmup(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, camelmailer_core::StoreError> {
+        self.warmup.reload(&self.store).await?;
+        let day = now.date_naive() - chrono::Duration::days(1);
+        let stats = DeliveryStatsStore::ip_delivery_stats(&self.store, day).await?;
+        let addresses: HashMap<camelmailer_core::Id, String> =
+            camelmailer_core::WarmupStore::warmup_addresses(&self.store)
+                .await?
+                .into_iter()
+                .map(|a| (a.ip_address_id, a.ipv4))
+                .collect();
+        let no_signals = |_: camelmailer_core::Id, _: &camelmailer_core::ProviderGroup| Vec::new();
+        let written = self
+            .warmup
+            .evaluate_day(&self.store, day, &stats, &addresses, &no_signals, now)
+            .await?;
+        Ok(written.len())
     }
 
     /// Remove a queue row this worker holds; warns when another worker took
@@ -1033,6 +1109,9 @@ impl Worker {
         if let Err(error) = self.refresh_source_pools().await {
             tracing::warn!(%error, "could not refresh the local IP pools");
         }
+        if let Err(error) = self.warmup.refresh(&self.store).await {
+            tracing::warn!(%error, "could not read the warm-up settings");
+        }
         let Some(queued) = self.queue.dequeue(&self.worker_id).await? else {
             return Ok(None);
         };
@@ -1155,6 +1234,8 @@ impl Worker {
         // Source-address selection: send from the message stream's IP pool if
         // it sets one, else the server's pool. A stream without a pool
         // resolves to the server pool exactly as before.
+        // Every address the delivery may go out from, for warm-up overflow.
+        let mut candidates: Vec<camelmailer_core::IpAddress> = Vec::new();
         let source: Option<camelmailer_core::IpAddress> =
             if let Some(selection) = &self.source_selection {
                 // Host-aware: only the pool addresses this host holds. A pool
@@ -1195,6 +1276,7 @@ impl Worker {
                     let is_local = selection.local_check();
                     let local: Vec<&camelmailer_core::IpAddress> =
                         addresses.iter().filter(|a| is_local(&a.ipv4)).collect();
+                    candidates = local.iter().map(|a| (*a).clone()).collect();
                     match choose_source_address(&local, &queued.domain) {
                         Some(address) => Some(address.clone()),
                         None => {
@@ -1218,15 +1300,71 @@ impl Worker {
                 }
             } else {
                 // The pool's first address (lowest priority number, then id).
-                camelmailer_core::ServerStore::source_addresses_for(
+                let addresses = camelmailer_core::ServerStore::source_addresses_for(
                     &self.store,
                     message.server_id,
                     message.stream_id,
                 )
                 .await
                 .ok()
-                .and_then(|addresses| addresses.into_iter().next())
+                .unwrap_or_default();
+                candidates = addresses.clone();
+                addresses.into_iter().next()
             };
+        // Warm-up: only when an address of the pool warms up. With warm-up
+        // off everywhere this is skipped and the source stays as chosen.
+        let source = match source {
+            Some(chosen) if self.warmup.covers(&candidates) => {
+                let provider = self.providers.classify(&queued.domain).await;
+                match self
+                    .warmup
+                    .pick(
+                        &self.store,
+                        &chosen,
+                        &candidates,
+                        &provider,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                {
+                    crate::warmup::Pick::Use(address) => Some(address),
+                    crate::warmup::Pick::Wait => {
+                        tracing::info!(
+                            message_id = message.id,
+                            provider = provider.as_str(),
+                            "no warm-up allowance left in the pool today; the message waits"
+                        );
+                        owned(
+                            "queued_messages",
+                            queued.id,
+                            self.queue
+                                .defer(queued.id, &self.worker_id, self.warmup.defer_seconds, None)
+                                .await?,
+                        );
+                        return Ok(ProcessOutcome::WarmupDeferred);
+                    }
+                    crate::warmup::Pick::WaitForStorage => {
+                        // The warm-up storage cannot be read and no address
+                        // known to be warm is available: never send from a
+                        // possibly cold address without its limit.
+                        owned(
+                            "queued_messages",
+                            queued.id,
+                            self.queue
+                                .defer(
+                                    queued.id,
+                                    &self.worker_id,
+                                    crate::warmup::STORAGE_RETRY_SECONDS,
+                                    None,
+                                )
+                                .await?,
+                        );
+                        return Ok(ProcessOutcome::WarmupStorageUnavailable);
+                    }
+                }
+            }
+            other => other,
+        };
         let source_ip: Option<IpAddr> = source.as_ref().and_then(|a| a.ipv4.parse().ok());
         // EHLO with the bound address's own name when asked to and it has
         // one; otherwise the installation's name.
@@ -2295,6 +2433,22 @@ impl Worker {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "pruned expired send-limit counters"),
             Err(error) => tracing::error!(%error, "send-counter pruning error"),
+        }
+
+        // Warm-up: judge yesterday, and prune usage and the decision log.
+        match self.evaluate_warmup(now).await {
+            Ok(0) => {}
+            Ok(decisions) => tracing::info!(decisions, "warm-up evaluated"),
+            Err(error) => tracing::error!(%error, "warm-up evaluation error"),
+        }
+        if let Err(error) = camelmailer_core::WarmupStore::prune_warmup(
+            &self.store,
+            now.date_naive() - chrono::Duration::days(WARMUP_USAGE_DAYS),
+            now - chrono::Duration::days(DELIVERY_STATS_DAYS),
+        )
+        .await
+        {
+            tracing::error!(%error, "warm-up pruning error");
         }
 
         // Delivery counters older than DELIVERY_STATS_DAYS, and the record
