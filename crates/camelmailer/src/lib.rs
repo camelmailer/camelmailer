@@ -352,6 +352,7 @@ pub async fn build_state(
             Some(billing),
         )
         .with_org_sso_store(pg.clone())
+        .with_feedback_store(pg.clone())
         .with_delivery_stats(pg.clone())
         .with_warmup_store(pg.clone())
         .with_spf_resolver(spf_resolver);
@@ -369,6 +370,7 @@ pub async fn build_state(
             Some(billing),
         )
         .with_org_sso_store(memory.clone())
+        .with_feedback_store(memory.clone())
         .with_delivery_stats(memory.clone())
         .with_warmup_store(memory)
         .with_spf_resolver(spf_resolver);
@@ -491,6 +493,8 @@ pub async fn worker() -> std::io::Result<()> {
     // Forward-confirmed reverse DNS of the source addresses, at start and
     // every smtp_client.reverse_dns_check_interval seconds.
     camelmailer_worker::reverse_dns::spawn(&config, Arc::new(store.clone()));
+    // Provider feedback (Postmaster Tools, SNDS), when credentials are set.
+    camelmailer_worker::feedback::spawn(&config, Arc::new(store.clone()));
     let filter = worker_queue_filter(&store, &settings)
         .await
         .map_err(std::io::Error::other)?;

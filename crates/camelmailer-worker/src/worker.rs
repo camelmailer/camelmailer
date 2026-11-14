@@ -639,6 +639,8 @@ pub struct Worker {
     auth_event_days: u32,
     /// `retention.api_request_days` (0 = keep forever).
     api_request_days: u32,
+    /// `retention.feedback_report_days` (0 = keep with the message content).
+    feedback_report_days: u32,
     /// `retention.batch_size`.
     retention_batch: i64,
     /// Validated shared SMTP return-path domain. Invalid placeholders retain
@@ -657,6 +659,8 @@ pub struct Worker {
     heartbeat_interval: Duration,
     /// `worker.shutdown_grace_seconds`.
     shutdown_grace: Duration,
+    /// `deliverability_feedback.fbl.suppress_complainants`.
+    fbl_suppress_complainants: bool,
     /// Classifies recipient domains by mailbox provider for the counters.
     providers: crate::provider::ProviderClassifier,
     /// Adaptive warm-up (inactive until an address warms up).
@@ -731,6 +735,7 @@ impl Worker {
             ),
             auth_event_days: config.retention.auth_event_days,
             api_request_days: config.retention.api_request_days,
+            feedback_report_days: config.retention.feedback_report_days,
             retention_batch: config.retention.batch_size.max(1) as i64,
             return_path_domain,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
@@ -743,6 +748,7 @@ impl Worker {
             in_flight: InFlight::default(),
             heartbeat_interval: HEARTBEAT_INTERVAL,
             shutdown_grace: Duration::from_secs(u64::from(config.worker.shutdown_grace_seconds)),
+            fbl_suppress_complainants: config.deliverability_feedback.fbl.suppress_complainants,
             providers: crate::provider::ProviderClassifier::default().with_groups(
                 crate::provider::ProviderClassifier::groups_from_config(&config.provider_groups),
             ),
@@ -816,6 +822,22 @@ impl Worker {
             &refreshed,
         );
         Ok(count)
+    }
+
+    /// Whether a feedback-loop complaint about transactional mail of
+    /// `server_id` suppresses the recipient: the server's own setting, else
+    /// `deliverability_feedback.fbl.suppress_complainants`.
+    async fn suppress_complainants(&self, server_id: camelmailer_core::Id) -> bool {
+        match camelmailer_core::FeedbackStore::server_complaint_suppression(&self.store, server_id)
+            .await
+        {
+            Ok(Some(choice)) => choice,
+            Ok(None) => self.fbl_suppress_complainants,
+            Err(error) => {
+                tracing::warn!(%error, server_id, "could not read the server's complaint setting; using the default");
+                self.fbl_suppress_complainants
+            }
+        }
     }
 
     /// The outcome of a delivery whose result was handed to
@@ -1895,6 +1917,17 @@ impl Worker {
         queued: &camelmailer_db::QueuedMessageRow,
         message: &StoredMessage,
     ) -> Result<ProcessOutcome, sqlx::Error> {
+        // The report holds recipient data: remember it for
+        // `retention.feedback_report_days`, whatever happens below.
+        if let Err(error) = camelmailer_core::FeedbackStore::record_feedback_report(
+            &self.store,
+            message.server_id,
+            message.id,
+        )
+        .await
+        {
+            tracing::warn!(%error, message_id = message.id, "could not register the feedback report for retention");
+        }
         let report = match crate::arf::extract_feedback(&message.raw_message) {
             Ok(report) => report,
             Err(error) => {
@@ -1930,7 +1963,20 @@ impl Worker {
                 message_tokens: report.message_tokens.clone(),
                 message_id: report.original_message_id.clone(),
                 recipient: report.recipient(),
+                suppress_transactional: self.suppress_complainants(message.server_id).await,
             };
+            // Count the complaint for the provider that reported it (JMRP,
+            // CFL, ...). Per-IP crediting comes from the IP metrics. A failure
+            // here never holds up the complaint itself.
+            if let Err(error) = camelmailer_core::FeedbackStore::record_fbl_complaint(
+                &self.store,
+                report.provider(),
+                chrono::Utc::now().date_naive(),
+            )
+            .await
+            {
+                tracing::warn!(%error, provider = report.provider(), "could not count the feedback-loop complaint");
+            }
             match self
                 .sink
                 .record_feedback_complaint(message.server_id, &complaint)
@@ -1957,8 +2003,15 @@ impl Worker {
                     }
                     let detail = match outcome {
                         FeedbackComplaintOutcome::Recorded {
-                            suppressed: true, ..
-                        } => "spam complaint recorded for the broadcast recipient".to_string(),
+                            suppressed: true,
+                            message_id,
+                            ..
+                        } => match message_id {
+                            Some(id) if complaint.unsubscribe_token.is_none() => format!(
+                                "spam complaint recorded for <msg:{id}>; recipient suppressed"
+                            ),
+                            _ => "spam complaint recorded for the broadcast recipient".to_string(),
+                        },
                         FeedbackComplaintOutcome::Recorded {
                             message_id: Some(id),
                             ..
@@ -2394,6 +2447,13 @@ impl Worker {
             report.api_requests_deleted = self.store.prune_api_request_log(cutoff, batch).await?;
         }
         report.expired_tokens_deleted = self.store.prune_expired_auth_tokens(now, batch).await?;
+        if self.feedback_report_days > 0 {
+            let cutoff = now - chrono::Duration::days(self.feedback_report_days as i64);
+            match self.store.purge_feedback_reports(cutoff, batch).await {
+                Ok(n) => report.feedback_reports_purged = n,
+                Err(error) => tracing::error!(%error, "feedback report retention failed"),
+            }
+        }
         Ok(report)
     }
 

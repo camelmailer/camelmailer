@@ -135,6 +135,16 @@ it. From there:
   recorded as `Processed` and taken no further.
 - A storage error while recording the complaint is treated as transient
   and retried with backoff, so a complaint is not lost to a blip.
+- Every abuse report is counted for the provider that sent it
+  (`microsoft` for JMRP, `yahoo` for CFL, `google`, `other`) and shown on
+  the [Provider feedback](provider-feedback.md) page.
+- A complaint about transactional mail also suppresses the recipient for the
+  stream of the complained-about message
+  (`deliverability_feedback.fbl.suppress_complainants`, on by default). Each
+  server can switch it off under Settings → Spam complaints, which keeps the
+  sender in charge of opt-out as described above.
+- The raw report is emptied after `retention.feedback_report_days` (30); the
+  complaint, its suppression and the counts stay.
 
 The subscription flip is why a complaint on a broadcast subscriber does
 double duty: the `complaint` suppression stops future sends on that

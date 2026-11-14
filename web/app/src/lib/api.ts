@@ -456,6 +456,43 @@ export type SourceAddressCheck = {
   checked_by: string
   checked_at: string
 }
+/** Whether a feedback-loop complaint about a server's transactional mail
+ *  suppresses the recipient. `suppress_complainants` null follows the
+ *  installation default. */
+export type ComplaintSettings = {
+  suppress_complainants: boolean | null
+  installation_default: boolean
+  effective: boolean
+}
+export type FeedbackVerdict = "unknown" | "ok" | "warn" | "bad"
+export type FeedbackSnapshot = {
+  source: string
+  provider: "google" | "microsoft" | "yahoo" | "other"
+  subject_kind: "domain" | "ip" | "provider"
+  subject: string
+  data_date: string
+  verdict: FeedbackVerdict
+  detail: string
+  metrics: Record<string, unknown>
+  fetched_at: string
+}
+export type FeedbackSourceStatus = {
+  source: string
+  enabled: boolean
+  last_attempt_at: string | null
+  last_success_at: string | null
+  last_error: string | null
+  consecutive_failures: number
+  next_attempt_at: string | null
+}
+export type FeedbackSource = {
+  source: "postmaster_tools" | "snds" | "fbl"
+  provider: "google" | "microsoft" | "several"
+  enabled: boolean
+  freshness_seconds: number | null
+  status: FeedbackSourceStatus | null
+  snapshots: FeedbackSnapshot[]
+}
 export type IpAddress = {
   id: number
   uuid: string
@@ -1049,6 +1086,15 @@ export const adminApi = {
       api.post<{ server: Server }>(
         `/api/v2/admin/organizations/${org}/servers/${server}/unsuspend`,
       ),
+    complaintSettings: (server: string) =>
+      api.get<{ complaint_settings: ComplaintSettings }>(
+        `/api/v2/admin/organizations/${org}/servers/${server}/complaint_settings`,
+      ),
+    updateComplaintSettings: (server: string, suppress_complainants: boolean | null) =>
+      api.patch<{ complaint_settings: ComplaintSettings }>(
+        `/api/v2/admin/organizations/${org}/servers/${server}/complaint_settings`,
+        { suppress_complainants },
+      ),
     setIpPool: (server: string, ip_pool_id: number | null) =>
       api.post<{ server: Server }>(
         `/api/v2/admin/organizations/${org}/servers/${server}/ip_pool`,
@@ -1206,6 +1252,10 @@ export const adminApi = {
       api.get<{ source_addresses: SourceAddressCheck[]; failing: number }>(
         "/api/v2/admin/source_addresses",
       ),
+  },
+  deliverabilityFeedback: {
+    list: () =>
+      api.get<{ sources: FeedbackSource[] }>("/api/v2/admin/deliverability/feedback"),
   },
   adminApiKeys: {
     list: () =>

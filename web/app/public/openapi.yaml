@@ -2283,6 +2283,67 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Success" }
 
+  /api/v2/admin/organizations/{org}/servers/{server}/complaint_settings:
+    get:
+      tags: [Servers]
+      summary: Complaint handling of a server
+      description: >-
+        Whether a feedback-loop complaint (Microsoft JMRP, Yahoo CFL, other ARF reports) about
+        this server's transactional mail suppresses the recipient for that message's stream.
+        `suppress_complainants` is the server's own choice; `null` follows the installation
+        default `deliverability_feedback.fbl.suppress_complainants` (on). Complaints about
+        broadcast mail always suppress.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200":
+          description: The setting
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      complaint_settings: { $ref: "#/components/schemas/ComplaintSettings" }
+    patch:
+      tags: [Servers]
+      summary: Change the complaint handling of a server
+      description: Organization admins and owners. `null` returns to the installation default.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [suppress_complainants]
+              properties:
+                suppress_complainants: { type: boolean, nullable: true }
+      responses:
+        "200":
+          description: The new setting
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      complaint_settings: { $ref: "#/components/schemas/ComplaintSettings" }
+        "422": { description: "`suppress_complainants` is not true, false or null" }
+
   /api/v2/admin/organizations/{org}/servers/{server}/domains:
     get:
       tags: [Domains]
@@ -3401,6 +3462,66 @@ paths:
                             nullable: true
         "404": { description: No such pool }
         "422": { description: Unknown mode or invalid profile }
+  /api/v2/admin/deliverability/feedback:
+    get:
+      tags: [Instance]
+      summary: Provider feedback
+      description: >-
+        What the large mailbox providers report about this installation's mail, per source:
+        Google Postmaster Tools (per sending domain and day: spam rate, SPF/DKIM/DMARC success,
+        outbound TLS, delivery error rates), Microsoft SNDS (per sending IP and day: filter
+        result, complaint rate, trap hits) and the complaint feedback loops (ARF reports counted
+        per provider and day). `enabled` says whether a worker has the source's credentials;
+        `freshness_seconds` is the age of the newest data. Each source lists its newest snapshot
+        per domain, IP or provider, worst verdict first. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200":
+          description: Every source
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      sources:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            source: { type: string, enum: [postmaster_tools, snds, fbl] }
+                            provider: { type: string, enum: [google, microsoft, several] }
+                            enabled: { type: boolean }
+                            freshness_seconds: { type: integer, nullable: true }
+                            status:
+                              type: object
+                              nullable: true
+                              properties:
+                                source: { type: string }
+                                enabled: { type: boolean }
+                                last_attempt_at: { type: string, format: date-time, nullable: true }
+                                last_success_at: { type: string, format: date-time, nullable: true }
+                                last_error: { type: string, nullable: true }
+                                consecutive_failures: { type: integer }
+                                next_attempt_at: { type: string, format: date-time, nullable: true }
+                            snapshots:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  source: { type: string }
+                                  provider: { type: string, enum: [google, microsoft, yahoo, other] }
+                                  subject_kind: { type: string, enum: [domain, ip, provider] }
+                                  subject: { type: string }
+                                  data_date: { type: string, format: date }
+                                  verdict: { type: string, enum: [unknown, ok, warn, bad] }
+                                  detail: { type: string }
+                                  metrics: { type: object, additionalProperties: true }
+                                  fetched_at: { type: string, format: date-time }
   /api/v2/admin/admin_api_keys:
     get:
       tags: [Instance]
@@ -3683,6 +3804,12 @@ components:
                     expected: { type: array, items: { type: string } }
                     instructions: { type: array, items: { type: string } }
                     detail: { type: string }
+    ComplaintSettings:
+      type: object
+      properties:
+        suppress_complainants: { type: boolean, nullable: true }
+        installation_default: { type: boolean }
+        effective: { type: boolean }
     OrganizationUsage:
       type: object
       properties:

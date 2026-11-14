@@ -69,6 +69,9 @@ pub struct ApiState {
     /// when accounts storage is not enabled; the dashboard endpoints then
     /// report the feature unavailable.
     pub org_sso_store: Option<Arc<dyn camelmailer_core::OrgSsoStore>>,
+    /// Provider feedback snapshots (Postmaster Tools, SNDS, feedback loops).
+    /// `None` reports every source as off.
+    pub feedback_store: Option<Arc<dyn camelmailer_core::FeedbackStore>>,
     /// Delivery counters per sending address and provider (IP metrics,
     /// warm-up). `None` answers the IP metrics with no data.
     pub delivery_stats: Option<Arc<dyn camelmailer_core::DeliveryStatsStore>>,
@@ -109,6 +112,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            feedback_store: None,
             delivery_stats: None,
             warmup_store: None,
             spf_resolver: None,
@@ -136,6 +140,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            feedback_store: None,
             delivery_stats: None,
             warmup_store: None,
             spf_resolver: None,
@@ -308,6 +313,7 @@ impl ApiState {
             webhook_sender,
             installation_signing_key_pem,
             org_sso_store: None,
+            feedback_store: None,
             delivery_stats: None,
             warmup_store: None,
             spf_resolver: None,
@@ -360,6 +366,17 @@ impl ApiState {
     ) -> Arc<Self> {
         let mut state = (*self).clone();
         state.org_sso_store = Some(org_sso_store);
+        Arc::new(state)
+    }
+
+    /// Attach the provider feedback store. Returns a fresh state, as
+    /// [`ApiState::with_org_sso_store`] does.
+    pub fn with_feedback_store(
+        self: Arc<Self>,
+        feedback_store: Arc<dyn camelmailer_core::FeedbackStore>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.feedback_store = Some(feedback_store);
         Arc::new(state)
     }
 
@@ -607,7 +624,11 @@ fn required_role(rest: &[&str], method: &axum::http::Method) -> camelmailer_core
         Some(&"sso") => Role::Admin,
         Some(&"servers") => match rest.get(2) {
             // server lifecycle (create/update/delete/suspend/ip_pool)
-            None | Some(&"suspend") | Some(&"unsuspend") | Some(&"ip_pool") => {
+            None
+            | Some(&"suspend")
+            | Some(&"unsuspend")
+            | Some(&"ip_pool")
+            | Some(&"complaint_settings") => {
                 if read {
                     Role::Viewer
                 } else {
@@ -1802,6 +1823,11 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             axum::routing::post(servers_set_ip_pool),
         )
         .route(
+            "/organizations/{permalink}/servers/{server_permalink}/complaint_settings",
+            get(crate::deliverability::complaint_settings_show)
+                .patch(crate::deliverability::complaint_settings_update),
+        )
+        .route(
             "/organizations/{permalink}/servers/{server_permalink}/stats",
             get(server_stats_show),
         )
@@ -2036,6 +2062,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/dns_checks/candidate",
             get(crate::dns_checks::dns_checks_candidate),
+        )
+        .route(
+            "/deliverability/feedback",
+            get(crate::deliverability::feedback_index),
         )
         .route(
             "/ip_pools/{pool_id}/ip_addresses",

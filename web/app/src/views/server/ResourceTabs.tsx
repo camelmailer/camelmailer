@@ -1993,6 +1993,18 @@ export function Suppressions({ org, server }: Scope) {
             loading={suppressions.isPending}
             searchKeys={["address"]}
             searchPlaceholder="Search addresses…"
+            filters={[
+              {
+                columnId: "type",
+                label: "Type",
+                options: Array.from(new Set(rows.map((r) => r.type)))
+                  .sort()
+                  .map((type) => ({
+                    label: type === "complaint" ? "Spam complaint" : type,
+                    value: type,
+                  })),
+              },
+            ]}
             emptyText="No suppressions match your search."
             initialPageSize={20}
             fillHeight

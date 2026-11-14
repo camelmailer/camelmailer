@@ -346,6 +346,7 @@ retention:
   dmarc_report_days: 0
   auth_event_days: 0
   api_request_days: 30
+  feedback_report_days: 30   # raw ARF complaint reports (recipient data)
   batch_size: 1000
 ```
 
@@ -682,6 +683,29 @@ lifecycle_webhooks:
 
 Events, payload and signature are described in
 [Webhooks: installation lifecycle events](webhooks.md#installation-lifecycle-events).
+
+### `deliverability_feedback:` provider feedback
+
+Google Postmaster Tools, Microsoft SNDS and the complaint feedback loops.
+Every source is off until its credentials are present; secrets come from the
+environment or from files, never from this file. Setup per source:
+[Provider feedback](provider-feedback.md).
+
+```yaml
+deliverability_feedback:
+  fetch_interval_seconds: 21600       # 0 turns the scheduled fetch off
+  snapshot_retention_days: 400
+  postmaster_tools:
+    domains: []                       # verified in Postmaster Tools
+    # client_id: …apps.googleusercontent.com   # or CAMELMAILER_POSTMASTER_CLIENT_ID
+    # client_secret_file: /run/secrets/postmaster_client_secret   # or CAMELMAILER_POSTMASTER_CLIENT_SECRET
+    # refresh_token_file: /run/secrets/postmaster_refresh_token   # or CAMELMAILER_POSTMASTER_REFRESH_TOKEN
+    days: 7
+  snds:
+    # data_url_file: /run/secrets/snds_data_url                   # or CAMELMAILER_SNDS_DATA_URL
+  fbl:
+    suppress_complainants: true       # also for transactional mail; servers can opt out
+```
 
 ### `captcha:` registration captcha
 

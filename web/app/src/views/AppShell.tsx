@@ -119,6 +119,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   users: "Users",
   "ip-pools": "IP pools",
   infrastructure: "Infrastructure",
+  feedback: "Provider feedback",
   dns: "DNS checks",
   "api-keys": "Admin API keys",
   audit: "Audit log",

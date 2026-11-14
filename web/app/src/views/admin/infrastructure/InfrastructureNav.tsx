@@ -12,6 +12,7 @@ export const INFRASTRUCTURE_SECTIONS: readonly (readonly [href: string, label: s
   ["/admin/infrastructure", "Topology"],
   ["/admin/infrastructure/dns", "DNS checks"],
   ["/admin/infrastructure/ips", "IP metrics & warm-up"],
+  ["/admin/infrastructure/feedback", "Provider feedback"],
 ]
 
 export function InfrastructureNav() {
