@@ -2283,6 +2283,67 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Success" }
 
+  /api/v2/admin/organizations/{org}/servers/{server}/complaint_settings:
+    get:
+      tags: [Servers]
+      summary: Complaint handling of a server
+      description: >-
+        Whether a feedback-loop complaint (Microsoft JMRP, Yahoo CFL, other ARF reports) about
+        this server's transactional mail suppresses the recipient for that message's stream.
+        `suppress_complainants` is the server's own choice; `null` follows the installation
+        default `deliverability_feedback.fbl.suppress_complainants` (on). Complaints about
+        broadcast mail always suppress.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200":
+          description: The setting
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      complaint_settings: { $ref: "#/components/schemas/ComplaintSettings" }
+    patch:
+      tags: [Servers]
+      summary: Change the complaint handling of a server
+      description: Organization admins and owners. `null` returns to the installation default.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [suppress_complainants]
+              properties:
+                suppress_complainants: { type: boolean, nullable: true }
+      responses:
+        "200":
+          description: The new setting
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      complaint_settings: { $ref: "#/components/schemas/ComplaintSettings" }
+        "422": { description: "`suppress_complainants` is not true, false or null" }
+
   /api/v2/admin/organizations/{org}/servers/{server}/domains:
     get:
       tags: [Domains]
@@ -3035,6 +3096,518 @@ paths:
                             detail: { type: string }
                             checked_by: { type: string }
                             checked_at: { type: string, format: date-time }
+  /api/v2/admin/cluster:
+    get:
+      tags: [Instance]
+      summary: Cluster topology
+      description: >-
+        Every registered web, SMTP and worker process with its role, version and heartbeat
+        (`status` is `live`, `stale` once not heard from for `cluster.node_stale_seconds`, or
+        `stopped` after a graceful shutdown), the queue rows each worker holds (by its lock id),
+        locks held under an id no registered worker has, the load balancer address and inbound
+        host name from `cluster`, and the IP pools with their addresses. `mixed_versions` is true
+        when live processes report different versions. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200":
+          description: The topology
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      cluster:
+                        type: object
+                        properties:
+                          load_balancer_address: { type: string, nullable: true }
+                          inbound_hostname: { type: string, nullable: true }
+                          heartbeat_interval_seconds: { type: integer }
+                          node_stale_seconds: { type: integer }
+                      nodes:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            instance_id: { type: string }
+                            role: { type: string, enum: [web, smtp, worker] }
+                            node_name: { type: string }
+                            version: { type: string }
+                            status: { type: string, enum: [live, stale, stopped] }
+                            started_at: { type: string, format: date-time }
+                            last_seen_at: { type: string, format: date-time }
+                            seconds_since_seen: { type: integer }
+                            stopped_at: { type: string, format: date-time, nullable: true }
+                            details: { type: object }
+                            leases:
+                              type: object
+                              nullable: true
+                              description: Workers only.
+                              properties:
+                                queued_messages: { type: integer }
+                                webhook_requests: { type: integer }
+                                lifecycle_events: { type: integer }
+                                oldest_lock_at: { type: string, format: date-time, nullable: true }
+                                oldest_lock_age_seconds: { type: integer, nullable: true }
+                      unregistered_leases:
+                        type: array
+                        items: { type: object }
+                      versions: { type: array, items: { type: string } }
+                      mixed_versions: { type: boolean }
+                      ip_pools:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: integer }
+                            name: { type: string }
+                            default: { type: boolean }
+                            address_family: { type: string, nullable: true }
+                            addresses:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  id: { type: integer }
+                                  ipv4: { type: string }
+                                  ipv6: { type: string, nullable: true }
+                                  hostname: { type: string }
+                                  priority: { type: integer }
+  /api/v2/admin/dns_checks:
+    get:
+      tags: [Instance]
+      summary: DNS checks with the exact expected records
+      description: >-
+        Checks the DNS the installation depends on and names the exact record each check
+        expects: A/AAAA of `cluster.inbound_hostname` on the load balancer (or the live SMTP
+        nodes), PTR, forward-confirmed reverse DNS and EHLO of every sending address (IP pool
+        addresses and the `cluster.public_addresses` of live workers), then by domain role: the
+        return-path domain (SPF against every sending address, MX on the installation), every
+        verified sending domain (at most 100: SPF against every sending address, the DKIM record
+        at `<selector>._domainkey.<domain>` carrying the key the worker signs with, a DMARC record
+        with `p=none` as a warning), every domain with an inbound route (MX on the installation),
+        and the tracking host name. Each check has `status` ok / warn / fail, `found`, `expected` and copyable
+        `instructions`; `instructions` at the top level lists every record to set once. Read-only.
+        The result is reused for 60 seconds unless `refresh=1`. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: refresh, in: query, required: false, schema: { type: string, enum: ["1", "true"] } }
+      responses:
+        "200":
+          description: The checks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data: { $ref: "#/components/schemas/DnsCheckRun" }
+  /api/v2/admin/dns_checks/candidate:
+    get:
+      tags: [Instance]
+      summary: DNS checks for a planned sending address
+      description: >-
+        The checks a new address must pass before it goes into an IP pool: A/AAAA of `hostname`,
+        PTR, forward-confirmed reverse DNS, EHLO match (`hostname` is what it will greet with) and
+        SPF coverage of the return-path and tenant domains. `ready` is true when every check
+        passes. Read-only: it never changes DNS or pools. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: ipv4, in: query, required: false, schema: { type: string } }
+        - { name: ipv6, in: query, required: false, schema: { type: string } }
+        - { name: hostname, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The checks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    allOf:
+                      - $ref: "#/components/schemas/DnsCheckRun"
+                      - type: object
+                        properties:
+                          ready: { type: boolean }
+                          candidate:
+                            type: object
+                            properties:
+                              ipv4: { type: string, nullable: true }
+                              ipv6: { type: string, nullable: true }
+                              hostname: { type: string }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/admin/ip_metrics:
+    get:
+      tags: [Instance]
+      summary: Delivery counters per sending address
+      description: >-
+        Outbound SMTP results counted per UTC day, per source address (the IPv4 value of the
+        IP-pool address a delivery was bound to, or `default` for servers without a pool) and per
+        receiving provider group (`microsoft`, `google`, `yahoo`, `other`). Deferral, bounce and
+        policy-block rates are shares of all attempts; the complaint rate is per accepted message.
+        Pools sum the addresses they hold. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - name: days
+          in: query
+          description: Days to cover, today included (1 to 90, default 7).
+          schema: { type: integer, minimum: 1, maximum: 90, default: 7 }
+      responses:
+        "200":
+          description: The counters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      days: { type: integer }
+                      since: { type: string, format: date }
+                      until: { type: string, format: date }
+                      addresses:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            source_ip: { type: string }
+                            ip_address_id: { type: integer, nullable: true }
+                            default_source: { type: boolean }
+                            pool:
+                              type: object
+                              nullable: true
+                              properties:
+                                id: { type: integer }
+                                name: { type: string }
+                            hostname: { type: string, nullable: true }
+                            totals: { $ref: "#/components/schemas/IpMetricTotals" }
+                            today: { $ref: "#/components/schemas/IpMetricTotals" }
+                            providers:
+                              type: array
+                              items:
+                                allOf:
+                                  - $ref: "#/components/schemas/IpMetricTotals"
+                                  - type: object
+                                    properties:
+                                      provider: { type: string, description: "Provider group (built-in: microsoft, google, yahoo, apple, united_internet, t_online, other; more via provider_groups)" }
+                            daily:
+                              type: array
+                              items:
+                                allOf:
+                                  - $ref: "#/components/schemas/IpMetricTotals"
+                                  - type: object
+                                    properties:
+                                      day: { type: string, format: date }
+                      pools:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: integer }
+                            name: { type: string }
+                            totals: { $ref: "#/components/schemas/IpMetricTotals" }
+  /api/v2/admin/ip_warmup:
+    get:
+      tags: [Instance]
+      summary: Warm-up state of every pool address
+      description: >-
+        Adaptive IP warm-up, off by default. For every pool address: the mode in force (`off`,
+        `slow`, `normal`, `fast`, `custom`) and where it comes from (`address`, `pool` or
+        `default`), the profile, and per receiving provider group (`microsoft`, `google`, `yahoo`,
+        `other`) the daily allowance, today's use, the status (`not_started`, `ramping`,
+        `holding`, `slowed`, `paused`, `warm`), the last decision and brake with their reasons, the
+        progress towards the cap and an estimate of the healthy days until warm. Also the built-in
+        profiles, the configured thresholds (`warmup` config group) and recent decisions. Global
+        administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200":
+          description: The warm-up state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      profiles:
+                        type: object
+                        additionalProperties: { $ref: "#/components/schemas/WarmupProfile" }
+                      thresholds: { type: object, additionalProperties: true }
+                      provider_groups: { type: array, items: { type: string } }
+                      storage_incidents:
+                        type: array
+                        items: { $ref: "#/components/schemas/WarmupLogEntry" }
+                      addresses:
+                        type: array
+                        items: { $ref: "#/components/schemas/WarmupAddress" }
+  /api/v2/admin/ip_warmup/log:
+    get:
+      tags: [Instance]
+      summary: Warm-up decision log
+      description: >-
+        Every warm-up decision (`advance`, `hold`, `slow`, `brake`, `warm`) and mode change
+        (`mode`), newest first, with its reason. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - name: ip_address_id
+          in: query
+          schema: { type: integer }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200":
+          description: The log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      log:
+                        type: array
+                        items: { $ref: "#/components/schemas/WarmupLogEntry" }
+  /api/v2/admin/ip_warmup/addresses/{id}:
+    patch:
+      tags: [Instance]
+      summary: Set the warm-up mode of a pool address
+      description: >-
+        `inherit` removes the address's own mode, so the pool's applies. `custom` needs a profile
+        (start 1 to 1000000, growth 1.05 to 3.0, cap above start). Changing the mode keeps the
+        current allowance: the ramp continues and never restarts. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetWarmup" }
+      responses:
+        "200":
+          description: The address with its new mode
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      address: { $ref: "#/components/schemas/WarmupAddress" }
+        "404": { description: No such pool address }
+        "422": { description: Unknown mode or invalid profile }
+  /api/v2/admin/ip_warmup/pools/{id}:
+    patch:
+      tags: [Instance]
+      summary: Set the default warm-up mode of an IP pool
+      description: >-
+        The mode every address of the pool uses unless it sets its own. `inherit` removes it (off).
+        Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetWarmup" }
+      responses:
+        "200":
+          description: The pool's mode
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      ip_pool:
+                        type: object
+                        properties:
+                          id: { type: integer }
+                          mode: { type: string, nullable: true }
+                          profile:
+                            allOf: [{ $ref: "#/components/schemas/WarmupProfile" }]
+                            nullable: true
+        "404": { description: No such pool }
+        "422": { description: Unknown mode or invalid profile }
+  /api/v2/admin/deliverability/feedback:
+    get:
+      tags: [Instance]
+      summary: Provider feedback
+      description: >-
+        What the large mailbox providers report about this installation's mail, per source:
+        Google Postmaster Tools (per sending domain and day: spam rate, SPF/DKIM/DMARC success,
+        outbound TLS, delivery error rates), Microsoft SNDS (per sending IP and day: filter
+        result, complaint rate, trap hits), the complaint feedback loops (ARF reports counted
+        per provider and day) and the seed placement tests (inbox, spam or missing per sending IP
+        and provider). `enabled` says whether a worker has the source's credentials;
+        `freshness_seconds` is the age of the newest data. Each source lists its newest snapshot
+        per domain, IP or provider, worst verdict first. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200":
+          description: Every source
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      sources:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            source: { type: string, enum: [postmaster_tools, snds, fbl, placement] }
+                            provider: { type: string, enum: [google, microsoft, several] }
+                            enabled: { type: boolean }
+                            freshness_seconds: { type: integer, nullable: true }
+                            status:
+                              type: object
+                              nullable: true
+                              properties:
+                                source: { type: string }
+                                enabled: { type: boolean }
+                                last_attempt_at: { type: string, format: date-time, nullable: true }
+                                last_success_at: { type: string, format: date-time, nullable: true }
+                                last_error: { type: string, nullable: true }
+                                consecutive_failures: { type: integer }
+                                next_attempt_at: { type: string, format: date-time, nullable: true }
+                            snapshots:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  source: { type: string }
+                                  provider: { type: string, pattern: "^[a-z0-9_]+$" }
+                                  subject_kind: { type: string, enum: [domain, ip, provider] }
+                                  subject: { type: string }
+                                  data_date: { type: string, format: date }
+                                  verdict: { type: string, enum: [unknown, ok, warn, bad] }
+                                  detail: { type: string }
+                                  metrics: { type: object, additionalProperties: true }
+                                  fetched_at: { type: string, format: date-time }
+  /api/v2/admin/deliverability/placement_tests:
+    get:
+      tags: [Instance]
+      summary: Seed placement history
+      description: >-
+        Every inbox placement test with its result and time, newest first: one test message
+        per sending IP to every configured seed mailbox, looked up read-only over IMAP.
+        `configured` says whether `deliverability_feedback.placement` has a server, a sender
+        and seeds. The warm-up reads the worst result of the last 24 hours per IP and provider
+        group. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: ip, in: query, required: false, schema: { type: string } }
+        - { name: provider, in: query, required: false, description: A provider group name., schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
+      responses:
+        "200":
+          description: The tests
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      configured: { type: boolean }
+                      last_round:
+                        $ref: "#/components/schemas/PlacementRound"
+                      placement_tests:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: integer }
+                            round_id: { type: integer }
+                            server_id: { type: integer }
+                            message_id: { type: integer, nullable: true }
+                            ip_pool_id: { type: integer }
+                            ip_address_id: { type: integer }
+                            ip: { type: string }
+                            seed_address: { type: string }
+                            seed_provider: { type: string, enum: [gmail, outlook, yahoo, imap] }
+                            provider: { type: string, pattern: "^[a-z0-9_]+$" }
+                            status: { type: string, enum: [pending, inbox, spam, missing, error] }
+                            folder: { type: string, nullable: true }
+                            spf: { type: string, nullable: true }
+                            dkim: { type: string, nullable: true }
+                            dmarc: { type: string, nullable: true }
+                            received_ip: { type: string, nullable: true }
+                            helo: { type: string, nullable: true }
+                            detail: { type: string }
+                            checks: { type: integer }
+                            created_at: { type: string, format: date-time }
+                            checked_at: { type: string, format: date-time, nullable: true }
+    post:
+      tags: [Instance]
+      summary: Run a placement round now
+      description: >-
+        Requests one round of seed placement tests; a worker sends it within a minute. At most
+        one round per `deliverability_feedback.placement.min_round_interval_seconds` (3600),
+        scheduled rounds included. The tests only measure: nothing is opened, clicked, answered
+        or moved in the seed mailboxes. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "202":
+          description: The round was requested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      placement_round:
+                        $ref: "#/components/schemas/PlacementRound"
+        "409":
+          description: >-
+            `PlacementNotConfigured` (no server, sender or seeds) or `PlacementRateLimited`
+            (a round was requested too recently)
   /api/v2/admin/admin_api_keys:
     get:
       tags: [Instance]
@@ -3197,6 +3770,140 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
   schemas:
+    PlacementRound:
+      type: object
+      nullable: true
+      properties:
+        id: { type: integer }
+        trigger: { type: string, enum: [schedule, manual] }
+        requested_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time, nullable: true }
+    WarmupProfile:
+      type: object
+      properties:
+        start: { type: integer }
+        growth: { type: number }
+        cap: { type: integer }
+        groups:
+          type: object
+          description: Per provider group, the first day's allowance and the cap.
+          additionalProperties:
+            type: object
+            properties:
+              start: { type: integer }
+              cap: { type: integer }
+    SetWarmup:
+      type: object
+      required: [mode]
+      properties:
+        mode: { type: string, enum: ["off", slow, normal, fast, custom, inherit] }
+        profile: { $ref: "#/components/schemas/WarmupProfile" }
+    WarmupLogEntry:
+      type: object
+      properties:
+        ip_address_id: { type: integer }
+        provider: { type: string, nullable: true }
+        decision: { type: string, enum: [advance, hold, slow, brake, warm, mode, storage] }
+        reason: { type: string }
+        allowance_before: { type: integer, nullable: true }
+        allowance_after: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+    WarmupAddress:
+      type: object
+      properties:
+        ip_address_id: { type: integer }
+        ipv4: { type: string }
+        hostname: { type: string }
+        pool:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            mode: { type: string, nullable: true }
+        mode: { type: string, enum: ["off", slow, normal, fast, custom] }
+        mode_source: { type: string, enum: [address, pool, default] }
+        address_mode: { type: string, nullable: true }
+        active: { type: boolean }
+        profile:
+          allOf: [{ $ref: "#/components/schemas/WarmupProfile" }]
+          nullable: true
+        eta_days: { type: integer, nullable: true }
+        providers:
+          type: array
+          items:
+            type: object
+            properties:
+              provider: { type: string }
+              allowance: { type: integer, nullable: true }
+              used_today: { type: integer }
+              status:
+                type: string
+                nullable: true
+                enum: [not_started, ramping, holding, slowed, paused, warm]
+              paused: { type: boolean }
+              paused_until: { type: string, format: date-time, nullable: true }
+              last_reason: { type: string, nullable: true }
+              last_brake_reason: { type: string, nullable: true }
+              last_brake_at: { type: string, format: date-time, nullable: true }
+              evaluated_day: { type: string, format: date, nullable: true }
+              progress: { type: number, nullable: true }
+              eta_days: { type: integer, nullable: true }
+        recent_decisions:
+          type: array
+          items: { $ref: "#/components/schemas/WarmupLogEntry" }
+    IpMetricTotals:
+      type: object
+      properties:
+        sent: { type: integer }
+        deferred: { type: integer }
+        bounced: { type: integer }
+        policy_blocks: { type: integer }
+        complaints: { type: integer }
+        attempts: { type: integer }
+        deferral_rate: { type: number, nullable: true }
+        bounce_rate: { type: number, nullable: true }
+        policy_block_rate: { type: number, nullable: true }
+        complaint_rate: { type: number, nullable: true }
+    DnsCheckRun:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            ok: { type: integer }
+            warn: { type: integer }
+            fail: { type: integer }
+        instructions: { type: array, items: { type: string } }
+        truncated_domains: { type: integer }
+        checked_at: { type: string, format: date-time }
+        cached: { type: boolean }
+        groups:
+          type: array
+          items:
+            type: object
+            properties:
+              group: { type: string, enum: [address, hostname, domain] }
+              subject: { type: string }
+              status: { type: string, enum: [ok, warn, fail] }
+              checks:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    group: { type: string }
+                    subject: { type: string }
+                    kind: { type: string, enum: [a, ptr, fcrdns, ehlo, spf, dkim, dmarc, mx, resolves] }
+                    status: { type: string, enum: [ok, warn, fail] }
+                    found: { type: array, items: { type: string } }
+                    expected: { type: array, items: { type: string } }
+                    instructions: { type: array, items: { type: string } }
+                    detail: { type: string }
+    ComplaintSettings:
+      type: object
+      properties:
+        suppress_complainants: { type: boolean, nullable: true }
+        installation_default: { type: boolean }
+        effective: { type: boolean }
     OrganizationUsage:
       type: object
       properties:

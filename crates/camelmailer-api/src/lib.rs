@@ -5,8 +5,11 @@ mod app_mailer;
 pub mod auth_api;
 pub mod billing;
 pub mod captcha;
+mod cluster_api;
 pub mod cors;
+mod deliverability;
 pub mod dns;
+pub mod dns_checks;
 mod memberships;
 pub mod oidc;
 pub mod org_sso_api;
@@ -24,8 +27,11 @@ mod workspace;
 mod xmldsig;
 
 mod insights;
+mod ip_metrics;
+mod ip_warmup;
 mod lifecycle;
 mod quota;
+pub mod warmup_config;
 
 pub use app::{build_app, build_assets_router, build_router, ApiState};
 pub use auth_api::build_auth_router;

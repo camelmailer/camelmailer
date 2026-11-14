@@ -101,6 +101,7 @@ smtp_server:
   tls_certificate_path: $config-file-root/smtp.cert
   tls_private_key_path: $config-file-root/smtp.key
   proxy_protocol: false       # enable behind HAProxy/NLB
+  shutdown_grace_seconds: 30  # default; env SMTP_SERVER_SHUTDOWN_GRACE_SECONDS
   listeners:                  # additional ports (default: none)
     - { port: 587, mode: smtp }
     - { port: 465, mode: smtps }
@@ -178,6 +179,32 @@ disabled.
 
 The server logs a warning at startup for as long as the window is open, so an
 installation cannot forget it is in this state.
+
+#### Graceful shutdown of the web and SMTP servers
+
+On SIGTERM or SIGINT both servers stop accepting connections and finish
+what is in flight before they stop, then mark their entry in the cluster
+topology stopped (see `cluster:` below):
+
+| | Grace period | What happens |
+|---|---|---|
+| SMTP | `smtp_server.shutdown_grace_seconds` (30; env `SMTP_SERVER_SHUTDOWN_GRACE_SECONDS`) | New connections are refused. A session in the middle of a transaction (from `MAIL FROM` to the end of `DATA`) finishes it; once its message is accepted or refused it gets `421 4.3.2 <smtp_hostname> Service shutting down, closing transmission channel` and is closed. When the grace period is over, every session still open gets the same `421` at once and is closed. |
+| Web | `web_server.shutdown_grace_seconds` (30; env `WEB_SERVER_SHUTDOWN_GRACE_SECONDS`) | New connections are refused, idle keep-alive connections are closed, requests in flight finish. When the grace period is over the server stops. |
+
+No accepted message is lost: the SMTP server queues a message before it
+answers `250`, so a message cut off by the grace period was never
+acknowledged and the client sends it again (to another node behind the load
+balancer, or later). The server stops as soon as nothing is left open, so
+the grace period is an upper bound, not a wait.
+
+The process manager's stop timeout must stay above the grace period, or the
+process is killed before it finishes. The compose file runs both servers
+with `init: true` and `stop_grace_period: 40s`; for systemd the default
+`TimeoutStopSec` of 90 seconds is enough. Docker without a
+`stop_grace_period` kills after 10 seconds: lower the grace periods or set
+one. Behind a load balancer, take the node out of the pool (or let its
+health check fail) before stopping it, so no new connections are routed to
+it while it drains.
 
 ### `dns:` — the records you publish
 
@@ -319,6 +346,7 @@ retention:
   dmarc_report_days: 0
   auth_event_days: 0
   api_request_days: 30
+  feedback_report_days: 30   # raw ARF complaint reports (recipient data)
   batch_size: 1000
 ```
 
@@ -420,13 +448,19 @@ On SIGTERM or SIGINT the worker stops taking new work and gives the
 deliveries in flight `shutdown_grace_seconds` to finish. Whatever is still
 running then is stopped:
 
-- A row stopped before it reached a receiver (still loading or signing) goes
-  back to the queue without counting an attempt, and the next worker takes it
-  straight away.
-- A row stopped while talking to the receiver keeps its lock until the lease
-  runs out, as after a crash. The receiver may already have accepted it, so it
-  is not sent again early. With the default lease of one day that delivery
-  waits a day; set `queued_message_lock_stale_seconds` to shorten it.
+- A row stopped before its message started to go out goes back to the queue
+  without counting an attempt, and the next worker takes it straight away.
+  That covers loading and signing, and an SMTP delivery that has not sent
+  `DATA` yet: connecting, the greeting, EHLO, STARTTLS, `MAIL FROM` and
+  `RCPT TO`. No receiver can have the message at that point. The release and
+  the `DATA` command exclude each other, so a released delivery never sends
+  its message.
+- A row stopped after its client sent `DATA` (on any of the MX hosts tried)
+  keeps its lock until the lease runs out, as after a crash. The receiver may
+  already have accepted it, so it is not sent again early. With the default
+  lease of one day that delivery waits a day; set
+  `queued_message_lock_stale_seconds` to shorten it. Inbound routes and
+  webhook requests count as started as soon as the request begins.
 - A row whose processing failed half way (for example the database was gone
   after the receiver's `250`) also keeps its lock for the lease.
 
@@ -544,6 +578,98 @@ out when both fail, and `ipv4_only` and `ipv6_only` are never changed. It
 is off by default: the check runs once an hour, so a fixed PTR record takes
 effect at the next check, and a record that breaks is not noticed sooner.
 
+### `warmup:` adaptive IP warm-up
+
+Warm-up is off until a pool or a pool address is given a mode in the
+dashboard (Infrastructure, IP metrics & warm-up) or with
+`PATCH /api/v2/admin/ip_warmup/addresses/{id}` /
+`PATCH /api/v2/admin/ip_warmup/pools/{id}`. With every address off the worker
+never consults it, and delivery is unchanged. This group only sets the limits
+it judges by:
+
+```yaml
+warmup:
+  min_volume_fraction: 0.5      # below this share of the allowance: hold
+  advance_fraction: 0.9         # share of the allowance needed to grow
+  deferral_rate_slow: 0.05      # deferrals (of attempts) that stop the growth
+  bounce_rate_brake: 0.05       # bounces (of attempts) that brake
+  policy_blocks_brake: 3        # policy refusals that brake: at least this many
+  policy_block_rate_brake: 0.01 # and at least this share of the attempts
+  complaint_rate_warn: 0.001    # complaints (of accepted mail): slow
+  complaint_rate_brake: 0.003   # complaints: brake
+  pause_hours: 24               # a brake pauses the address for that provider
+  step_back: 0.5                # and multiplies its allowance by this
+  defer_seconds: 900            # wait when no address of the pool has room
+```
+
+The built-in profiles (`slow`, `normal`, `fast`) can be changed, per
+provider group too, including groups added in `provider_groups`:
+
+```yaml
+warmup:
+  profiles:
+    normal:
+      growth: 1.4                       # all groups of this profile
+      groups:
+        microsoft: { start: 80, cap: 30000 }
+        seznam: { start: 80, cap: 25000 }
+```
+
+Every value is checked at start: rates between 0 and 1, the warning levels
+not above the brake levels, `step_back` between 0.1 and 1, `defer_seconds` at
+least 60. How the modes and the brake work is described in
+[deliverability.md](deliverability.md#adaptive-ip-warm-up).
+
+### `provider_groups:` receiving providers
+
+The IP metrics (and the warm-up) count every delivery per receiving provider
+group. Built in: `microsoft` (Outlook.com, Hotmail, Live, Microsoft 365),
+`google` (Gmail, Workspace), `yahoo` (incl. AOL), `apple` (iCloud),
+`united_internet` (GMX, WEB.DE, mail.com, 1&1 and IONOS) and `t_online`;
+everyone else is `other`. A recipient domain is matched against `domains`
+first, then the domain's lowest MX host against `mx_patterns`.
+
+```yaml
+provider_groups:
+  - name: seznam                     # [a-z0-9_], at most 40 characters
+    domains: [seznam.cz, email.cz]   # exact, or brand.* for any TLD
+    mx_patterns: [seznam.cz]         # the host and every host under it
+```
+
+An entry with a built-in name replaces that group; any other name adds one,
+tried after the built-in groups. `other` cannot be configured.
+### `cluster:` topology and public addresses
+
+Every web, SMTP and worker process registers itself in the database and
+refreshes its entry every `heartbeat_interval_seconds`. The infrastructure
+dashboard and `GET /api/v2/admin/cluster` show the result: each process with
+its node name, role, version and last heartbeat, and for a worker the queue
+rows it holds (its lock id is its registration id). An entry not refreshed
+for `node_stale_seconds` shows as stale; a process that shuts down
+gracefully (SIGTERM or SIGINT) marks its entry stopped, so only a process
+that was killed or crashed goes stale. Entries not seen for seven days are removed. A failed registration is
+logged and retried on the next heartbeat; it never stops a process.
+
+```yaml
+cluster:
+  node_name: mail-1                  # default: the host name; env CAMELMAILER_NODE_NAME
+  load_balancer_address: 203.0.113.5 # the public address in front of the nodes
+  inbound_hostname: mail.example.com # MX target, A/AAAA on the load balancer
+  public_addresses: [203.0.113.10, "2001:db8::10"]   # env CAMELMAILER_PUBLIC_ADDRESSES
+  heartbeat_interval_seconds: 30     # at least 5
+  node_stale_seconds: 90             # at least twice the heartbeat interval
+```
+
+`load_balancer_address` and `inbound_hostname` describe the installation for
+the dashboard and its DNS checks. `public_addresses` lists the addresses
+receivers see for servers without an IP pool. Set it where the process only
+sees a private address, for example inside a Docker network, where the
+worker would otherwise check the reverse DNS of `172.18.0.5`. The reverse-DNS
+check then uses the listed address of each family instead of the detected
+one; a family that is not listed is still detected. With
+`smtp_client.skip_family_without_reverse_dns: true` the family decision
+follows the listed address too, which is the address the receiver judges.
+
 ### `lifecycle_webhooks:` installation events
 
 Forwards installation-wide events to outside systems such as a billing or
@@ -557,6 +683,37 @@ lifecycle_webhooks:
 
 Events, payload and signature are described in
 [Webhooks: installation lifecycle events](webhooks.md#installation-lifecycle-events).
+
+### `deliverability_feedback:` provider feedback
+
+Google Postmaster Tools, Microsoft SNDS and the complaint feedback loops.
+Every source is off until its credentials are present; secrets come from the
+environment or from files, never from this file. Setup per source:
+[Provider feedback](provider-feedback.md).
+
+```yaml
+deliverability_feedback:
+  fetch_interval_seconds: 21600       # 0 turns the scheduled fetch off
+  snapshot_retention_days: 400
+  postmaster_tools:
+    domains: []                       # verified in Postmaster Tools
+    # client_id: …apps.googleusercontent.com   # or CAMELMAILER_POSTMASTER_CLIENT_ID
+    # client_secret_file: /run/secrets/postmaster_client_secret   # or CAMELMAILER_POSTMASTER_CLIENT_SECRET
+    # refresh_token_file: /run/secrets/postmaster_refresh_token   # or CAMELMAILER_POSTMASTER_REFRESH_TOKEN
+    days: 7
+  snds:
+    # data_url_file: /run/secrets/snds_data_url                   # or CAMELMAILER_SNDS_DATA_URL
+  fbl:
+    suppress_complainants: true       # also for transactional mail; servers can opt out
+  placement:                          # seed inbox placement tests; off without seeds
+    server: ""                        # organization/server that sends the tests
+    from_address: ""                  # on a verified domain of that server
+    interval_seconds: 0               # 0 = only on demand
+    min_round_interval_seconds: 3600
+    check_after_seconds: 600
+    max_checks: 3
+    seeds: []                         # provider, address, auth and secret references
+```
 
 ### `captcha:` registration captcha
 

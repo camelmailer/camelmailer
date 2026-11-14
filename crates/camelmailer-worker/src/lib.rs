@@ -4,14 +4,19 @@
 pub mod arf;
 pub mod dkim;
 pub mod dmarc;
+pub mod feedback;
+pub mod imap;
 pub mod inspection;
 pub mod outbound;
+pub mod placement;
+pub mod provider;
 pub mod reverse_dns;
 pub mod sender;
 pub mod signer;
 pub mod smtp_client;
 pub mod ssrf;
 pub mod tracking;
+pub mod warmup;
 pub mod worker;
 
 pub use sender::SmtpSender;

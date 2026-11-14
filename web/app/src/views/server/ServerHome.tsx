@@ -51,6 +51,61 @@ function errorToast(err: unknown, fallback: string) {
   toast.error(err instanceof ApiError ? err.message : fallback)
 }
 
+/// Whether a spam complaint from a feedback loop (Microsoft JMRP, Yahoo CFL)
+/// about this server's transactional mail suppresses the recipient. Broadcast
+/// complaints always suppress for their stream.
+function ComplaintSection({ org, server }: { org: string; server: string }) {
+  const queryClient = useQueryClient()
+  const key = ["server", org, server, "complaint-settings"]
+  const settings = useQuery({
+    queryKey: key,
+    queryFn: () => adminApi.servers(org).complaintSettings(server),
+  })
+  const save = useMutation({
+    mutationFn: (choice: boolean | null) =>
+      adminApi.servers(org).updateComplaintSettings(server, choice),
+    onSuccess: (data) => {
+      queryClient.setQueryData(key, data)
+      toast.success("Complaint handling updated")
+    },
+    onError: (err) => errorToast(err, "Could not update complaint handling"),
+  })
+  const current = settings.data?.complaint_settings
+  const value =
+    current?.suppress_complainants == null
+      ? "default"
+      : current.suppress_complainants
+        ? "suppress"
+        : "keep"
+  return (
+    <FormSection
+      title="Spam complaints"
+      description="When a recipient marks transactional mail from this server as spam and the provider reports it through a feedback loop, the recipient can be suppressed for that stream. Complaints about broadcast mail always suppress. Suppressed addresses are listed, and can be removed, under Suppressions."
+    >
+      <Field label="On a complaint" span={3} htmlFor="srv-complaints">
+        <Select
+          value={value}
+          disabled={!current || save.isPending}
+          onValueChange={(next) =>
+            save.mutate(next === "default" ? null : next === "suppress")
+          }
+        >
+          <SelectTrigger id="srv-complaints">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="default">
+              Installation default ({current?.installation_default ? "suppress" : "keep sending"})
+            </SelectItem>
+            <SelectItem value="suppress">Suppress the recipient</SelectItem>
+            <SelectItem value="keep">Keep sending, report the complaint only</SelectItem>
+          </SelectContent>
+        </Select>
+      </Field>
+    </FormSection>
+  )
+}
+
 function Settings({ org, server }: { org: string; server: Server }) {
   const queryClient = useQueryClient()
   const router = useRouter()
@@ -286,6 +341,8 @@ function Settings({ org, server }: { org: string; server: Server }) {
             </FormActions>
           </FormSection>
         )}
+
+        <ComplaintSection org={org} server={server.permalink} />
 
         <FormSection
           title="Suspension & deletion"

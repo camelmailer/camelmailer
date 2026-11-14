@@ -456,6 +456,72 @@ export type SourceAddressCheck = {
   checked_by: string
   checked_at: string
 }
+/** Whether a feedback-loop complaint about a server's transactional mail
+ *  suppresses the recipient. `suppress_complainants` null follows the
+ *  installation default. */
+export type ComplaintSettings = {
+  suppress_complainants: boolean | null
+  installation_default: boolean
+  effective: boolean
+}
+export type FeedbackVerdict = "unknown" | "ok" | "warn" | "bad"
+export type FeedbackSnapshot = {
+  source: string
+  provider: "google" | "microsoft" | "yahoo" | "other"
+  subject_kind: "domain" | "ip" | "provider"
+  subject: string
+  data_date: string
+  verdict: FeedbackVerdict
+  detail: string
+  metrics: Record<string, unknown>
+  fetched_at: string
+}
+export type FeedbackSourceStatus = {
+  source: string
+  enabled: boolean
+  last_attempt_at: string | null
+  last_success_at: string | null
+  last_error: string | null
+  consecutive_failures: number
+  next_attempt_at: string | null
+}
+export type FeedbackSource = {
+  source: "postmaster_tools" | "snds" | "fbl" | "placement"
+  provider: "google" | "microsoft" | "several"
+  enabled: boolean
+  freshness_seconds: number | null
+  status: FeedbackSourceStatus | null
+  snapshots: FeedbackSnapshot[]
+}
+export type PlacementRound = {
+  id: number
+  trigger: "schedule" | "manual"
+  requested_at: string
+  started_at: string | null
+}
+export type PlacementTest = {
+  id: number
+  round_id: number
+  server_id: number
+  message_id: number | null
+  ip_pool_id: number
+  ip_address_id: number
+  ip: string
+  seed_address: string
+  seed_provider: "gmail" | "outlook" | "yahoo" | "imap"
+  provider: string
+  status: "pending" | "inbox" | "spam" | "missing" | "error"
+  folder: string | null
+  spf: string | null
+  dkim: string | null
+  dmarc: string | null
+  received_ip: string | null
+  helo: string | null
+  detail: string
+  checks: number
+  created_at: string
+  checked_at: string | null
+}
 export type IpAddress = {
   id: number
   uuid: string
@@ -1049,6 +1115,15 @@ export const adminApi = {
       api.post<{ server: Server }>(
         `/api/v2/admin/organizations/${org}/servers/${server}/unsuspend`,
       ),
+    complaintSettings: (server: string) =>
+      api.get<{ complaint_settings: ComplaintSettings }>(
+        `/api/v2/admin/organizations/${org}/servers/${server}/complaint_settings`,
+      ),
+    updateComplaintSettings: (server: string, suppress_complainants: boolean | null) =>
+      api.patch<{ complaint_settings: ComplaintSettings }>(
+        `/api/v2/admin/organizations/${org}/servers/${server}/complaint_settings`,
+        { suppress_complainants },
+      ),
     setIpPool: (server: string, ip_pool_id: number | null) =>
       api.post<{ server: Server }>(
         `/api/v2/admin/organizations/${org}/servers/${server}/ip_pool`,
@@ -1205,6 +1280,21 @@ export const adminApi = {
     list: () =>
       api.get<{ source_addresses: SourceAddressCheck[]; failing: number }>(
         "/api/v2/admin/source_addresses",
+      ),
+  },
+  deliverabilityFeedback: {
+    list: () =>
+      api.get<{ sources: FeedbackSource[] }>("/api/v2/admin/deliverability/feedback"),
+    placementTests: () =>
+      api.get<{
+        configured: boolean
+        last_round: PlacementRound | null
+        placement_tests: PlacementTest[]
+      }>("/api/v2/admin/deliverability/placement_tests?limit=1000"),
+    runPlacementTests: () =>
+      api.post<{ placement_round: PlacementRound }>(
+        "/api/v2/admin/deliverability/placement_tests",
+        {},
       ),
   },
   adminApiKeys: {

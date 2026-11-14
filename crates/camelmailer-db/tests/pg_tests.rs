@@ -5683,6 +5683,7 @@ async fn webhook_delete_during_soft_failure_fanout_preserves_retry_schedule() {
                 server_id,
                 message_id,
                 queued_message_id,
+                "soft-failure-worker",
                 "SoftFail",
                 "temporary delivery failure",
                 "421 Try again later",
@@ -5701,7 +5702,10 @@ async fn webhook_delete_during_soft_failure_fanout_preserves_retry_schedule() {
     wait_for_locked_query(&pool, "DELETE FROM webhooks").await;
 
     release_webhook_insert_barrier(&mut barrier).await;
-    assert!(record_task.await.unwrap().unwrap().is_some());
+    assert!(matches!(
+        record_task.await.unwrap().unwrap(),
+        camelmailer_db::OutboundRecord::Recorded(_)
+    ));
     assert!(delete_task.await.unwrap().unwrap());
 
     let stored = sink
@@ -5838,11 +5842,17 @@ async fn late_outbound_results_cannot_overwrite_a_correlated_bounce() {
             .enqueue(original_id, f.server.id, "dest.example")
             .await
             .unwrap();
+        sqlx::query("UPDATE queued_messages SET locked_by = 'w', locked_at = now() WHERE id = $1")
+            .bind(queued_message_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         assert!(
             sink.record_outbound_delivery(
                 f.server.id,
                 original_id,
                 queued_message_id,
+                "w",
                 status,
                 "stale outbound result",
                 "stale SMTP response",
@@ -5854,7 +5864,7 @@ async fn late_outbound_results_cannot_overwrite_a_correlated_bounce() {
             )
             .await
             .unwrap()
-            .is_none(),
+                == camelmailer_db::OutboundRecord::AlreadyBounced,
             "queued {status} result must lose to the correlated bounce"
         );
         let queue_row_exists: bool =
@@ -7188,11 +7198,26 @@ async fn the_lifecycle_queue_dequeues_retries_and_completes() {
     assert_eq!(row.payload, event.body());
     // Locked: a second worker sees nothing.
     assert!(queue.dequeue("w2").await.unwrap().is_none());
-    queue.retry(row.id, row.attempts, "HTTP 500").await.unwrap();
+    // Only the worker holding the row may reschedule it.
+    assert!(!queue
+        .retry(row.id, row.attempts, "HTTP 500", "w2")
+        .await
+        .unwrap());
+    assert!(queue
+        .retry(row.id, row.attempts, "HTTP 500", "w1")
+        .await
+        .unwrap());
     // Backed off: not ready yet.
     assert!(queue.dequeue("w2").await.unwrap().is_none());
     assert_eq!(queue.pending().await.unwrap()[0].attempts, 1);
-    queue.complete(row.id).await.unwrap();
+    // Released by the retry: w1 no longer holds it.
+    assert!(!queue.complete(row.id, "w1").await.unwrap());
+    sqlx::query("UPDATE lifecycle_events SET retry_after = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let row = queue.dequeue("w2").await.unwrap().unwrap();
+    assert!(queue.complete(row.id, "w2").await.unwrap());
     assert!(queue.pending().await.unwrap().is_empty());
     f.store.enqueue_lifecycle_event(&event.clone()).await.ok();
     assert_eq!(queue.discard_all().await.unwrap(), 1);
@@ -7645,4 +7670,768 @@ async fn an_outgoing_message_is_sent_again_on_request() {
             .unwrap(),
         OutboundRetry::NotFound
     );
+}
+
+/// Issue #81: `complete`, `retry` and `defer` change a queue row only while
+/// the calling worker still holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_changes_need_the_worker_that_holds_the_row() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let mut message = message_for(f.server.id, "user@dest.example");
+    message.scope = MessageScope::Outgoing;
+    sink.insert_message(&message).await.unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    let row = queue.dequeue("w1").await.unwrap().unwrap();
+
+    assert!(!queue.complete(row.id, "w2").await.unwrap());
+    assert!(!queue.retry(row.id, 0, "w2").await.unwrap());
+    assert!(!queue.defer(row.id, "w2", 60, None).await.unwrap());
+    let (locked_by, attempts): (Option<String>, i32) =
+        sqlx::query_as("SELECT locked_by, attempts FROM queued_messages WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((locked_by.as_deref(), attempts), (Some("w1"), 0));
+
+    assert!(queue.retry(row.id, 0, "w1").await.unwrap());
+    queue.clear_backoff().await.unwrap();
+    let row = queue.dequeue("w2").await.unwrap().unwrap();
+    assert!(!queue.complete(row.id, "w1").await.unwrap());
+    assert!(queue.complete(row.id, "w2").await.unwrap());
+    assert_eq!(queue.queue_size().await.unwrap(), 0);
+}
+
+/// Issue #81: `record_outbound_delivery` records nothing for a queue row the
+/// worker no longer holds, and records as before for one it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_outbound_delivery_needs_the_worker_that_holds_the_row() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let mut message = message_for(f.server.id, "user@dest.example");
+    message.scope = MessageScope::Outgoing;
+    let message_id = sink.insert_message(&message).await.unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    let row = queue.dequeue("w1").await.unwrap().unwrap();
+    let payload = serde_json::json!({ "message": { "id": message_id } });
+
+    for action in [
+        camelmailer_db::OutboundQueueAction::Complete,
+        camelmailer_db::OutboundQueueAction::Retry { attempts: 0 },
+    ] {
+        let recorded = sink
+            .record_outbound_delivery(
+                f.server.id,
+                message_id,
+                row.id,
+                "w2",
+                "Sent",
+                "message accepted by the remote server",
+                "250 OK",
+                true,
+                None,
+                action,
+                "MessageSent",
+                &payload,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorded, camelmailer_db::OutboundRecord::NotOwner);
+    }
+    let stored = sink
+        .message_by_id(f.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Pending");
+    assert!(sink
+        .deliveries_for_message(f.server.id, message_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(queue.queue_size().await.unwrap(), 1);
+
+    let recorded = sink
+        .record_outbound_delivery(
+            f.server.id,
+            message_id,
+            row.id,
+            "w1",
+            "SoftFail",
+            "temporary delivery failure",
+            "451 later",
+            false,
+            None,
+            camelmailer_db::OutboundQueueAction::Retry { attempts: 0 },
+            "MessageDelayed",
+            &payload,
+        )
+        .await
+        .unwrap();
+    assert!(recorded.delivery_id().is_some());
+    let (locked_by, attempts): (Option<String>, i32) =
+        sqlx::query_as("SELECT locked_by, attempts FROM queued_messages WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((locked_by, attempts), (None, 1));
+
+    // Released by the retry: the worker that held it cannot record again.
+    let recorded = sink
+        .record_outbound_delivery(
+            f.server.id,
+            message_id,
+            row.id,
+            "w1",
+            "Sent",
+            "message accepted by the remote server",
+            "250 OK",
+            true,
+            None,
+            camelmailer_db::OutboundQueueAction::Complete,
+            "MessageSent",
+            &payload,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recorded, camelmailer_db::OutboundRecord::NotOwner);
+}
+
+/// Issue #81: the webhook queue checks the owner as the delivery queue does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_queue_changes_need_the_worker_that_holds_the_row() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    f.store
+        .create_webhook(NewWebhook::all(
+            f.server.id,
+            "events",
+            "https://hooks.example.test/x",
+            false,
+        ))
+        .await
+        .unwrap();
+    let mut message = message_for(f.server.id, "user@dest.example");
+    message.scope = MessageScope::Outgoing;
+    let message_id = sink.insert_message(&message).await.unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    let row = queue.dequeue("w1").await.unwrap().unwrap();
+    sink.record_outbound_delivery(
+        f.server.id,
+        message_id,
+        row.id,
+        "w1",
+        "Sent",
+        "accepted",
+        "250 OK",
+        true,
+        None,
+        camelmailer_db::OutboundQueueAction::Complete,
+        "MessageSent",
+        &serde_json::json!({ "message": { "id": message_id } }),
+    )
+    .await
+    .unwrap();
+    let webhooks = camelmailer_db::PgWebhookQueue::new(pool.clone());
+    let request = webhooks.dequeue("w1").await.unwrap().unwrap();
+    assert!(!webhooks.complete(request.id, "w2").await.unwrap());
+    assert!(!webhooks.retry(request.id, 0, "w2").await.unwrap());
+    assert!(webhooks.retry(request.id, 0, "w1").await.unwrap());
+    assert!(!webhooks.complete(request.id, "w1").await.unwrap());
+}
+
+/// The cluster topology: registration upserts and keeps started_at, a
+/// graceful stop is recorded and undone by the next registration, old
+/// entries are pruned, and the leases each worker holds are counted per
+/// queue by its lock id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_nodes_register_stop_prune_and_count_leases() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let node = camelmailer_core::NodeRegistration {
+        instance_id: "worker-abc".into(),
+        role: "worker".into(),
+        node_name: "mail-1".into(),
+        version: "0.15.0".into(),
+        details: serde_json::json!({ "threads": 4 }),
+    };
+    f.store.register_node(&node).await.unwrap();
+    let first = f.store.list_cluster_nodes().await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].details["threads"], 4);
+
+    f.store
+        .mark_node_stopped("worker-abc", "worker")
+        .await
+        .unwrap();
+    assert!(f.store.list_cluster_nodes().await.unwrap()[0]
+        .stopped_at
+        .is_some());
+    let mut again = node.clone();
+    again.version = "0.15.1".into();
+    f.store.register_node(&again).await.unwrap();
+    let listed = f.store.list_cluster_nodes().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].stopped_at.is_none());
+    assert_eq!(listed[0].version, "0.15.1");
+    assert_eq!(listed[0].started_at, first[0].started_at);
+
+    // A row the worker holds in the delivery queue.
+    let sink = PgMessageSink::new(f.store.clone());
+    let mut message = message_for(f.server.id, "user@dest.example");
+    message.scope = MessageScope::Outgoing;
+    sink.insert_message(&message).await.unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    queue.dequeue("worker-abc").await.unwrap().unwrap();
+    let leases = f.store.cluster_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].locked_by, "worker-abc");
+    assert_eq!(leases[0].queued_messages, 1);
+    assert_eq!(leases[0].webhook_requests, 0);
+    assert!(leases[0].oldest_lock_at.is_some());
+
+    sqlx::query("UPDATE cluster_nodes SET last_seen_at = now() - interval '8 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(f.store.prune_cluster_nodes(7).await.unwrap(), 1);
+    assert!(f.store.list_cluster_nodes().await.unwrap().is_empty());
+}
+
+/// `DeliveryStatsStore` on Postgres behaves like the MemoryStore test in
+/// camelmailer-core: counters per day/address/provider, complaints credited
+/// through the message source, pruning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_counters_add_up_and_complaints_reach_the_sending_address() {
+    use camelmailer_core::{DeliveryKind, DeliveryStatsStore, IpDeliveryRecord, ProviderGroup};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let store = PgStore::new(pool.clone());
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
+    let record = |kind, message_id, policy_block| IpDeliveryRecord {
+        day,
+        source_ip: "203.0.113.5".into(),
+        ip_address_id: Some(3),
+        provider: ProviderGroup::microsoft(),
+        kind,
+        policy_block,
+        server_id: 1,
+        message_id,
+    };
+    store
+        .record_ip_delivery(&record(DeliveryKind::Sent, 1, false))
+        .await
+        .unwrap();
+    store
+        .record_ip_delivery(&record(DeliveryKind::Sent, 2, false))
+        .await
+        .unwrap();
+    store
+        .record_ip_delivery(&record(DeliveryKind::Bounced, 3, true))
+        .await
+        .unwrap();
+    store
+        .record_ip_delivery(&record(DeliveryKind::Deferred, 4, false))
+        .await
+        .unwrap();
+    let mut google = record(DeliveryKind::Sent, 5, false);
+    google.provider = ProviderGroup::google();
+    store.record_ip_delivery(&google).await.unwrap();
+
+    let at = chrono::DateTime::parse_from_rfc3339("2026-11-15T08:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let credited = store.record_ip_complaint(2, at).await.unwrap().unwrap();
+    assert_eq!(credited.provider, ProviderGroup::microsoft());
+    assert_eq!(credited.ip_address_id, Some(3));
+    assert!(store.record_ip_complaint(3, at).await.unwrap().is_none());
+
+    let stats = store
+        .ip_delivery_stats(chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stats.len(), 3);
+    let ms = stats
+        .iter()
+        .find(|s| s.provider == ProviderGroup::microsoft() && s.day == day)
+        .unwrap();
+    assert_eq!(
+        (ms.sent, ms.deferred, ms.bounced, ms.policy_blocks),
+        (2, 1, 1, 1)
+    );
+    assert_eq!(stats.iter().map(|s| s.complaints).sum::<i64>(), 1);
+
+    let removed = store
+        .prune_delivery_stats(chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(), at)
+        .await
+        .unwrap();
+    assert_eq!(removed, 2 + 3);
+}
+
+/// `WarmupStore` on Postgres, in lockstep with the MemoryStore test in
+/// camelmailer-core: reservations stop at the allowance and while paused,
+/// optimistic concurrency, inherited settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn warmup_reservations_settings_and_state_on_postgres() {
+    use camelmailer_core::{
+        ProviderGroup, WarmupLogEntry, WarmupMode, WarmupProfile, WarmupState, WarmupStatus,
+        WarmupStore,
+    };
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let store = PgStore::new(pool.clone());
+    let ip_pool = store.create_ip_pool("Main", true).await.unwrap();
+    let address = store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: ip_pool.id,
+            ipv4: "203.0.113.5".into(),
+            ipv6: None,
+            hostname: "out1.example.com".into(),
+            priority: 100,
+        })
+        .await
+        .unwrap();
+    let profile = WarmupProfile::uniform(2, 2.0, 100);
+    let initial = WarmupState::initial(
+        address.id,
+        ProviderGroup::google(),
+        &profile.ramp(&ProviderGroup::google()),
+    );
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
+    let now = chrono::Utc::now();
+    for expected in [true, true, false] {
+        assert_eq!(
+            store
+                .try_reserve_warmup(address.id, ProviderGroup::google(), day, &initial, now)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+    assert!(store
+        .try_reserve_warmup(address.id, ProviderGroup::yahoo(), day, &initial, now)
+        .await
+        .unwrap());
+    assert_eq!(
+        store.warmup_usage(day).await.unwrap(),
+        vec![
+            (address.id, ProviderGroup::google(), 2),
+            (address.id, ProviderGroup::yahoo(), 1)
+        ]
+    );
+
+    let mut state = store
+        .warmup_states()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.provider == ProviderGroup::google())
+        .unwrap();
+    assert_eq!(state.version, 1);
+    state.status = WarmupStatus::Paused;
+    state.paused_until = Some(now + chrono::Duration::hours(1));
+    let entry = WarmupLogEntry {
+        ip_address_id: address.id,
+        provider: Some(ProviderGroup::google()),
+        decision: "brake".into(),
+        reason: "test".into(),
+        allowance_before: Some(2),
+        allowance_after: Some(2),
+        created_at: now,
+    };
+    assert!(store.save_warmup_state(&state, Some(&entry)).await.unwrap());
+    assert!(
+        !store.save_warmup_state(&state, None).await.unwrap(),
+        "stale version"
+    );
+    assert!(!store
+        .try_reserve_warmup(
+            address.id,
+            ProviderGroup::google(),
+            day.succ_opt().unwrap(),
+            &initial,
+            now
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        store.warmup_log(Some(address.id), 10).await.unwrap().len(),
+        1
+    );
+
+    assert!(store
+        .set_pool_warmup(ip_pool.id, Some(WarmupMode::Slow), None)
+        .await
+        .unwrap());
+    assert_eq!(
+        store.warmup_addresses().await.unwrap()[0].effective_mode(),
+        (WarmupMode::Slow, "pool")
+    );
+    assert!(store
+        .set_address_warmup(address.id, Some(WarmupMode::Custom), Some(profile.clone()))
+        .await
+        .unwrap());
+    let listed = store.warmup_addresses().await.unwrap();
+    assert_eq!(listed[0].effective_mode(), (WarmupMode::Custom, "address"));
+    assert_eq!(
+        listed[0].effective_profile(&camelmailer_core::WarmupProfiles::default()),
+        Some(profile.clone())
+    );
+    assert!(store
+        .set_address_warmup(address.id, None, None)
+        .await
+        .unwrap());
+    assert_eq!(
+        store.warmup_addresses().await.unwrap()[0].effective_mode(),
+        (WarmupMode::Slow, "pool")
+    );
+    assert!(!store.set_address_warmup(99_999, None, None).await.unwrap());
+    assert!(!store.set_pool_warmup(99_999, None, None).await.unwrap());
+    let removed = store
+        .prune_warmup(day.succ_opt().unwrap(), now + chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(removed, 2 + 1);
+}
+
+/// The Postgres feedback store in lockstep with `MemoryStore`
+/// (`camelmailer_core::feedback` tests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_feedback_snapshots_claims_and_signals() {
+    use camelmailer_core::feedback::{provider, source, subject_kind};
+    use camelmailer_core::{FeedbackStore, NewFeedbackSnapshot, Verdict};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let store = &f.store;
+    let snap = |src: &str, prov: &str, kind: &str, subject: &str, day: u32, verdict: Verdict| {
+        NewFeedbackSnapshot {
+            source: src.into(),
+            provider: prov.into(),
+            subject_kind: kind.into(),
+            subject: subject.into(),
+            data_date: chrono::NaiveDate::from_ymd_opt(2026, 11, day).unwrap(),
+            verdict,
+            detail: format!("{verdict:?}"),
+            metrics: serde_json::json!({ "day": day }),
+        }
+    };
+    store
+        .upsert_feedback_snapshots(&[
+            snap(
+                source::SNDS,
+                provider::MICROSOFT,
+                subject_kind::IP,
+                "192.0.2.1",
+                10,
+                Verdict::Bad,
+            ),
+            snap(
+                source::SNDS,
+                provider::MICROSOFT,
+                subject_kind::IP,
+                "192.0.2.1",
+                11,
+                Verdict::Ok,
+            ),
+            snap(
+                source::SNDS,
+                provider::MICROSOFT,
+                subject_kind::IP,
+                "192.0.2.2",
+                11,
+                Verdict::Warn,
+            ),
+            snap(
+                source::POSTMASTER_TOOLS,
+                provider::GOOGLE,
+                subject_kind::DOMAIN,
+                "example.com",
+                11,
+                Verdict::Bad,
+            ),
+        ])
+        .await
+        .unwrap();
+    store
+        .upsert_feedback_snapshots(&[snap(
+            source::SNDS,
+            provider::MICROSOFT,
+            subject_kind::IP,
+            "192.0.2.2",
+            11,
+            Verdict::Bad,
+        )])
+        .await
+        .unwrap();
+    let latest = store.latest_feedback_snapshots(source::SNDS).await.unwrap();
+    let summary: Vec<(&str, Verdict)> = latest
+        .iter()
+        .map(|s| (s.subject.as_str(), s.verdict))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![("192.0.2.2", Verdict::Bad), ("192.0.2.1", Verdict::Ok)]
+    );
+
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 12).unwrap();
+    store
+        .record_fbl_complaint(provider::MICROSOFT, day)
+        .await
+        .unwrap();
+    store
+        .record_fbl_complaint(provider::MICROSOFT, day)
+        .await
+        .unwrap();
+    let signals = store
+        .latest_provider_signals("192.0.2.1", provider::MICROSOFT)
+        .await
+        .unwrap();
+    let sources: Vec<(&str, &str)> = signals
+        .iter()
+        .map(|s| (s.source.as_str(), s.subject.as_str()))
+        .collect();
+    assert_eq!(sources, vec![("snds", "192.0.2.1"), ("fbl", "microsoft")]);
+    assert_eq!(signals[1].detail, "2 complaints reported");
+    let google = store
+        .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+        .await
+        .unwrap();
+    assert_eq!(google.len(), 1);
+    assert_eq!(google[0].verdict, Verdict::Bad);
+
+    assert!(store
+        .claim_feedback_fetch(source::SNDS, "w1", 60)
+        .await
+        .unwrap());
+    assert!(!store
+        .claim_feedback_fetch(source::SNDS, "w2", 60)
+        .await
+        .unwrap());
+    let later = chrono::Utc::now() + chrono::Duration::hours(1);
+    store
+        .finish_feedback_fetch(source::SNDS, "w2", None, later)
+        .await
+        .unwrap();
+    store
+        .finish_feedback_fetch(source::SNDS, "w1", Some("HTTP 500"), later)
+        .await
+        .unwrap();
+    store
+        .set_feedback_source_enabled(source::SNDS, true)
+        .await
+        .unwrap();
+    let status = &store.feedback_source_statuses().await.unwrap()[0];
+    assert_eq!(status.source, "snds");
+    assert!(status.enabled);
+    assert_eq!(status.last_error.as_deref(), Some("HTTP 500"));
+    assert_eq!(status.consecutive_failures, 1);
+    assert!(status.last_success_at.is_none());
+    assert!(!store
+        .claim_feedback_fetch(source::SNDS, "w2", 60)
+        .await
+        .unwrap());
+
+    assert_eq!(
+        store
+            .server_complaint_suppression(f.server.id)
+            .await
+            .unwrap(),
+        None
+    );
+    store
+        .set_server_complaint_suppression(f.server.id, Some(false))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .server_complaint_suppression(f.server.id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    store
+        .set_server_complaint_suppression(f.server.id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .server_complaint_suppression(f.server.id)
+            .await
+            .unwrap(),
+        None
+    );
+    store.record_feedback_report(f.server.id, 42).await.unwrap();
+    store.record_feedback_report(f.server.id, 42).await.unwrap();
+
+    // everything above is from 2026-11, far older than one day
+    assert!(store.prune_feedback_snapshots(1).await.unwrap() >= 4);
+    assert!(store
+        .latest_feedback_snapshots(source::SNDS)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Placement rounds and tests in Postgres, in lockstep with `MemoryStore`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placement_rounds_tests_and_signals() {
+    use camelmailer_core::feedback::{placement_status, provider};
+    use camelmailer_core::{FeedbackStore, NewPlacementTest, PlacementResult, Verdict};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let store = &f.store;
+    let round = store
+        .request_placement_round("manual", 3600)
+        .await
+        .unwrap()
+        .expect("first round");
+    assert!(store
+        .request_placement_round("schedule", 3600)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.last_placement_round().await.unwrap().unwrap().id,
+        round.id
+    );
+    assert_eq!(
+        store.start_placement_round().await.unwrap().unwrap().id,
+        round.id
+    );
+    assert!(store.start_placement_round().await.unwrap().is_none());
+
+    let new = |token: &str, group: &str| NewPlacementTest {
+        round_id: round.id,
+        token: token.into(),
+        server_id: f.server.id,
+        ip_pool_id: 1,
+        ip_address_id: 2,
+        ip: "192.0.2.1".into(),
+        seed_address: format!("seed@{group}.example"),
+        seed_provider: "imap".into(),
+        provider: group.into(),
+        check_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+    };
+    let tests = store
+        .create_placement_tests(&[new("t1", "google"), new("t2", "microsoft")])
+        .await
+        .unwrap();
+    store.set_placement_message(tests[0].id, 42).await.unwrap();
+    let by_token = store.placement_test_by_token("t1").await.unwrap().unwrap();
+    assert_eq!(by_token.message_id, Some(42));
+    assert!(store
+        .placement_test_by_token("nope")
+        .await
+        .unwrap()
+        .is_none());
+
+    assert_eq!(
+        store
+            .claim_due_placement_tests(10, 300)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(store
+        .claim_due_placement_tests(10, 300)
+        .await
+        .unwrap()
+        .is_empty());
+    store
+        .record_placement_result(
+            tests[0].id,
+            &PlacementResult {
+                status: placement_status::SPAM.into(),
+                folder: Some("[Gmail]/Spam".into()),
+                spf: Some("pass".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .record_placement_result(
+            tests[1].id,
+            &PlacementResult {
+                status: placement_status::PENDING.into(),
+                detail: "not found yet".into(),
+                check_again_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let listed = store
+        .list_placement_tests(&camelmailer_core::PlacementFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed[0].id, tests[1].id);
+    assert_eq!(listed[0].checks, 1);
+    assert_eq!(listed[1].status, "spam");
+    assert_eq!(listed[1].spf.as_deref(), Some("pass"));
+    let due = store.claim_due_placement_tests(10, 300).await.unwrap();
+    assert_eq!(
+        due.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![tests[1].id]
+    );
+
+    let google = store
+        .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+        .await
+        .unwrap();
+    assert_eq!(google.len(), 1);
+    assert_eq!(google[0].source, "placement");
+    assert_eq!(google[0].verdict, Verdict::Bad);
+
+    // The worst result of the last 24 hours counts; the history keeps all.
+    let more = store
+        .create_placement_tests(&[new("t3", "google")])
+        .await
+        .unwrap();
+    store
+        .record_placement_result(
+            more[0].id,
+            &PlacementResult {
+                status: placement_status::INBOX.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let google = store
+        .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+        .await
+        .unwrap();
+    assert_eq!(google[0].verdict, Verdict::Bad);
+    assert!(
+        google[0].detail.contains("1 inbox, 1 spam"),
+        "{}",
+        google[0].detail
+    );
+    let history = store
+        .list_placement_tests(&camelmailer_core::PlacementFilter {
+            ip: Some("192.0.2.1".into()),
+            provider: Some("google".into()),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    let summary = store.latest_feedback_snapshots("placement").await.unwrap();
+    assert_eq!(summary.len(), 1, "one row per provider and IP");
 }

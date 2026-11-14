@@ -1,0 +1,12 @@
+{
+  "domainStats": [
+    {"name": "domains/example.com/domainStats/a1", "metric": "spam_rate", "date": {"year": 2026, "month": 11, "day": 11}, "value": {"doubleValue": 0.0004}},
+    {"name": "domains/example.com/domainStats/a2", "metric": "dkim_success_rate", "date": {"year": 2026, "month": 11, "day": 11}, "value": {"doubleValue": 1.0}},
+    {"name": "domains/example.com/domainStats/a3", "metric": "reject_rate", "date": {"year": 2026, "month": 11, "day": 11}, "value": {"floatValue": 0.002}},
+    {"name": "domains/example.com/domainStats/b1", "metric": "spam_rate", "date": {"year": 2026, "month": 11, "day": 12}, "value": {"doubleValue": 0.0015}},
+    {"name": "domains/example.com/domainStats/c1", "metric": "spam_rate", "date": {"year": 2026, "month": 11, "day": 13}, "value": {"doubleValue": 0.0031}},
+    {"name": "domains/example.com/domainStats/c2", "metric": "reject_low_ip_reputation_rate", "date": {"year": 2026, "month": 11, "day": 13}, "value": {"doubleValue": 0.012}},
+    {"name": "domains/example.com/domainStats/c3", "metric": "tls_outbound_rate", "date": {"year": 2026, "month": 11, "day": 13}, "value": {"intValue": "1"}}
+  ],
+  "nextPageToken": ""
+}

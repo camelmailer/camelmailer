@@ -184,6 +184,11 @@ pub struct WebServer {
     /// Origins allowed to call the HTTP APIs from a browser. Empty (the
     /// default) sends no CORS headers; `["*"]` allows any origin.
     pub cors_origins: Vec<String>,
+    /// On SIGTERM or SIGINT the web server stops accepting connections and
+    /// gives requests in flight this many seconds to finish before it stops
+    /// (env `WEB_SERVER_SHUTDOWN_GRACE_SECONDS`). Keep the process manager's
+    /// stop timeout above it.
+    pub shutdown_grace_seconds: u32,
 }
 
 impl Default for WebServer {
@@ -193,7 +198,48 @@ impl Default for WebServer {
             default_bind_address: "127.0.0.1".into(),
             max_threads: 5,
             cors_origins: vec![],
+            shutdown_grace_seconds: DEFAULT_SERVER_SHUTDOWN_GRACE_SECONDS,
         }
+    }
+}
+
+/// The default grace period of the web and SMTP servers' graceful shutdown.
+pub const DEFAULT_SERVER_SHUTDOWN_GRACE_SECONDS: u32 = 30;
+
+/// `name` as a number of seconds when the variable is set: the override of a
+/// `shutdown_grace_seconds` setting.
+fn grace_override(
+    var: impl Fn(&str) -> Option<String>,
+    name: &str,
+    current: u32,
+) -> Result<u32, ConfigError> {
+    match var(name) {
+        None => Ok(current),
+        Some(value) => value.trim().parse().map_err(|_| {
+            ConfigError::Invalid(format!(
+                "{name} must be a number of seconds (got {value:?})"
+            ))
+        }),
+    }
+}
+
+impl WebServer {
+    /// `shutdown_grace_seconds` with `WEB_SERVER_SHUTDOWN_GRACE_SECONDS`
+    /// applied.
+    pub fn shutdown_grace(&self) -> Result<std::time::Duration, ConfigError> {
+        self.shutdown_grace_with(|name| std::env::var(name).ok())
+    }
+
+    fn shutdown_grace_with(
+        &self,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<std::time::Duration, ConfigError> {
+        let seconds = grace_override(
+            var,
+            "WEB_SERVER_SHUTDOWN_GRACE_SECONDS",
+            self.shutdown_grace_seconds,
+        )?;
+        Ok(std::time::Duration::from_secs(u64::from(seconds)))
     }
 }
 
@@ -408,6 +454,12 @@ pub struct Retention {
     pub auth_event_days: u32,
     /// The per-server API request log. Installation-wide; default 30.
     pub api_request_days: u32,
+    /// Raw ARF feedback reports (complaints from JMRP, CFL and other
+    /// feedback loops). They contain the complaining recipient's address,
+    /// so their content is removed after this many days; the complaint, its
+    /// suppression and the provider counts stay. Installation-wide; default
+    /// 30, `0` keeps them as long as the message content.
+    pub feedback_report_days: u32,
     /// Rows deleted per statement, so a large backlog never holds one long
     /// transaction or lock.
     pub batch_size: u32,
@@ -422,7 +474,226 @@ impl Default for Retention {
             dmarc_report_days: 0,
             auth_event_days: 0,
             api_request_days: 30,
+            feedback_report_days: 30,
             batch_size: 1000,
+        }
+    }
+}
+
+/// Provider feedback (`deliverability_feedback`): what the large mailbox
+/// providers report about this installation's mail. Every source is optional
+/// and switched on only by its credentials; a source without them is
+/// disabled, never an error. Secrets are never written into this file: they
+/// come from environment variables or from files (Docker or systemd secrets)
+/// named here. See `docs/provider-feedback.md`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeliverabilityFeedback {
+    /// How often a worker fetches the Postmaster Tools and SNDS data, in
+    /// seconds. Both publish once a day; the default is six hours. `0`
+    /// turns the scheduled fetch off. Failures back off exponentially up to
+    /// this interval.
+    pub fetch_interval_seconds: u32,
+    /// How long fetched snapshots and feedback-loop counts are kept.
+    pub snapshot_retention_days: u32,
+    pub postmaster_tools: PostmasterTools,
+    pub snds: Snds,
+    pub fbl: FeedbackLoops,
+    pub placement: Placement,
+}
+
+impl Default for DeliverabilityFeedback {
+    fn default() -> Self {
+        Self {
+            fetch_interval_seconds: 21_600,
+            snapshot_retention_days: 400,
+            postmaster_tools: PostmasterTools::default(),
+            snds: Snds::default(),
+            fbl: FeedbackLoops::default(),
+            placement: Placement::default(),
+        }
+    }
+}
+
+/// Google Postmaster Tools API v2
+/// (https://developers.google.com/workspace/gmail/postmaster/reference/rest).
+/// Authorised as a Google account that has the domains verified in
+/// Postmaster Tools, through an OAuth client and a refresh token with the
+/// `https://www.googleapis.com/auth/postmaster.traffic.readonly` scope.
+/// Enabled when `domains`, the client id, the client secret and the refresh
+/// token are all present.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PostmasterTools {
+    /// Domains registered and verified in Postmaster Tools.
+    pub domains: Vec<String>,
+    /// OAuth client id (not secret). Env `CAMELMAILER_POSTMASTER_CLIENT_ID`
+    /// wins.
+    pub client_id: Option<String>,
+    /// File holding the OAuth client secret. Env
+    /// `CAMELMAILER_POSTMASTER_CLIENT_SECRET` wins.
+    pub client_secret_file: Option<String>,
+    /// File holding the refresh token. Env
+    /// `CAMELMAILER_POSTMASTER_REFRESH_TOKEN` wins.
+    pub refresh_token_file: Option<String>,
+    /// How many past days each fetch asks for.
+    pub days: u32,
+    /// API base URL (tests point it at a mock).
+    pub api_base_url: String,
+    /// OAuth token endpoint.
+    pub token_url: String,
+}
+
+impl Default for PostmasterTools {
+    fn default() -> Self {
+        Self {
+            domains: Vec::new(),
+            client_id: None,
+            client_secret_file: None,
+            refresh_token_file: None,
+            days: 7,
+            api_base_url: "https://gmailpostmastertools.googleapis.com".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+        }
+    }
+}
+
+/// Microsoft SNDS automated data access
+/// (https://substrate.office.com/ip-domain-management-snds/SNDS/FAQ). The
+/// SNDS portal shows the data URL, which carries the access key, on its
+/// "Automated Access" page once the feature is switched on. The URL is a
+/// secret. Enabled when it is present.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Snds {
+    /// File holding the SNDS data URL. Env `CAMELMAILER_SNDS_DATA_URL` wins.
+    pub data_url_file: Option<String>,
+}
+
+/// Inbox placement tests with seed mailboxes the operator owns. A test
+/// message per sending IP goes to every seed; the worker then looks it up
+/// over IMAP, read-only, and records inbox, spam or missing. It only
+/// measures: it never opens, clicks, replies to, flags or moves a message.
+/// Off while `seeds` is empty.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Placement {
+    /// The mail server that sends the tests, as `organization/server`
+    /// permalinks. `from_address` must be on one of its verified domains,
+    /// so the tests carry its DKIM signature.
+    pub server: String,
+    /// Envelope and header sender of the tests.
+    pub from_address: String,
+    /// Run a round every this many seconds. `0`: only on demand from the
+    /// dashboard or `POST /api/v2/admin/deliverability/placement_tests`.
+    pub interval_seconds: u32,
+    /// At most one round per this many seconds, on demand included.
+    pub min_round_interval_seconds: u32,
+    /// How long after sending to look for a test, and between lookups.
+    pub check_after_seconds: u32,
+    /// Lookups before a test that was not found counts as missing.
+    pub max_checks: u32,
+    pub seeds: Vec<Seed>,
+}
+
+impl Default for Placement {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            from_address: String::new(),
+            interval_seconds: 0,
+            min_round_interval_seconds: 3600,
+            check_after_seconds: 600,
+            max_checks: 3,
+            seeds: Vec::new(),
+        }
+    }
+}
+
+/// The mailbox provider of a seed, which sets the IMAP defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeedProvider {
+    /// Gmail: imap.gmail.com:993, XOAUTH2 (scope https://mail.google.com/)
+    /// or an app password.
+    Gmail,
+    /// Outlook.com / Hotmail: outlook.office365.com:993, XOAUTH2 only
+    /// (basic authentication ended 2024-09-16).
+    Outlook,
+    /// Yahoo Mail: imap.mail.yahoo.com:993 with an app password.
+    Yahoo,
+    /// Any other IMAP server; `imap_host` is required.
+    #[default]
+    Imap,
+}
+
+/// How a seed logs in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedAuth {
+    /// `LOGIN` with an app password (Gmail with 2-Step Verification, Yahoo).
+    #[default]
+    AppPassword,
+    /// `AUTHENTICATE XOAUTH2` with an access token from a refresh token.
+    Xoauth2,
+}
+
+/// One seed mailbox. Secrets come from the environment variable or the
+/// file named here, never from this file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Seed {
+    pub provider: SeedProvider,
+    /// The seed's address (the test's recipient).
+    pub address: String,
+    /// IMAP login; defaults to `address`.
+    pub username: Option<String>,
+    pub imap_host: Option<String>,
+    pub imap_port: Option<u16>,
+    /// TLS from the first byte (993). Only tests turn it off.
+    pub imap_tls: Option<bool>,
+    pub auth: SeedAuth,
+    /// App password: environment variable, else file.
+    pub password_env: Option<String>,
+    pub password_file: Option<String>,
+    /// XOAUTH2: token endpoint (provider default when unset), client id,
+    /// client secret and refresh token (each from env, else file).
+    pub token_url: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret_env: Option<String>,
+    pub client_secret_file: Option<String>,
+    pub refresh_token_env: Option<String>,
+    pub refresh_token_file: Option<String>,
+    /// OAuth scope (provider default when unset).
+    pub scope: Option<String>,
+    /// The spam folder, when the server does not mark it `\Junk`.
+    pub junk_folder: Option<String>,
+    /// The provider group the seed measures (lowercase letters, digits and
+    /// `_`, as in `provider_groups`). Defaults to `google` for gmail,
+    /// `microsoft` for outlook, `yahoo` for yahoo and `other` for imap; set
+    /// it for an `imap` seed at, say, GMX (`united_internet`), T-Online
+    /// (`t_online`) or iCloud (`apple`).
+    pub group: Option<String>,
+}
+
+/// Complaint feedback loops (Microsoft JMRP, Yahoo CFL and any other ARF
+/// feedback loop). Reports reach the installation as inbound mail to a
+/// route address; they are recognised by their ARF envelope (RFC 5965).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FeedbackLoops {
+    /// Also suppress the complainant when the complaint is about
+    /// transactional mail (a message without a broadcast unsubscribe token),
+    /// for the message's stream. On by default; each mail server can choose
+    /// otherwise in its settings. Broadcast complaints are always suppressed
+    /// for their stream.
+    pub suppress_complainants: bool,
+}
+
+impl Default for FeedbackLoops {
+    fn default() -> Self {
+        Self {
+            suppress_complainants: true,
         }
     }
 }
@@ -689,6 +960,174 @@ impl Default for Worker {
     }
 }
 
+/// How this process appears in the cluster topology (`cluster`): every
+/// web, SMTP and worker process registers itself under `node_name` and
+/// refreshes its entry every `heartbeat_interval_seconds`. The other values
+/// describe the installation for the infrastructure dashboard and its DNS
+/// checks; nothing here changes how mail is received or delivered.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cluster {
+    /// The name this host appears under. Empty takes the host name (env
+    /// `CAMELMAILER_NODE_NAME`).
+    pub node_name: String,
+    /// The public address of the load balancer in front of the SMTP and
+    /// web nodes, if there is one (for example `2.31.154.200`).
+    pub load_balancer_address: Option<String>,
+    /// The host name MX records point at, whose A/AAAA records lead to the
+    /// load balancer (or to the SMTP nodes without one), for example
+    /// `mail.example.com`.
+    pub inbound_hostname: Option<String>,
+    /// This host's public addresses, the ones receivers see for servers
+    /// without an IP pool. Listed, they replace the addresses the worker
+    /// detects for the reverse-DNS check, per family (a family not listed is
+    /// still detected). Needed where the process only sees a private address,
+    /// such as `172.18.0.5` inside a Docker network (env
+    /// `CAMELMAILER_PUBLIC_ADDRESSES`, comma separated).
+    pub public_addresses: Vec<String>,
+    /// How often a process refreshes its entry. At least 5.
+    pub heartbeat_interval_seconds: u32,
+    /// An entry not refreshed for this long shows as stale. At least twice
+    /// the heartbeat interval.
+    pub node_stale_seconds: u32,
+}
+
+impl Default for Cluster {
+    fn default() -> Self {
+        Self {
+            node_name: String::new(),
+            load_balancer_address: None,
+            inbound_hostname: None,
+            public_addresses: Vec::new(),
+            heartbeat_interval_seconds: 30,
+            node_stale_seconds: 90,
+        }
+    }
+}
+
+impl Cluster {
+    /// The cluster settings with `CAMELMAILER_NODE_NAME` and
+    /// `CAMELMAILER_PUBLIC_ADDRESSES` applied, so one config file can serve
+    /// several hosts.
+    pub fn with_env_overrides(&self) -> Result<Self, ConfigError> {
+        self.with_overrides(|name| std::env::var(name).ok())
+    }
+
+    fn with_overrides(&self, var: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let mut cluster = self.clone();
+        if let Some(value) = var("CAMELMAILER_NODE_NAME") {
+            cluster.node_name = value.trim().to_string();
+        }
+        if let Some(value) = var("CAMELMAILER_PUBLIC_ADDRESSES") {
+            cluster.public_addresses = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(String::from)
+                .collect();
+        }
+        cluster.validate()?;
+        Ok(cluster)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for address in &self.public_addresses {
+            if address.parse::<std::net::IpAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.public_addresses takes IP addresses (got {address:?})"
+                )));
+            }
+        }
+        if let Some(address) = self.load_balancer_address.as_deref() {
+            if !address.is_empty() && address.parse::<std::net::IpAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.load_balancer_address takes an IP address (got {address:?})"
+                )));
+            }
+        }
+        if let Some(name) = self.inbound_hostname.as_deref() {
+            if !name.is_empty() && !is_host_name(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.inbound_hostname must be a fully qualified host name (got {name:?})"
+                )));
+            }
+        }
+        if self.heartbeat_interval_seconds < 5 {
+            return Err(ConfigError::Invalid(
+                "cluster.heartbeat_interval_seconds must be at least 5".into(),
+            ));
+        }
+        if self.node_stale_seconds < self.heartbeat_interval_seconds.saturating_mul(2) {
+            return Err(ConfigError::Invalid(
+                "cluster.node_stale_seconds must be at least twice cluster.heartbeat_interval_seconds".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The parsed `public_addresses`.
+    pub fn public_ips(&self) -> Vec<std::net::IpAddr> {
+        self.public_addresses
+            .iter()
+            .filter_map(|address| address.trim().parse().ok())
+            .collect()
+    }
+
+    /// `node_name`, or the host name when it is empty.
+    pub fn effective_node_name(&self) -> String {
+        if !self.node_name.trim().is_empty() {
+            return self.node_name.trim().to_string();
+        }
+        std::env::var("HOSTNAME")
+            .ok()
+            .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "camelmailer".into())
+    }
+
+    /// `load_balancer_address` when set and not empty.
+    pub fn load_balancer(&self) -> Option<&str> {
+        self.load_balancer_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    /// `inbound_hostname` when set and not empty, lower-cased.
+    pub fn inbound_host(&self) -> Option<String> {
+        self.inbound_hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+    }
+}
+
+/// A fully qualified host name (the same rule as
+/// `camelmailer_core::dns::is_valid_helo_hostname`, which this crate cannot
+/// depend on): at least two labels of letters, digits and
+/// hyphens, no trailing dot, no IP literal.
+fn is_host_name(name: &str) -> bool {
+    if name.len() > 253 || name.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && !labels
+            .last()
+            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Which mail a worker delivers (`worker.deliver`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -937,6 +1376,12 @@ pub struct SmtpServer {
     /// Additional listeners beyond `default_port` (which always runs in
     /// `smtp` mode). Empty by default: only `default_port` is bound.
     pub listeners: Vec<SmtpListener>,
+    /// On SIGTERM or SIGINT the SMTP server stops accepting connections and
+    /// gives open sessions this many seconds to finish their transaction;
+    /// sessions still open then get `421 4.3.2` and are closed (env
+    /// `SMTP_SERVER_SHUTDOWN_GRACE_SECONDS`). Keep the process manager's stop
+    /// timeout above it.
+    pub shutdown_grace_seconds: u32,
 }
 
 impl Default for SmtpServer {
@@ -957,7 +1402,28 @@ impl Default for SmtpServer {
             max_message_size: 14,
             log_ip_address_exclusion_matcher: None,
             listeners: vec![],
+            shutdown_grace_seconds: DEFAULT_SERVER_SHUTDOWN_GRACE_SECONDS,
         }
+    }
+}
+
+impl SmtpServer {
+    /// `shutdown_grace_seconds` with `SMTP_SERVER_SHUTDOWN_GRACE_SECONDS`
+    /// applied.
+    pub fn shutdown_grace(&self) -> Result<std::time::Duration, ConfigError> {
+        self.shutdown_grace_with(|name| std::env::var(name).ok())
+    }
+
+    fn shutdown_grace_with(
+        &self,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<std::time::Duration, ConfigError> {
+        let seconds = grace_override(
+            var,
+            "SMTP_SERVER_SHUTDOWN_GRACE_SECONDS",
+            self.shutdown_grace_seconds,
+        )?;
+        Ok(std::time::Duration::from_secs(u64::from(seconds)))
     }
 }
 
@@ -1336,6 +1802,7 @@ pub struct Config {
     pub app_mail: AppMail,
     pub billing: Billing,
     pub lifecycle_webhooks: LifecycleWebhooks,
+    pub deliverability_feedback: DeliverabilityFeedback,
     pub captcha: Captcha,
     pub retention: Retention,
     pub legal: Legal,
@@ -1355,6 +1822,211 @@ pub struct Config {
     pub smtp_client: SmtpClient,
     pub rspamd: Rspamd,
     pub clamav: Clamav,
+    pub warmup: Warmup,
+    pub cluster: Cluster,
+    /// Receiving provider groups for the IP metrics and the warm-up, merged
+    /// into the built-in ones (microsoft, google, yahoo, apple,
+    /// united_internet, t_online): an entry with a built-in name replaces
+    /// that group, any other name adds one. Whatever matches no group is
+    /// `other`.
+    pub provider_groups: Vec<ProviderGroupConfig>,
+}
+
+/// One receiving provider group (`provider_groups`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderGroupConfig {
+    /// `[a-z0-9_]`, at most 40 characters.
+    pub name: String,
+    /// Recipient domains of the provider's own mail service: `example.com`
+    /// exactly, or `brand.*` for the brand under any top-level domain.
+    pub domains: Vec<String>,
+    /// MX hosts: `example.net` matches it and every host under it.
+    pub mx_patterns: Vec<String>,
+}
+
+/// Adaptive IP warm-up (`warmup`). Warm-up itself is off until a pool or a
+/// pool address is given a mode (dashboard or
+/// `PATCH /api/v2/admin/ip_warmup/...`); these are the limits it judges by.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Warmup {
+    /// Below this share of its allowance an address's day is too quiet to
+    /// judge, and the ramp holds.
+    pub min_volume_fraction: f64,
+    /// The share of its allowance an address must have used, with healthy
+    /// results, for the allowance to grow.
+    pub advance_fraction: f64,
+    /// Deferral rate (of attempts to one provider) from which the ramp
+    /// stops growing.
+    pub deferral_rate_slow: f64,
+    /// Bounce rate (of attempts) from which the ramp brakes.
+    pub bounce_rate_brake: f64,
+    /// Policy refusals (blocks, reputation refusals) that brake: at least
+    /// this many, and at least `policy_block_rate_brake` of the attempts.
+    pub policy_blocks_brake: i64,
+    pub policy_block_rate_brake: f64,
+    /// Complaint rate (of accepted messages) that slows, and that brakes.
+    /// Google's sender guidelines: stay below 0.1 %, never reach 0.3 %.
+    pub complaint_rate_warn: f64,
+    pub complaint_rate_brake: f64,
+    /// How long a brake stops an address from sending to that provider.
+    pub pause_hours: i64,
+    /// The factor a brake steps the allowance back by (0.1 to 1).
+    pub step_back: f64,
+    /// How long a message waits when no address of its pool has room left
+    /// today. No attempt is counted.
+    pub defer_seconds: u32,
+    /// Changes to the built-in profiles `slow`, `normal` and `fast`: the base
+    /// ramp (used by `other` and by groups the profile does not name) and the
+    /// first day's allowance and cap per provider group.
+    pub profiles: std::collections::BTreeMap<String, WarmupProfileConfig>,
+}
+
+/// Changes to one built-in warm-up profile (`warmup.profiles.<name>`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WarmupProfileConfig {
+    pub start: Option<i64>,
+    pub growth: Option<f64>,
+    pub cap: Option<i64>,
+    /// Per provider group: `{ start, cap }`.
+    pub groups: std::collections::BTreeMap<String, WarmupGroupLimits>,
+}
+
+/// The first day's allowance and the cap of one provider group.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WarmupGroupLimits {
+    pub start: i64,
+    pub cap: i64,
+}
+
+impl Warmup {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let fractions = [
+            ("min_volume_fraction", self.min_volume_fraction),
+            ("advance_fraction", self.advance_fraction),
+            ("deferral_rate_slow", self.deferral_rate_slow),
+            ("bounce_rate_brake", self.bounce_rate_brake),
+            ("policy_block_rate_brake", self.policy_block_rate_brake),
+            ("complaint_rate_warn", self.complaint_rate_warn),
+            ("complaint_rate_brake", self.complaint_rate_brake),
+        ];
+        for (name, value) in fractions {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(ConfigError::Invalid(format!(
+                    "warmup.{name} must be between 0 and 1 (got {value})"
+                )));
+            }
+        }
+        if self.min_volume_fraction > self.advance_fraction {
+            return Err(ConfigError::Invalid(
+                "warmup.min_volume_fraction must not be above warmup.advance_fraction".into(),
+            ));
+        }
+        if self.complaint_rate_warn > self.complaint_rate_brake {
+            return Err(ConfigError::Invalid(
+                "warmup.complaint_rate_warn must not be above warmup.complaint_rate_brake".into(),
+            ));
+        }
+        if !(0.1..=1.0).contains(&self.step_back) {
+            return Err(ConfigError::Invalid(format!(
+                "warmup.step_back must be between 0.1 and 1 (got {})",
+                self.step_back
+            )));
+        }
+        for (name, profile) in &self.profiles {
+            if !matches!(name.as_str(), "slow" | "normal" | "fast") {
+                return Err(ConfigError::Invalid(format!(
+                    "warmup.profiles: {name:?} is not a built-in profile (slow, normal, fast)"
+                )));
+            }
+            if profile.start.is_some_and(|v| !(1..=1_000_000).contains(&v))
+                || profile.growth.is_some_and(|v| !(1.05..=3.0).contains(&v))
+                || profile.cap.is_some_and(|v| !(2..=10_000_000).contains(&v))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "warmup.profiles.{name}: start 1 to 1000000, growth 1.05 to 3.0, cap up to 10000000"
+                )));
+            }
+            for (group, limits) in &profile.groups {
+                let valid_name = !group.is_empty()
+                    && group.len() <= 40
+                    && group
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                if !valid_name
+                    || limits.start < 1
+                    || limits.cap <= limits.start
+                    || limits.cap > 10_000_000
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "warmup.profiles.{name}.groups.{group}: needs a valid group name, start >= 1 and cap above start"
+                    )));
+                }
+            }
+        }
+        if self.pause_hours < 1 || self.policy_blocks_brake < 1 || self.defer_seconds < 60 {
+            return Err(ConfigError::Invalid(
+                "warmup.pause_hours and warmup.policy_blocks_brake must be at least 1, \
+                 warmup.defer_seconds at least 60"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+
+    #[test]
+    fn warmup_limits_are_validated() {
+        assert!(Config::default().validate().is_ok());
+        let mut config = Config::default();
+        config.warmup.complaint_rate_warn = 0.01;
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("warmup:\n  pause_hours: 48\n  defer_seconds: 600\n").unwrap();
+        assert_eq!(config.warmup.pause_hours, 48);
+        assert_eq!(config.warmup.advance_fraction, 0.9);
+        assert!(config.validate().is_ok());
+        assert!(Config::from_yaml("warmup:\n  unknown: 1\n").is_err());
+        let config = Config::from_yaml(
+            "warmup:\n  profiles:\n    normal:\n      growth: 1.4\n      groups:\n        seznam: { start: 80, cap: 25000 }\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.warmup.profiles["normal"].groups["seznam"].cap, 25000);
+        for bad in [
+            "warmup:\n  profiles:\n    turbo: { start: 10 }\n",
+            "warmup:\n  profiles:\n    slow: { growth: 5 }\n",
+            "warmup:\n  profiles:\n    slow:\n      groups:\n        x: { start: 10, cap: 5 }\n",
+        ] {
+            assert!(Config::from_yaml(bad).unwrap().validate().is_err(), "{bad}");
+        }
+    }
+}
+
+impl Default for Warmup {
+    fn default() -> Self {
+        Self {
+            min_volume_fraction: 0.5,
+            advance_fraction: 0.9,
+            deferral_rate_slow: 0.05,
+            bounce_rate_brake: 0.05,
+            policy_blocks_brake: 3,
+            policy_block_rate_brake: 0.01,
+            complaint_rate_warn: 0.001,
+            complaint_rate_brake: 0.003,
+            pause_hours: 24,
+            step_back: 0.5,
+            defer_seconds: 900,
+            profiles: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 impl Config {
@@ -1468,6 +2140,28 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.worker.validate()?;
+        self.warmup.validate()?;
+        for group in &self.provider_groups {
+            let valid = !group.name.is_empty()
+                && group.name.len() <= 40
+                && group
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if !valid || group.name == "other" {
+                return Err(ConfigError::Invalid(format!(
+                    "provider_groups: {:?} is not a valid group name ([a-z0-9_], at most 40 characters, not \"other\")",
+                    group.name
+                )));
+            }
+            if group.domains.is_empty() && group.mx_patterns.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "provider_groups: {} needs domains or mx_patterns",
+                    group.name
+                )));
+            }
+        }
+        self.cluster.validate()?;
         if !matches!(self.camelmailer.web_protocol.as_str(), "http" | "https") {
             return Err(ConfigError::Invalid(format!(
                 "camelmailer.web_protocol must be http or https (got {:?})",
@@ -2425,6 +3119,92 @@ smtp_server:
     }
 
     #[test]
+    fn server_shutdown_grace_defaults_and_env_overrides() {
+        let config = Config::from_yaml("").unwrap();
+        assert_eq!(config.web_server.shutdown_grace_seconds, 30);
+        assert_eq!(config.smtp_server.shutdown_grace_seconds, 30);
+        let config = Config::from_yaml(
+            "web_server:\n  shutdown_grace_seconds: 12\nsmtp_server:\n  shutdown_grace_seconds: 45\n",
+        )
+        .unwrap();
+        let none = |_: &str| None;
+        assert_eq!(
+            config.web_server.shutdown_grace_with(none).unwrap(),
+            std::time::Duration::from_secs(12)
+        );
+        assert_eq!(
+            config.smtp_server.shutdown_grace_with(none).unwrap(),
+            std::time::Duration::from_secs(45)
+        );
+        let env = |name: &str| match name {
+            "WEB_SERVER_SHUTDOWN_GRACE_SECONDS" => Some("5".to_string()),
+            "SMTP_SERVER_SHUTDOWN_GRACE_SECONDS" => Some(" 0 ".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            config.web_server.shutdown_grace_with(env).unwrap(),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.smtp_server.shutdown_grace_with(env).unwrap(),
+            std::time::Duration::ZERO
+        );
+        let bad = |_: &str| Some("soon".to_string());
+        assert!(config.smtp_server.shutdown_grace_with(bad).is_err());
+    }
+
+    #[test]
+    fn cluster_defaults_and_validation() {
+        let config = Config::from_yaml("").unwrap();
+        assert_eq!(config.cluster.heartbeat_interval_seconds, 30);
+        assert_eq!(config.cluster.node_stale_seconds, 90);
+        assert!(config.cluster.public_addresses.is_empty());
+        assert!(config.validate().is_ok());
+
+        let config = Config::from_yaml(
+            "cluster:\n  node_name: mail-1\n  load_balancer_address: 2.31.154.200\n  inbound_hostname: Mail.Example.com\n  public_addresses: [\"49.13.35.233\", \"2a01:4f8::1\"]\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.cluster.effective_node_name(), "mail-1");
+        assert_eq!(config.cluster.load_balancer(), Some("2.31.154.200"));
+        assert_eq!(
+            config.cluster.inbound_host().as_deref(),
+            Some("mail.example.com")
+        );
+        assert_eq!(config.cluster.public_ips().len(), 2);
+
+        for bad in [
+            "cluster:\n  public_addresses: [\"172.18.0.x\"]\n",
+            "cluster:\n  load_balancer_address: lb.example.com\n",
+            "cluster:\n  inbound_hostname: \"mail\"\n",
+            "cluster:\n  inbound_hostname: \"mail.example.com.\"\n",
+            "cluster:\n  heartbeat_interval_seconds: 2\n",
+            "cluster:\n  heartbeat_interval_seconds: 30\n  node_stale_seconds: 40\n",
+        ] {
+            let config = Config::from_yaml(bad).unwrap();
+            assert!(config.validate().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cluster_env_overrides_replace_the_file_values() {
+        let env = |name: &str| match name {
+            "CAMELMAILER_NODE_NAME" => Some(" mail-2 ".to_string()),
+            "CAMELMAILER_PUBLIC_ADDRESSES" => Some("167.233.167.89, 2a01:4f8:1c18:aa2d::1".into()),
+            _ => None,
+        };
+        let cluster = Cluster::default().with_overrides(env).unwrap();
+        assert_eq!(cluster.node_name, "mail-2");
+        assert_eq!(
+            cluster.public_addresses,
+            vec!["167.233.167.89", "2a01:4f8:1c18:aa2d::1"]
+        );
+        let bad = |name: &str| (name == "CAMELMAILER_PUBLIC_ADDRESSES").then(|| "nope".to_string());
+        assert!(Cluster::default().with_overrides(bad).is_err());
+    }
+
+    #[test]
     fn worker_env_overrides_replace_the_file_values() {
         let file = Worker {
             servers: vec!["acme/a".into()],
@@ -2485,5 +3265,74 @@ smtp_server:
         let junk =
             |name: &str| (name == "WORKER_FOREIGN_POOL_DELAY_SECONDS").then(|| "soon".to_string());
         assert!(Worker::default().with_overrides(junk).is_err());
+    }
+
+    #[test]
+    fn provider_feedback_is_off_without_credentials_and_reads_its_group() {
+        let config = Config::from_yaml("").unwrap();
+        let feedback = &config.deliverability_feedback;
+        assert_eq!(feedback.fetch_interval_seconds, 21_600);
+        assert!(feedback.postmaster_tools.domains.is_empty());
+        assert!(feedback.snds.data_url_file.is_none());
+        assert!(feedback.fbl.suppress_complainants, "on by default");
+        assert_eq!(config.retention.feedback_report_days, 30);
+        assert_eq!(
+            feedback.postmaster_tools.api_base_url,
+            "https://gmailpostmastertools.googleapis.com"
+        );
+
+        let config = Config::from_yaml(
+            "deliverability_feedback:\n  postmaster_tools:\n    domains: [example.com]\n    \
+             client_id: id\n    refresh_token_file: /run/secrets/t\n  snds:\n    \
+             data_url_file: /run/secrets/snds\n  fbl:\n    suppress_complainants: false\n",
+        )
+        .unwrap();
+        let feedback = &config.deliverability_feedback;
+        assert_eq!(feedback.postmaster_tools.domains, vec!["example.com"]);
+        assert_eq!(feedback.postmaster_tools.days, 7);
+        assert_eq!(
+            feedback.snds.data_url_file.as_deref(),
+            Some("/run/secrets/snds")
+        );
+        assert!(!feedback.fbl.suppress_complainants);
+        assert!(Config::from_yaml("deliverability_feedback:\n  snds:\n    key: x\n").is_err());
+
+        let config = Config::from_yaml(
+            "deliverability_feedback:\n  placement:\n    server: ops/placement\n    \
+             from_address: p@example.com\n    seeds:\n      - provider: outlook\n        \
+             address: s@outlook.com\n        auth: xoauth2\n        client_id: c\n        \
+             refresh_token_file: /run/secrets/r\n      - provider: yahoo\n        \
+             address: s@yahoo.com\n        password_env: SEED_YAHOO\n",
+        )
+        .unwrap();
+        let placement = &config.deliverability_feedback.placement;
+        assert_eq!(placement.seeds.len(), 2);
+        assert_eq!(placement.seeds[0].provider, SeedProvider::Outlook);
+        assert_eq!(placement.seeds[0].auth, SeedAuth::Xoauth2);
+        assert_eq!(placement.seeds[1].auth, SeedAuth::AppPassword);
+        assert_eq!(placement.min_round_interval_seconds, 3600);
+        assert_eq!(placement.interval_seconds, 0);
+    }
+}
+
+#[cfg(test)]
+mod provider_group_tests {
+    use super::*;
+
+    #[test]
+    fn provider_groups_are_read_and_checked() {
+        let config = Config::from_yaml(
+            "provider_groups:\n  - name: seznam\n    domains: [seznam.cz]\n    mx_patterns: [seznam.cz]\n",
+        )
+        .unwrap();
+        assert_eq!(config.provider_groups[0].name, "seznam");
+        assert!(config.validate().is_ok());
+        for bad in [
+            "provider_groups:\n  - name: Seznam\n    domains: [seznam.cz]\n",
+            "provider_groups:\n  - name: other\n    domains: [x.cz]\n",
+            "provider_groups:\n  - name: empty\n",
+        ] {
+            assert!(Config::from_yaml(bad).unwrap().validate().is_err(), "{bad}");
+        }
     }
 }

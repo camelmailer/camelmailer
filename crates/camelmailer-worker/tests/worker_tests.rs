@@ -3516,7 +3516,12 @@ async fn arf_reports_without_an_engine_unsubscribe_token_still_fire_message_comp
         .insert_message(&outgoing_message(s.server.id, "r@dest.example"))
         .await
         .unwrap();
-    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    // With per-server suppression switched off the sender keeps opt-out for
+    // its own List-Unsubscribe (the default suppresses; see
+    // feedback_loop_reports_are_counted_per_provider_and_suppress_as_the_server_chooses).
+    let mut config = worker_config(smtp.port);
+    config.deliverability_feedback.fbl.suppress_complainants = false;
+    let worker = Worker::new(&config, s.store.clone());
     assert!(matches!(
         worker.process_next().await.unwrap().unwrap(),
         ProcessOutcome::Delivered { .. }
@@ -3567,8 +3572,8 @@ async fn arf_reports_without_an_engine_unsubscribe_token_still_fire_message_comp
         assert_eq!(hook["payload"]["user_agent"], "ISP-FBL/1.0");
     }
 
-    // The sender owns opt-out for its own List-Unsubscribe: no suppression,
-    // and the original keeps its delivery status.
+    // Suppression off: no suppression, and the original keeps its delivery
+    // status.
     assert!(
         !ServerStore::address_suppressed(&s.store, s.server.id, "r@dest.example", None)
             .await
@@ -3581,6 +3586,117 @@ async fn arf_reports_without_an_engine_unsubscribe_token_still_fire_message_comp
         .unwrap()
         .unwrap();
     assert_eq!(original.status, "Sent");
+}
+
+/// Feedback-loop reports are counted per reporting provider and day (a
+/// JMRP report from Hotmail counts for `microsoft`), and with
+/// `deliverability_feedback.fbl.suppress_complainants` the complainant of a
+/// transactional message is suppressed for that message's stream. Off by
+/// default: transactional mail to the complainant keeps flowing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feedback_loop_reports_are_counted_per_provider_and_suppress_as_the_server_chooses() {
+    use camelmailer_core::feedback::{provider, source};
+    use camelmailer_core::{FeedbackStore, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    // (installation default, the server's own choice, suppressed?)
+    for (default, choice, suppress, rcpt) in [
+        (true, None, true, "default@dest.example"),
+        (true, Some(false), false, "keep@dest.example"),
+        (false, Some(true), true, "stop@dest.example"),
+        (false, None, false, "off@dest.example"),
+    ] {
+        let mut config = worker_config(smtp.port);
+        config.deliverability_feedback.fbl.suppress_complainants = default;
+        s.store
+            .set_server_complaint_suppression(s.server.id, choice)
+            .await
+            .unwrap();
+        let worker = Worker::new(&config, s.store.clone());
+        let original_id = s
+            .sink
+            .insert_message(&outgoing_message(s.server.id, rcpt))
+            .await
+            .unwrap();
+        assert!(matches!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::Delivered { .. }
+        ));
+        let original = s
+            .sink
+            .message_by_id(s.server.id, original_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut report = outgoing_message(s.server.id, "fbl@org.example");
+        report.scope = MessageScope::Incoming;
+        report.raw_message = String::from_utf8(arf_mail_with_sender_unsubscribe(
+            Some(&original.token),
+            rcpt,
+        ))
+        .unwrap()
+        .replace("From: feedback@isp.example", "From: staff@hotmail.com")
+        .into_bytes();
+        s.sink.insert_message(&report).await.unwrap();
+        assert_eq!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::FeedbackReportIngested
+        );
+        assert_eq!(
+            ServerStore::address_suppressed(&s.store, s.server.id, rcpt, None)
+                .await
+                .unwrap(),
+            suppress,
+            "{rcpt}"
+        );
+    }
+    let counts = s
+        .store
+        .latest_feedback_snapshots(source::FBL)
+        .await
+        .unwrap();
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].provider, provider::MICROSOFT);
+    assert_eq!(counts[0].metrics["complaints"], 4);
+    assert_eq!(counts[0].detail, "4 complaints reported");
+
+    // The raw reports carry recipient data: retention empties them and
+    // keeps the counts.
+    let pool = s.store.pool().clone();
+    let reports: i64 = sqlx::query_scalar("SELECT count(*) FROM feedback_reports")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reports, 4);
+    assert_eq!(
+        s.store
+            .purge_feedback_reports(chrono::Utc::now() - chrono::Duration::days(1), 100)
+            .await
+            .unwrap(),
+        0,
+        "nothing older than the cutoff yet"
+    );
+    assert_eq!(
+        s.store
+            .purge_feedback_reports(chrono::Utc::now() + chrono::Duration::seconds(1), 3)
+            .await
+            .unwrap(),
+        4
+    );
+    let reports: i64 = sqlx::query_scalar("SELECT count(*) FROM feedback_reports")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(reports, 0);
+    let counts = s
+        .store
+        .latest_feedback_snapshots(source::FBL)
+        .await
+        .unwrap();
+    assert_eq!(counts[0].metrics["complaints"], 4);
 }
 
 // ------------------------------------------------ lifecycle webhooks
@@ -4778,7 +4894,7 @@ async fn enqueue_records_the_pool_and_the_queue_filters_by_it() {
     assert!(queue.dequeue("elsewhere").await.unwrap().is_none());
     queue.set_source_pools(Some(vec![pool_id as i64]));
     let row = queue.dequeue("here").await.unwrap().expect("own pool");
-    queue.retry(row.id, 0).await.unwrap();
+    assert!(queue.retry(row.id, 0, "here").await.unwrap());
     queue.clear_backoff().await.unwrap();
     queue.set_source_pools(None);
     assert!(queue.dequeue("legacy").await.unwrap().is_some());
@@ -4995,4 +5111,742 @@ async fn an_invalid_pool_hostname_never_reaches_the_wire() {
             "{hostname:?}: {seen:?}"
         );
     }
+}
+
+/// Issue #81: the worker lost its row while talking to the receiver (its
+/// lease ran out and another worker took the row over). It must not record
+/// its result over the new owner's: the message, its deliveries and the
+/// queue row stay as the new owner left them, for every SMTP result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_for_a_row_another_worker_took_over_is_not_recorded() {
+    for final_reply in ["250 Accepted", "451 Try later", "550 No such user"] {
+        let base = require_db!();
+        let pool = test_pool_with_connections(&base, 6).await;
+        let s = setup(pool.clone()).await;
+        let smtp = paused_mock_smtp(final_reply).await;
+        let message_id = s
+            .sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+
+        let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+        let task = tokio::spawn(async move { worker.process_next().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            smtp.final_response_ready.notified(),
+        )
+        .await
+        .expect("the delivery reached the final reply");
+        // Another worker takes the row over meanwhile.
+        sqlx::query("UPDATE queued_messages SET locked_by = 'new-owner', locked_at = now()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        smtp.final_response_release.notify_one();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, ProcessOutcome::NotOwner, "{final_reply}");
+        let stored = s
+            .sink
+            .message_by_id(s.server.id, message_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "Pending", "{final_reply}");
+        assert!(s
+            .sink
+            .deliveries_for_message(s.server.id, message_id)
+            .await
+            .unwrap()
+            .is_empty());
+        let (locked_by, attempts): (Option<String>, i32) =
+            sqlx::query_as("SELECT locked_by, attempts FROM queued_messages")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(locked_by.as_deref(), Some("new-owner"), "{final_reply}");
+        assert_eq!(attempts, 0, "{final_reply}");
+        let webhooks: i64 = sqlx::query_scalar("SELECT count(*) FROM webhook_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(webhooks, 0, "{final_reply}");
+    }
+}
+
+/// Issue #81: a row the worker still holds is recorded exactly as before
+/// the owner check, for every SMTP result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_for_a_row_the_worker_still_holds_is_recorded_as_before() {
+    for (final_reply, status, queued_after) in [
+        ("250 Accepted", "Sent", false),
+        ("451 Try later", "SoftFail", true),
+        ("550 No such user", "HardFail", false),
+    ] {
+        let base = require_db!();
+        let pool = test_pool_with_connections(&base, 6).await;
+        let s = setup(pool.clone()).await;
+        let smtp = mock_smtp(final_reply).await;
+        let message_id = s
+            .sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+        let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+        worker.process_next().await.unwrap().unwrap();
+        let stored = s
+            .sink
+            .message_by_id(s.server.id, message_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, status, "{final_reply}");
+        let deliveries = s
+            .sink
+            .deliveries_for_message(s.server.id, message_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1, "{final_reply}");
+        assert_eq!(deliveries[0].status, status, "{final_reply}");
+        let rows: Vec<(Option<String>, i32)> =
+            sqlx::query_as("SELECT locked_by, attempts FROM queued_messages")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        if queued_after {
+            assert_eq!(rows, vec![(None, 1)], "{final_reply}");
+        } else {
+            assert!(rows.is_empty(), "{final_reply}");
+        }
+    }
+}
+
+/// A mock SMTP server that stops answering at one point of the conversation
+/// and signals `ready` when it gets there: `"GREETING"` holds the 220 banner,
+/// any other value holds the reply to the first command starting with it
+/// (`"EHLO"`, `"MAIL"`, `"RCPT"`, `"DATA"`). Every other command is answered
+/// as `mock_smtp` does. The lines it received are captured.
+async fn stalling_mock_smtp(
+    stall_at: &'static str,
+) -> (u16, Arc<Mutex<Vec<String>>>, Arc<tokio::sync::Notify>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let signal = ready.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let captured = captured.clone();
+            let signal = signal.clone();
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                if stall_at == "GREETING" {
+                    signal.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                write_half.write_all(b"220 mock ESMTP\r\n").await.ok();
+                let mut in_data = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let trimmed = line.trim_end().to_string();
+                    captured.lock().unwrap().push(trimmed.clone());
+                    if in_data {
+                        if trimmed == "." {
+                            in_data = false;
+                            write_half.write_all(b"250 Accepted\r\n").await.ok();
+                        }
+                        continue;
+                    }
+                    let upper = trimmed.to_ascii_uppercase();
+                    if upper.starts_with(stall_at) {
+                        signal.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    let reply: &str = if upper.starts_with("EHLO") {
+                        "250-mock\r\n250 OK"
+                    } else if upper.starts_with("DATA") {
+                        in_data = true;
+                        "354 Go ahead"
+                    } else if upper.starts_with("QUIT") {
+                        write_half.write_all(b"221 Bye\r\n").await.ok();
+                        return;
+                    } else {
+                        "250 OK"
+                    };
+                    write_half
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await
+                        .ok();
+                }
+            });
+        }
+    });
+    (port, received, ready)
+}
+
+/// Issue #82: a delivery stopped by a shutdown before its client sent `DATA`
+/// goes straight back to the queue with no attempt counted, wherever it was
+/// stopped (greeting, EHLO, MAIL FROM, RCPT TO); one stopped after `DATA`
+/// was sent keeps its lock for the lease. The receiver never sees `DATA` for
+/// a released row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_releases_a_delivery_stopped_before_data_and_keeps_one_after() {
+    for (stall_at, released) in [
+        ("GREETING", true),
+        ("EHLO", true),
+        ("MAIL", true),
+        ("RCPT", true),
+        ("DATA", false),
+    ] {
+        let base = require_db!();
+        let pool = test_pool_with_connections(&base, 6).await;
+        let s = setup(pool.clone()).await;
+        let (port, received, ready) = stalling_mock_smtp(stall_at).await;
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+
+        let mut config = worker_config(port);
+        config.smtp_client.read_timeout = 60;
+        let worker = Worker::new(&config, s.store.clone())
+            .with_shutdown_grace(std::time::Duration::from_millis(300));
+        let worker_id = worker.worker_id().to_string();
+        let (stop, handle) = run_in_background(worker);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), ready.notified())
+            .await
+            .unwrap_or_else(|_| panic!("the delivery reached {stall_at}"));
+        assert_eq!(
+            queue_row_state(&pool).await,
+            Some((Some(worker_id.clone()), 0)),
+            "{stall_at}: the delivery holds its row"
+        );
+
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("the worker stops within its grace period")
+            .unwrap()
+            .unwrap();
+
+        if released {
+            assert_eq!(
+                queue_row_state(&pool).await,
+                Some((None, 0)),
+                "{stall_at}: released without an attempt"
+            );
+            assert!(
+                PgQueue::new(pool.clone())
+                    .dequeue("another-worker")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{stall_at}: another worker takes it at once"
+            );
+            assert!(
+                !received.lock().unwrap().iter().any(|l| l == "DATA"),
+                "{stall_at}: no DATA for a released row"
+            );
+        } else {
+            assert_eq!(
+                queue_row_state(&pool).await,
+                Some((Some(worker_id.clone()), 0)),
+                "{stall_at}: kept for the lease"
+            );
+            assert!(PgQueue::new(pool.clone())
+                .dequeue("another-worker")
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+/// Issue #82: a closed data gate stops the client before `DATA`, and an open
+/// one changes nothing: the same conversation, the same outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_data_gate_only_observes_unless_it_is_closed() {
+    use camelmailer_worker::smtp_client::{DataGate, OutboundSource};
+    let smtp = mock_smtp("250 Accepted").await;
+    let sender = camelmailer_worker::SmtpSender::new(&worker_config(smtp.port));
+    let raw = b"Subject: x\r\n\r\nHello.\r\n";
+
+    let plain = sender
+        .send(
+            "dest.example",
+            "a@org.example",
+            "b@dest.example",
+            raw,
+            OutboundSource::default(),
+        )
+        .await;
+    let plain_lines = std::mem::take(&mut *smtp.received.lock().unwrap());
+
+    let gate = DataGate::default();
+    let gated = sender
+        .send_gated(
+            "dest.example",
+            "a@org.example",
+            "b@dest.example",
+            raw,
+            OutboundSource::default(),
+            None,
+            gate.clone(),
+        )
+        .await;
+    let gated_lines = std::mem::take(&mut *smtp.received.lock().unwrap());
+    assert_eq!(plain, gated);
+    // QUIT is written without waiting, so it may land in either capture.
+    let without_quit =
+        |lines: Vec<String>| -> Vec<String> { lines.into_iter().filter(|l| l != "QUIT").collect() };
+    assert_eq!(without_quit(plain_lines), without_quit(gated_lines));
+    assert!(gate.data_started());
+    assert!(!gate.close(), "a gate past DATA does not close");
+
+    let closed = DataGate::default();
+    assert!(closed.close());
+    let outcome = sender
+        .send_gated(
+            "dest.example",
+            "a@org.example",
+            "b@dest.example",
+            raw,
+            OutboundSource::default(),
+            None,
+            closed,
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        camelmailer_worker::SendOutcome::SoftFail { .. }
+    ));
+    let lines = smtp.received.lock().unwrap().clone();
+    assert!(lines.iter().any(|l| l.starts_with("RCPT TO")));
+    assert!(!lines.iter().any(|l| l == "DATA"));
+}
+
+fn fixed_providers() -> camelmailer_worker::provider::ProviderClassifier {
+    camelmailer_worker::provider::ProviderClassifier::with_lookup(Arc::new(|domain: String| {
+        Box::pin(async move {
+            (domain == "dest.example")
+                .then(|| "dest-example.mail.protection.outlook.com".to_string())
+        })
+    }))
+}
+
+/// IP metrics: every outbound SMTP result is counted against the pool
+/// address it was bound to and the receiving provider; policy refusals are
+/// counted apart; an accepted message remembers its source so a later
+/// complaint is credited to that address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outbound_results_are_counted_per_address_and_provider() {
+    use camelmailer_core::{DeliveryStatsStore, ProviderGroup};
+    for (reply, sent, deferred, bounced, blocks) in [
+        ("250 Accepted", 1, 0, 0, 0),
+        ("451 4.3.0 Try later", 0, 1, 0, 0),
+        (
+            "421 4.7.0 [TSS04] Messages from 127.0.0.1 temporarily deferred",
+            0,
+            1,
+            0,
+            1,
+        ),
+        (
+            "550 5.7.1 Unfortunately, messages weren't sent. (S3150)",
+            0,
+            0,
+            1,
+            1,
+        ),
+        ("550 5.1.1 No such user", 0, 0, 1, 0),
+    ] {
+        let base = require_db!();
+        let pool = test_pool(&base).await;
+        let s = setup(pool).await;
+        let smtp = mock_smtp(reply).await;
+        let ip_pool = s.store.create_ip_pool("pool", true).await.unwrap();
+        let address = s
+            .store
+            .create_ip_address(camelmailer_core::NewIpAddress {
+                ip_pool_id: ip_pool.id,
+                ipv4: "127.0.0.1".into(),
+                ipv6: None,
+                hostname: "mx.example".into(),
+                priority: 10,
+            })
+            .await
+            .unwrap();
+        s.store
+            .set_server_ip_pool(s.server.id, Some(ip_pool.id))
+            .await
+            .unwrap();
+        let message_id = s
+            .sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+
+        let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+            .with_provider_classifier(fixed_providers());
+        worker.process_next().await.unwrap().unwrap();
+
+        let today = chrono::Utc::now().date_naive();
+        let stats = s.store.ip_delivery_stats(today).await.unwrap();
+        assert_eq!(stats.len(), 1, "{reply}");
+        let stat = &stats[0];
+        assert_eq!(stat.source_ip, "127.0.0.1");
+        assert_eq!(stat.ip_address_id, Some(address.id));
+        assert_eq!(stat.provider, ProviderGroup::microsoft(), "{reply}");
+        assert_eq!(
+            (stat.sent, stat.deferred, stat.bounced, stat.policy_blocks),
+            (sent, deferred, bounced, blocks),
+            "{reply}"
+        );
+        let credited = s
+            .store
+            .record_ip_complaint(message_id, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(credited.is_some(), sent == 1, "{reply}");
+    }
+}
+
+/// Without an IP pool the result is counted under the `default` source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_without_a_pool_counts_under_the_default_source() {
+    use camelmailer_core::DeliveryStatsStore;
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@gmail.com"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let stats = s
+        .store
+        .ip_delivery_stats(chrono::Utc::now().date_naive())
+        .await
+        .unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].source_ip, camelmailer_core::DEFAULT_SOURCE);
+    assert_eq!(stats[0].provider, camelmailer_core::ProviderGroup::google());
+    assert_eq!(stats[0].ip_address_id, None);
+}
+
+async fn warmup_pool(s: &Setup) -> camelmailer_core::IpAddress {
+    let ip_pool = s.store.create_ip_pool("pool", true).await.unwrap();
+    let address = s
+        .store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: ip_pool.id,
+            ipv4: "127.0.0.1".into(),
+            ipv6: None,
+            hostname: "mx.example".into(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    s.store
+        .set_server_ip_pool(s.server.id, Some(ip_pool.id))
+        .await
+        .unwrap();
+    address
+}
+
+/// Warm-up off (the default): nothing is reserved or limited, and every
+/// message goes out from the pool address as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_warmup_off_nothing_is_limited() {
+    use camelmailer_core::WarmupStore;
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    warmup_pool(&s).await;
+    for _ in 0..5 {
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+    }
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    for _ in 0..5 {
+        assert!(matches!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::Delivered { .. }
+        ));
+    }
+    let today = chrono::Utc::now().date_naive();
+    assert!(s.store.warmup_usage(today).await.unwrap().is_empty());
+    assert!(s.store.warmup_states().await.unwrap().is_empty());
+}
+
+/// Warm-up on: once the address's allowance for the provider is used up and
+/// no other address of the pool has room, the message waits without an
+/// attempt and nothing reaches the receiver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn beyond_the_warmup_allowance_a_message_waits_without_an_attempt() {
+    use camelmailer_core::{WarmupMode, WarmupProfile, WarmupStore};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let address = warmup_pool(&s).await;
+    s.store
+        .set_address_warmup(
+            address.id,
+            Some(WarmupMode::Custom),
+            Some(WarmupProfile::uniform(1, 2.0, 100)),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+    }
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::WarmupDeferred
+    );
+    let (locked_by, attempts, waits): (Option<String>, i32, bool) = sqlx::query_as(
+        "SELECT locked_by, attempts, retry_after > now() + interval '10 minutes' FROM queued_messages",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((locked_by, attempts, waits), (None, 0, true));
+    let received = smtp.received.lock().unwrap().clone();
+    assert_eq!(received.iter().filter(|l| l.as_str() == "DATA").count(), 1);
+    let today = chrono::Utc::now().date_naive();
+    assert_eq!(
+        s.store.warmup_usage(today).await.unwrap(),
+        vec![(address.id, camelmailer_core::ProviderGroup::microsoft(), 1)]
+    );
+}
+
+/// Warm-up on: a run of policy refusals brakes the address for that provider
+/// at once (paused, allowance stepped back, logged), and the next message to
+/// that provider waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_refusals_brake_the_warmup_during_the_day() {
+    use camelmailer_core::{WarmupMode, WarmupProfile, WarmupStatus, WarmupStore};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp =
+        mock_smtp("550 5.7.1 Unfortunately, messages from [127.0.0.1] weren't sent. (S3150)").await;
+    let address = warmup_pool(&s).await;
+    s.store
+        .set_address_warmup(
+            address.id,
+            Some(WarmupMode::Custom),
+            Some(WarmupProfile::uniform(20, 2.0, 1000)),
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+    }
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    for _ in 0..3 {
+        assert!(matches!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::Failed { .. }
+        ));
+    }
+    let states = s.store.warmup_states().await.unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].status, WarmupStatus::Paused);
+    assert_eq!(states[0].allowance, 20, "never below the start");
+    assert!(states[0]
+        .last_brake_reason
+        .as_deref()
+        .unwrap()
+        .contains("3 policy refusals"));
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::WarmupDeferred
+    );
+    let log = s.store.warmup_log(Some(address.id), 10).await.unwrap();
+    assert_eq!(log[0].decision, "brake");
+}
+
+/// Provider feedback reaches the nightly warm-up decision: a red SNDS
+/// reading for the address brakes it for Microsoft and the log says why;
+/// Google, without a signal and with a quiet day, only holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_feedback_brakes_the_warmup_for_that_provider() {
+    use camelmailer_core::{
+        FeedbackStore, NewFeedbackSnapshot, ProviderGroup, Verdict, WarmupMode, WarmupProfile,
+        WarmupState, WarmupStatus, WarmupStore,
+    };
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let address = warmup_pool(&s).await;
+    s.store
+        .set_address_warmup(address.id, Some(WarmupMode::Normal), None)
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let yesterday = now.date_naive() - chrono::Duration::days(1);
+    for provider in [ProviderGroup::microsoft(), ProviderGroup::google()] {
+        let ramp = WarmupProfile::normal().ramp(&provider);
+        let initial = WarmupState::initial(address.id, provider.clone(), &ramp);
+        assert!(s
+            .store
+            .try_reserve_warmup(address.id, provider.clone(), yesterday, &initial, now)
+            .await
+            .unwrap());
+    }
+    s.store
+        .upsert_feedback_snapshots(&[NewFeedbackSnapshot {
+            source: "snds".into(),
+            provider: "microsoft".into(),
+            subject_kind: "ip".into(),
+            subject: "127.0.0.1".into(),
+            data_date: yesterday,
+            verdict: Verdict::Bad,
+            detail: "filter result RED".into(),
+            metrics: serde_json::json!({}),
+        }])
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(25), s.store.clone());
+    assert_eq!(worker.evaluate_warmup(now).await.unwrap(), 2);
+    let states = s.store.warmup_states().await.unwrap();
+    let microsoft = states
+        .iter()
+        .find(|s| s.provider == ProviderGroup::microsoft())
+        .unwrap();
+    assert_eq!(microsoft.status, WarmupStatus::Paused);
+    assert!(microsoft
+        .last_reason
+        .contains("snds: ip 127.0.0.1: filter result RED"));
+    let google = states
+        .iter()
+        .find(|s| s.provider == ProviderGroup::google())
+        .unwrap();
+    assert_eq!(google.status, WarmupStatus::Holding);
+    let log = s.store.warmup_log(Some(address.id), 10).await.unwrap();
+    assert!(log
+        .iter()
+        .any(|e| e.decision == "brake" && e.reason.contains("snds")));
+}
+
+/// Decision 1, end to end: while the warm-up storage cannot be read, a
+/// message that would go out from a not-yet-warm address waits without an
+/// attempt and nothing reaches the receiver; once it can be read again the
+/// message is delivered and the outage is in the address's warm-up log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn while_warmup_storage_is_unreadable_a_cold_address_does_not_send() {
+    use camelmailer_core::{WarmupMode, WarmupProfile, WarmupStore};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let address = warmup_pool(&s).await;
+    s.store
+        .set_address_warmup(
+            address.id,
+            Some(WarmupMode::Custom),
+            Some(WarmupProfile::uniform(5, 2.0, 100)),
+        )
+        .await
+        .unwrap();
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    // Load the settings, then make the reservations fail.
+    worker.process_next().await.ok();
+    sqlx::query("DELETE FROM deliveries")
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("UPDATE queued_messages SET retry_after = NULL, attempts = 0, locked_by = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    smtp.received.lock().unwrap().clear();
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM queued_messages")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    if queued == 0 {
+        // The first pass delivered it: queue another one.
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+    }
+    sqlx::query("ALTER TABLE ip_warmup_usage RENAME TO ip_warmup_usage_away")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::WarmupStorageUnavailable
+    );
+    let (attempts, waits): (i32, bool) = sqlx::query_as(
+        "SELECT attempts, retry_after BETWEEN now() + interval '30 seconds' AND now() + interval '90 seconds' FROM queued_messages",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((attempts, waits), (0, true));
+    assert!(!smtp.received.lock().unwrap().iter().any(|l| l == "DATA"));
+
+    sqlx::query("ALTER TABLE ip_warmup_usage_away RENAME TO ip_warmup_usage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE queued_messages SET retry_after = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let log = s.store.warmup_log(Some(address.id), 10).await.unwrap();
+    assert!(log.iter().any(|e| e.decision == "storage"), "{log:?}");
 }

@@ -9,17 +9,19 @@ use crate::dkim;
 use crate::inspection::{ClamavInspector, RspamdInspector};
 use crate::sender::SmtpSender;
 use crate::signer::Signer;
-use crate::smtp_client::SendOutcome;
+use crate::smtp_client::{DataGate, SendOutcome};
 use crate::ssrf::SsrfGuard;
 use crate::tracking;
 use base64::Engine;
 use camelmailer_core::{AdminStore, RouteMode};
+use camelmailer_core::{DeliveryKind, DeliveryStatsStore, IpDeliveryRecord};
 use camelmailer_db::webhook_payload::{
     postal_webhook_message_id, postal_webhook_subject, postal_webhook_timestamp,
 };
 use camelmailer_db::{
     BounceCorrelationOutcome, BounceOriginal, FeedbackComplaintOutcome, OutboundQueueAction,
-    PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, QueueFilter, StoredMessage,
+    OutboundRecord, PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, QueueFilter,
+    StoredMessage,
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -254,19 +256,50 @@ mod interface_tests {
     }
 }
 
+/// How long the per-address delivery counters are kept (IP metrics,
+/// warm-up history).
+const DELIVERY_STATS_DAYS: i64 = 400;
+
+/// How long the daily warm-up usage is kept.
+const WARMUP_USAGE_DAYS: i64 = 30;
+
+/// How long the worker remembers which address sent an accepted message, so
+/// a feedback-loop complaint can be counted against it. Feedback loops
+/// report within hours to a few days.
+const MESSAGE_SOURCE_DAYS: i64 = 30;
+
 /// How often a worker refreshes the locks of the rows it is working on. The
 /// shortest lease the queues accept is three of these.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How far the processing of one in-flight row has got.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum Phase {
     /// Loading and preparing; nothing has reached a receiver yet.
     Preparing,
-    /// Talking to the receiver (SMTP, webhook or lifecycle URL). From here
-    /// on the receiver may already have the message, so a stopped row keeps
-    /// its lock for the lease instead of going straight back to the queue.
+    /// An outgoing message on its way to the receiving MX or relay. Until
+    /// its [`DataGate`] is entered (the client is about to send `DATA`) no
+    /// receiver can have the message, and a shutdown may hand the row back.
+    Delivering(DataGate),
+    /// Talking to the receiver (SMTP from `DATA` on, a route, webhook or
+    /// lifecycle URL). From here on the receiver may already have the
+    /// message, so a stopped row keeps its lock for the lease instead of
+    /// going straight back to the queue.
     Sending,
+    /// Handed back to the queue by a shutdown; must not reach a receiver.
+    Released,
+}
+
+/// Warn when a queue change matched no row because this worker no longer
+/// holds it (its lease ran out and another worker took it over).
+fn owned(table: &str, id: i64, matched: bool) {
+    if !matched {
+        tracing::warn!(
+            table,
+            id,
+            "another worker took over this row before its result was recorded; left to that worker"
+        );
+    }
 }
 
 /// Lock a mutex even when a panicking thread poisoned it: the sets below
@@ -300,21 +333,50 @@ impl Tracked {
         lock(&self.rows).keys().copied().collect()
     }
 
-    /// The rows in flight that have not reached a receiver yet, the only
-    /// ones that may go back to the queue on shutdown.
-    fn unstarted(&self) -> Vec<i64> {
-        lock(&self.rows)
-            .iter()
-            .filter(|(_, phase)| **phase == Phase::Preparing)
-            .map(|(id, _)| *id)
-            .collect()
+    /// Take the rows in flight that have not reached a receiver yet, the
+    /// only ones that may go back to the queue on shutdown: rows still
+    /// preparing, and outgoing deliveries whose client has not sent `DATA`.
+    /// Their gates are closed in the same step, so none of them can send its
+    /// message afterwards, and they are marked released.
+    fn take_unstarted(&self) -> Vec<i64> {
+        let mut rows = lock(&self.rows);
+        let mut taken = Vec::new();
+        for (id, phase) in rows.iter_mut() {
+            let unstarted = match phase {
+                Phase::Preparing => true,
+                Phase::Delivering(gate) => gate.close(),
+                Phase::Sending | Phase::Released => false,
+            };
+            if unstarted {
+                *phase = Phase::Released;
+                taken.push(*id);
+            }
+        }
+        taken
     }
 
     /// Row `id` is about to reach its receiver.
     fn sending(&self, id: i64) {
         if let Some(phase) = lock(&self.rows).get_mut(&id) {
-            *phase = Phase::Sending;
+            if !matches!(phase, Phase::Released) {
+                *phase = Phase::Sending;
+            }
         }
+    }
+
+    /// Outgoing row `id` is about to be delivered over SMTP. Returns the
+    /// gate its client enters before `DATA`; for a row a shutdown already
+    /// handed back the gate is closed, so its message never goes out.
+    fn delivering(&self, id: i64) -> DataGate {
+        let gate = DataGate::default();
+        match lock(&self.rows).get_mut(&id) {
+            Some(Phase::Released) => {
+                gate.close();
+            }
+            Some(phase) => *phase = Phase::Delivering(gate.clone()),
+            None => {}
+        }
+        gate
     }
 
     fn contains(&self, id: i64) -> bool {
@@ -524,6 +586,19 @@ pub enum ProcessOutcome {
     /// It went back to the queue without an attempt and is retried after
     /// `worker.foreign_pool_delay_seconds`.
     PoolUnavailable,
+    /// The worker no longer held the queue row when it came to record the
+    /// result: its lease ran out and another worker took the row over, or
+    /// the row is gone. Nothing was recorded; the row belongs to its new
+    /// owner.
+    NotOwner,
+    /// Warm-up: no address of the message's pool has room left today for
+    /// its receiving provider. It went back to the queue without an attempt
+    /// and is looked at again after `warmup.defer_seconds`.
+    WarmupDeferred,
+    /// Warm-up: the warm-up storage could not be read and the message would
+    /// have gone out from an address not known to be warm. It went back to
+    /// the queue without an attempt and is tried again a minute later.
+    WarmupStorageUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,6 +639,8 @@ pub struct Worker {
     auth_event_days: u32,
     /// `retention.api_request_days` (0 = keep forever).
     api_request_days: u32,
+    /// `retention.feedback_report_days` (0 = keep with the message content).
+    feedback_report_days: u32,
     /// `retention.batch_size`.
     retention_batch: i64,
     /// Validated shared SMTP return-path domain. Invalid placeholders retain
@@ -582,6 +659,12 @@ pub struct Worker {
     heartbeat_interval: Duration,
     /// `worker.shutdown_grace_seconds`.
     shutdown_grace: Duration,
+    /// `deliverability_feedback.fbl.suppress_complainants`.
+    fbl_suppress_complainants: bool,
+    /// Classifies recipient domains by mailbox provider for the counters.
+    providers: crate::provider::ProviderClassifier,
+    /// Adaptive warm-up (inactive until an address warms up).
+    warmup: crate::warmup::WarmupGate,
 }
 
 impl Worker {
@@ -652,6 +735,7 @@ impl Worker {
             ),
             auth_event_days: config.retention.auth_event_days,
             api_request_days: config.retention.api_request_days,
+            feedback_report_days: config.retention.feedback_report_days,
             retention_batch: config.retention.batch_size.max(1) as i64,
             return_path_domain,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
@@ -664,12 +748,27 @@ impl Worker {
             in_flight: InFlight::default(),
             heartbeat_interval: HEARTBEAT_INTERVAL,
             shutdown_grace: Duration::from_secs(u64::from(config.worker.shutdown_grace_seconds)),
+            fbl_suppress_complainants: config.deliverability_feedback.fbl.suppress_complainants,
+            providers: crate::provider::ProviderClassifier::default().with_groups(
+                crate::provider::ProviderClassifier::groups_from_config(&config.provider_groups),
+            ),
+            warmup: crate::warmup::WarmupGate::new(&config.warmup),
         }
     }
 
     /// The id this process locks rows with (`locked_by`).
     pub fn worker_id(&self) -> &str {
         &self.worker_id
+    }
+
+    /// Classify recipient domains with `providers` (tests use a fixed MX
+    /// lookup).
+    pub fn with_provider_classifier(
+        mut self,
+        providers: crate::provider::ProviderClassifier,
+    ) -> Self {
+        self.providers = providers;
+        self
     }
 
     /// Override how often the heartbeat runs (tests; the default is
@@ -725,6 +824,225 @@ impl Worker {
         Ok(count)
     }
 
+    /// The pool address a seed placement test must be sent from. Only a
+    /// message that carries the `X-Camelmailer-Placement-Test` header with a
+    /// token the placement runner created, on the server the runner sent it
+    /// from, gets one; for every other message this is one header lookup
+    /// and `None`, and its source is chosen as before. A tenant cannot pick
+    /// an IP this way: the token is random and bound to the runner's row.
+    pub async fn placement_address(
+        &self,
+        message: &StoredMessage,
+    ) -> Option<camelmailer_core::IpAddress> {
+        let token = camelmailer_core::message::header_value(
+            &message.raw_message,
+            crate::placement::PLACEMENT_HEADER,
+        )?;
+        let test =
+            camelmailer_core::FeedbackStore::placement_test_by_token(&self.store, token.trim())
+                .await
+                .ok()
+                .flatten()
+                .filter(|test| test.server_id == message.server_id)?;
+        camelmailer_core::AdminStore::list_ip_addresses(&self.store, test.ip_pool_id)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|address| address.id == test.ip_address_id)
+    }
+
+    /// Whether a feedback-loop complaint about transactional mail of
+    /// `server_id` suppresses the recipient: the server's own setting, else
+    /// `deliverability_feedback.fbl.suppress_complainants`.
+    async fn suppress_complainants(&self, server_id: camelmailer_core::Id) -> bool {
+        match camelmailer_core::FeedbackStore::server_complaint_suppression(&self.store, server_id)
+            .await
+        {
+            Ok(Some(choice)) => choice,
+            Ok(None) => self.fbl_suppress_complainants,
+            Err(error) => {
+                tracing::warn!(%error, server_id, "could not read the server's complaint setting; using the default");
+                self.fbl_suppress_complainants
+            }
+        }
+    }
+
+    /// The outcome of a delivery whose result was handed to
+    /// `record_outbound_delivery`: `outcome` when it was recorded.
+    fn recorded_outcome(
+        &self,
+        recorded: OutboundRecord,
+        message_id: i64,
+        outcome: ProcessOutcome,
+    ) -> ProcessOutcome {
+        match recorded {
+            OutboundRecord::Recorded(_) => outcome,
+            OutboundRecord::AlreadyBounced => ProcessOutcome::AlreadyBounced,
+            OutboundRecord::NotOwner => {
+                tracing::warn!(
+                    message_id,
+                    worker_id = %self.worker_id,
+                    ?outcome,
+                    "another worker took over this message's queue row before its result was recorded; the result was not recorded"
+                );
+                ProcessOutcome::NotOwner
+            }
+        }
+    }
+
+    /// Count one outbound SMTP result against the address it was sent from
+    /// and the receiving provider (`ip_delivery_stats`), once the result is
+    /// recorded. Counting never changes the delivery: a failure is logged
+    /// and ignored.
+    async fn count_delivery(
+        &self,
+        recorded: OutboundRecord,
+        source: Option<&camelmailer_core::IpAddress>,
+        domain: &str,
+        message: &StoredMessage,
+        kind: DeliveryKind,
+        response: &str,
+    ) {
+        if !matches!(recorded, OutboundRecord::Recorded(_)) {
+            return;
+        }
+        let provider = self.providers.classify(domain).await;
+        let record = IpDeliveryRecord {
+            day: chrono::Utc::now().date_naive(),
+            source_ip: source
+                .map(|address| address.ipv4.clone())
+                .unwrap_or_else(|| camelmailer_core::DEFAULT_SOURCE.to_string()),
+            ip_address_id: source.map(|address| address.id),
+            provider: provider.clone(),
+            kind,
+            policy_block: kind != DeliveryKind::Sent && camelmailer_core::is_policy_block(response),
+            server_id: message.server_id,
+            message_id: message.id,
+        };
+        if let Err(error) = DeliveryStatsStore::record_ip_delivery(&self.store, &record).await {
+            tracing::warn!(%error, message_id = message.id, "could not count the delivery");
+            return;
+        }
+        // Warm-up: a run of policy refusals today brakes the address for
+        // this provider at once.
+        if let (true, Some(address)) = (record.policy_block, source) {
+            if self.warmup.profile(address.id).is_some() {
+                self.brake_if_blocked(address, &provider, record.day).await;
+            }
+        }
+    }
+
+    async fn brake_if_blocked(
+        &self,
+        address: &camelmailer_core::IpAddress,
+        provider: &camelmailer_core::ProviderGroup,
+        day: chrono::NaiveDate,
+    ) {
+        let today = match DeliveryStatsStore::ip_delivery_stats(&self.store, day).await {
+            Ok(stats) => stats
+                .into_iter()
+                .find(|s| s.day == day && &s.provider == provider && s.source_ip == address.ipv4),
+            Err(error) => {
+                tracing::warn!(%error, "could not read today's counters for the warm-up brake");
+                return;
+            }
+        };
+        let Some(today) = today else { return };
+        if let Err(error) = self
+            .warmup
+            .brake_if_blocked(
+                &self.store,
+                address.id,
+                provider,
+                &today,
+                chrono::Utc::now(),
+            )
+            .await
+        {
+            tracing::warn!(%error, "could not apply the warm-up brake");
+        }
+    }
+
+    /// Warm-up: judge yesterday for every warming address (once; several
+    /// workers may try, the first to save wins). Runs from housekeeping.
+    pub async fn evaluate_warmup(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize, camelmailer_core::StoreError> {
+        self.warmup.reload(&self.store).await?;
+        let day = now.date_naive() - chrono::Duration::days(1);
+        let stats = DeliveryStatsStore::ip_delivery_stats(&self.store, day).await?;
+        let addresses: HashMap<camelmailer_core::Id, String> =
+            camelmailer_core::WarmupStore::warmup_addresses(&self.store)
+                .await?
+                .into_iter()
+                .map(|a| (a.ip_address_id, a.ipv4))
+                .collect();
+        // Outside verdicts (Postmaster Tools, SNDS, feedback loops, seed
+        // placement) per warming address and provider, read up front.
+        let mut signals: HashMap<
+            (camelmailer_core::Id, camelmailer_core::ProviderGroup),
+            Vec<camelmailer_core::WarmupSignal>,
+        > = HashMap::new();
+        for state in camelmailer_core::WarmupStore::warmup_states(&self.store).await? {
+            if self.warmup.profile(state.ip_address_id).is_none() {
+                continue;
+            }
+            let Some(ipv4) = addresses.get(&state.ip_address_id) else {
+                continue;
+            };
+            match camelmailer_core::FeedbackStore::latest_provider_signals(
+                &self.store,
+                ipv4,
+                state.provider.as_str(),
+            )
+            .await
+            {
+                Ok(found) => {
+                    signals.insert(
+                        (state.ip_address_id, state.provider.clone()),
+                        crate::warmup::warmup_signals(&found, day),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, ipv4, "could not read provider signals for the warm-up")
+                }
+            }
+        }
+        let lookup = |id: camelmailer_core::Id, provider: &camelmailer_core::ProviderGroup| {
+            signals
+                .get(&(id, provider.clone()))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let written = self
+            .warmup
+            .evaluate_day(&self.store, day, &stats, &addresses, &lookup, now)
+            .await?;
+        Ok(written.len())
+    }
+
+    /// Remove a queue row this worker holds; warns when another worker took
+    /// it over meanwhile and leaves it to that worker.
+    async fn complete_row(&self, id: i64) -> Result<(), sqlx::Error> {
+        owned(
+            "queued_messages",
+            id,
+            self.queue.complete(id, &self.worker_id).await?,
+        );
+        Ok(())
+    }
+
+    /// Reschedule a queue row this worker holds, as [`Worker::complete_row`].
+    async fn retry_row(&self, id: i64, attempts: i32) -> Result<(), sqlx::Error> {
+        owned(
+            "queued_messages",
+            id,
+            self.queue.retry(id, attempts, &self.worker_id).await?,
+        );
+        Ok(())
+    }
+
     /// Log the in-flight rows of `tracked` the heartbeat could not refresh
     /// although they are still in flight; returns how many it refreshed.
     fn warn_lost(&self, table: &str, tracked: &Tracked, asked: &[i64], refreshed: &[i64]) -> u64 {
@@ -752,9 +1070,9 @@ impl Worker {
     /// whose processing failed half way (say after the receiver's `250`)
     /// must not be sent again straight away.
     pub async fn release_unstarted(&self) -> Result<Released, sqlx::Error> {
-        let messages = self.in_flight.messages.unstarted();
-        let webhooks = self.in_flight.webhooks.unstarted();
-        let lifecycle = self.in_flight.lifecycle.unstarted();
+        let messages = self.in_flight.messages.take_unstarted();
+        let webhooks = self.in_flight.webhooks.take_unstarted();
+        let lifecycle = self.in_flight.lifecycle.take_unstarted();
         Ok(Released {
             messages: self.queue.release(&self.worker_id, &messages).await?,
             webhooks: self
@@ -876,6 +1194,9 @@ impl Worker {
         if let Err(error) = self.refresh_source_pools().await {
             tracing::warn!(%error, "could not refresh the local IP pools");
         }
+        if let Err(error) = self.warmup.refresh(&self.store).await {
+            tracing::warn!(%error, "could not read the warm-up settings");
+        }
         let Some(queued) = self.queue.dequeue(&self.worker_id).await? else {
             return Ok(None);
         };
@@ -893,7 +1214,7 @@ impl Worker {
                 .map(|message| (message, None))
         };
         let Some((mut message, server_token)) = loaded else {
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             return Ok(Some(ProcessOutcome::MessageMissing));
         };
 
@@ -916,7 +1237,7 @@ impl Worker {
         server_token: Option<&str>,
     ) -> Result<ProcessOutcome, sqlx::Error> {
         if message.status == "Bounced" {
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             tracing::info!(
                 message_id = message.id,
                 "completed stale queue row for already bounced message"
@@ -944,6 +1265,7 @@ impl Worker {
                     message.server_id,
                     message.id,
                     queued.id,
+                    &self.worker_id,
                     "Held",
                     details,
                     "",
@@ -954,11 +1276,7 @@ impl Worker {
                     &payload,
                 )
                 .await?;
-            return Ok(if recorded.is_some() {
-                ProcessOutcome::Held
-            } else {
-                ProcessOutcome::AlreadyBounced
-            });
+            return Ok(self.recorded_outcome(recorded, message.id, ProcessOutcome::Held));
         }
 
         // Rewrite HTML links for click tracking and append an open pixel
@@ -1001,72 +1319,160 @@ impl Worker {
         // Source-address selection: send from the message stream's IP pool if
         // it sets one, else the server's pool. A stream without a pool
         // resolves to the server pool exactly as before.
-        let source: Option<camelmailer_core::IpAddress> =
+        // Every address the delivery may go out from, for warm-up overflow.
+        let mut candidates: Vec<camelmailer_core::IpAddress> = Vec::new();
+        // A seed placement test names the pool address it measures (and is
+        // left out of warm-up overflow: no candidates); every other message
+        // (no placement header) takes the usual path below.
+        let placement = self.placement_address(message).await;
+        let source: Option<camelmailer_core::IpAddress> = if let Some(address) = placement {
             if let Some(selection) = &self.source_selection {
-                // Host-aware: only the pool addresses this host holds. A pool
-                // with none here goes back to the queue for a host that has one;
-                // no pool at all keeps the OS default address.
-                let addresses = match camelmailer_core::ServerStore::source_addresses_for(
-                    &self.store,
-                    message.server_id,
-                    message.stream_id,
-                )
-                .await
-                {
-                    Ok(addresses) => addresses,
-                    Err(error) => {
-                        // The row is locked: hand it back without an attempt
-                        // instead of leaving it locked until the stale-lock
-                        // reclaim. Sending from an address the pool may not
-                        // hold would be worse than a short wait.
-                        tracing::warn!(
-                            message_id = message.id,
-                            %error,
-                            "could not read the IP pool; handing the message back"
-                        );
+                if !selection.local_check()(&address.ipv4) {
+                    // Another host holds this address: hand the test over.
+                    owned(
+                        "queued_messages",
+                        queued.id,
                         self.queue
-                            .defer(queued.id, selection.foreign_pool_delay_seconds, None)
+                            .defer(
+                                queued.id,
+                                &self.worker_id,
+                                selection.foreign_pool_delay_seconds,
+                                Some(address.ip_pool_id as i64),
+                            )
+                            .await?,
+                    );
+                    return Ok(ProcessOutcome::ForeignPool);
+                }
+            }
+            Some(address)
+        } else if let Some(selection) = &self.source_selection {
+            // Host-aware: only the pool addresses this host holds. A pool
+            // with none here goes back to the queue for a host that has one;
+            // no pool at all keeps the OS default address.
+            let addresses = match camelmailer_core::ServerStore::source_addresses_for(
+                &self.store,
+                message.server_id,
+                message.stream_id,
+            )
+            .await
+            {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    // The row is locked: hand it back without an attempt
+                    // instead of leaving it locked until the stale-lock
+                    // reclaim. Sending from an address the pool may not
+                    // hold would be worse than a short wait.
+                    tracing::warn!(
+                        message_id = message.id,
+                        %error,
+                        "could not read the IP pool; handing the message back"
+                    );
+                    self.queue
+                        .defer(
+                            queued.id,
+                            &self.worker_id,
+                            selection.foreign_pool_delay_seconds,
+                            None,
+                        )
+                        .await?;
+                    return Ok(ProcessOutcome::PoolUnavailable);
+                }
+            };
+            if addresses.is_empty() {
+                None
+            } else {
+                let is_local = selection.local_check();
+                let local: Vec<&camelmailer_core::IpAddress> =
+                    addresses.iter().filter(|a| is_local(&a.ipv4)).collect();
+                candidates = local.iter().map(|a| (*a).clone()).collect();
+                match choose_source_address(&local, &queued.domain) {
+                    Some(address) => Some(address.clone()),
+                    None => {
+                        let pool_id = addresses[0].ip_pool_id;
+                        selection.report_foreign(pool_id);
+                        // Record the pool as resolved now, so the queue
+                        // filter of the hosts without an address of it skips
+                        // the row from here on (rows queued before the
+                        // column, or after the pool changed).
+                        self.queue
+                            .defer(
+                                queued.id,
+                                &self.worker_id,
+                                selection.foreign_pool_delay_seconds,
+                                Some(pool_id as i64),
+                            )
                             .await?;
-                        return Ok(ProcessOutcome::PoolUnavailable);
+                        return Ok(ProcessOutcome::ForeignPool);
                     }
-                };
-                if addresses.is_empty() {
-                    None
-                } else {
-                    let is_local = selection.local_check();
-                    let local: Vec<&camelmailer_core::IpAddress> =
-                        addresses.iter().filter(|a| is_local(&a.ipv4)).collect();
-                    match choose_source_address(&local, &queued.domain) {
-                        Some(address) => Some(address.clone()),
-                        None => {
-                            let pool_id = addresses[0].ip_pool_id;
-                            selection.report_foreign(pool_id);
-                            // Record the pool as resolved now, so the queue
-                            // filter of the hosts without an address of it skips
-                            // the row from here on (rows queued before the
-                            // column, or after the pool changed).
+                }
+            }
+        } else {
+            // The pool's first address (lowest priority number, then id).
+            let addresses = camelmailer_core::ServerStore::source_addresses_for(
+                &self.store,
+                message.server_id,
+                message.stream_id,
+            )
+            .await
+            .ok()
+            .unwrap_or_default();
+            candidates = addresses.clone();
+            addresses.into_iter().next()
+        };
+        // Warm-up: only when an address of the pool warms up. With warm-up
+        // off everywhere this is skipped and the source stays as chosen.
+        let source = match source {
+            Some(chosen) if self.warmup.covers(&candidates) => {
+                let provider = self.providers.classify(&queued.domain).await;
+                match self
+                    .warmup
+                    .pick(
+                        &self.store,
+                        &chosen,
+                        &candidates,
+                        &provider,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                {
+                    crate::warmup::Pick::Use(address) => Some(address),
+                    crate::warmup::Pick::Wait => {
+                        tracing::info!(
+                            message_id = message.id,
+                            provider = provider.as_str(),
+                            "no warm-up allowance left in the pool today; the message waits"
+                        );
+                        owned(
+                            "queued_messages",
+                            queued.id,
+                            self.queue
+                                .defer(queued.id, &self.worker_id, self.warmup.defer_seconds, None)
+                                .await?,
+                        );
+                        return Ok(ProcessOutcome::WarmupDeferred);
+                    }
+                    crate::warmup::Pick::WaitForStorage => {
+                        // The warm-up storage cannot be read and no address
+                        // known to be warm is available: never send from a
+                        // possibly cold address without its limit.
+                        owned(
+                            "queued_messages",
+                            queued.id,
                             self.queue
                                 .defer(
                                     queued.id,
-                                    selection.foreign_pool_delay_seconds,
-                                    Some(pool_id as i64),
+                                    &self.worker_id,
+                                    crate::warmup::STORAGE_RETRY_SECONDS,
+                                    None,
                                 )
-                                .await?;
-                            return Ok(ProcessOutcome::ForeignPool);
-                        }
+                                .await?,
+                        );
+                        return Ok(ProcessOutcome::WarmupStorageUnavailable);
                     }
                 }
-            } else {
-                // The pool's first address (lowest priority number, then id).
-                camelmailer_core::ServerStore::source_addresses_for(
-                    &self.store,
-                    message.server_id,
-                    message.stream_id,
-                )
-                .await
-                .ok()
-                .and_then(|addresses| addresses.into_iter().next())
-            };
+            }
+            other => other,
+        };
         let source_ip: Option<IpAddr> = source.as_ref().and_then(|a| a.ipv4.parse().ok());
         // EHLO with the bound address's own name when asked to and it has
         // one; otherwise the installation's name.
@@ -1087,16 +1493,19 @@ impl Worker {
         )
         .await;
 
-        self.in_flight.messages.sending(queued.id);
+        // Until the client sends DATA a shutdown may hand the row back (the
+        // gate); from DATA on the row keeps its lock for the lease.
+        let data_gate = self.in_flight.messages.delivering(queued.id);
         let outcome = self
             .sender
-            .send_with_helo(
+            .send_gated(
                 &queued.domain,
                 &return_path,
                 &message.rcpt_to,
                 &raw_message,
                 outbound,
                 helo_hostname,
+                data_gate,
             )
             .await;
 
@@ -1109,6 +1518,7 @@ impl Worker {
                         message.server_id,
                         message.id,
                         queued.id,
+                        &self.worker_id,
                         "Sent",
                         "message accepted by the remote server",
                         &response,
@@ -1119,14 +1529,26 @@ impl Worker {
                         &payload,
                     )
                     .await?;
-                if recorded.is_none() {
+                if recorded == OutboundRecord::AlreadyBounced {
                     tracing::info!(
                         message_id = message.id,
                         "preserved newer bounced state after outbound SMTP success"
                     );
-                    return Ok(ProcessOutcome::AlreadyBounced);
                 }
-                Ok(ProcessOutcome::Delivered { response })
+                self.count_delivery(
+                    recorded,
+                    source.as_ref(),
+                    &queued.domain,
+                    message,
+                    DeliveryKind::Sent,
+                    &response,
+                )
+                .await;
+                Ok(self.recorded_outcome(
+                    recorded,
+                    message.id,
+                    ProcessOutcome::Delivered { response },
+                ))
             }
             SendOutcome::SoftFail { response } => {
                 if queued.attempts + 1 >= self.max_attempts {
@@ -1141,6 +1563,7 @@ impl Worker {
                             message.server_id,
                             message.id,
                             queued.id,
+                            &self.worker_id,
                             "HardFail",
                             "delivery attempts exhausted",
                             &response,
@@ -1151,11 +1574,20 @@ impl Worker {
                             &payload,
                         )
                         .await?;
-                    Ok(if recorded.is_some() {
-                        ProcessOutcome::Failed { response }
-                    } else {
-                        ProcessOutcome::AlreadyBounced
-                    })
+                    self.count_delivery(
+                        recorded,
+                        source.as_ref(),
+                        &queued.domain,
+                        message,
+                        DeliveryKind::Deferred,
+                        &response,
+                    )
+                    .await;
+                    Ok(self.recorded_outcome(
+                        recorded,
+                        message.id,
+                        ProcessOutcome::Failed { response },
+                    ))
                 } else {
                     let payload = self.message_payload(message, &response);
                     let recorded = self
@@ -1164,6 +1596,7 @@ impl Worker {
                             message.server_id,
                             message.id,
                             queued.id,
+                            &self.worker_id,
                             "SoftFail",
                             "temporary delivery failure",
                             &response,
@@ -1178,11 +1611,20 @@ impl Worker {
                             &payload,
                         )
                         .await?;
-                    Ok(if recorded.is_some() {
-                        ProcessOutcome::Delayed { response }
-                    } else {
-                        ProcessOutcome::AlreadyBounced
-                    })
+                    self.count_delivery(
+                        recorded,
+                        source.as_ref(),
+                        &queued.domain,
+                        message,
+                        DeliveryKind::Deferred,
+                        &response,
+                    )
+                    .await;
+                    Ok(self.recorded_outcome(
+                        recorded,
+                        message.id,
+                        ProcessOutcome::Delayed { response },
+                    ))
                 }
             }
             SendOutcome::HardFail { response } => {
@@ -1194,6 +1636,7 @@ impl Worker {
                         message.server_id,
                         message.id,
                         queued.id,
+                        &self.worker_id,
                         "HardFail",
                         "message rejected by the remote server",
                         &response,
@@ -1204,11 +1647,22 @@ impl Worker {
                         &payload,
                     )
                     .await?;
-                Ok(if recorded.is_some() {
-                    ProcessOutcome::Failed { response }
-                } else {
-                    ProcessOutcome::AlreadyBounced
-                })
+                self.count_delivery(
+                    recorded,
+                    source.as_ref(),
+                    &queued.domain,
+                    message,
+                    DeliveryKind::Bounced,
+                    &response,
+                )
+                .await;
+                Ok(
+                    self.recorded_outcome(
+                        recorded,
+                        message.id,
+                        ProcessOutcome::Failed { response },
+                    ),
+                )
             }
         }
     }
@@ -1299,7 +1753,7 @@ impl Worker {
                     None,
                 )
                 .await?;
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             return Ok(ProcessOutcome::Held);
         }
 
@@ -1336,7 +1790,7 @@ impl Worker {
         let Some(endpoint_url) = endpoint_url else {
             // Accept/Hold routes and bounces: the message is stored; there is
             // nothing to deliver.
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             return Ok(ProcessOutcome::NothingToDo);
         };
 
@@ -1354,10 +1808,10 @@ impl Worker {
             tracing::warn!(%error, endpoint = %endpoint_url, "route endpoint blocked by SSRF guard");
             let response = format!("route endpoint blocked by address guard: {error}");
             return if queued.attempts + 1 >= self.max_attempts {
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 Ok(ProcessOutcome::Failed { response })
             } else {
-                self.queue.retry(queued.id, queued.attempts).await?;
+                self.retry_row(queued.id, queued.attempts).await?;
                 Ok(ProcessOutcome::Delayed { response })
             };
         }
@@ -1376,7 +1830,7 @@ impl Worker {
         let result = self.http.post(&endpoint_url).json(&payload).send().await;
         let success = matches!(&result, Ok(response) if response.status().is_success());
         if success {
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             Ok(ProcessOutcome::Routed)
         } else {
             let response = match result {
@@ -1384,10 +1838,10 @@ impl Worker {
                 Err(error) => format!("endpoint request failed: {error}"),
             };
             if queued.attempts + 1 >= self.max_attempts {
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 Ok(ProcessOutcome::Failed { response })
             } else {
-                self.queue.retry(queued.id, queued.attempts).await?;
+                self.retry_row(queued.id, queued.attempts).await?;
                 Ok(ProcessOutcome::Delayed { response })
             }
         }
@@ -1425,7 +1879,7 @@ impl Worker {
         match correlation {
             BounceCorrelationOutcome::Correlated(_) => {}
             BounceCorrelationOutcome::AlreadyCorrelated => {
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 return Ok(Some(ProcessOutcome::BounceCorrelated));
             }
             BounceCorrelationOutcome::NotMatched if message.route_id.is_none() => {
@@ -1444,7 +1898,7 @@ impl Worker {
             }
             BounceCorrelationOutcome::NotMatched => return Ok(None),
         }
-        self.queue.complete(queued.id).await?;
+        self.complete_row(queued.id).await?;
         Ok(Some(ProcessOutcome::BounceCorrelated))
     }
 
@@ -1462,7 +1916,7 @@ impl Worker {
             Ok(report) => report,
             Err(error) => {
                 tracing::warn!(%error, message_id = message.id, "unparseable DMARC report held");
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 self.sink
                     .record_delivery(
                         message.server_id,
@@ -1504,7 +1958,7 @@ impl Worker {
         };
         match camelmailer_core::ServerStore::store_dmarc_report(&self.store, new).await {
             Ok(stored) => {
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 self.sink
                     .record_delivery(
                         message.server_id,
@@ -1527,10 +1981,10 @@ impl Worker {
                 tracing::warn!(%error, message_id = message.id, "could not store DMARC report");
                 let response = format!("could not store the DMARC report: {error}");
                 if queued.attempts + 1 >= self.max_attempts {
-                    self.queue.complete(queued.id).await?;
+                    self.complete_row(queued.id).await?;
                     Ok(ProcessOutcome::Failed { response })
                 } else {
-                    self.queue.retry(queued.id, queued.attempts).await?;
+                    self.retry_row(queued.id, queued.attempts).await?;
                     Ok(ProcessOutcome::Delayed { response })
                 }
             }
@@ -1549,11 +2003,22 @@ impl Worker {
         queued: &camelmailer_db::QueuedMessageRow,
         message: &StoredMessage,
     ) -> Result<ProcessOutcome, sqlx::Error> {
+        // The report holds recipient data: remember it for
+        // `retention.feedback_report_days`, whatever happens below.
+        if let Err(error) = camelmailer_core::FeedbackStore::record_feedback_report(
+            &self.store,
+            message.server_id,
+            message.id,
+        )
+        .await
+        {
+            tracing::warn!(%error, message_id = message.id, "could not register the feedback report for retention");
+        }
         let report = match crate::arf::extract_feedback(&message.raw_message) {
             Ok(report) => report,
             Err(error) => {
                 tracing::warn!(%error, message_id = message.id, "unparseable ARF report held");
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 self.sink
                     .record_delivery(
                         message.server_id,
@@ -1584,18 +2049,55 @@ impl Worker {
                 message_tokens: report.message_tokens.clone(),
                 message_id: report.original_message_id.clone(),
                 recipient: report.recipient(),
+                suppress_transactional: self.suppress_complainants(message.server_id).await,
             };
+            // Count the complaint for the provider that reported it (JMRP,
+            // CFL, ...). Per-IP crediting comes from the IP metrics. A failure
+            // here never holds up the complaint itself.
+            if let Err(error) = camelmailer_core::FeedbackStore::record_fbl_complaint(
+                &self.store,
+                report.provider(),
+                chrono::Utc::now().date_naive(),
+            )
+            .await
+            {
+                tracing::warn!(%error, provider = report.provider(), "could not count the feedback-loop complaint");
+            }
             match self
                 .sink
                 .record_feedback_complaint(message.server_id, &complaint)
                 .await
             {
                 Ok(outcome) => {
-                    self.queue.complete(queued.id).await?;
+                    self.complete_row(queued.id).await?;
+                    if let FeedbackComplaintOutcome::Recorded {
+                        message_id: Some(id),
+                        ..
+                    } = &outcome
+                    {
+                        // Count the complaint against the address that sent
+                        // the message (best effort, like every counter).
+                        if let Err(error) = DeliveryStatsStore::record_ip_complaint(
+                            &self.store,
+                            *id,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, message_id = id, "could not count the complaint");
+                        }
+                    }
                     let detail = match outcome {
                         FeedbackComplaintOutcome::Recorded {
-                            suppressed: true, ..
-                        } => "spam complaint recorded for the broadcast recipient".to_string(),
+                            suppressed: true,
+                            message_id,
+                            ..
+                        } => match message_id {
+                            Some(id) if complaint.unsubscribe_token.is_none() => format!(
+                                "spam complaint recorded for <msg:{id}>; recipient suppressed"
+                            ),
+                            _ => "spam complaint recorded for the broadcast recipient".to_string(),
+                        },
                         FeedbackComplaintOutcome::Recorded {
                             message_id: Some(id),
                             ..
@@ -1626,17 +2128,17 @@ impl Worker {
                     tracing::warn!(%error, message_id = message.id, "could not record feedback complaint");
                     let response = format!("could not record the feedback complaint: {error}");
                     if queued.attempts + 1 >= self.max_attempts {
-                        self.queue.complete(queued.id).await?;
+                        self.complete_row(queued.id).await?;
                         Ok(ProcessOutcome::Failed { response })
                     } else {
-                        self.queue.retry(queued.id, queued.attempts).await?;
+                        self.retry_row(queued.id, queued.attempts).await?;
                         Ok(ProcessOutcome::Delayed { response })
                     }
                 }
             }
         } else {
             // Recognised ARF of a non-abuse type. Store and move on.
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             self.sink
                 .record_delivery(
                     message.server_id,
@@ -1777,12 +2279,22 @@ impl Worker {
                 .log_attempt(&request, attempt, None, false, &detail)
                 .await?;
             return if attempt >= WEBHOOK_MAX_ATTEMPTS {
-                self.webhook_queue.complete(request.id).await?;
+                owned(
+                    "webhook_requests",
+                    request.id,
+                    self.webhook_queue
+                        .complete(request.id, &self.worker_id)
+                        .await?,
+                );
                 Ok(Some(WebhookOutcome::GivenUp))
             } else {
-                self.webhook_queue
-                    .retry(request.id, request.attempts)
-                    .await?;
+                owned(
+                    "webhook_requests",
+                    request.id,
+                    self.webhook_queue
+                        .retry(request.id, request.attempts, &self.worker_id)
+                        .await?,
+                );
                 Ok(Some(WebhookOutcome::Retrying))
             };
         }
@@ -1835,16 +2347,32 @@ impl Worker {
             .await?;
 
         if success {
-            self.webhook_queue.complete(request.id).await?;
+            owned(
+                "webhook_requests",
+                request.id,
+                self.webhook_queue
+                    .complete(request.id, &self.worker_id)
+                    .await?,
+            );
             Ok(Some(WebhookOutcome::Delivered))
         } else if attempt >= WEBHOOK_MAX_ATTEMPTS {
-            self.webhook_queue.complete(request.id).await?;
+            owned(
+                "webhook_requests",
+                request.id,
+                self.webhook_queue
+                    .complete(request.id, &self.worker_id)
+                    .await?,
+            );
             tracing::warn!(url = %request.url, "webhook given up after {WEBHOOK_MAX_ATTEMPTS} attempts");
             Ok(Some(WebhookOutcome::GivenUp))
         } else {
-            self.webhook_queue
-                .retry(request.id, request.attempts)
-                .await?;
+            owned(
+                "webhook_requests",
+                request.id,
+                self.webhook_queue
+                    .retry(request.id, request.attempts, &self.worker_id)
+                    .await?,
+            );
             Ok(Some(WebhookOutcome::Retrying))
         }
     }
@@ -1890,21 +2418,37 @@ impl Worker {
             }
         }
         if failures.is_empty() {
-            self.lifecycle_queue.complete(event.id).await?;
+            owned(
+                "lifecycle_events",
+                event.id,
+                self.lifecycle_queue
+                    .complete(event.id, &self.worker_id)
+                    .await?,
+            );
             return Ok(Some(WebhookOutcome::Delivered));
         }
         let detail = failures.join("; ");
         if event.attempts + 1 >= WEBHOOK_MAX_ATTEMPTS {
             tracing::warn!(event = %event.event, id = %event.uuid, %detail,
                 "lifecycle event given up after {WEBHOOK_MAX_ATTEMPTS} attempts");
-            self.lifecycle_queue.complete(event.id).await?;
+            owned(
+                "lifecycle_events",
+                event.id,
+                self.lifecycle_queue
+                    .complete(event.id, &self.worker_id)
+                    .await?,
+            );
             Ok(Some(WebhookOutcome::GivenUp))
         } else {
             tracing::info!(event = %event.event, id = %event.uuid, %detail,
                 "lifecycle event delivery failed, retrying");
-            self.lifecycle_queue
-                .retry(event.id, event.attempts, &detail)
-                .await?;
+            owned(
+                "lifecycle_events",
+                event.id,
+                self.lifecycle_queue
+                    .retry(event.id, event.attempts, &detail, &self.worker_id)
+                    .await?,
+            );
             Ok(Some(WebhookOutcome::Retrying))
         }
     }
@@ -1989,6 +2533,13 @@ impl Worker {
             report.api_requests_deleted = self.store.prune_api_request_log(cutoff, batch).await?;
         }
         report.expired_tokens_deleted = self.store.prune_expired_auth_tokens(now, batch).await?;
+        if self.feedback_report_days > 0 {
+            let cutoff = now - chrono::Duration::days(self.feedback_report_days as i64);
+            match self.store.purge_feedback_reports(cutoff, batch).await {
+                Ok(n) => report.feedback_reports_purged = n,
+                Err(error) => tracing::error!(%error, "feedback report retention failed"),
+            }
+        }
         Ok(report)
     }
 
@@ -2028,6 +2579,37 @@ impl Worker {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "pruned expired send-limit counters"),
             Err(error) => tracing::error!(%error, "send-counter pruning error"),
+        }
+
+        // Warm-up: judge yesterday, and prune usage and the decision log.
+        match self.evaluate_warmup(now).await {
+            Ok(0) => {}
+            Ok(decisions) => tracing::info!(decisions, "warm-up evaluated"),
+            Err(error) => tracing::error!(%error, "warm-up evaluation error"),
+        }
+        if let Err(error) = camelmailer_core::WarmupStore::prune_warmup(
+            &self.store,
+            now.date_naive() - chrono::Duration::days(WARMUP_USAGE_DAYS),
+            now - chrono::Duration::days(DELIVERY_STATS_DAYS),
+        )
+        .await
+        {
+            tracing::error!(%error, "warm-up pruning error");
+        }
+
+        // Delivery counters older than DELIVERY_STATS_DAYS, and the record
+        // of which address sent a message once a complaint about it can no
+        // longer be expected (MESSAGE_SOURCE_DAYS).
+        match DeliveryStatsStore::prune_delivery_stats(
+            &self.store,
+            now.date_naive() - chrono::Duration::days(DELIVERY_STATS_DAYS),
+            now - chrono::Duration::days(MESSAGE_SOURCE_DAYS),
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(pruned) => tracing::info!(pruned, "pruned delivery counters"),
+            Err(error) => tracing::error!(%error, "delivery-counter pruning error"),
         }
 
         // Without a lifecycle URL nothing can deliver the outbox (usage
@@ -2290,12 +2872,40 @@ mod tests {
         let sending = tracked.hold(2);
         sending.sending();
         tracked.hold(3).sending();
-        assert_eq!(tracked.unstarted(), vec![1]);
+        assert_eq!(tracked.take_unstarted(), vec![1]);
         let mut all = tracked.ids();
         all.sort_unstable();
         assert_eq!(all, vec![1, 2]);
+        // Taken once: a released row is not handed back twice.
+        assert!(tracked.take_unstarted().is_empty());
         drop(preparing);
-        assert!(tracked.unstarted().is_empty());
+        assert!(tracked.take_unstarted().is_empty());
+    }
+
+    #[test]
+    fn a_delivery_counts_as_unstarted_until_its_client_enters_the_data_gate() {
+        let tracked = Tracked::default();
+        let _before = tracked.hold(1);
+        let before_gate = tracked.delivering(1);
+        let _after = tracked.hold(2);
+        let after_gate = tracked.delivering(2);
+        assert!(after_gate.enter(), "an open gate lets DATA through");
+
+        assert_eq!(tracked.take_unstarted(), vec![1]);
+        assert!(!before_gate.enter(), "a released delivery never sends DATA");
+        assert!(after_gate.data_started());
+        assert!(after_gate.enter(), "a later endpoint may send DATA again");
+    }
+
+    #[test]
+    fn a_row_released_while_preparing_gets_a_closed_gate() {
+        let tracked = Tracked::default();
+        let _held = tracked.hold(7);
+        assert_eq!(tracked.take_unstarted(), vec![7]);
+        let gate = tracked.delivering(7);
+        assert!(!gate.enter());
+        tracked.sending(7);
+        assert!(tracked.take_unstarted().is_empty());
     }
 }
 

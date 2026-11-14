@@ -58,6 +58,9 @@ web_server:
   #   - https://mail-admin.example.com
   default_port: 5000
   default_bind_address: 127.0.0.1   # containers override via BIND_ADDRESS
+  # On SIGTERM: no new connections, requests in flight finish within this
+  # many seconds (env WEB_SERVER_SHUTDOWN_GRACE_SECONDS).
+  shutdown_grace_seconds: 30
 
 smtp_server:
   default_port: 25
@@ -75,6 +78,9 @@ smtp_server:
   # the client address. Turn it back on once the log stays quiet.
   # auth_requires_tls: false
   # proxy_protocol: true            # behind HAProxy etc.
+  # On SIGTERM: no new connections, open transactions finish within this
+  # many seconds, the rest get 421 (env SMTP_SERVER_SHUTDOWN_GRACE_SECONDS).
+  shutdown_grace_seconds: 30
   # Additional listeners besides default_port (which always speaks plain
   # SMTP with optional STARTTLS). mode "smtp" behaves like default_port;
   # mode "smtps" is implicit TLS from the first byte (port 465) and
@@ -211,6 +217,7 @@ retention:
   dmarc_report_days: 0       # received DMARC aggregate reports
   auth_event_days: 0         # authentication audit log
   api_request_days: 30       # per-server API request log
+  feedback_report_days: 30   # raw ARF complaint reports (they hold the recipient's address)
   batch_size: 1000           # rows per delete statement
 
 # Installation lifecycle webhooks: organization.created,
@@ -222,6 +229,50 @@ retention:
 lifecycle_webhooks:
   urls: []
   # secret: a-long-random-string   # required when urls is set
+
+# Provider feedback: Google Postmaster Tools (API v2), Microsoft SNDS and
+# complaint feedback loops (JMRP, Yahoo CFL). Each source is off until its
+# credentials are present. Secrets come from the environment variables named
+# below or from files; never write them into this file.
+# See docs/provider-feedback.md.
+deliverability_feedback:
+  fetch_interval_seconds: 21600      # 0 turns the scheduled fetch off
+  snapshot_retention_days: 400
+  postmaster_tools:
+    domains: []                      # e.g. [example.com], verified in Postmaster Tools
+    # client_id: 1234567890-abc.apps.googleusercontent.com    # CAMELMAILER_POSTMASTER_CLIENT_ID
+    # client_secret_file: /run/secrets/postmaster_client_secret  # CAMELMAILER_POSTMASTER_CLIENT_SECRET
+    # refresh_token_file: /run/secrets/postmaster_refresh_token  # CAMELMAILER_POSTMASTER_REFRESH_TOKEN
+  snds: {}
+    # data_url_file: /run/secrets/snds_data_url                  # CAMELMAILER_SNDS_DATA_URL
+  fbl:
+    suppress_complainants: true      # also for transactional mail; each server can opt out
+  # Seed inbox placement tests: one message per sending IP to each seed,
+  # looked up read-only over IMAP. They only measure; nothing is opened,
+  # clicked, answered or moved. Off while seeds is empty.
+  placement:
+    server: ""                       # organization/server that sends the tests
+    from_address: ""                 # e.g. placement@example.com, on a verified domain
+    interval_seconds: 0              # 0 = only on demand from the dashboard
+    min_round_interval_seconds: 3600
+    check_after_seconds: 600
+    max_checks: 3
+    seeds: []
+    # - provider: gmail              # gmail | outlook | yahoo | imap
+    #   address: seed@gmail.com
+    #   auth: app_password           # app_password | xoauth2 (Outlook.com: xoauth2 only)
+    #   password_file: /run/secrets/seed_gmail
+    # - provider: outlook
+    #   address: seed@outlook.com
+    #   auth: xoauth2
+    #   client_id: 00000000-0000-0000-0000-000000000000
+    #   client_secret_file: /run/secrets/seed_outlook_client_secret
+    #   refresh_token_file: /run/secrets/seed_outlook_refresh_token
+    # - provider: imap               # any other provider, e.g. GMX
+    #   address: seed@gmx.de
+    #   imap_host: imap.gmx.net
+    #   group: united_internet       # the provider group this seed measures
+    #   password_file: /run/secrets/seed_gmx
 
 # Captcha at self-registration (POST /api/v2/auth/register). `cap` speaks
 # the Cap siteverify contract (https://trycap.dev). The endpoint includes
@@ -265,3 +316,41 @@ saml:
 scim:
   enabled: false
   # bearer_token: "<long random secret>"   # required when enabled
+
+# Adaptive IP warm-up. Off until a pool or a pool address gets a mode
+# (dashboard: Infrastructure > IP metrics & warm-up). These are the limits it
+# judges by; the defaults suit most installations.
+warmup:
+  min_volume_fraction: 0.5      # below this share of the allowance: hold
+  advance_fraction: 0.9         # share of the allowance needed to grow
+  deferral_rate_slow: 0.05      # deferrals that stop the growth
+  bounce_rate_brake: 0.05       # bounces that brake
+  policy_blocks_brake: 3        # policy refusals that brake (count ...)
+  policy_block_rate_brake: 0.01 # ... and share of attempts)
+  complaint_rate_warn: 0.001    # 0.1 %: slow (Google's guideline)
+  complaint_rate_brake: 0.003   # 0.3 %: brake
+  pause_hours: 24               # how long a brake pauses the provider
+  step_back: 0.5                # allowance factor after a brake
+  defer_seconds: 900            # wait when no address of the pool has room
+
+# Receiving provider groups for IP metrics and warm-up. Built in: microsoft,
+# google, yahoo (incl. AOL), apple (iCloud), united_internet (GMX, WEB.DE,
+# mail.com, 1&1/IONOS), t_online; the rest is "other". Same name replaces a
+# built-in group, a new name adds one.
+# provider_groups:
+#   - name: seznam
+#     domains: [seznam.cz, email.cz]   # exact, or brand.* for any TLD
+#     mx_patterns: [seznam.cz]         # the host and every host under it
+# Cluster topology (the infrastructure dashboard). Every web, SMTP and
+# worker process registers under node_name and refreshes its entry every
+# heartbeat_interval_seconds. Nothing here changes how mail is received or
+# delivered.
+cluster:
+  node_name: ""                      # default: the host name (env CAMELMAILER_NODE_NAME)
+  # load_balancer_address: 203.0.113.5   # the public address in front of the SMTP/web nodes
+  # inbound_hostname: mail.example.com   # what MX records point at (A/AAAA on the LB)
+  # public_addresses: [203.0.113.10, "2001:db8::10"]   # this host's public addresses for
+  #                                    # servers without an IP pool, when the process only sees
+  #                                    # a private one (Docker); env CAMELMAILER_PUBLIC_ADDRESSES
+  heartbeat_interval_seconds: 30
+  node_stale_seconds: 90

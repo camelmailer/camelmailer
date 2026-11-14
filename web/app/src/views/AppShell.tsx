@@ -37,6 +37,7 @@ import {
   ScrollTextIcon,
   SearchIcon,
   SendIcon,
+  ServerCogIcon,
   ServerIcon,
   SettingsIcon,
   ShieldCheckIcon,
@@ -117,6 +118,9 @@ const SEGMENT_LABELS: Record<string, string> = {
   organizations: "Organizations",
   users: "Users",
   "ip-pools": "IP pools",
+  infrastructure: "Infrastructure",
+  feedback: "Provider feedback",
+  dns: "DNS checks",
   "api-keys": "Admin API keys",
   audit: "Audit log",
 }
@@ -641,6 +645,7 @@ function AppSidebar({ activeOrg }: { activeOrg: string | undefined }) {
                     ["/admin/organizations", "Organizations", Building2Icon],
                     ["/admin/users", "Users", UsersIcon],
                     ["/admin/ip-pools", "IP pools", NetworkIcon],
+                    ["/admin/infrastructure", "Infrastructure", ServerCogIcon],
                     ["/admin/api-keys", "Admin API keys", KeyRoundIcon],
                     ["/admin/audit", "Audit log", ScrollTextIcon],
                   ] as const
