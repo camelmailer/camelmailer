@@ -218,6 +218,24 @@ For deliverability you publish, per installation:
 | Return-path | `dns.return_path_domain` | MX to Camelmailer plus an SPF TXT record authorizing its outbound senders |
 | Click/open tracking | `dns.track_domain` | CNAME → the web server |
 
+Every DNS check of the installation (domain verification, the domain health
+check, the infrastructure DNS checks and the workers' reverse-DNS check) asks
+the public resolvers in `dns.check_resolvers`, never the host's or
+container's own resolver. That resolver can answer from local configuration,
+for example a PTR query for the host's address with its host name from
+`/etc/hosts`, which receivers on the internet never see. Set your own when
+outbound DNS to the defaults is blocked:
+
+```yaml
+dns:
+  check_resolvers: ["1.1.1.1", "9.9.9.9"]   # default; IP or IP:port, e.g. "[2620:fe::fe]:53"
+```
+
+Delivery (MX lookups) and the SPF check of inbound mail keep using the system
+resolver. A PTR name without a dot, or under `.local`, `.localdomain`,
+`.internal`, `.lan` or `.home.arpa`, never counts as a PTR record: the check
+fails and names the reason.
+
 `dns.return_path_envelope` defaults to `false` in 0.7.x. Setting a
 return-path domain alone configures intake and does not change outbound
 `MAIL FROM`. Publish the return-path MX and SPF records, then explicitly set

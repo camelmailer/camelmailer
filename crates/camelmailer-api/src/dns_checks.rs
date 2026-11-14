@@ -315,19 +315,57 @@ pub async fn address_checks(
                 detail: "no PTR record; receivers such as Microsoft 365 and Gmail refuse or junk mail from an address without one".into(),
             },
         ),
-        Ok(names) => (
-            names.clone(),
-            DnsCheck {
-                group: "address",
-                subject: subject.clone(),
-                kind: "ptr",
-                status: CheckStatus::Ok,
-                found: names.clone(),
-                expected: vec![ehlo.clone()],
-                instructions: Vec::new(),
-                detail: "has a PTR record".into(),
-            },
-        ),
+        Ok(names) => {
+            // A bare host name or a local-only name is what a host's own
+            // resolver answers for itself; it never counts as a PTR record.
+            let public: Vec<String> = names
+                .iter()
+                .filter(|name| camelmailer_core::ptr_name_problem(name).is_none())
+                .cloned()
+                .collect();
+            if public.is_empty() {
+                let reasons: Vec<String> = names
+                    .iter()
+                    .map(|name| {
+                        format!(
+                            "{name}: {}",
+                            camelmailer_core::ptr_name_problem(name)
+                                .unwrap_or("not a public name")
+                        )
+                    })
+                    .collect();
+                (
+                    Vec::new(),
+                    DnsCheck {
+                        group: "address",
+                        subject: subject.clone(),
+                        kind: "ptr",
+                        status: CheckStatus::Fail,
+                        found: names.clone(),
+                        expected: vec![ehlo.clone()],
+                        instructions: vec![ptr_instruction(&address, &ehlo)],
+                        detail: format!(
+                            "no public PTR record ({}); receivers such as Microsoft 365 and Gmail refuse or junk mail from an address without one",
+                            reasons.join("; ")
+                        ),
+                    },
+                )
+            } else {
+                (
+                    public,
+                    DnsCheck {
+                        group: "address",
+                        subject: subject.clone(),
+                        kind: "ptr",
+                        status: CheckStatus::Ok,
+                        found: names.clone(),
+                        expected: vec![ehlo.clone()],
+                        instructions: Vec::new(),
+                        detail: "has a PTR record".into(),
+                    },
+                )
+            }
+        }
     };
     checks.push(ptr_check);
 
@@ -1097,10 +1135,11 @@ pub struct DnsChecksCache {
 }
 
 fn resolver_for(state: &ApiState) -> Arc<dyn DnsCheckResolver> {
-    state
-        .dns_check_resolver
-        .clone()
-        .unwrap_or_else(|| Arc::new(crate::dns::HickoryDnsCheckResolver::new()))
+    state.dns_check_resolver.clone().unwrap_or_else(|| {
+        Arc::new(crate::dns::HickoryDnsCheckResolver::new(
+            &state.config.dns.check_resolver_addresses(),
+        ))
+    })
 }
 
 #[derive(Deserialize)]
@@ -1367,6 +1406,65 @@ pub(crate) mod tests {
             vec!["set AAAA out1.mail.example.com → 2001:db8::10, TTL 300"]
         );
         assert_eq!(checks.len(), 2, "no EHLO comparison without a PTR");
+    }
+
+    /// The case camelmailer.com showed on 2026-11-14: the container's
+    /// resolver answered the IPv6 PTR with the host name, which resolved
+    /// back. A bare or local-only name never counts as a PTR record.
+    #[tokio::test]
+    async fn a_local_host_name_is_not_a_ptr_record() {
+        let mut dns = FakeDns::default();
+        dns.ptr.insert(
+            ip("2001:db8::10"),
+            vec!["camelmailer".into(), "camelmailer.local".into()],
+        );
+        dns.ips
+            .insert("camelmailer.local".into(), vec![ip("2001:db8::10")]);
+        let checks = address_checks(&dns, &sending("2001:db8::10", "mx.example.com")).await;
+        assert_eq!(checks[0].kind, "ptr");
+        assert_eq!(checks[0].status, CheckStatus::Fail);
+        assert!(
+            checks[0].detail.contains("no public PTR record"),
+            "{}",
+            checks[0].detail
+        );
+        assert!(checks[0]
+            .detail
+            .contains("camelmailer: a name without a dot"));
+        assert!(checks[0]
+            .detail
+            .contains("camelmailer.local: a local-only name"));
+        assert_eq!(
+            checks[0].instructions,
+            vec!["set PTR 2001:db8::10 → mx.example.com (at the provider of the address)"]
+        );
+        assert_eq!(checks[1].kind, "fcrdns");
+        assert_ne!(
+            checks[1].status,
+            CheckStatus::Ok,
+            "a local name never confirms"
+        );
+    }
+
+    #[test]
+    fn the_production_resolvers_ask_the_configured_public_servers() {
+        let defaults = crate::dns::default_check_resolvers();
+        assert_eq!(
+            defaults,
+            vec![
+                "1.1.1.1:53".parse::<std::net::SocketAddr>().unwrap(),
+                "9.9.9.9:53".parse().unwrap()
+            ]
+        );
+        // Building one from any list (including an empty one, which falls
+        // back to the defaults) never panics.
+        let _ = crate::dns::public_resolver(&[]);
+        let resolver = crate::dns::public_resolver(&["192.0.2.53:5353".parse().unwrap()]);
+        // Never the hosts file, which is where a container's own name lives.
+        assert_eq!(
+            resolver.options().use_hosts_file,
+            hickory_resolver::config::ResolveHosts::Never
+        );
     }
 
     #[tokio::test]

@@ -89,7 +89,7 @@ impl ApiState {
         Self::new_with_resolver(
             store,
             global_admin_api_key,
-            Arc::new(crate::dns::HickoryDnsResolver),
+            Arc::new(crate::dns::HickoryDnsResolver::default()),
         )
     }
 
@@ -134,7 +134,7 @@ impl ApiState {
             global_admin_api_key,
             config: camelmailer_config::Config::default(),
             billing: Arc::new(crate::billing::NoBilling),
-            dns_resolver: Arc::new(crate::dns::HickoryDnsResolver),
+            dns_resolver: Arc::new(crate::dns::HickoryDnsResolver::default()),
             installation_dkim_public_key: None,
             sso_github: Arc::new(crate::sso::HttpGithub::default()),
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
@@ -158,13 +158,16 @@ impl ApiState {
         global_admin_api_key: Option<String>,
         config: camelmailer_config::Config,
     ) -> Arc<Self> {
+        let dns_resolver = Arc::new(crate::dns::HickoryDnsResolver::new(
+            config.dns.check_resolver_addresses(),
+        ));
         Self::full_with_resolver(
             store,
             server_store,
             auth_store,
             global_admin_api_key,
             config,
-            Arc::new(crate::dns::HickoryDnsResolver),
+            dns_resolver,
         )
     }
 
@@ -177,6 +180,9 @@ impl ApiState {
         config: camelmailer_config::Config,
         billing: Option<Arc<dyn crate::billing::BillingProvider>>,
     ) -> Arc<Self> {
+        let dns_resolver = Arc::new(crate::dns::HickoryDnsResolver::new(
+            config.dns.check_resolver_addresses(),
+        ));
         Self::full_with(
             store,
             server_store,
@@ -184,7 +190,7 @@ impl ApiState {
             global_admin_api_key,
             config,
             billing,
-            Arc::new(crate::dns::HickoryDnsResolver),
+            dns_resolver,
         )
     }
 
@@ -218,6 +224,9 @@ impl ApiState {
         config: camelmailer_config::Config,
         sso_github: Arc<dyn crate::sso::GithubOauth>,
     ) -> Arc<Self> {
+        let dns_resolver = Arc::new(crate::dns::HickoryDnsResolver::new(
+            config.dns.check_resolver_addresses(),
+        ));
         Self::full_with_all(
             store,
             server_store,
@@ -225,7 +234,7 @@ impl ApiState {
             global_admin_api_key,
             config,
             None,
-            Arc::new(crate::dns::HickoryDnsResolver),
+            dns_resolver,
             sso_github,
         )
     }

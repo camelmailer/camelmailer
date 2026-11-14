@@ -118,10 +118,33 @@ pub struct HickoryReverseDnsResolver {
 }
 
 impl HickoryReverseDnsResolver {
-    pub fn new() -> Result<Self, String> {
-        let resolver = hickory_resolver::TokioResolver::builder_tokio()
-            .and_then(|builder| builder.build())
-            .map_err(|error| error.to_string())?;
+    /// Asks only the public resolvers `servers` (`dns.check_resolvers`):
+    /// no system configuration, no hosts file. The host's or container's
+    /// own resolver can answer a PTR query for the host's address with its
+    /// host name, which receivers never see.
+    pub fn new(servers: &[SocketAddr]) -> Result<Self, String> {
+        use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig};
+        if servers.is_empty() {
+            return Err("no resolver in dns.check_resolvers".into());
+        }
+        let mut config = ResolverConfig::from_parts(None, Vec::new(), Vec::new());
+        for server in servers {
+            let mut name_server = NameServerConfig::udp_and_tcp(server.ip());
+            for connection in &mut name_server.connections {
+                connection.port = server.port();
+            }
+            config.add_name_server(name_server);
+        }
+        let mut builder = hickory_resolver::TokioResolver::builder_with_config(
+            config,
+            hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+        );
+        let options = builder.options_mut();
+        options.use_hosts_file = ResolveHosts::Never;
+        options.ndots = 0;
+        options.timeout = Duration::from_secs(3);
+        options.attempts = 2;
+        let resolver = builder.build().map_err(|error| error.to_string())?;
         Ok(Self { resolver })
     }
 }
@@ -247,8 +270,35 @@ pub async fn check_address(
             )
         }
     };
+    // A bare host name or a local-only name (camelmailer, box.local) is what
+    // a host's own resolver answers for itself; receivers never see it, so it
+    // does not count as a PTR record.
+    let public: Vec<&String> = names
+        .iter()
+        .filter(|name| camelmailer_core::ptr_name_problem(name).is_none())
+        .collect();
+    if public.is_empty() {
+        let reasons: Vec<String> = names
+            .iter()
+            .map(|name| {
+                format!(
+                    "{name}: {}",
+                    camelmailer_core::ptr_name_problem(name).unwrap_or("not a public name")
+                )
+            })
+            .collect();
+        return result(
+            ReverseDnsStatus::NoPtr,
+            names,
+            format!(
+                "{address} has no public PTR record ({}); receivers such as Microsoft 365 \
+                 refuse mail from it (S820)",
+                reasons.join("; ")
+            ),
+        );
+    }
     let mut failure = None;
-    for name in &names {
+    for name in public {
         match resolver.addresses(name, address).await {
             Ok(resolved) if resolved.contains(&address) => {
                 return result(
@@ -567,7 +617,7 @@ pub fn spawn(
         tracing::info!("reverse-DNS check of the source addresses is off");
         return None;
     }
-    let resolver = match HickoryReverseDnsResolver::new() {
+    let resolver = match HickoryReverseDnsResolver::new(&config.dns.check_resolver_addresses()) {
         Ok(resolver) => resolver,
         Err(error) => {
             tracing::warn!(%error, "no resolver for the reverse-DNS check of the source addresses");
@@ -678,6 +728,51 @@ mod tests {
         // the AAAA lookup confirms an IPv6 address
         let check = check_address(&table(), ip("2001:db8::10"), Origin::Host).await;
         assert_eq!(check.status, ReverseDnsStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn a_local_host_name_from_the_resolver_is_not_a_ptr() {
+        let mut table = table();
+        // What a host's own resolver answers for its address: its host name.
+        table.ptr.insert(
+            ip("203.0.113.40"),
+            Ok(vec!["camelmailer".into(), "camelmailer.local".into()]),
+        );
+        table
+            .forward
+            .insert("camelmailer.local".into(), Ok(vec![ip("203.0.113.40")]));
+        let check = check_address(&table, ip("203.0.113.40"), Origin::Host).await;
+        assert_eq!(check.status, ReverseDnsStatus::NoPtr);
+        assert!(check.detail.contains("no public PTR"), "{}", check.detail);
+        assert!(
+            check.detail.contains("camelmailer: a name without a dot"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("camelmailer.local: a local-only name"),
+            "{}",
+            check.detail
+        );
+        assert!(check.status.failed());
+
+        // A public name next to a local one still counts.
+        table.ptr.insert(
+            ip("203.0.113.41"),
+            Ok(vec!["box.lan".into(), "out2.example.com".into()]),
+        );
+        table
+            .forward
+            .insert("out2.example.com".into(), Ok(vec![ip("203.0.113.41")]));
+        let check = check_address(&table, ip("203.0.113.41"), Origin::Pool).await;
+        assert_eq!(check.status, ReverseDnsStatus::Pass);
+    }
+
+    #[test]
+    fn the_production_resolver_needs_a_configured_server() {
+        assert!(HickoryReverseDnsResolver::new(&[]).is_err());
     }
 
     #[tokio::test]

@@ -1,38 +1,80 @@
-//! The production [`DnsResolver`]: hickory-resolver on tokio, using the
-//! system resolver configuration (with the library defaults as fallback).
-//! Used by `POST …/domains/{name}/verify`; tests inject
-//! [`camelmailer_core::StaticDnsResolver`] instead.
+//! The production DNS resolvers of the checks: domain verification
+//! ([`HickoryDnsResolver`]), the domain health check's SPF evaluation
+//! ([`HickorySpfResolver`]) and the infrastructure DNS checks
+//! ([`HickoryDnsCheckResolver`]). All of them ask the public resolvers of
+//! `dns.check_resolvers` (default 1.1.1.1 and 9.9.9.9), never the host's or
+//! container's resolver, which can answer from local configuration (the
+//! host name, `/etc/hosts`, mDNS, a split-horizon zone) instead of what the
+//! rest of the internet sees. Tests inject
+//! [`camelmailer_core::StaticDnsResolver`] or a fake instead.
 
 use async_trait::async_trait;
 use camelmailer_core::{DnsError, DnsResolver};
-use hickory_resolver::config::{ResolverConfig, GOOGLE};
+use hickory_resolver::config::{ResolveHosts, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::NetError;
 use hickory_resolver::proto::rr::RData;
 use hickory_resolver::TokioResolver;
+use std::net::SocketAddr;
 
-/// A resolver from the system configuration, falling back to Google's public
-/// resolvers (the hickory 0.24 `ResolverConfig::default()`) when the system
-/// configuration cannot be read.
-fn system_resolver() -> TokioResolver {
-    TokioResolver::builder_tokio()
-        .and_then(|builder| builder.build())
-        .or_else(|_| {
-            TokioResolver::builder_with_config(
-                ResolverConfig::udp_and_tcp(&GOOGLE),
-                TokioRuntimeProvider::default(),
-            )
-            .build()
-        })
+/// The default public resolvers (`dns.check_resolvers`).
+pub fn default_check_resolvers() -> Vec<SocketAddr> {
+    camelmailer_config::DEFAULT_CHECK_RESOLVERS
+        .iter()
+        .map(|ip| SocketAddr::new(ip.parse().expect("a valid default resolver address"), 53))
+        .collect()
+}
+
+/// A resolver that asks only `servers` (UDP, then TCP): no system
+/// configuration, no hosts file, no search domains. Every name is looked up
+/// as given (the callers append the root dot).
+pub fn public_resolver(servers: &[SocketAddr]) -> TokioResolver {
+    let servers = if servers.is_empty() {
+        default_check_resolvers()
+    } else {
+        servers.to_vec()
+    };
+    let mut config = ResolverConfig::from_parts(None, Vec::new(), Vec::new());
+    for server in &servers {
+        let mut name_server = hickory_resolver::config::NameServerConfig::udp_and_tcp(server.ip());
+        for connection in &mut name_server.connections {
+            connection.port = server.port();
+        }
+        config.add_name_server(name_server);
+    }
+    let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+    let options = builder.options_mut();
+    options.use_hosts_file = ResolveHosts::Never;
+    options.ndots = 0;
+    options.timeout = std::time::Duration::from_secs(3);
+    options.attempts = 2;
+    builder
+        .build()
         .expect("a resolver with a static configuration always builds")
 }
 
-pub struct HickoryDnsResolver;
+/// Domain verification (`POST …/domains/{name}/verify`): TXT and CNAME
+/// lookups through the public resolvers.
+pub struct HickoryDnsResolver {
+    servers: Vec<SocketAddr>,
+}
+
+impl HickoryDnsResolver {
+    pub fn new(servers: Vec<SocketAddr>) -> Self {
+        Self { servers }
+    }
+}
+
+impl Default for HickoryDnsResolver {
+    fn default() -> Self {
+        Self::new(default_check_resolvers())
+    }
+}
 
 #[async_trait]
 impl DnsResolver for HickoryDnsResolver {
     async fn txt_records(&self, name: &str) -> Result<Vec<String>, DnsError> {
-        let resolver = system_resolver();
+        let resolver = public_resolver(&self.servers);
         match resolver.txt_lookup(format!("{name}.")).await {
             Ok(lookup) => Ok(txt_strings(&lookup)),
             // "no such record" is an answer, not a failure
@@ -43,7 +85,7 @@ impl DnsResolver for HickoryDnsResolver {
 
     async fn cname(&self, name: &str) -> Result<Option<String>, DnsError> {
         use hickory_resolver::proto::rr::RecordType;
-        let resolver = system_resolver();
+        let resolver = public_resolver(&self.servers);
         match resolver.lookup(format!("{name}."), RecordType::CNAME).await {
             Ok(lookup) => Ok(lookup
                 .answers()
@@ -74,15 +116,17 @@ pub struct HickorySpfResolver {
 }
 
 impl HickorySpfResolver {
-    pub fn new() -> Self {
-        let resolver = system_resolver();
-        Self { resolver }
+    /// Asks the public resolvers `servers` (`dns.check_resolvers`).
+    pub fn new(servers: &[SocketAddr]) -> Self {
+        Self {
+            resolver: public_resolver(servers),
+        }
     }
 }
 
 impl Default for HickorySpfResolver {
     fn default() -> Self {
-        Self::new()
+        Self::new(&default_check_resolvers())
     }
 }
 
@@ -231,16 +275,17 @@ pub struct HickoryDnsCheckResolver {
 pub const DNS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl HickoryDnsCheckResolver {
-    pub fn new() -> Self {
+    /// Asks the public resolvers `servers` (`dns.check_resolvers`).
+    pub fn new(servers: &[SocketAddr]) -> Self {
         Self {
-            spf: HickorySpfResolver::new(),
+            spf: HickorySpfResolver::new(servers),
         }
     }
 }
 
 impl Default for HickoryDnsCheckResolver {
     fn default() -> Self {
-        Self::new()
+        Self::new(&default_check_resolvers())
     }
 }
 

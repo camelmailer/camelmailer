@@ -113,6 +113,9 @@ dns:
   route_domain: routes.example.com
   track_domain: track.example.com
   dkim_identifier: camelmailer
+  # Public resolvers every DNS check asks (verification, health, the
+  # infrastructure DNS checks, reverse DNS); never the host's own resolver.
+  check_resolvers: ["1.1.1.1", "9.9.9.9"]
   # Domain-ownership challenge record (brandable). The API looks up a TXT
   # at "<verification_record_label>.<domain>" whose value is
   # "<verification_value_prefix>=<token>".
