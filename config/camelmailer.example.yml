@@ -58,6 +58,9 @@ web_server:
   #   - https://mail-admin.example.com
   default_port: 5000
   default_bind_address: 127.0.0.1   # containers override via BIND_ADDRESS
+  # On SIGTERM: no new connections, requests in flight finish within this
+  # many seconds (env WEB_SERVER_SHUTDOWN_GRACE_SECONDS).
+  shutdown_grace_seconds: 30
 
 smtp_server:
   default_port: 25
@@ -75,6 +78,9 @@ smtp_server:
   # the client address. Turn it back on once the log stays quiet.
   # auth_requires_tls: false
   # proxy_protocol: true            # behind HAProxy etc.
+  # On SIGTERM: no new connections, open transactions finish within this
+  # many seconds, the rest get 421 (env SMTP_SERVER_SHUTDOWN_GRACE_SECONDS).
+  shutdown_grace_seconds: 30
   # Additional listeners besides default_port (which always speaks plain
   # SMTP with optional STARTTLS). mode "smtp" behaves like default_port;
   # mode "smtps" is implicit TLS from the first byte (port 465) and
