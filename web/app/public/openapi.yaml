@@ -3470,8 +3470,9 @@ paths:
         What the large mailbox providers report about this installation's mail, per source:
         Google Postmaster Tools (per sending domain and day: spam rate, SPF/DKIM/DMARC success,
         outbound TLS, delivery error rates), Microsoft SNDS (per sending IP and day: filter
-        result, complaint rate, trap hits) and the complaint feedback loops (ARF reports counted
-        per provider and day). `enabled` says whether a worker has the source's credentials;
+        result, complaint rate, trap hits), the complaint feedback loops (ARF reports counted
+        per provider and day) and the seed placement tests (inbox, spam or missing per sending IP
+        and provider). `enabled` says whether a worker has the source's credentials;
         `freshness_seconds` is the age of the newest data. Each source lists its newest snapshot
         per domain, IP or provider, worst verdict first. Global administrators only.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
@@ -3493,7 +3494,7 @@ paths:
                         items:
                           type: object
                           properties:
-                            source: { type: string, enum: [postmaster_tools, snds, fbl] }
+                            source: { type: string, enum: [postmaster_tools, snds, fbl, placement] }
                             provider: { type: string, enum: [google, microsoft, several] }
                             enabled: { type: boolean }
                             freshness_seconds: { type: integer, nullable: true }
@@ -3514,7 +3515,7 @@ paths:
                                 type: object
                                 properties:
                                   source: { type: string }
-                                  provider: { type: string, enum: [google, microsoft, yahoo, other] }
+                                  provider: { type: string, pattern: "^[a-z0-9_]+$" }
                                   subject_kind: { type: string, enum: [domain, ip, provider] }
                                   subject: { type: string }
                                   data_date: { type: string, format: date }
@@ -3522,6 +3523,91 @@ paths:
                                   detail: { type: string }
                                   metrics: { type: object, additionalProperties: true }
                                   fetched_at: { type: string, format: date-time }
+  /api/v2/admin/deliverability/placement_tests:
+    get:
+      tags: [Instance]
+      summary: Seed placement history
+      description: >-
+        Every inbox placement test with its result and time, newest first: one test message
+        per sending IP to every configured seed mailbox, looked up read-only over IMAP.
+        `configured` says whether `deliverability_feedback.placement` has a server, a sender
+        and seeds. The warm-up reads the worst result of the last 24 hours per IP and provider
+        group. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: ip, in: query, required: false, schema: { type: string } }
+        - { name: provider, in: query, required: false, description: A provider group name., schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
+      responses:
+        "200":
+          description: The tests
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      configured: { type: boolean }
+                      last_round:
+                        $ref: "#/components/schemas/PlacementRound"
+                      placement_tests:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: integer }
+                            round_id: { type: integer }
+                            server_id: { type: integer }
+                            message_id: { type: integer, nullable: true }
+                            ip_pool_id: { type: integer }
+                            ip_address_id: { type: integer }
+                            ip: { type: string }
+                            seed_address: { type: string }
+                            seed_provider: { type: string, enum: [gmail, outlook, yahoo, imap] }
+                            provider: { type: string, pattern: "^[a-z0-9_]+$" }
+                            status: { type: string, enum: [pending, inbox, spam, missing, error] }
+                            folder: { type: string, nullable: true }
+                            spf: { type: string, nullable: true }
+                            dkim: { type: string, nullable: true }
+                            dmarc: { type: string, nullable: true }
+                            received_ip: { type: string, nullable: true }
+                            helo: { type: string, nullable: true }
+                            detail: { type: string }
+                            checks: { type: integer }
+                            created_at: { type: string, format: date-time }
+                            checked_at: { type: string, format: date-time, nullable: true }
+    post:
+      tags: [Instance]
+      summary: Run a placement round now
+      description: >-
+        Requests one round of seed placement tests; a worker sends it within a minute. At most
+        one round per `deliverability_feedback.placement.min_round_interval_seconds` (3600),
+        scheduled rounds included. The tests only measure: nothing is opened, clicked, answered
+        or moved in the seed mailboxes. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "202":
+          description: The round was requested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      placement_round:
+                        $ref: "#/components/schemas/PlacementRound"
+        "409":
+          description: >-
+            `PlacementNotConfigured` (no server, sender or seeds) or `PlacementRateLimited`
+            (a round was requested too recently)
   /api/v2/admin/admin_api_keys:
     get:
       tags: [Instance]
@@ -3684,6 +3770,14 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
   schemas:
+    PlacementRound:
+      type: object
+      nullable: true
+      properties:
+        id: { type: integer }
+        trigger: { type: string, enum: [schedule, manual] }
+        requested_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time, nullable: true }
     WarmupProfile:
       type: object
       properties:

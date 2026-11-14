@@ -10,6 +10,7 @@ feedback** (`/admin/infrastructure/feedback`) and through
 | Google Postmaster Tools (API v2) | Gmail | User-reported spam rate, SPF/DKIM/DMARC success, outbound TLS, delivery error rates | per sending domain and day |
 | Microsoft SNDS | Outlook.com, Hotmail | Filter result (green, yellow, red), complaint rate, trap hits, sample HELO | per sending IP and day |
 | Complaint feedback loops | Microsoft (JMRP), Yahoo (CFL), others | Spam complaints as ARF reports | per provider and day |
+| Seed placement tests | your own seed mailboxes | Inbox, spam or missing, with SPF/DKIM/DMARC, connecting IP and EHLO | per sending IP and seed |
 
 Every source is optional and switched on by its credentials alone. A source
 without credentials is shown as off; it never stops a process from starting.
@@ -43,6 +44,7 @@ reads:
 | Postmaster Tools | spam rate below 0.1 % | spam rate from 0.1 %, or any rejects for low IP or domain reputation | spam rate from 0.3 % |
 | SNDS | filter result green | filter result yellow, complaint rate from 0.3 %, or trap hits | filter result red |
 | Feedback loops | (a count; rated against the IP's volume by the warm-up) | | |
+| Placement tests | every test of the last 24 h in the inbox | | any test of the last 24 h in the spam folder or not found |
 
 The thresholds come from the providers: Google asks senders to keep the spam
 rate in Postmaster Tools below 0.10 % and never to reach 0.30 %
@@ -172,6 +174,92 @@ type `complaint` and the reason "Spam complaint (feedback loop)". Filter by
 type to see them; **Reactivate** removes one, after which the server mails
 the address again.
 
+## Seed placement tests
+
+Placement tests send one message from every sending IP (every IP pool
+address) to every seed mailbox you configure, then look each message up and
+record where it landed: **inbox**, **spam** or **missing**, together with
+what the receiving provider wrote into the message: the SPF, DKIM and DMARC
+results of its `Authentication-Results` header and the connecting IP and
+EHLO name of its `Received` line. A result per seed provider shows when an
+IP is welcome at Gmail but filtered at Outlook.com.
+
+**The tests only measure.** Camelmailer never opens, clicks, replies to,
+flags, moves or deletes a message in a seed mailbox, and never marks one as
+"not spam". It opens folders with `EXAMINE` (read-only) and reads headers
+with `BODY.PEEK`, which leaves the message unread; its IMAP client has no
+command that changes a mailbox. Faking engagement would distort the
+measurement and works against the providers' rules.
+
+### Setting up the seeds
+
+1. Create one mailbox per provider you want to measure, used for nothing
+   else: for example a Gmail, an Outlook.com and a Yahoo address. Do not add
+   the sending address to their contacts or safe senders, so they judge
+   your mail like any recipient would.
+2. Give the installation IMAP access, the way each provider requires it
+   today:
+
+   | Provider | IMAP server | Sign-in |
+   |---|---|---|
+   | Gmail | `imap.gmail.com:993` | an app password (needs 2-Step Verification) or OAuth2 (`XOAUTH2`, scope `https://mail.google.com/`), [Google](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol) |
+   | Outlook.com | `outlook.office365.com:993` | OAuth2 only (`XOAUTH2`, scope `https://outlook.office.com/IMAP.AccessAsUser.All offline_access`). Microsoft ended password sign-in for IMAP on 2024-09-16, [Microsoft](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth) |
+   | Yahoo | `imap.mail.yahoo.com:993` | an app password, [Yahoo](https://help.yahoo.com/kb/SLN4075.html) |
+   | Others (GMX, Web.de, T-Online, iCloud, ...) | the provider's IMAP server, `provider: imap` with `imap_host` | what the provider requires (often an app password) |
+
+   Each seed measures one provider group: `google` for gmail, `microsoft`
+   for outlook, `yahoo` for yahoo, `other` for imap. Set `group` on an
+   `imap` seed to measure another configured group, for example
+   `united_internet` for a GMX or Web.de seed, `t_online` or `apple`. Group
+   names are lowercase letters, digits and `_`, the same names as the
+   provider groups of the IP metrics and the warm-up.
+
+   For Outlook.com, register an app in Microsoft Entra ("Personal Microsoft
+   accounts" allowed), add the delegated permission `IMAP.AccessAsUser.All`
+   and obtain a refresh token for the seed account with the authorization
+   code or device code flow. The token endpoint for personal accounts is
+   `https://login.microsoftonline.com/consumers/oauth2/v2.0/token`.
+3. Pick the mail server that sends the tests (a server of your own
+   organization) and a sender address on one of its verified domains, so
+   the tests carry that domain's DKIM signature.
+4. Configure the worker:
+
+   ```yaml
+   deliverability_feedback:
+     placement:
+       server: ops/placement                 # organization/server permalinks
+       from_address: placement@example.com
+       interval_seconds: 86400               # once a day; 0 = only on demand
+       seeds:
+         - provider: gmail
+           address: seed.example@gmail.com
+           auth: app_password
+           password_file: /run/secrets/seed_gmail
+         - provider: outlook
+           address: seed.example@outlook.com
+           auth: xoauth2
+           client_id: 00000000-0000-0000-0000-000000000000
+           client_secret_file: /run/secrets/seed_outlook_client_secret
+           refresh_token_file: /run/secrets/seed_outlook_refresh_token
+         - provider: yahoo
+           address: seed.example@yahoo.com
+           password_env: SEED_YAHOO_PASSWORD
+   ```
+
+Run a round from the Provider feedback page or with
+`POST /api/v2/admin/deliverability/placement_tests`. A worker sends it
+within a minute and looks the messages up after `check_after_seconds` (600),
+up to `max_checks` (3) times before it records a message as missing. At most
+one round runs per `min_round_interval_seconds` (3600), so the seeds receive
+a handful of messages a day.
+
+The tests are plain text, carry the subject prefix `[Placement test]` and
+the header `X-Camelmailer-Placement-Test`, and go through the normal queue
+and the server's suppression list. The worker sends a test from the IP it
+names only when the header carries a token the placement runner created for
+that server; for every other message the header changes nothing. With
+`worker.host_aware_pools`, a test is handed to the host that holds its IP.
+
 ## Privacy of complaint reports
 
 An ARF report contains the complaining recipient's address and usually the
@@ -198,11 +286,47 @@ follows:
 Tell your recipients in your privacy policy that spam complaints are
 processed to stop further mail to them.
 
+### The IMAP client
+
+Camelmailer reads the seeds with a small IMAP client of its own instead of
+the `async-imap` crate: every `async-imap` release depends on `pin-utils`,
+which RustSec lists as unmaintained (RUSTSEC-2026-0441, no fixed release),
+and the project's dependency policy (`cargo deny`) admits no exception for
+it. The client needs only a read-only command set, so it stays small:
+
+- `LOGIN` or `AUTHENTICATE XOAUTH2`, `LIST`, `EXAMINE`,
+  `UID SEARCH HEADER`, `UID FETCH (BODY.PEEK[HEADER])` and `LOGOUT`. It has
+  no command that could store flags, copy, move, delete or expunge.
+- It treats every server answer as untrusted: a line is read up to 1 MiB, a
+  response with its literals up to 4 MiB (a literal's announced size is
+  checked before anything is allocated), a command accepts up to 100,000
+  untagged lines, and every read times out after 30 seconds. Anything beyond
+  that ends the lookup with an error; the test is retried at the next check.
+- Invalid UTF-8 and NUL bytes are replaced or ignored, never trusted.
+
+Its tests feed it crafted and generated hostile responses (huge and
+overflowing literal sizes, unterminated quotes, deep nesting, invalid UTF-8,
+split line ends, missing tags, endless lines, NUL bytes) and require that it
+neither panics nor hangs.
+
+### Placement history
+
+Every test is kept with its result and the time it was checked, until
+`deliverability_feedback.snapshot_retention_days` (400). The Provider
+feedback page lists the history and filters it by IP, provider group and
+result; `GET /api/v2/admin/deliverability/placement_tests?ip=…&provider=…`
+returns the same (newest first, up to 1000).
+
+For the warm-up, the WORST result of the last 24 hours per IP and provider
+group counts: one test in the spam folder, or one that never arrived, makes
+the signal `bad` even when another seed of the same group saw the inbox.
+Only when every test of the last 24 hours reached the inbox is it `ok`.
+
 ## Use by the warm-up
 
 The verdicts are stored so that the adaptive warm-up can read the newest
 signals of one IP and provider group in a single query
 (`FeedbackStore::latest_provider_signals`): SNDS rows of that IP, plus the
 domain-wide Postmaster Tools rows and the provider-wide feedback-loop counts
-of that provider. Connecting them to the warm-up brake is a separate change;
+of that provider, plus the worst placement result of the last 24 hours. Connecting them to the warm-up brake is a separate change;
 until then the signals are shown and change nothing about delivery.

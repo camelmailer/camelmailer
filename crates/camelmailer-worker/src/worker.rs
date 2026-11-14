@@ -824,6 +824,33 @@ impl Worker {
         Ok(count)
     }
 
+    /// The pool address a seed placement test must be sent from. Only a
+    /// message that carries the `X-Camelmailer-Placement-Test` header with a
+    /// token the placement runner created, on the server the runner sent it
+    /// from, gets one; for every other message this is one header lookup
+    /// and `None`, and its source is chosen as before. A tenant cannot pick
+    /// an IP this way: the token is random and bound to the runner's row.
+    pub async fn placement_address(
+        &self,
+        message: &StoredMessage,
+    ) -> Option<camelmailer_core::IpAddress> {
+        let token = camelmailer_core::message::header_value(
+            &message.raw_message,
+            crate::placement::PLACEMENT_HEADER,
+        )?;
+        let test =
+            camelmailer_core::FeedbackStore::placement_test_by_token(&self.store, token.trim())
+                .await
+                .ok()
+                .flatten()
+                .filter(|test| test.server_id == message.server_id)?;
+        camelmailer_core::AdminStore::list_ip_addresses(&self.store, test.ip_pool_id)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|address| address.id == test.ip_address_id)
+    }
+
     /// Whether a feedback-loop complaint about transactional mail of
     /// `server_id` suppresses the recipient: the server's own setting, else
     /// `deliverability_feedback.fbl.suppress_complainants`.
@@ -1258,81 +1285,104 @@ impl Worker {
         // resolves to the server pool exactly as before.
         // Every address the delivery may go out from, for warm-up overflow.
         let mut candidates: Vec<camelmailer_core::IpAddress> = Vec::new();
-        let source: Option<camelmailer_core::IpAddress> =
+        // A seed placement test names the pool address it measures (and is
+        // left out of warm-up overflow: no candidates); every other message
+        // (no placement header) takes the usual path below.
+        let placement = self.placement_address(message).await;
+        let source: Option<camelmailer_core::IpAddress> = if let Some(address) = placement {
             if let Some(selection) = &self.source_selection {
-                // Host-aware: only the pool addresses this host holds. A pool
-                // with none here goes back to the queue for a host that has one;
-                // no pool at all keeps the OS default address.
-                let addresses = match camelmailer_core::ServerStore::source_addresses_for(
-                    &self.store,
-                    message.server_id,
-                    message.stream_id,
-                )
-                .await
-                {
-                    Ok(addresses) => addresses,
-                    Err(error) => {
-                        // The row is locked: hand it back without an attempt
-                        // instead of leaving it locked until the stale-lock
-                        // reclaim. Sending from an address the pool may not
-                        // hold would be worse than a short wait.
-                        tracing::warn!(
-                            message_id = message.id,
-                            %error,
-                            "could not read the IP pool; handing the message back"
-                        );
+                if !selection.local_check()(&address.ipv4) {
+                    // Another host holds this address: hand the test over.
+                    owned(
+                        "queued_messages",
+                        queued.id,
                         self.queue
                             .defer(
                                 queued.id,
                                 &self.worker_id,
                                 selection.foreign_pool_delay_seconds,
-                                None,
+                                Some(address.ip_pool_id as i64),
+                            )
+                            .await?,
+                    );
+                    return Ok(ProcessOutcome::ForeignPool);
+                }
+            }
+            Some(address)
+        } else if let Some(selection) = &self.source_selection {
+            // Host-aware: only the pool addresses this host holds. A pool
+            // with none here goes back to the queue for a host that has one;
+            // no pool at all keeps the OS default address.
+            let addresses = match camelmailer_core::ServerStore::source_addresses_for(
+                &self.store,
+                message.server_id,
+                message.stream_id,
+            )
+            .await
+            {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    // The row is locked: hand it back without an attempt
+                    // instead of leaving it locked until the stale-lock
+                    // reclaim. Sending from an address the pool may not
+                    // hold would be worse than a short wait.
+                    tracing::warn!(
+                        message_id = message.id,
+                        %error,
+                        "could not read the IP pool; handing the message back"
+                    );
+                    self.queue
+                        .defer(
+                            queued.id,
+                            &self.worker_id,
+                            selection.foreign_pool_delay_seconds,
+                            None,
+                        )
+                        .await?;
+                    return Ok(ProcessOutcome::PoolUnavailable);
+                }
+            };
+            if addresses.is_empty() {
+                None
+            } else {
+                let is_local = selection.local_check();
+                let local: Vec<&camelmailer_core::IpAddress> =
+                    addresses.iter().filter(|a| is_local(&a.ipv4)).collect();
+                candidates = local.iter().map(|a| (*a).clone()).collect();
+                match choose_source_address(&local, &queued.domain) {
+                    Some(address) => Some(address.clone()),
+                    None => {
+                        let pool_id = addresses[0].ip_pool_id;
+                        selection.report_foreign(pool_id);
+                        // Record the pool as resolved now, so the queue
+                        // filter of the hosts without an address of it skips
+                        // the row from here on (rows queued before the
+                        // column, or after the pool changed).
+                        self.queue
+                            .defer(
+                                queued.id,
+                                &self.worker_id,
+                                selection.foreign_pool_delay_seconds,
+                                Some(pool_id as i64),
                             )
                             .await?;
-                        return Ok(ProcessOutcome::PoolUnavailable);
-                    }
-                };
-                if addresses.is_empty() {
-                    None
-                } else {
-                    let is_local = selection.local_check();
-                    let local: Vec<&camelmailer_core::IpAddress> =
-                        addresses.iter().filter(|a| is_local(&a.ipv4)).collect();
-                    candidates = local.iter().map(|a| (*a).clone()).collect();
-                    match choose_source_address(&local, &queued.domain) {
-                        Some(address) => Some(address.clone()),
-                        None => {
-                            let pool_id = addresses[0].ip_pool_id;
-                            selection.report_foreign(pool_id);
-                            // Record the pool as resolved now, so the queue
-                            // filter of the hosts without an address of it skips
-                            // the row from here on (rows queued before the
-                            // column, or after the pool changed).
-                            self.queue
-                                .defer(
-                                    queued.id,
-                                    &self.worker_id,
-                                    selection.foreign_pool_delay_seconds,
-                                    Some(pool_id as i64),
-                                )
-                                .await?;
-                            return Ok(ProcessOutcome::ForeignPool);
-                        }
+                        return Ok(ProcessOutcome::ForeignPool);
                     }
                 }
-            } else {
-                // The pool's first address (lowest priority number, then id).
-                let addresses = camelmailer_core::ServerStore::source_addresses_for(
-                    &self.store,
-                    message.server_id,
-                    message.stream_id,
-                )
-                .await
-                .ok()
-                .unwrap_or_default();
-                candidates = addresses.clone();
-                addresses.into_iter().next()
-            };
+            }
+        } else {
+            // The pool's first address (lowest priority number, then id).
+            let addresses = camelmailer_core::ServerStore::source_addresses_for(
+                &self.store,
+                message.server_id,
+                message.stream_id,
+            )
+            .await
+            .ok()
+            .unwrap_or_default();
+            candidates = addresses.clone();
+            addresses.into_iter().next()
+        };
         // Warm-up: only when an address of the pool warms up. With warm-up
         // off everywhere this is skipped and the source stays as chosen.
         let source = match source {

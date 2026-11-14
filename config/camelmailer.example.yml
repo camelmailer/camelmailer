@@ -247,6 +247,32 @@ deliverability_feedback:
     # data_url_file: /run/secrets/snds_data_url                  # CAMELMAILER_SNDS_DATA_URL
   fbl:
     suppress_complainants: true      # also for transactional mail; each server can opt out
+  # Seed inbox placement tests: one message per sending IP to each seed,
+  # looked up read-only over IMAP. They only measure; nothing is opened,
+  # clicked, answered or moved. Off while seeds is empty.
+  placement:
+    server: ""                       # organization/server that sends the tests
+    from_address: ""                 # e.g. placement@example.com, on a verified domain
+    interval_seconds: 0              # 0 = only on demand from the dashboard
+    min_round_interval_seconds: 3600
+    check_after_seconds: 600
+    max_checks: 3
+    seeds: []
+    # - provider: gmail              # gmail | outlook | yahoo | imap
+    #   address: seed@gmail.com
+    #   auth: app_password           # app_password | xoauth2 (Outlook.com: xoauth2 only)
+    #   password_file: /run/secrets/seed_gmail
+    # - provider: outlook
+    #   address: seed@outlook.com
+    #   auth: xoauth2
+    #   client_id: 00000000-0000-0000-0000-000000000000
+    #   client_secret_file: /run/secrets/seed_outlook_client_secret
+    #   refresh_token_file: /run/secrets/seed_outlook_refresh_token
+    # - provider: imap               # any other provider, e.g. GMX
+    #   address: seed@gmx.de
+    #   imap_host: imap.gmx.net
+    #   group: united_internet       # the provider group this seed measures
+    #   password_file: /run/secrets/seed_gmx
 
 # Captcha at self-registration (POST /api/v2/auth/register). `cap` speaks
 # the Cap siteverify contract (https://trycap.dev). The endpoint includes

@@ -495,6 +495,8 @@ pub async fn worker() -> std::io::Result<()> {
     camelmailer_worker::reverse_dns::spawn(&config, Arc::new(store.clone()));
     // Provider feedback (Postmaster Tools, SNDS), when credentials are set.
     camelmailer_worker::feedback::spawn(&config, Arc::new(store.clone()));
+    // Seed inbox placement tests, when seeds are configured.
+    camelmailer_worker::placement::spawn(&config, store.clone());
     let filter = worker_queue_filter(&store, &settings)
         .await
         .map_err(std::io::Error::other)?;

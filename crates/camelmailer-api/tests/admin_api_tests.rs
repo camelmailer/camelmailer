@@ -1485,7 +1485,7 @@ async fn provider_feedback_reports_every_source_with_freshness_and_snapshots() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"]["sources"].as_array().unwrap().len(), 3);
+    assert_eq!(body["data"]["sources"].as_array().unwrap().len(), 4);
     assert_eq!(body["data"]["sources"][0]["enabled"], false);
 
     let store = Arc::new(MemoryStore::new());
@@ -1541,7 +1541,7 @@ async fn provider_feedback_reports_every_source_with_freshness_and_snapshots() {
         .iter()
         .map(|s| s["source"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["postmaster_tools", "snds", "fbl"]);
+    assert_eq!(names, vec!["postmaster_tools", "snds", "fbl", "placement"]);
     assert_eq!(sources[0]["enabled"], false);
     assert_eq!(sources[1]["enabled"], true);
     assert_eq!(sources[1]["provider"], "microsoft");
@@ -1556,6 +1556,92 @@ async fn provider_feedback_reports_every_source_with_freshness_and_snapshots() {
         &app,
         "GET",
         "/api/v2/admin/deliverability/feedback",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn placement_rounds_are_requested_on_demand_once_per_interval() {
+    let store = Arc::new(MemoryStore::new());
+    let mut config = camelmailer_config::Config::default();
+    let state = ApiState::new(store.clone(), Some(GLOBAL_KEY.to_string()))
+        .with_feedback_store(store.clone());
+    let app = build_router(state.clone());
+
+    // Without seeds the button has nothing to do.
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/deliverability/placement_tests",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "PlacementNotConfigured");
+
+    let placement = &mut config.deliverability_feedback.placement;
+    placement.server = "org/placement".into();
+    placement.from_address = "placement@example.com".into();
+    placement.seeds = vec![camelmailer_config::Seed {
+        address: "seed@gmail.com".into(),
+        ..Default::default()
+    }];
+    let mut configured = (*state).clone();
+    configured.config = config;
+    let app = build_router(Arc::new(configured));
+
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/deliverability/placement_tests",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["data"]["placement_round"]["trigger"], "manual");
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/deliverability/placement_tests",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], "PlacementRateLimited");
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/deliverability/placement_tests",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["configured"], true);
+    assert_eq!(body["data"]["last_round"]["trigger"], "manual");
+    assert_eq!(body["data"]["placement_tests"], json!([]));
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/deliverability/placement_tests?ip=192.0.2.1&provider=united_internet&limit=5000",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["placement_tests"], json!([]));
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/v2/admin/deliverability/placement_tests",
         None,
         None,
     )

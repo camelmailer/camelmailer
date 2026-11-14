@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest"
 import type { FeedbackSource } from "@/lib/api"
-import { age, formatMetric, sourceState, verdictTone, worstVerdict } from "@/views/admin/feedback"
+import {
+  age,
+  authSummary,
+  formatMetric,
+  placementTone,
+  providerLabel,
+  sourceState,
+  verdictTone,
+  worstVerdict,
+} from "@/views/admin/feedback"
 
 function source(overrides: Partial<FeedbackSource>): FeedbackSource {
   return {
@@ -69,5 +78,23 @@ describe("verdicts and values", () => {
     expect(age(7200)).toBe("2 h")
     expect(age(400_000)).toBe("5 d")
     expect(age(null)).toBeNull()
+  })
+})
+
+describe("placement", () => {
+  it("names results and summarises authentication", () => {
+    expect(placementTone("spam")).toEqual({ label: "Spam", tone: "red" })
+    expect(placementTone("pending").label).toBe("Waiting")
+    expect(authSummary({ spf: "pass", dkim: null, dmarc: "fail" })).toBe("spf pass · dmarc fail")
+    expect(authSummary({ spf: null, dkim: null, dmarc: null })).toBeNull()
+  })
+
+  it("labels configured provider groups", () => {
+    expect(providerLabel("united_internet")).toBe("GMX / Web.de / 1&1")
+    expect(providerLabel("some_isp")).toBe("some isp")
+  })
+
+  it("never calls placement stale", () => {
+    expect(sourceState(source({ source: "placement", freshness_seconds: 900_000 }))).toBe("fresh")
   })
 })

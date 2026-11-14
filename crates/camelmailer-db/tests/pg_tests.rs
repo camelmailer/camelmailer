@@ -8281,3 +8281,157 @@ async fn provider_feedback_snapshots_claims_and_signals() {
         .unwrap()
         .is_empty());
 }
+
+/// Placement rounds and tests in Postgres, in lockstep with `MemoryStore`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn placement_rounds_tests_and_signals() {
+    use camelmailer_core::feedback::{placement_status, provider};
+    use camelmailer_core::{FeedbackStore, NewPlacementTest, PlacementResult, Verdict};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let store = &f.store;
+    let round = store
+        .request_placement_round("manual", 3600)
+        .await
+        .unwrap()
+        .expect("first round");
+    assert!(store
+        .request_placement_round("schedule", 3600)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.last_placement_round().await.unwrap().unwrap().id,
+        round.id
+    );
+    assert_eq!(
+        store.start_placement_round().await.unwrap().unwrap().id,
+        round.id
+    );
+    assert!(store.start_placement_round().await.unwrap().is_none());
+
+    let new = |token: &str, group: &str| NewPlacementTest {
+        round_id: round.id,
+        token: token.into(),
+        server_id: f.server.id,
+        ip_pool_id: 1,
+        ip_address_id: 2,
+        ip: "192.0.2.1".into(),
+        seed_address: format!("seed@{group}.example"),
+        seed_provider: "imap".into(),
+        provider: group.into(),
+        check_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+    };
+    let tests = store
+        .create_placement_tests(&[new("t1", "google"), new("t2", "microsoft")])
+        .await
+        .unwrap();
+    store.set_placement_message(tests[0].id, 42).await.unwrap();
+    let by_token = store.placement_test_by_token("t1").await.unwrap().unwrap();
+    assert_eq!(by_token.message_id, Some(42));
+    assert!(store
+        .placement_test_by_token("nope")
+        .await
+        .unwrap()
+        .is_none());
+
+    assert_eq!(
+        store
+            .claim_due_placement_tests(10, 300)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(store
+        .claim_due_placement_tests(10, 300)
+        .await
+        .unwrap()
+        .is_empty());
+    store
+        .record_placement_result(
+            tests[0].id,
+            &PlacementResult {
+                status: placement_status::SPAM.into(),
+                folder: Some("[Gmail]/Spam".into()),
+                spf: Some("pass".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .record_placement_result(
+            tests[1].id,
+            &PlacementResult {
+                status: placement_status::PENDING.into(),
+                detail: "not found yet".into(),
+                check_again_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let listed = store
+        .list_placement_tests(&camelmailer_core::PlacementFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed[0].id, tests[1].id);
+    assert_eq!(listed[0].checks, 1);
+    assert_eq!(listed[1].status, "spam");
+    assert_eq!(listed[1].spf.as_deref(), Some("pass"));
+    let due = store.claim_due_placement_tests(10, 300).await.unwrap();
+    assert_eq!(
+        due.iter().map(|t| t.id).collect::<Vec<_>>(),
+        vec![tests[1].id]
+    );
+
+    let google = store
+        .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+        .await
+        .unwrap();
+    assert_eq!(google.len(), 1);
+    assert_eq!(google[0].source, "placement");
+    assert_eq!(google[0].verdict, Verdict::Bad);
+
+    // The worst result of the last 24 hours counts; the history keeps all.
+    let more = store
+        .create_placement_tests(&[new("t3", "google")])
+        .await
+        .unwrap();
+    store
+        .record_placement_result(
+            more[0].id,
+            &PlacementResult {
+                status: placement_status::INBOX.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let google = store
+        .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+        .await
+        .unwrap();
+    assert_eq!(google[0].verdict, Verdict::Bad);
+    assert!(
+        google[0].detail.contains("1 inbox, 1 spam"),
+        "{}",
+        google[0].detail
+    );
+    let history = store
+        .list_placement_tests(&camelmailer_core::PlacementFilter {
+            ip: Some("192.0.2.1".into()),
+            provider: Some("google".into()),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    let summary = store.latest_feedback_snapshots("placement").await.unwrap();
+    assert_eq!(summary.len(), 1, "one row per provider and IP");
+}
