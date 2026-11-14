@@ -262,8 +262,9 @@ async fn access(
             if !scope.is_empty() {
                 form.push(("scope", scope));
             }
+            let token_url = crate::feedback::secure_url(&token_url, "the seed's token_url")?;
             let response = http
-                .post(&token_url)
+                .post(token_url)
                 .form(&form)
                 .send()
                 .await
