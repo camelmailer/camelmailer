@@ -2283,6 +2283,67 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/Success" }
 
+  /api/v2/admin/organizations/{org}/servers/{server}/complaint_settings:
+    get:
+      tags: [Servers]
+      summary: Complaint handling of a server
+      description: >-
+        Whether a feedback-loop complaint (Microsoft JMRP, Yahoo CFL, other ARF reports) about
+        this server's transactional mail suppresses the recipient for that message's stream.
+        `suppress_complainants` is the server's own choice; `null` follows the installation
+        default `deliverability_feedback.fbl.suppress_complainants` (on). Complaints about
+        broadcast mail always suppress.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      responses:
+        "200":
+          description: The setting
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      complaint_settings: { $ref: "#/components/schemas/ComplaintSettings" }
+    patch:
+      tags: [Servers]
+      summary: Change the complaint handling of a server
+      description: Organization admins and owners. `null` returns to the installation default.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/Org" }
+        - { $ref: "#/components/parameters/ServerPermalink" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [suppress_complainants]
+              properties:
+                suppress_complainants: { type: boolean, nullable: true }
+      responses:
+        "200":
+          description: The new setting
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      complaint_settings: { $ref: "#/components/schemas/ComplaintSettings" }
+        "422": { description: "`suppress_complainants` is not true, false or null" }
+
   /api/v2/admin/organizations/{org}/servers/{server}/domains:
     get:
       tags: [Domains]
@@ -3257,6 +3318,12 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
   schemas:
+    ComplaintSettings:
+      type: object
+      properties:
+        suppress_complainants: { type: boolean, nullable: true }
+        installation_default: { type: boolean }
+        effective: { type: boolean }
     OrganizationUsage:
       type: object
       properties:

@@ -14,10 +14,11 @@ organization can override them, and the worker applies them once an hour.
 | DMARC reports | Received aggregate reports and their rows | `retention.dmarc_report_days` | yes |
 | Authentication log | Sign-in, 2FA, SSO and SCIM events with IP address and user agent | `retention.auth_event_days` | no |
 | API request log | Method, path, status and user agent of server API calls | `retention.api_request_days` (default 30) | no |
+| Complaint reports | Raw content of ARF feedback-loop reports (the complaining recipient's address and the quoted original); the complaint, its suppression and the provider counts stay | `retention.feedback_report_days` (default 30) | no |
 | Expired tokens | Sessions, password resets, invitations, message share links, OIDC, passkey and SAML ceremony state | always, at expiry | no |
 
 A value of `0` keeps the data forever. That is the default for every class
-except the API request log, so an installation that configures nothing keeps
+except the API request log and the complaint reports, so an installation that configures nothing keeps
 all of its mail data.
 
 **Message content goes first.** When content expires, the worker empties

@@ -7785,6 +7785,38 @@ async fn provider_feedback_snapshots_claims_and_signals() {
         .await
         .unwrap());
 
+    assert_eq!(
+        store
+            .server_complaint_suppression(f.server.id)
+            .await
+            .unwrap(),
+        None
+    );
+    store
+        .set_server_complaint_suppression(f.server.id, Some(false))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .server_complaint_suppression(f.server.id)
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    store
+        .set_server_complaint_suppression(f.server.id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .server_complaint_suppression(f.server.id)
+            .await
+            .unwrap(),
+        None
+    );
+    store.record_feedback_report(f.server.id, 42).await.unwrap();
+    store.record_feedback_report(f.server.id, 42).await.unwrap();
+
     // everything above is from 2026-11, far older than one day
     assert!(store.prune_feedback_snapshots(1).await.unwrap() >= 4);
     assert!(store
