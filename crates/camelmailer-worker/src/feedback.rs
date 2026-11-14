@@ -132,6 +132,28 @@ pub fn snds_data_url(
     )
 }
 
+/// Parse a URL that carries or receives a secret and insist on HTTPS. Plain
+/// HTTP is accepted only to a loopback address (local mocks in tests), so a
+/// key or token never crosses a network in the clear. The error never
+/// contains the URL, which may hold a key.
+pub fn secure_url(value: &str, what: &str) -> Result<reqwest::Url, String> {
+    let url =
+        reqwest::Url::parse(value.trim()).map_err(|_| format!("{what} is not a valid URL"))?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if loopback => Ok(url),
+        _ => Err(format!("{what} must use https")),
+    }
+}
+
 // ------------------------------------------------------- Postmaster Tools
 
 /// The metrics asked for, by the name they come back under. Filters follow
@@ -344,6 +366,7 @@ async fn google_access_token(
     token_url: &str,
     credentials: &PostmasterCredentials,
 ) -> Result<String, String> {
+    let token_url = secure_url(token_url, "postmaster_tools.token_url")?;
     let response = http
         .post(token_url)
         .form(&[
@@ -588,8 +611,9 @@ pub async fn fetch_snds(
     data_url: &str,
     today: NaiveDate,
 ) -> Result<Vec<NewFeedbackSnapshot>, String> {
+    let url = secure_url(data_url, "the SNDS data URL")?;
     let response = http
-        .get(data_url)
+        .get(url)
         .send()
         .await
         // The URL carries the key: never put it in the error.
@@ -917,6 +941,18 @@ mod tests {
         let snapshots = snds_snapshots(rows, day(2026, 11, 14));
         assert_eq!(snapshots[2].subject, "198.51.100.7");
         assert_eq!(snapshots[2].subject_kind, "ip");
+    }
+
+    #[test]
+    fn secrets_only_travel_over_https() {
+        assert!(secure_url("https://substrate.office.com/x?key=k", "u").is_ok());
+        assert!(secure_url("http://127.0.0.1:8080/snds?key=k", "u").is_ok());
+        let error =
+            secure_url("http://example.com/snds?key=secret", "the SNDS data URL").unwrap_err();
+        assert_eq!(error, "the SNDS data URL must use https");
+        assert!(!secure_url("not a url key=secret", "u")
+            .unwrap_err()
+            .contains("secret"));
     }
 
     #[test]
