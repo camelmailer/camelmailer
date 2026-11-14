@@ -14,6 +14,7 @@
 
 mod auth_pg;
 mod delivery_stats_pg;
+mod feedback_pg;
 mod lifecycle_queue;
 mod org_sso_pg;
 mod pg_store;

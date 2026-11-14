@@ -1129,6 +1129,100 @@ async fn source_addresses_list_the_reverse_dns_results_for_global_admins() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn provider_feedback_reports_every_source_with_freshness_and_snapshots() {
+    use camelmailer_core::feedback::{provider, source, subject_kind};
+    use camelmailer_core::{FeedbackStore, NewFeedbackSnapshot, Verdict};
+
+    // Without a feedback store every source is reported as off.
+    let (app, _) = build_app().await;
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/deliverability/feedback",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["sources"].as_array().unwrap().len(), 3);
+    assert_eq!(body["data"]["sources"][0]["enabled"], false);
+
+    let store = Arc::new(MemoryStore::new());
+    let state = ApiState::new(store.clone(), Some(GLOBAL_KEY.to_string()))
+        .with_feedback_store(store.clone());
+    let app = build_router(state);
+    store
+        .set_feedback_source_enabled(source::SNDS, true)
+        .await
+        .unwrap();
+    assert!(store
+        .claim_feedback_fetch(source::SNDS, "w1", 60)
+        .await
+        .unwrap());
+    store
+        .upsert_feedback_snapshots(&[NewFeedbackSnapshot {
+            source: source::SNDS.into(),
+            provider: provider::MICROSOFT.into(),
+            subject_kind: subject_kind::IP.into(),
+            subject: "192.0.2.10".into(),
+            data_date: chrono::Utc::now().date_naive(),
+            verdict: Verdict::Warn,
+            detail: "filter result yellow".into(),
+            metrics: json!({ "filter_result": "YELLOW" }),
+        }])
+        .await
+        .unwrap();
+    store
+        .finish_feedback_fetch(
+            source::SNDS,
+            "w1",
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(6),
+        )
+        .await
+        .unwrap();
+    store
+        .record_fbl_complaint(provider::YAHOO, chrono::Utc::now().date_naive())
+        .await
+        .unwrap();
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/deliverability/feedback",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sources = body["data"]["sources"].as_array().unwrap();
+    let names: Vec<&str> = sources
+        .iter()
+        .map(|s| s["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["postmaster_tools", "snds", "fbl"]);
+    assert_eq!(sources[0]["enabled"], false);
+    assert_eq!(sources[1]["enabled"], true);
+    assert_eq!(sources[1]["provider"], "microsoft");
+    assert!(sources[1]["freshness_seconds"].as_i64().unwrap() < 60);
+    assert_eq!(sources[1]["snapshots"][0]["verdict"], "warn");
+    assert_eq!(sources[1]["snapshots"][0]["subject"], "192.0.2.10");
+    assert_eq!(sources[1]["status"]["last_error"], Value::Null);
+    assert_eq!(sources[2]["snapshots"][0]["provider"], "yahoo");
+    assert_eq!(sources[2]["snapshots"][0]["metrics"]["complaints"], 1);
+
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/deliverability/feedback",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 // ------------------------------------------------ P0: server config + keys
 
 #[tokio::test]

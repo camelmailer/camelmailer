@@ -75,6 +75,9 @@ pub struct ApiState {
     /// Adaptive warm-up settings and state. `None` answers the warm-up
     /// endpoints with 503.
     pub warmup_store: Option<Arc<dyn camelmailer_core::WarmupStore>>,
+    /// Provider feedback snapshots (Postmaster Tools, SNDS, feedback loops).
+    /// `None` reports every source as off.
+    pub feedback_store: Option<Arc<dyn camelmailer_core::FeedbackStore>>,
 }
 
 impl ApiState {
@@ -107,6 +110,7 @@ impl ApiState {
             org_sso_store: None,
             delivery_stats: None,
             warmup_store: None,
+            feedback_store: None,
             spf_resolver: None,
         })
     }
@@ -132,6 +136,7 @@ impl ApiState {
             org_sso_store: None,
             delivery_stats: None,
             warmup_store: None,
+            feedback_store: None,
             spf_resolver: None,
         })
     }
@@ -302,6 +307,7 @@ impl ApiState {
             org_sso_store: None,
             delivery_stats: None,
             warmup_store: None,
+            feedback_store: None,
             spf_resolver: None,
         })
     }
@@ -361,6 +367,17 @@ impl ApiState {
     ) -> Arc<Self> {
         let mut state = (*self).clone();
         state.warmup_store = Some(warmup_store);
+        Arc::new(state)
+    }
+
+    /// Attach the provider feedback store. Returns a fresh state, as
+    /// [`ApiState::with_org_sso_store`] does.
+    pub fn with_feedback_store(
+        self: Arc<Self>,
+        feedback_store: Arc<dyn camelmailer_core::FeedbackStore>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.feedback_store = Some(feedback_store);
         Arc::new(state)
     }
 
@@ -2009,6 +2026,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/ip_warmup/pools/{id}",
             axum::routing::patch(crate::ip_warmup::ip_warmup_pool_update),
+        )
+        .route(
+            "/deliverability/feedback",
+            get(crate::deliverability::feedback_index),
         )
         .route(
             "/ip_pools/{pool_id}/ip_addresses",

@@ -175,6 +175,8 @@ pub(crate) fn count_outgoing(
 
 #[derive(Default)]
 pub(crate) struct MemoryStoreInner {
+    /// Provider feedback snapshots and fetch state.
+    pub(crate) feedback: crate::feedback::MemoryFeedback,
     /// Daily outgoing-message counts per server, the in-memory analogue of
     /// the `server_send_counters` table. Keyed by (server id, UTC date).
     pub(crate) send_counters: HashMap<(Id, chrono::NaiveDate), i64>,

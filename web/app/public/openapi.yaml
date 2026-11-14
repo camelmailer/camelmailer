@@ -3035,6 +3035,66 @@ paths:
                             detail: { type: string }
                             checked_by: { type: string }
                             checked_at: { type: string, format: date-time }
+  /api/v2/admin/deliverability/feedback:
+    get:
+      tags: [Instance]
+      summary: Provider feedback
+      description: >-
+        What the large mailbox providers report about this installation's mail, per source:
+        Google Postmaster Tools (per sending domain and day: spam rate, SPF/DKIM/DMARC success,
+        outbound TLS, delivery error rates), Microsoft SNDS (per sending IP and day: filter
+        result, complaint rate, trap hits) and the complaint feedback loops (ARF reports counted
+        per provider and day). `enabled` says whether a worker has the source's credentials;
+        `freshness_seconds` is the age of the newest data. Each source lists its newest snapshot
+        per domain, IP or provider, worst verdict first. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200":
+          description: Every source
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      sources:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            source: { type: string, enum: [postmaster_tools, snds, fbl] }
+                            provider: { type: string, enum: [google, microsoft, several] }
+                            enabled: { type: boolean }
+                            freshness_seconds: { type: integer, nullable: true }
+                            status:
+                              type: object
+                              nullable: true
+                              properties:
+                                source: { type: string }
+                                enabled: { type: boolean }
+                                last_attempt_at: { type: string, format: date-time, nullable: true }
+                                last_success_at: { type: string, format: date-time, nullable: true }
+                                last_error: { type: string, nullable: true }
+                                consecutive_failures: { type: integer }
+                                next_attempt_at: { type: string, format: date-time, nullable: true }
+                            snapshots:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  source: { type: string }
+                                  provider: { type: string, enum: [google, microsoft, yahoo, other] }
+                                  subject_kind: { type: string, enum: [domain, ip, provider] }
+                                  subject: { type: string }
+                                  data_date: { type: string, format: date }
+                                  verdict: { type: string, enum: [unknown, ok, warn, bad] }
+                                  detail: { type: string }
+                                  metrics: { type: object, additionalProperties: true }
+                                  fetched_at: { type: string, format: date-time }
   /api/v2/admin/ip_metrics:
     get:
       tags: [Instance]

@@ -223,6 +223,24 @@ lifecycle_webhooks:
   urls: []
   # secret: a-long-random-string   # required when urls is set
 
+# Provider feedback: Google Postmaster Tools (API v2), Microsoft SNDS and
+# complaint feedback loops (JMRP, Yahoo CFL). Each source is off until its
+# credentials are present. Secrets come from the environment variables named
+# below or from files; never write them into this file.
+# See docs/provider-feedback.md.
+deliverability_feedback:
+  fetch_interval_seconds: 21600      # 0 turns the scheduled fetch off
+  snapshot_retention_days: 400
+  postmaster_tools:
+    domains: []                      # e.g. [example.com], verified in Postmaster Tools
+    # client_id: 1234567890-abc.apps.googleusercontent.com    # CAMELMAILER_POSTMASTER_CLIENT_ID
+    # client_secret_file: /run/secrets/postmaster_client_secret  # CAMELMAILER_POSTMASTER_CLIENT_SECRET
+    # refresh_token_file: /run/secrets/postmaster_refresh_token  # CAMELMAILER_POSTMASTER_REFRESH_TOKEN
+  snds: {}
+    # data_url_file: /run/secrets/snds_data_url                  # CAMELMAILER_SNDS_DATA_URL
+  fbl:
+    suppress_complainants: false     # also suppress complainants of transactional mail
+
 # Captcha at self-registration (POST /api/v2/auth/register). `cap` speaks
 # the Cap siteverify contract (https://trycap.dev). The endpoint includes
 # the site key; the dashboard loads the widget against it, and the server

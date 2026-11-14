@@ -4,6 +4,7 @@
 pub mod arf;
 pub mod dkim;
 pub mod dmarc;
+pub mod feedback;
 pub mod inspection;
 pub mod outbound;
 pub mod provider;

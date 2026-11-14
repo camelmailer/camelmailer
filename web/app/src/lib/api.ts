@@ -456,6 +456,35 @@ export type SourceAddressCheck = {
   checked_by: string
   checked_at: string
 }
+export type FeedbackVerdict = "unknown" | "ok" | "warn" | "bad"
+export type FeedbackSnapshot = {
+  source: string
+  provider: "google" | "microsoft" | "yahoo" | "other"
+  subject_kind: "domain" | "ip" | "provider"
+  subject: string
+  data_date: string
+  verdict: FeedbackVerdict
+  detail: string
+  metrics: Record<string, unknown>
+  fetched_at: string
+}
+export type FeedbackSourceStatus = {
+  source: string
+  enabled: boolean
+  last_attempt_at: string | null
+  last_success_at: string | null
+  last_error: string | null
+  consecutive_failures: number
+  next_attempt_at: string | null
+}
+export type FeedbackSource = {
+  source: "postmaster_tools" | "snds" | "fbl"
+  provider: "google" | "microsoft" | "several"
+  enabled: boolean
+  freshness_seconds: number | null
+  status: FeedbackSourceStatus | null
+  snapshots: FeedbackSnapshot[]
+}
 export type IpAddress = {
   id: number
   uuid: string
@@ -1206,6 +1235,10 @@ export const adminApi = {
       api.get<{ source_addresses: SourceAddressCheck[]; failing: number }>(
         "/api/v2/admin/source_addresses",
       ),
+  },
+  deliverabilityFeedback: {
+    list: () =>
+      api.get<{ sources: FeedbackSource[] }>("/api/v2/admin/deliverability/feedback"),
   },
   adminApiKeys: {
     list: () =>

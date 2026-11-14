@@ -4068,14 +4068,19 @@ pub struct FeedbackComplaint {
     pub message_id: Option<String>,
     /// The complaining recipient (bare address).
     pub recipient: Option<String>,
+    /// Also suppress the recipient when the complaint is about a
+    /// transactional message (no broadcast unsubscribe token), for that
+    /// message's stream (`deliverability_feedback.fbl.suppress_complainants`).
+    pub suppress_transactional: bool,
 }
 
 /// Result of recording one ARF complaint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedbackComplaintOutcome {
     /// `MessageComplained` was queued. `message_id` is the matched outgoing
-    /// message (if any); `suppressed` is true when the unsubscribe token also
-    /// wrote the stream-scoped complaint suppression.
+    /// message (if any); `suppressed` is true when a stream-scoped complaint
+    /// suppression was written (always for a broadcast unsubscribe token,
+    /// for transactional mail only with `suppress_transactional`).
     Recorded {
         message_id: Option<i64>,
         address: String,
@@ -5057,8 +5062,22 @@ impl PgMessageSink {
             return Ok(FeedbackComplaintOutcome::NotMatched);
         };
 
+        let mut suppressed = false;
         if let Some((_, stream_id, _)) = &token_target {
             write_feedback_complaint(&mut tx, tenant, *stream_id, &address).await?;
+            suppressed = true;
+        } else if complaint.suppress_transactional {
+            if let Some(message_id) = message_id {
+                let stream_id: Option<i64> =
+                    sqlx::query_scalar("SELECT stream_id FROM messages WHERE id = $1")
+                        .bind(message_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .flatten();
+                write_feedback_complaint(&mut tx, tenant, stream_id.map(|id| id as Id), &address)
+                    .await?;
+                suppressed = true;
+            }
         }
 
         let payload = serde_json::json!({
@@ -5074,7 +5093,7 @@ impl PgMessageSink {
         Ok(FeedbackComplaintOutcome::Recorded {
             message_id,
             address,
-            suppressed: token_target.is_some(),
+            suppressed,
         })
     }
 

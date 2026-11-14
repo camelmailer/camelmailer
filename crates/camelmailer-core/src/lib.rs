@@ -11,6 +11,7 @@ pub mod bounce;
 pub mod delivery_stats;
 pub mod dmarc;
 pub mod dns;
+pub mod feedback;
 pub mod hashing;
 pub mod lifecycle;
 pub mod message;
@@ -48,6 +49,10 @@ pub use dmarc::{
     NewDmarcReport, DMARC_REPORTS_ENDPOINT,
 };
 pub use dns::{is_valid_helo_hostname, DnsError, DnsResolver, StaticDnsResolver};
+pub use feedback::{
+    FeedbackSnapshot, FeedbackSourceStatus, FeedbackStore, NewFeedbackSnapshot, ProviderSignal,
+    Verdict,
+};
 pub use lifecycle::LifecycleEvent;
 pub use message::{
     MemorySink, MessageRecord, MessageScope, MessageSink, QueueMessagesOutcome, QueuedMessage,
