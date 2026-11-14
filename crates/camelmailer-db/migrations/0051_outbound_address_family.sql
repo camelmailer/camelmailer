@@ -22,7 +22,8 @@ CREATE TABLE source_address_checks (
     address TEXT PRIMARY KEY,
     family TEXT NOT NULL CHECK (family IN ('ipv4', 'ipv6')),
     origin TEXT NOT NULL CHECK (origin IN ('host', 'pool')),
-    status TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('pass', 'no_ptr', 'mismatch', 'lookup_failed', 'not_public')),
     ptr TEXT[] NOT NULL DEFAULT '{}',
     detail TEXT NOT NULL DEFAULT '',
     checked_by TEXT NOT NULL,

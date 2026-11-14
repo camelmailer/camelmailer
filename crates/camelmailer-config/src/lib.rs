@@ -1011,9 +1011,10 @@ impl Default for Smtp {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AddressFamily {
-    /// Both families, IPv6 first, alternating with IPv4 (RFC 8305), so a
-    /// broken IPv6 path costs one connection timeout and not one per AAAA
-    /// record. The normal behaviour of a dual-stack host.
+    /// Both families, IPv6 first, alternating with IPv4 (RFC 8305), raced
+    /// with `connection_attempt_delay_ms` so a broken IPv6 path costs the
+    /// attempt delay and not a connection timeout. The normal behaviour of
+    /// a dual-stack host.
     #[default]
     DualStack,
     /// Both families, every IPv4 address before the first IPv6 one.
@@ -1080,8 +1081,18 @@ impl std::str::FromStr for AddressFamily {
 #[serde(default, deny_unknown_fields)]
 pub struct SmtpClient {
     /// Which address families outgoing connections use when the server has
-    /// no IP pool, or its pool sets none of its own. Default `dual_stack`.
+    /// no IP pool. A pool without an `address_family` of its own does not
+    /// inherit this: it stays on its addresses' IPv4 values. Default
+    /// `dual_stack`.
     pub address_family: AddressFamily,
+    /// Milliseconds `dual_stack` waits for a connection attempt before it
+    /// starts the next remote address in parallel (RFC 8305 section 5,
+    /// "Connection Attempt Delay"). Each attempt keeps its own full
+    /// `open_timeout`, a failed attempt starts the next one at once, and the
+    /// first connection to succeed is used. `0` connects to one address at a
+    /// time. The other families always connect one address at a time.
+    /// Default `250`.
+    pub connection_attempt_delay_ms: u32,
     /// Seconds between two reverse-DNS checks of the worker's source
     /// addresses (the first runs at start). `0` turns the check off.
     pub reverse_dns_check_interval: u32,
@@ -1104,6 +1115,7 @@ impl Default for SmtpClient {
     fn default() -> Self {
         Self {
             address_family: AddressFamily::DualStack,
+            connection_attempt_delay_ms: 250,
             reverse_dns_check_interval: 3600,
             skip_family_without_reverse_dns: false,
             open_timeout: 30,
@@ -1545,6 +1557,9 @@ mod tests {
         assert_eq!(config.smtp_client.address_family, AddressFamily::DualStack);
         assert_eq!(config.smtp_client.reverse_dns_check_interval, 3600);
         assert!(!config.smtp_client.skip_family_without_reverse_dns);
+        assert_eq!(config.smtp_client.connection_attempt_delay_ms, 250);
+        let config = Config::from_yaml("smtp_client:\n  connection_attempt_delay_ms: 0\n").unwrap();
+        assert_eq!(config.smtp_client.connection_attempt_delay_ms, 0);
 
         for family in AddressFamily::ALL {
             let config = Config::from_yaml(&format!(

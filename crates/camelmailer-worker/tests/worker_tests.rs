@@ -2962,6 +2962,102 @@ async fn a_pool_address_family_decides_which_pool_values_are_bound() {
     assert!(seen.iter().any(|l| l == "RCPT TO:<first@dest.example>"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_with_an_empty_pool_still_delivers_as_before() {
+    // A pool without a usable address never sends dual-stack from the host's
+    // IPv6 address: it sends as before address families and delivers.
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let ip_pool = s.store.create_ip_pool("empty", false).await.unwrap();
+    s.store
+        .set_server_ip_pool(s.server.id, Some(ip_pool.id))
+        .await
+        .unwrap();
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "empty@dest.example"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+    let seen = smtp.received.lock().unwrap().clone();
+    assert!(seen.iter().any(|l| l == "RCPT TO:<empty@dest.example>"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reverse_dns_run_that_cannot_read_the_pools_keeps_the_stored_results() {
+    use camelmailer_worker::reverse_dns::{
+        run_once, LookupError, ReverseDnsResolver, ReverseDnsState,
+    };
+
+    struct NoPtr;
+    #[async_trait::async_trait]
+    impl ReverseDnsResolver for NoPtr {
+        async fn ptr(&self, _: std::net::IpAddr) -> Result<Vec<String>, LookupError> {
+            Err(LookupError::NotFound)
+        }
+        async fn addresses(
+            &self,
+            _: &str,
+            _: std::net::IpAddr,
+        ) -> Result<Vec<std::net::IpAddr>, LookupError> {
+            Err(LookupError::NotFound)
+        }
+    }
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let ip_pool = s.store.create_ip_pool("main", false).await.unwrap();
+    s.store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: ip_pool.id,
+            ipv4: "203.0.113.10".into(),
+            ipv6: None,
+            hostname: "out.example.com".into(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    let state = ReverseDnsState::new();
+    run_once(&NoPtr, &s.store, &state, None, None, "worker-1").await;
+    let stored = s.store.list_source_address_checks().await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].address, "203.0.113.10");
+
+    // The pools cannot be read (a transient storage error): the run checks
+    // what it can and leaves the stored pool results alone.
+    sqlx::query("ALTER TABLE ip_addresses RENAME TO ip_addresses_away")
+        .execute(s.store.pool())
+        .await
+        .unwrap();
+    run_once(&NoPtr, &s.store, &state, None, None, "worker-1").await;
+    let stored = s.store.list_source_address_checks().await.unwrap();
+    assert_eq!(stored.len(), 1, "a failed enumeration must not prune");
+
+    // Once the pools read again, an address that left every pool is pruned.
+    sqlx::query("ALTER TABLE ip_addresses_away RENAME TO ip_addresses")
+        .execute(s.store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM ip_addresses")
+        .execute(s.store.pool())
+        .await
+        .unwrap();
+    run_once(&NoPtr, &s.store, &state, None, None, "worker-1").await;
+    assert!(s
+        .store
+        .list_source_address_checks()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 // -------------------------------------- HTTP send end-to-end (P2)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

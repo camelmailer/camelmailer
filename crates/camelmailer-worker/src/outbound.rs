@@ -8,6 +8,12 @@
 //!
 //! A pool address without an `ipv6` value never sends over IPv6, whatever
 //! the family: the bound address pins the family.
+//!
+//! A message whose pool yields no usable address (the pool is empty, its
+//! address is not an IPv4 address, or the lookup failed) is sent as before
+//! address families: from the operating system's address, every IPv4
+//! remote first. It never falls back to `dual_stack`, which would send from
+//! the host's IPv6 address, the one most likely to lack reverse DNS.
 
 use crate::sender::SmtpSender;
 use crate::smtp_client::{AddressFamily, OutboundSource};
@@ -25,13 +31,26 @@ pub async fn source_for<S: ServerStore + ?Sized>(
     source_ip: Option<IpAddr>,
 ) -> OutboundSource {
     let Some(source_ip) = source_ip else {
-        return OutboundSource::system(sender.address_family());
+        return match store.pool_source_for(server_id, stream_id, None).await {
+            Ok(None) => OutboundSource::system(sender.address_family()),
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    server_id,
+                    "the IP pool has no usable address; sending from the host's address, IPv4 first"
+                );
+                OutboundSource::system(pool_fallback_family(sender.address_family()))
+            }
+            Err(error) => {
+                tracing::warn!(%error, server_id, "could not read the IP pool; sending from the host's address, IPv4 first");
+                OutboundSource::system(pool_fallback_family(sender.address_family()))
+            }
+        };
     };
     let IpAddr::V4(ipv4) = source_ip else {
         return OutboundSource::bound(source_ip);
     };
     let pool = match store
-        .pool_source_for(server_id, stream_id, &ipv4.to_string())
+        .pool_source_for(server_id, stream_id, Some(&ipv4.to_string()))
         .await
     {
         Ok(pool) => pool,
@@ -41,6 +60,16 @@ pub async fn source_for<S: ServerStore + ?Sized>(
         }
     };
     pool_source(ipv4, pool)
+}
+
+/// The family of a message that has (or may have) a pool but no usable pool
+/// address: the order from before address families (`prefer_ipv4`) instead
+/// of `dual_stack`; an installation restricted to one family stays on it.
+fn pool_fallback_family(installation: AddressFamily) -> AddressFamily {
+    match installation {
+        AddressFamily::DualStack => AddressFamily::PreferIpv4,
+        other => other,
+    }
 }
 
 /// The source for the pool address `ipv4`, given what the store knows about
@@ -72,11 +101,26 @@ pub fn pool_source(
         .and_then(|value| match value.parse::<Ipv6Addr>() {
             Ok(ipv6) => Some(ipv6),
             Err(_) => {
-                tracing::warn!(%ipv4, value, "the ipv6 value of an IP pool address is not an IPv6 address; it is not bound");
+                if first_warning(value) {
+                    tracing::warn!(%ipv4, value, "the ipv6 value of an IP pool address is not an IPv6 address; it is not bound");
+                }
                 None
             }
         });
     OutboundSource::pool(family, Some(ipv4), ipv6)
+}
+
+/// Whether `value` is warned about for the first time in this process, so
+/// an unusable pool value is logged once and not on every delivery (the
+/// reverse-DNS check repeats it at each run).
+fn first_warning(value: &str) -> bool {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut warned| warned.insert(value.to_string()))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -122,6 +166,55 @@ mod tests {
         assert_eq!(source.ipv6, None, "never bound, so IPv4 only in effect");
         let source = pool_source(V4, pool(Some("ipv4_first"), Some("2001:db8::10")));
         assert_eq!(source, OutboundSource::bound(IpAddr::V4(V4)));
+    }
+
+    #[test]
+    fn an_unusable_value_is_warned_about_once() {
+        assert!(first_warning("not-an-ipv6-once"));
+        assert!(!first_warning("not-an-ipv6-once"));
+        assert!(first_warning("another-bad-value"));
+    }
+
+    #[tokio::test]
+    async fn a_pool_without_a_usable_address_never_falls_back_to_dual_stack() {
+        use camelmailer_core::{AdminStore, NewIpAddress};
+
+        let fixtures = camelmailer_core::testing::Fixtures::new();
+        let store = fixtures.store();
+        let server_id = fixtures.server_id();
+        let sender = SmtpSender::new(&camelmailer_config::Config::default());
+        assert_eq!(sender.address_family(), AddressFamily::DualStack);
+
+        // An empty pool: the worker finds no address (source_ip None).
+        let pool = store.create_ip_pool("empty", false).await.unwrap();
+        store
+            .set_server_ip_pool(server_id, Some(pool.id))
+            .await
+            .unwrap();
+        let source = source_for(&*store, &sender, server_id, None, None).await;
+        assert_eq!(source, OutboundSource::system(AddressFamily::PreferIpv4));
+
+        // A pool address that is not an IPv4 address never parses into
+        // source_ip either; the same fallback applies.
+        store
+            .create_ip_address(NewIpAddress {
+                ip_pool_id: pool.id,
+                ipv4: "not-an-ip".into(),
+                ipv6: Some("2001:db8::10".into()),
+                hostname: "out.example".into(),
+                priority: 10,
+            })
+            .await
+            .unwrap();
+        let source = source_for(&*store, &sender, server_id, None, None).await;
+        assert_eq!(source, OutboundSource::system(AddressFamily::PreferIpv4));
+
+        // An installation restricted to one family stays on it.
+        let mut config = camelmailer_config::Config::default();
+        config.smtp_client.address_family = AddressFamily::Ipv4Only;
+        let sender = SmtpSender::new(&config);
+        let source = source_for(&*store, &sender, server_id, None, None).await;
+        assert_eq!(source, OutboundSource::system(AddressFamily::Ipv4Only));
     }
 
     #[tokio::test]

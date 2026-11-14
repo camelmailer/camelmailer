@@ -100,7 +100,15 @@ A pool address without an `ipv6` value never sends over IPv6, whatever the
 family: the bound address pins the family. A pool set to `ipv6_only` whose
 address has no `ipv6` value cannot send, and each attempt fails softly
 saying so. In every case the worker moves on to the next remote address
-when a connection fails.
+when a connection fails; `dual_stack` also races the two families
+(`smtp_client.connection_attempt_delay_ms`, see
+[Configuration](configuration.md#address-family)).
+
+Two cases keep the order from before address families (every IPv4 address
+first, from the operating system's address): a message whose pool has no
+usable address (an empty pool, an `ipv4` value that does not parse), and
+delivery through `smtp_relays`, where the smarthost and not the receiver
+sees the connection. A pool still binds its addresses towards a relay.
 
 Set the family to match the reverse DNS you can publish. A pool whose
 addresses have PTR records for both families can use `dual_stack`; a pool

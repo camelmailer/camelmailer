@@ -283,7 +283,16 @@ pub trait AdminStore: Send + Sync {
     // IP pools (global) + nested addresses
     async fn list_ip_pools(&self) -> Result<Vec<IpPool>, StoreError>;
     async fn ip_pool_by_id(&self, id: Id) -> Result<Option<IpPool>, StoreError>;
-    async fn create_ip_pool(&self, name: &str, default: bool) -> Result<IpPool, StoreError>;
+    async fn create_ip_pool(&self, name: &str, default: bool) -> Result<IpPool, StoreError> {
+        self.create_ip_pool_with_family(name, default, None).await
+    }
+    /// Create a pool with its `address_family` in one write.
+    async fn create_ip_pool_with_family(
+        &self,
+        name: &str,
+        default: bool,
+        address_family: Option<String>,
+    ) -> Result<IpPool, StoreError>;
     async fn update_ip_pool(&self, pool: IpPool) -> Result<IpPool, StoreError>;
     async fn delete_ip_pool(&self, id: Id) -> Result<bool, StoreError>;
     async fn list_ip_addresses(&self, ip_pool_id: Id) -> Result<Vec<IpAddress>, StoreError>;
@@ -296,12 +305,15 @@ pub trait AdminStore: Send + Sync {
     async fn delete_ip_address(&self, id: Id) -> Result<bool, StoreError>;
 
     /// Store the results of one reverse-DNS check run of a worker: each
-    /// check replaces the previous result for its address. Pool results for
-    /// addresses that are no longer in any pool (absent from `checks`) and
-    /// results older than seven days are removed.
+    /// check replaces the previous result for its address. Results older
+    /// than seven days are removed. With `prune_pool_addresses`, pool
+    /// results for addresses that are no longer in any pool (absent from
+    /// `checks`) are removed too; a run that could not read every pool
+    /// passes `false`, so a transient storage error never wipes results.
     async fn record_source_address_checks(
         &self,
         checks: &[SourceAddressCheck],
+        prune_pool_addresses: bool,
     ) -> Result<(), StoreError>;
     /// The latest reverse-DNS check of every source address, failures
     /// first, then by address.
@@ -1269,13 +1281,18 @@ impl AdminStore for crate::store::MemoryStore {
         Ok(self.inner.read().unwrap().ip_pools.get(&id).cloned())
     }
 
-    async fn create_ip_pool(&self, name: &str, default: bool) -> Result<IpPool, StoreError> {
+    async fn create_ip_pool_with_family(
+        &self,
+        name: &str,
+        default: bool,
+        address_family: Option<String>,
+    ) -> Result<IpPool, StoreError> {
         let pool = IpPool {
             id: self.next_id(),
             uuid: crate::token::generate_uuid(),
             name: name.into(),
             default,
-            address_family: None,
+            address_family,
         };
         self.inner
             .write()
@@ -1358,6 +1375,7 @@ impl AdminStore for crate::store::MemoryStore {
     async fn record_source_address_checks(
         &self,
         checks: &[SourceAddressCheck],
+        prune_pool_addresses: bool,
     ) -> Result<(), StoreError> {
         let mut inner = self.inner.write().unwrap();
         let stored = &mut inner.source_address_checks;
@@ -1367,7 +1385,8 @@ impl AdminStore for crate::store::MemoryStore {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
         stored.retain(|address, check| {
             check.checked_at >= cutoff
-                && (check.origin != "pool"
+                && (!prune_pool_addresses
+                    || check.origin != "pool"
                     || checks
                         .iter()
                         .any(|c| c.origin == "pool" && &c.address == address))

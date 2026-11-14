@@ -23,14 +23,24 @@ integration tests) is green.
   Microsoft 365's S820 refusal. That went against the normal behaviour of a
   dual-stack host and hid the actual problem, a missing PTR record. The new
   setting `smtp_client.address_family` defaults to `dual_stack`: IPv6 first,
-  alternating with IPv4 (RFC 8305), so a broken IPv6 path costs one
-  connection timeout and not one per AAAA record. Moving on to the next
+  alternating with IPv4 (RFC 8305). When the remote host has addresses of
+  both families, `dual_stack` races them (Happy Eyeballs): if an attempt
+  has not connected after `smtp_client.connection_attempt_delay_ms` (250),
+  the next address is started alongside it, and the first connection wins.
+  A black-holed IPv6 path therefore costs a quarter of a second, not a
+  connection timeout. Every attempt keeps its full `open_timeout`, a
+  refused attempt starts the next address at once, and every address is
+  still tried; `0` connects one address at a time. Moving on to the next
   address when a connection fails stays.
   **If you relied on IPv4 first** because your IPv6 address has no PTR
   record, either give it one (and an SPF entry), or set
   `smtp_client.address_family: prefer_ipv4` (the 0.13.0 order) or
   `ipv4_only`. The reverse-DNS check below tells you which addresses need
-  it. Servers with an IP pool are unaffected.
+  it. Servers with an IP pool are unaffected, and so is delivery through
+  `smtp_relays`: a smarthost is reached in the 0.13 order (IPv4 first)
+  whatever the family. A server whose pool has no usable address (empty,
+  or an address that does not parse) also keeps the 0.13 order and never
+  falls back to `dual_stack`.
 
 ### Added
 

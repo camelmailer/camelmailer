@@ -119,6 +119,11 @@ pub struct SendParams {
     /// Where the connection comes from: the address families to use and,
     /// for an IP pool, the local addresses to bind.
     pub source: OutboundSource,
+    /// `dual_stack` only: how long a connection attempt runs before the
+    /// next remote address is started in parallel
+    /// (`smtp_client.connection_attempt_delay_ms`, RFC 8305 section 5).
+    /// Zero connects to one address at a time.
+    pub connection_attempt_delay: Duration,
 }
 
 /// Where an outgoing connection comes from.
@@ -387,8 +392,9 @@ fn tls_connector(mode: TlsMode) -> TlsConnector {
 /// The resolver's order is kept within each family. Across families:
 ///
 /// - `dual_stack` starts with IPv6 and alternates with IPv4 (RFC 8305
-///   section 4), so a host whose IPv6 path is broken loses one connection
-///   timeout before it reaches IPv4, not one per AAAA record;
+///   section 4), and [`connect`] races the addresses (see [`race`]), so a
+///   host whose IPv6 path is broken reaches IPv4 after the connection
+///   attempt delay, not after a connection timeout per AAAA record;
 /// - `prefer_ipv4` tries every IPv4 address before the first IPv6 one;
 /// - `ipv4_only` and `ipv6_only` drop the other family.
 ///
@@ -458,6 +464,9 @@ fn interleave(first: Vec<SocketAddr>, second: Vec<SocketAddr>) -> Vec<SocketAddr
 async fn connect(params: &SendParams) -> std::io::Result<TcpStream> {
     let addresses = tokio::net::lookup_host((params.host.as_str(), params.port)).await?;
     let candidates = remote_addresses(addresses, &params.source, &params.host)?;
+    if races(&params.source, &candidates, params.connection_attempt_delay) {
+        return race(candidates, params, params.connection_attempt_delay).await;
+    }
     let mut last_error = None;
     for address in candidates {
         match connect_to(address, params).await {
@@ -472,9 +481,104 @@ async fn connect(params: &SendParams) -> std::io::Result<TcpStream> {
         .unwrap_or_else(|| std::io::Error::other(format!("no address for {}", params.host))))
 }
 
+/// Whether [`connect`] races the candidates instead of trying them one at a
+/// time: only for `dual_stack`, only with a non-zero attempt delay, and only
+/// when both families are among the candidates. Every other case keeps the
+/// one-at-a-time order unchanged.
+fn races(source: &OutboundSource, candidates: &[SocketAddr], delay: Duration) -> bool {
+    source.family == AddressFamily::DualStack
+        && !delay.is_zero()
+        && candidates.iter().any(SocketAddr::is_ipv4)
+        && candidates.iter().any(SocketAddr::is_ipv6)
+}
+
+/// Happy Eyeballs connection racing (RFC 8305 section 5) over `candidates`,
+/// in their order: the next address is started when the running attempts
+/// have not connected within `delay`, or at once when an attempt fails. Each
+/// attempt keeps its own full `open_timeout` ([`connect_to`]), so every
+/// address starts no later than it would one at a time and gets as long to
+/// connect. The first connection wins; dropping the others closes them. The
+/// last connection error is returned when none answers.
+async fn race(
+    candidates: Vec<SocketAddr>,
+    params: &SendParams,
+    delay: Duration,
+) -> std::io::Result<TcpStream> {
+    let source = params.source.clone();
+    let timeout = params.timeout;
+    race_with(candidates, delay, &params.host, move |address| {
+        connect_from(address, source.local_for(&address), timeout)
+    })
+    .await
+}
+
+/// The racing of [`race`], over any `connect` (tests substitute one).
+async fn race_with<T, F, Fut>(
+    candidates: Vec<SocketAddr>,
+    delay: Duration,
+    host: &str,
+    connect: F,
+) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: Fn(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>> + Send + 'static,
+{
+    let mut pending = candidates.into_iter();
+    // Dropping the set aborts the attempts still running.
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut last_error = None;
+    let start = |attempts: &mut tokio::task::JoinSet<_>, address: SocketAddr| {
+        let attempt = connect(address);
+        attempts.spawn(async move { (address, attempt.await) });
+    };
+    loop {
+        if attempts.is_empty() {
+            match pending.next() {
+                Some(address) => start(&mut attempts, address),
+                None => break,
+            }
+        }
+        tokio::select! {
+            Some(joined) = attempts.join_next() => {
+                match joined {
+                    Ok((_, Ok(stream))) => return Ok(stream),
+                    Ok((address, Err(error))) => {
+                        tracing::debug!(%address, host, %error, "connect failed, trying the next address");
+                        last_error = Some(error);
+                    }
+                    Err(error) => {
+                        last_error = Some(std::io::Error::other(format!(
+                            "connection attempt failed: {error}"
+                        )));
+                    }
+                }
+                if let Some(next) = pending.next() {
+                    start(&mut attempts, next);
+                }
+            },
+            _ = tokio::time::sleep(delay), if !pending.as_slice().is_empty() => {
+                if let Some(next) = pending.next() {
+                    start(&mut attempts, next);
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other(format!("no address for {host}"))))
+}
+
 async fn connect_to(address: SocketAddr, params: &SendParams) -> std::io::Result<TcpStream> {
+    connect_from(address, params.source.local_for(&address), params.timeout).await
+}
+
+/// One TCP connection to `address`, from `local` when set, within `timeout`.
+async fn connect_from(
+    address: SocketAddr,
+    local: Option<IpAddr>,
+    timeout: Duration,
+) -> std::io::Result<TcpStream> {
     let connect = async {
-        match params.source.local_for(&address) {
+        match local {
             Some(source_ip) => {
                 let socket = if source_ip.is_ipv4() {
                     TcpSocket::new_v4()?
@@ -487,7 +591,7 @@ async fn connect_to(address: SocketAddr, params: &SendParams) -> std::io::Result
             None => TcpStream::connect(address).await,
         }
     };
-    within(params.timeout, "connect", connect).await
+    within(timeout, "connect", connect).await
 }
 
 /// Outcome of a single connection attempt: either a fully classified
@@ -1046,5 +1150,246 @@ mod tests {
                 .contains("the IP pool address has no IPv6 address to send from"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn only_dual_stack_with_both_families_races() {
+        let delay = Duration::from_millis(250);
+        let mixed = [v6(1), v4(10)];
+        assert!(races(&system(AddressFamily::DualStack), &mixed, delay));
+        // a dual-stack pool races its two bound addresses too
+        let pool = OutboundSource::pool(
+            AddressFamily::DualStack,
+            Some("198.51.100.5".parse().unwrap()),
+            Some("2001:db8:1::5".parse().unwrap()),
+        );
+        assert!(races(&pool, &mixed, delay));
+        // everything else connects one address at a time, as before
+        assert!(!races(
+            &system(AddressFamily::DualStack),
+            &mixed,
+            Duration::ZERO
+        ));
+        assert!(!races(&system(AddressFamily::PreferIpv4), &mixed, delay));
+        assert!(!races(
+            &system(AddressFamily::Ipv4Only),
+            &[v4(10), v4(11)],
+            delay
+        ));
+        assert!(!races(
+            &system(AddressFamily::DualStack),
+            &[v4(10), v4(11)],
+            delay
+        ));
+        assert!(!races(
+            &system(AddressFamily::DualStack),
+            &[v6(1), v6(2)],
+            delay
+        ));
+        assert!(!races(
+            &OutboundSource::bound("198.51.100.5".parse().unwrap()),
+            &[v4(10), v4(11)],
+            delay
+        ));
+    }
+
+    type Attempts = Arc<std::sync::Mutex<Vec<(SocketAddr, std::time::Instant)>>>;
+
+    /// A fake connect: each address answers after its delay, with success
+    /// or a refusal, and every start is recorded.
+    fn fake(
+        plan: Vec<(SocketAddr, u64, bool)>,
+        started: Attempts,
+    ) -> impl Fn(
+        SocketAddr,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<SocketAddr>> + Send>,
+    > {
+        move |address| {
+            started
+                .lock()
+                .unwrap()
+                .push((address, std::time::Instant::now()));
+            let (_, after, ok) = *plan.iter().find(|(a, _, _)| *a == address).unwrap();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(after)).await;
+                if ok {
+                    Ok(address)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        format!("refused by {address}"),
+                    ))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn racing_starts_the_next_address_after_the_attempt_delay() {
+        // The IPv6 path is black-holed: today that costs a full open_timeout
+        // before IPv4 is tried. With racing, IPv4 starts after the delay.
+        let started = Attempts::default();
+        let begin = std::time::Instant::now();
+        let winner = race_with(
+            vec![v6(1), v4(10)],
+            Duration::from_millis(50),
+            "mx.example",
+            fake(
+                vec![(v6(1), 30_000, true), (v4(10), 0, true)],
+                started.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, v4(10));
+        assert!(begin.elapsed() < Duration::from_secs(5));
+        let started = started.lock().unwrap().clone();
+        assert_eq!(started.len(), 2);
+        assert!(started[1].1 - started[0].1 >= Duration::from_millis(45));
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_starts_the_next_address_at_once() {
+        let started = Attempts::default();
+        let begin = std::time::Instant::now();
+        let winner = race_with(
+            vec![v6(1), v4(10), v6(2)],
+            Duration::from_secs(30),
+            "mx.example",
+            fake(
+                vec![(v6(1), 0, false), (v4(10), 0, false), (v6(2), 0, true)],
+                started.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, v6(2));
+        assert!(
+            begin.elapsed() < Duration::from_secs(5),
+            "no attempt delay waited"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_attempt_keeps_running_after_the_next_one_starts() {
+        // Strictly no worse than one at a time: the first address keeps its
+        // own timeout and wins when the later one fails.
+        let started = Attempts::default();
+        let winner = race_with(
+            vec![v6(1), v4(10)],
+            Duration::from_millis(20),
+            "mx.example",
+            fake(
+                vec![(v6(1), 300, true), (v4(10), 0, false)],
+                started.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, v6(1));
+    }
+
+    #[tokio::test]
+    async fn every_address_is_tried_and_the_last_error_returned() {
+        let started = Attempts::default();
+        let error = race_with(
+            vec![v6(1), v4(10), v6(2), v4(11)],
+            Duration::from_millis(10),
+            "mx.example",
+            fake(
+                vec![
+                    (v6(1), 40, false),
+                    (v4(10), 30, false),
+                    (v6(2), 20, false),
+                    (v4(11), 200, false),
+                ],
+                started.clone(),
+            ),
+        )
+        .await
+        .expect_err("all refused");
+        assert!(error.to_string().contains("refused by"), "{error}");
+        let mut tried: Vec<SocketAddr> = started.lock().unwrap().iter().map(|(a, _)| *a).collect();
+        // started in the candidate order
+        assert_eq!(tried, vec![v6(1), v4(10), v6(2), v4(11)]);
+        tried.dedup();
+        assert_eq!(tried.len(), 4, "each address once");
+    }
+
+    #[tokio::test]
+    async fn the_losing_attempts_are_cancelled() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = dropped.clone();
+        let winner = race_with(
+            vec![v6(1), v4(10)],
+            Duration::from_millis(10),
+            "mx.example",
+            move |address| {
+                let guard = address.is_ipv6().then(|| Dropped(flag.clone()));
+                async move {
+                    let _guard = guard;
+                    if address.is_ipv6() {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                    Ok::<_, std::io::Error>(address)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, v4(10));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the IPv6 attempt is aborted once IPv4 connected");
+    }
+
+    #[tokio::test]
+    async fn racing_real_sockets_passes_over_a_refusing_address() {
+        // An IPv6 address nobody listens on (refused, or unreachable where
+        // the host has no IPv6) before the IPv4 address that answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let closed = std::net::TcpListener::bind("[::1]:0")
+            .map(|l| l.local_addr().unwrap().port())
+            .unwrap_or(port);
+        let params = SendParams {
+            host: "mx.example".into(),
+            port,
+            helo_hostname: "sender.example".into(),
+            mail_from: String::new(),
+            rcpt_to: String::new(),
+            timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(5),
+            data_timeout: Duration::from_secs(5),
+            tls_mode: TlsMode::Disabled,
+            security: ConnectionSecurity::Opportunistic,
+            auth: None,
+            source: system(AddressFamily::DualStack),
+            connection_attempt_delay: Duration::from_millis(250),
+        };
+        let candidates = vec![
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), closed),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+        ];
+        assert!(races(
+            &params.source,
+            &candidates,
+            params.connection_attempt_delay
+        ));
+        let stream = race(candidates, &params, params.connection_attempt_delay)
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap().port(), port);
     }
 }

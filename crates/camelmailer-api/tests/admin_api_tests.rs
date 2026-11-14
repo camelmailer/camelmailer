@@ -1072,10 +1072,13 @@ async fn source_addresses_list_the_reverse_dns_results_for_global_admins() {
     };
     state
         .store
-        .record_source_address_checks(&[
-            check("203.0.113.10", "pass"),
-            check("2001:db8::10", "no_ptr"),
-        ])
+        .record_source_address_checks(
+            &[
+                check("203.0.113.10", "pass"),
+                check("2001:db8::10", "no_ptr"),
+            ],
+            true,
+        )
         .await
         .unwrap();
 

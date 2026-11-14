@@ -354,6 +354,7 @@ smtp_client:
   read_timeout: 300   # seconds for the greeting, a TLS handshake and each reply
   data_timeout: 600   # seconds to send the body and get the reply to its final dot
   address_family: dual_stack            # dual_stack | prefer_ipv4 | ipv4_only | ipv6_only
+  connection_attempt_delay_ms: 250      # dual_stack: start the next address after this; 0 = one at a time
   reverse_dns_check_interval: 3600      # seconds between reverse-DNS checks; 0 turns them off
   skip_family_without_reverse_dns: false
 ```
@@ -371,13 +372,29 @@ and when a connection fails the worker moves on to the next address.
 
 | Value | Remote addresses tried |
 |---|---|
-| `dual_stack` (default) | Both families, IPv6 first, alternating with IPv4 (RFC 8305), so a broken IPv6 path costs one `open_timeout` before IPv4 is tried, not one per AAAA record |
+| `dual_stack` (default) | Both families, IPv6 first, alternating with IPv4 (RFC 8305), raced (see below) |
 | `prefer_ipv4` | Both families, every IPv4 address before the first IPv6 one |
 | `ipv4_only` | IPv4 only |
 | `ipv6_only` | IPv6 only |
 
+With `dual_stack`, when the remote host has addresses of both families,
+the worker races them (Happy Eyeballs, RFC 8305 section 5): an attempt that
+has not connected after `connection_attempt_delay_ms` (default 250) gets
+the next address started alongside it, a refused attempt starts the next
+address at once, and the first connection wins while the others are
+closed. Each attempt keeps its full `open_timeout`, so every address starts
+no later than it would one at a time and is given as long to connect; a
+black-holed IPv6 path costs a quarter of a second instead of an
+`open_timeout`. `connection_attempt_delay_ms: 0` connects one address at a
+time. The other values always connect one address at a time.
+
 The setting applies to servers without an IP pool, where the operating
-system picks the local address. A server or stream with an IP pool follows
+system picks the local address. It does not apply to delivery through
+`smtp_relays`: the smarthost is reached in the 0.13 order (every IPv4
+address first, then IPv6), and the reverse-DNS skip below is not applied
+to it. A server or stream whose pool has no usable address (an empty pool,
+or an `ipv4` value that does not parse) sends from the host's address in
+the 0.13 order as well, never `dual_stack`. A server or stream with an IP pool follows
 the pool: a pool without an `address_family` of its own sends from each
 address's `ipv4` value, to IPv4 remotes only, as pools always have; a pool
 with one sends IPv4 connections from `ipv4` and IPv6 connections from

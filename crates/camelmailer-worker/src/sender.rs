@@ -140,6 +140,8 @@ pub struct SmtpSender {
     /// `smtp_client.address_family`, for servers without an IP pool and
     /// pools without a family of their own.
     address_family: AddressFamily,
+    /// `smtp_client.connection_attempt_delay_ms` (Happy Eyeballs, `dual_stack`).
+    connection_attempt_delay: Duration,
     /// `smtp_client.skip_family_without_reverse_dns`.
     skip_family_without_reverse_dns: bool,
     /// The latest reverse-DNS results of the source addresses.
@@ -177,6 +179,9 @@ impl SmtpSender {
             read_timeout: Duration::from_secs(config.smtp_client.read_timeout as u64),
             data_timeout: Duration::from_secs(config.smtp_client.data_timeout as u64),
             address_family: config.smtp_client.address_family,
+            connection_attempt_delay: Duration::from_millis(
+                config.smtp_client.connection_attempt_delay_ms as u64,
+            ),
             skip_family_without_reverse_dns: config.smtp_client.skip_family_without_reverse_dns,
             reverse_dns: ReverseDnsState::global(),
         }
@@ -194,10 +199,24 @@ impl SmtpSender {
         self
     }
 
-    /// `source`, without the family whose source address failed the
-    /// reverse-DNS check when `smtp_client.skip_family_without_reverse_dns`
+    /// The source a delivery actually uses.
+    ///
+    /// Through configured relays (`smtp.smtp_relays`) the smarthost, not a
+    /// receiving MX, sees the connection, so neither the address family nor
+    /// the reverse-DNS skip applies: without an IP pool the relay is reached
+    /// as before address families (every IPv4 address first, then IPv6),
+    /// and a pool binds its addresses as it always has.
+    ///
+    /// Direct to MX, `source` loses the family whose source address failed
+    /// the reverse-DNS check when `smtp_client.skip_family_without_reverse_dns`
     /// is on (see [`ReverseDnsState::narrow`]).
     pub fn effective_source(&self, source: OutboundSource) -> OutboundSource {
+        if !self.relays.is_empty() {
+            if source.pinned {
+                return source;
+            }
+            return OutboundSource::system(AddressFamily::PreferIpv4);
+        }
         if !self.skip_family_without_reverse_dns {
             return source;
         }
@@ -278,6 +297,7 @@ impl SmtpSender {
                 security: endpoint.security,
                 auth: endpoint.auth.clone(),
                 source: source.clone(),
+                connection_attempt_delay: self.connection_attempt_delay,
             };
             let outcome = smtp_client::send_message(&params, raw_message).await;
             match outcome {
@@ -346,6 +366,45 @@ mod tests {
             sender.effective_source(source).family,
             AddressFamily::Ipv4Only
         );
+    }
+
+    #[test]
+    fn relays_keep_the_order_from_before_address_families() {
+        use crate::reverse_dns::{AddressCheck, Origin, ReverseDnsStatus};
+        let state = ReverseDnsState::new();
+        let (v4, v6) = (
+            "203.0.113.10".parse().unwrap(),
+            "2001:db8::25".parse().unwrap(),
+        );
+        let check = |address, status| AddressCheck {
+            address,
+            origin: Origin::Host,
+            status,
+            ptr: Vec::new(),
+            detail: String::new(),
+        };
+        // IPv4 fails the check, so direct-to-MX would go IPv6 only
+        state.update(
+            &[
+                check(v4, ReverseDnsStatus::NoPtr),
+                check(v6, ReverseDnsStatus::Pass),
+            ],
+            Some(v4),
+            Some(v6),
+        );
+        let mut config = camelmailer_config::Config::default();
+        config.smtp_client.skip_family_without_reverse_dns = true;
+        config.smtp_client.address_family = AddressFamily::Ipv6Only;
+        config.camelmailer.smtp_relays = vec!["smtp://smarthost.example:587".into()];
+        let sender = SmtpSender::new(&config).with_reverse_dns(state);
+        // without a pool: neither the family nor the skip reaches the relay
+        assert_eq!(
+            sender.effective_source(OutboundSource::system(AddressFamily::Ipv6Only)),
+            OutboundSource::system(AddressFamily::PreferIpv4)
+        );
+        // a pool binds its addresses towards the relay as always
+        let pool = OutboundSource::bound("198.51.100.5".parse().unwrap());
+        assert_eq!(sender.effective_source(pool.clone()), pool);
     }
 
     #[test]

@@ -395,6 +395,17 @@ impl ReverseDnsState {
     }
 }
 
+/// The addresses one run checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckTargets {
+    /// Each address once, with where it comes from.
+    pub addresses: Vec<(IpAddr, Origin)>,
+    /// Whether every pool and every pool's addresses could be read. When
+    /// not, a pool address missing from `addresses` may still be in a pool,
+    /// so its stored result must not be pruned.
+    pub complete: bool,
+}
+
 /// Every address to check: the host's (for servers without a pool) and both
 /// values of every pool address, each once (a pool address wins over the
 /// same host address).
@@ -402,7 +413,8 @@ pub async fn addresses_to_check(
     store: &dyn AdminStore,
     host_ipv4: Option<IpAddr>,
     host_ipv6: Option<IpAddr>,
-) -> Vec<(IpAddr, Origin)> {
+) -> CheckTargets {
+    let mut complete = true;
     let mut targets: Vec<(IpAddr, Origin)> = Vec::new();
     let mut add = |address: IpAddr, origin: Origin| {
         if let Some(existing) = targets.iter_mut().find(|(a, _)| *a == address) {
@@ -435,17 +447,24 @@ pub async fn addresses_to_check(
                         }
                     }
                     Err(error) => {
+                        complete = false;
                         tracing::warn!(%error, pool = %pool.name, "could not list the addresses of an IP pool")
                     }
                 }
             }
         }
-        Err(error) => tracing::warn!(%error, "could not list the IP pools"),
+        Err(error) => {
+            complete = false;
+            tracing::warn!(%error, "could not list the IP pools")
+        }
     }
     for address in [host_ipv4, host_ipv6].into_iter().flatten() {
         add(address, Origin::Host);
     }
-    targets
+    CheckTargets {
+        addresses: targets,
+        complete,
+    }
 }
 
 /// One check run: check every address, log each failure, store the results
@@ -459,8 +478,8 @@ pub async fn run_once(
     checked_by: &str,
 ) -> Vec<AddressCheck> {
     let targets = addresses_to_check(store, host_ipv4, host_ipv6).await;
-    let mut checks = Vec::with_capacity(targets.len());
-    for (address, origin) in targets {
+    let mut checks = Vec::with_capacity(targets.addresses.len());
+    for (address, origin) in targets.addresses {
         let check = check_address(resolver, address, origin).await;
         match check.status {
             ReverseDnsStatus::Pass => {
@@ -499,7 +518,13 @@ pub async fn run_once(
             checked_at: now,
         })
         .collect();
-    if let Err(error) = store.record_source_address_checks(&rows).await {
+    if !targets.complete {
+        tracing::warn!("not every IP pool could be read; stored results of pool addresses are kept until a complete run");
+    }
+    if let Err(error) = store
+        .record_source_address_checks(&rows, targets.complete)
+        .await
+    {
         tracing::warn!(%error, "could not store the reverse-DNS results");
     }
     checks

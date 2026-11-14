@@ -2880,22 +2880,10 @@ pub(crate) async fn ip_pools_create(
         Ok(family) => family,
         Err(response) => return response,
     };
-    let pool = match state
+    let pool = state
         .store
-        .create_ip_pool(&name, body.default.unwrap_or(false))
-        .await
-    {
-        Ok(pool) if address_family.is_some() => {
-            state
-                .store
-                .update_ip_pool(IpPool {
-                    address_family,
-                    ..pool
-                })
-                .await
-        }
-        other => other,
-    };
+        .create_ip_pool_with_family(&name, body.default.unwrap_or(false), address_family)
+        .await;
     from_result(&start, pool, |pool| {
         created(&start, json!({ "ip_pool": ip_pool_json(&pool) }))
     })

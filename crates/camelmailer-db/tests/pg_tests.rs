@@ -2405,6 +2405,13 @@ async fn ip_pool_address_family_and_pool_source_round_trip() {
     let pool = test_pool(&base).await;
     let f = fixtures(pool).await;
 
+    // Without a pool the lookup without an address finds none.
+    assert_eq!(
+        ServerStore::pool_source_for(&f.store, f.server.id, None, None)
+            .await
+            .unwrap(),
+        None
+    );
     let ip_pool = f.store.create_ip_pool("dual", false).await.unwrap();
     assert_eq!(ip_pool.address_family, None);
     f.store
@@ -2422,7 +2429,7 @@ async fn ip_pool_address_family_and_pool_source_round_trip() {
         .await
         .unwrap();
 
-    let source = ServerStore::pool_source_for(&f.store, f.server.id, None, "198.51.100.1")
+    let source = ServerStore::pool_source_for(&f.store, f.server.id, None, Some("198.51.100.1"))
         .await
         .unwrap()
         .unwrap();
@@ -2438,16 +2445,26 @@ async fn ip_pool_address_family_and_pool_source_round_trip() {
         .unwrap();
     let reread = f.store.ip_pool_by_id(ip_pool.id).await.unwrap().unwrap();
     assert_eq!(reread.address_family.as_deref(), Some("ipv6_only"));
-    let source = ServerStore::pool_source_for(&f.store, f.server.id, None, "198.51.100.1")
+    let source = ServerStore::pool_source_for(&f.store, f.server.id, None, Some("198.51.100.1"))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(source.address_family.as_deref(), Some("ipv6_only"));
     assert_eq!(
-        ServerStore::pool_source_for(&f.store, f.server.id, None, "203.0.113.9")
+        ServerStore::pool_source_for(&f.store, f.server.id, None, Some("203.0.113.9"))
             .await
             .unwrap(),
         None
+    );
+    // Without an address: the server has a pool, and its family.
+    assert_eq!(
+        ServerStore::pool_source_for(&f.store, f.server.id, None, None)
+            .await
+            .unwrap(),
+        Some(camelmailer_core::PoolSource {
+            address_family: Some("ipv6_only".into()),
+            ipv6: None,
+        })
     );
 
     // The column only takes the known values.
@@ -2459,6 +2476,24 @@ async fn ip_pool_address_family_and_pool_source_round_trip() {
         })
         .await;
     assert!(invalid.is_err());
+
+    // A pool is created with its family in one write: a rejected family
+    // leaves no pool behind.
+    let created = f
+        .store
+        .create_ip_pool_with_family("v6", false, Some("dual_stack".into()))
+        .await
+        .unwrap();
+    assert_eq!(created.address_family.as_deref(), Some("dual_stack"));
+    let reread = f.store.ip_pool_by_id(created.id).await.unwrap().unwrap();
+    assert_eq!(reread, created);
+    let before = f.store.list_ip_pools().await.unwrap().len();
+    assert!(f
+        .store
+        .create_ip_pool_with_family("bad", false, Some("ipv4_first".into()))
+        .await
+        .is_err());
+    assert_eq!(f.store.list_ip_pools().await.unwrap().len(), before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2487,25 +2522,46 @@ async fn source_address_checks_are_replaced_and_pruned() {
         checked_at: now,
     };
     f.store
-        .record_source_address_checks(&[
-            check("198.51.100.1", "pool", "pass"),
-            check("198.51.100.2", "pool", "pass"),
-            check("2001:db8::9", "host", "no_ptr"),
-        ])
+        .record_source_address_checks(
+            &[
+                check("198.51.100.1", "pool", "pass"),
+                check("198.51.100.2", "pool", "pass"),
+                check("2001:db8::9", "host", "no_ptr"),
+            ],
+            true,
+        )
         .await
         .unwrap();
     let listed = f.store.list_source_address_checks().await.unwrap();
     assert_eq!(listed.len(), 3);
     assert_eq!(listed[0], check("2001:db8::9", "host", "no_ptr"));
 
+    // The status column only takes the known results.
+    assert!(f
+        .store
+        .record_source_address_checks(&[check("198.51.100.3", "pool", "ok")], true)
+        .await
+        .is_err());
+    assert_eq!(f.store.list_source_address_checks().await.unwrap().len(), 3);
+
+    // A run that could not read every pool does not prune pool results.
+    f.store
+        .record_source_address_checks(&[check("2001:db8::9", "host", "no_ptr")], false)
+        .await
+        .unwrap();
+    assert_eq!(f.store.list_source_address_checks().await.unwrap().len(), 3);
+
     let mut old_host = check("192.0.2.50", "host", "pass");
     old_host.checked_at = now - chrono::Duration::days(8);
     f.store
-        .record_source_address_checks(&[
-            check("198.51.100.1", "pool", "mismatch"),
-            check("2001:db8::9", "host", "pass"),
-            old_host,
-        ])
+        .record_source_address_checks(
+            &[
+                check("198.51.100.1", "pool", "mismatch"),
+                check("2001:db8::9", "host", "pass"),
+                old_host,
+            ],
+            true,
+        )
         .await
         .unwrap();
     let listed = f.store.list_source_address_checks().await.unwrap();
