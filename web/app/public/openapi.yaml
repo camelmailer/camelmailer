@@ -3124,10 +3124,12 @@ paths:
         Checks the DNS the installation depends on and names the exact record each check
         expects: A/AAAA of `cluster.inbound_hostname` on the load balancer (or the live SMTP
         nodes), PTR, forward-confirmed reverse DNS and EHLO of every sending address (IP pool
-        addresses and the `cluster.public_addresses` of live workers), SPF of the return-path
-        domain and of verified tenant domains (at most 100) against every sending address, MX of
-        the return-path domain and of tenant domains with an inbound route, and the tracking host
-        name. Each check has `status` ok / warn / fail, `found`, `expected` and copyable
+        addresses and the `cluster.public_addresses` of live workers), then by domain role: the
+        return-path domain (SPF against every sending address, MX on the installation), every
+        verified sending domain (at most 100: SPF against every sending address, the DKIM record
+        at `<selector>._domainkey.<domain>` carrying the key the worker signs with, a DMARC record
+        with `p=none` as a warning), every domain with an inbound route (MX on the installation),
+        and the tracking host name. Each check has `status` ok / warn / fail, `found`, `expected` and copyable
         `instructions`; `instructions` at the top level lists every record to set once. Read-only.
         The result is reused for 60 seconds unless `refresh=1`. Global administrators only.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
@@ -3371,7 +3373,7 @@ components:
                   properties:
                     group: { type: string }
                     subject: { type: string }
-                    kind: { type: string, enum: [a, ptr, fcrdns, ehlo, spf, mx, resolves] }
+                    kind: { type: string, enum: [a, ptr, fcrdns, ehlo, spf, dkim, dmarc, mx, resolves] }
                     status: { type: string, enum: [ok, warn, fail] }
                     found: { type: array, items: { type: string } }
                     expected: { type: array, items: { type: string } }

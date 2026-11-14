@@ -1324,6 +1324,111 @@ async fn dns_checks_report_the_records_to_set_and_cache_the_run() {
 }
 
 #[tokio::test]
+async fn dns_checks_cover_dkim_dmarc_and_inbound_mx_by_domain_role() {
+    let (app, state) = build_dns_app(Arc::new(FixedDns::default())).await;
+    let org = state
+        .store
+        .create_organization(camelmailer_core::admin_store::NewOrganization {
+            name: "Acme".into(),
+            permalink: "acme".into(),
+        })
+        .await
+        .unwrap();
+    let server = state
+        .store
+        .create_server(camelmailer_core::admin_store::NewServer {
+            organization_id: org.id,
+            name: "Live".into(),
+            permalink: "live".into(),
+            mode: camelmailer_core::ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let sending = state
+        .store
+        .create_server_domain(server.id, "send.example", None)
+        .await
+        .unwrap();
+    state
+        .store
+        .set_domain_verified(sending.id, true)
+        .await
+        .unwrap();
+    // A domain with an inbound route, not verified for sending.
+    let inbound = state
+        .store
+        .create_server_domain(server.id, "in.example", None)
+        .await
+        .unwrap();
+    state
+        .store
+        .create_route_record(camelmailer_core::admin_store::NewRoute {
+            server_id: server.id,
+            domain_id: Some(inbound.id),
+            name: "support".into(),
+            mode: camelmailer_core::RouteMode::Accept,
+            endpoint_url: None,
+        })
+        .await
+        .unwrap();
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/dns_checks",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = body["data"]["groups"].as_array().unwrap();
+    let kinds = |subject: &str| -> Vec<(String, String)> {
+        groups
+            .iter()
+            .find(|g| g["subject"] == subject)
+            .map(|g| {
+                g["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| {
+                        (
+                            c["kind"].as_str().unwrap().to_string(),
+                            c["status"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The sending domain: DKIM (no key in this test installation: a
+    // warning) and DMARC (missing: a failure). No SPF check without a
+    // sending address.
+    assert_eq!(
+        kinds("send.example"),
+        vec![
+            ("dkim".to_string(), "warn".to_string()),
+            ("dmarc".to_string(), "fail".to_string())
+        ]
+    );
+    // The inbound domain: only its MX, and missing is a failure.
+    assert_eq!(
+        kinds("in.example"),
+        vec![("mx".to_string(), "fail".to_string())]
+    );
+    let instructions: Vec<&str> = body["data"]["instructions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(instructions.contains(&"set MX in.example → 10 mail.example.com, TTL 300"));
+    assert!(instructions
+        .iter()
+        .any(|i| i.starts_with("set TXT _dmarc.send.example → \"v=DMARC1; p=none;")));
+}
+
+#[tokio::test]
 async fn the_candidate_check_guides_a_new_address_until_it_is_ready() {
     let ip = |v: &str| v.parse::<std::net::IpAddr>().unwrap();
     let (app, _) = build_dns_app(Arc::new(FixedDns::default())).await;
