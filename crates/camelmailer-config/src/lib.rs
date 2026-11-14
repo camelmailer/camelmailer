@@ -446,6 +446,7 @@ pub struct DeliverabilityFeedback {
     pub postmaster_tools: PostmasterTools,
     pub snds: Snds,
     pub fbl: FeedbackLoops,
+    pub placement: Placement,
 }
 
 impl Default for DeliverabilityFeedback {
@@ -456,6 +457,7 @@ impl Default for DeliverabilityFeedback {
             postmaster_tools: PostmasterTools::default(),
             snds: Snds::default(),
             fbl: FeedbackLoops::default(),
+            placement: Placement::default(),
         }
     }
 }
@@ -513,6 +515,106 @@ impl Default for PostmasterTools {
 pub struct Snds {
     /// File holding the SNDS data URL. Env `CAMELMAILER_SNDS_DATA_URL` wins.
     pub data_url_file: Option<String>,
+}
+
+/// Inbox placement tests with seed mailboxes the operator owns. A test
+/// message per sending IP goes to every seed; the worker then looks it up
+/// over IMAP, read-only, and records inbox, spam or missing. It only
+/// measures: it never opens, clicks, replies to, flags or moves a message.
+/// Off while `seeds` is empty.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Placement {
+    /// The mail server that sends the tests, as `organization/server`
+    /// permalinks. `from_address` must be on one of its verified domains,
+    /// so the tests carry its DKIM signature.
+    pub server: String,
+    /// Envelope and header sender of the tests.
+    pub from_address: String,
+    /// Run a round every this many seconds. `0`: only on demand from the
+    /// dashboard or `POST /api/v2/admin/deliverability/placement_tests`.
+    pub interval_seconds: u32,
+    /// At most one round per this many seconds, on demand included.
+    pub min_round_interval_seconds: u32,
+    /// How long after sending to look for a test, and between lookups.
+    pub check_after_seconds: u32,
+    /// Lookups before a test that was not found counts as missing.
+    pub max_checks: u32,
+    pub seeds: Vec<Seed>,
+}
+
+impl Default for Placement {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            from_address: String::new(),
+            interval_seconds: 0,
+            min_round_interval_seconds: 3600,
+            check_after_seconds: 600,
+            max_checks: 3,
+            seeds: Vec::new(),
+        }
+    }
+}
+
+/// The mailbox provider of a seed, which sets the IMAP defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeedProvider {
+    /// Gmail: imap.gmail.com:993, XOAUTH2 (scope https://mail.google.com/)
+    /// or an app password.
+    Gmail,
+    /// Outlook.com / Hotmail: outlook.office365.com:993, XOAUTH2 only
+    /// (basic authentication ended 2024-09-16).
+    Outlook,
+    /// Yahoo Mail: imap.mail.yahoo.com:993 with an app password.
+    Yahoo,
+    /// Any other IMAP server; `imap_host` is required.
+    #[default]
+    Imap,
+}
+
+/// How a seed logs in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedAuth {
+    /// `LOGIN` with an app password (Gmail with 2-Step Verification, Yahoo).
+    #[default]
+    AppPassword,
+    /// `AUTHENTICATE XOAUTH2` with an access token from a refresh token.
+    Xoauth2,
+}
+
+/// One seed mailbox. Secrets come from the environment variable or the
+/// file named here, never from this file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Seed {
+    pub provider: SeedProvider,
+    /// The seed's address (the test's recipient).
+    pub address: String,
+    /// IMAP login; defaults to `address`.
+    pub username: Option<String>,
+    pub imap_host: Option<String>,
+    pub imap_port: Option<u16>,
+    /// TLS from the first byte (993). Only tests turn it off.
+    pub imap_tls: Option<bool>,
+    pub auth: SeedAuth,
+    /// App password: environment variable, else file.
+    pub password_env: Option<String>,
+    pub password_file: Option<String>,
+    /// XOAUTH2: token endpoint (provider default when unset), client id,
+    /// client secret and refresh token (each from env, else file).
+    pub token_url: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret_env: Option<String>,
+    pub client_secret_file: Option<String>,
+    pub refresh_token_env: Option<String>,
+    pub refresh_token_file: Option<String>,
+    /// OAuth scope (provider default when unset).
+    pub scope: Option<String>,
+    /// The spam folder, when the server does not mark it `\Junk`.
+    pub junk_folder: Option<String>,
 }
 
 /// Complaint feedback loops (Microsoft JMRP, Yahoo CFL and any other ARF
@@ -2617,5 +2719,21 @@ smtp_server:
         );
         assert!(feedback.fbl.suppress_complainants);
         assert!(Config::from_yaml("deliverability_feedback:\n  snds:\n    key: x\n").is_err());
+
+        let config = Config::from_yaml(
+            "deliverability_feedback:\n  placement:\n    server: ops/placement\n    \
+             from_address: p@example.com\n    seeds:\n      - provider: outlook\n        \
+             address: s@outlook.com\n        auth: xoauth2\n        client_id: c\n        \
+             refresh_token_file: /run/secrets/r\n      - provider: yahoo\n        \
+             address: s@yahoo.com\n        password_env: SEED_YAHOO\n",
+        )
+        .unwrap();
+        let placement = &config.deliverability_feedback.placement;
+        assert_eq!(placement.seeds.len(), 2);
+        assert_eq!(placement.seeds[0].provider, SeedProvider::Outlook);
+        assert_eq!(placement.seeds[0].auth, SeedAuth::Xoauth2);
+        assert_eq!(placement.seeds[1].auth, SeedAuth::AppPassword);
+        assert_eq!(placement.min_round_interval_seconds, 3600);
+        assert_eq!(placement.interval_seconds, 0);
     }
 }

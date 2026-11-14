@@ -1,12 +1,13 @@
 // Judgment for the Provider feedback page, kept out of the view so it can
 // be tested on its own.
 
-import type { FeedbackSource, FeedbackVerdict } from "@/lib/api"
+import type { FeedbackSource, FeedbackVerdict, PlacementTest } from "@/lib/api"
 
 export const SOURCE_LABELS: Record<FeedbackSource["source"], { title: string; provider: string }> = {
   postmaster_tools: { title: "Google Postmaster Tools", provider: "Gmail" },
   snds: { title: "Microsoft SNDS", provider: "Outlook.com" },
   fbl: { title: "Complaint feedback loops", provider: "Microsoft JMRP, Yahoo CFL" },
+  placement: { title: "Seed placement", provider: "Your seed mailboxes" },
 }
 
 export const PROVIDER_LABELS: Record<string, string> = {
@@ -56,8 +57,10 @@ export function sourceState(
   if (!source.enabled) return "off"
   if (source.status?.last_error) return "failing"
   if (source.freshness_seconds == null) return "waiting"
-  // A feedback loop is quiet when nobody complains, which is good news.
-  if (source.source !== "fbl" && source.freshness_seconds > 172_800) return "stale"
+  // A feedback loop is quiet when nobody complains, which is good news, and
+  // placement rounds run as often as the operator asks.
+  const quietIsFine = source.source === "fbl" || source.source === "placement"
+  if (!quietIsFine && source.freshness_seconds > 172_800) return "stale"
   return "fresh"
 }
 
@@ -77,4 +80,31 @@ export function formatMetric(key: string, value: unknown): string {
     return `${(value * 100).toFixed(2)} %`
   }
   return String(value)
+}
+
+/** The pill of a placement result. */
+export function placementTone(status: PlacementTest["status"]): {
+  label: string
+  tone: "green" | "amber" | "red" | "gray"
+} {
+  switch (status) {
+    case "inbox":
+      return { label: "Inbox", tone: "green" }
+    case "spam":
+      return { label: "Spam", tone: "red" }
+    case "missing":
+      return { label: "Missing", tone: "amber" }
+    case "error":
+      return { label: "Error", tone: "red" }
+    default:
+      return { label: "Waiting", tone: "gray" }
+  }
+}
+
+/** `spf pass · dkim pass · dmarc fail`, or null without any result. */
+export function authSummary(test: Pick<PlacementTest, "spf" | "dkim" | "dmarc">): string | null {
+  const parts = (["spf", "dkim", "dmarc"] as const)
+    .filter((key) => test[key])
+    .map((key) => `${key} ${test[key]}`)
+  return parts.length ? parts.join(" · ") : null
 }

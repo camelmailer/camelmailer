@@ -3,18 +3,29 @@
 // Instance admin: what Google Postmaster Tools, Microsoft SNDS and the
 // complaint feedback loops report about this installation's mail.
 
-import { useQuery } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { PlayIcon } from "lucide-react"
+import { toast } from "sonner"
 import { PageHeader } from "@/components/shared"
 import { Page } from "@/components/page"
 import { StatusPill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { DataTable, type DataTableColumn } from "@/components/ui/data-table"
-import { adminApi, type FeedbackSnapshot, type FeedbackSource } from "@/lib/api"
+import { Button } from "@/components/ui/button"
+import {
+  adminApi,
+  ApiError,
+  type FeedbackSnapshot,
+  type FeedbackSource,
+  type PlacementTest,
+} from "@/lib/api"
 import { relativeTime } from "@/lib/api-p1"
 import {
   age,
+  authSummary,
   formatMetric,
+  placementTone,
   PROVIDER_LABELS,
   SOURCE_LABELS,
   sourceState,
@@ -47,13 +58,22 @@ const METRIC_COLUMNS: Record<FeedbackSource["source"], [string, string][]> = {
     ["trap_hits", "Trap hits"],
   ],
   fbl: [["complaints", "Complaints"]],
+  placement: [
+    ["seed", "Seed"],
+    ["folder", "Folder"],
+  ],
 }
 
 function SnapshotTable({ source }: { source: FeedbackSource }) {
   const columns: DataTableColumn<FeedbackSnapshot>[] = [
     {
       id: "subject",
-      header: source.source === "fbl" ? "Provider" : source.source === "snds" ? "IP" : "Domain",
+      header:
+        source.source === "fbl"
+          ? "Provider"
+          : source.source === "postmaster_tools"
+            ? "Domain"
+            : "IP",
       accessorFn: (r) => r.subject,
       cell: ({ row }) => (
         <span className="block truncate font-mono text-xs font-medium">
@@ -171,6 +191,128 @@ function SourceCard({ source }: { source: FeedbackSource }) {
   )
 }
 
+function PlacementCard() {
+  const queryClient = useQueryClient()
+  const tests = useQuery({
+    queryKey: ["admin", "placement-tests"],
+    queryFn: adminApi.deliverabilityFeedback.placementTests,
+    refetchInterval: 60_000,
+  })
+  const run = useMutation({
+    mutationFn: adminApi.deliverabilityFeedback.runPlacementTests,
+    onSuccess: () => {
+      toast.success("Placement round requested. A worker sends it within a minute.")
+      void queryClient.invalidateQueries({ queryKey: ["admin", "placement-tests"] })
+    },
+    onError: (err) =>
+      toast.error(
+        err instanceof ApiError ? err.message : "The placement round could not be requested",
+      ),
+  })
+  const columns: DataTableColumn<PlacementTest>[] = [
+    {
+      id: "ip",
+      header: "IP",
+      accessorFn: (r) => r.ip,
+      cell: ({ row }) => (
+        <span className="block truncate font-mono text-xs font-medium">{row.original.ip}</span>
+      ),
+    },
+    {
+      id: "seed_address",
+      header: "Seed",
+      accessorFn: (r) => r.seed_address,
+      cell: ({ row }) => <span className="truncate">{row.original.seed_address}</span>,
+    },
+    {
+      id: "status",
+      header: "Result",
+      accessorFn: (r) => r.status,
+      cell: ({ row }) => {
+        const pill = placementTone(row.original.status)
+        return <StatusPill status={pill.label} tone={pill.tone} />
+      },
+    },
+    {
+      id: "auth",
+      header: "Authentication",
+      accessorFn: (r) => authSummary(r) ?? "",
+      cell: ({ row }) => (
+        <span className="text-muted-foreground">{authSummary(row.original) ?? "—"}</span>
+      ),
+    },
+    {
+      id: "received",
+      header: "Seen as",
+      accessorFn: (r) => r.helo ?? "",
+      cell: ({ row }) => (
+        <span className="font-mono text-xs text-muted-foreground" title={row.original.detail}>
+          {row.original.helo || row.original.received_ip
+            ? `${row.original.helo ?? "?"} [${row.original.received_ip ?? "?"}]`
+            : row.original.detail || "—"}
+        </span>
+      ),
+    },
+    {
+      id: "created_at",
+      header: "Sent",
+      accessorFn: (r) => r.created_at,
+      cell: ({ row }) => (
+        <span className="text-muted-foreground">{relativeTime(row.original.created_at)}</span>
+      ),
+    },
+  ]
+  const configured = tests.data?.configured ?? false
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex flex-wrap items-center gap-2 text-base">
+          Seed placement tests
+          <Button
+            size="sm"
+            variant="outline"
+            className="ml-auto"
+            disabled={!configured || run.isPending}
+            onClick={() => run.mutate()}
+          >
+            <PlayIcon />
+            Run a round now
+          </Button>
+        </CardTitle>
+        <p className="text-sm text-muted-foreground">
+          One test message from every sending IP to each of your seed mailboxes, then a read-only
+          look into the inbox and the spam folder. Nothing in the seed mailboxes is opened, clicked,
+          answered or moved.
+          {!configured && " Configure seeds in deliverability_feedback.placement to use it."}
+          {tests.data?.last_round &&
+            ` Last round requested ${relativeTime(tests.data.last_round.requested_at)}.`}
+        </p>
+      </CardHeader>
+      {configured && (
+        <CardContent>
+          <DataTable
+            columns={columns}
+            data={tests.data?.placement_tests ?? []}
+            loading={tests.isLoading}
+            searchKeys={["ip", "seed_address"]}
+            filters={[
+              {
+                columnId: "status",
+                label: "Result",
+                options: (["inbox", "spam", "missing", "pending", "error"] as const).map((v) => ({
+                  label: placementTone(v).label,
+                  value: v,
+                })),
+              },
+            ]}
+            emptyText="No placement tests yet. Run a round to start."
+          />
+        </CardContent>
+      )}
+    </Card>
+  )
+}
+
 export default function ProviderFeedback() {
   const feedback = useQuery({
     queryKey: ["admin", "deliverability-feedback"],
@@ -195,6 +337,7 @@ export default function ProviderFeedback() {
         {feedback.data?.sources.map((source) => (
           <SourceCard key={source.source} source={source} />
         ))}
+        <PlacementCard />
       </div>
     </Page>
   )

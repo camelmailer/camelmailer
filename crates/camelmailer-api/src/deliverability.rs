@@ -5,7 +5,9 @@
 //! installation. The data is fetched by the worker
 //! (`camelmailer_worker::feedback`); this endpoint only reads it.
 
-use crate::app::{render_store_error, render_success, ApiResponse, ApiState, RequestStart};
+use crate::app::{
+    render_error, render_store_error, render_success, ApiResponse, ApiState, RequestStart,
+};
 use axum::extract::State;
 use axum::http::StatusCode;
 use camelmailer_core::feedback::source;
@@ -51,7 +53,7 @@ pub(crate) async fn feedback_index(
         // Fetched sources are as fresh as their last successful fetch; the
         // feedback loops as their newest report.
         let fresh_at = match name {
-            source::FBL => snapshots.iter().map(|s| s.fetched_at).max(),
+            source::FBL | source::PLACEMENT => snapshots.iter().map(|s| s.fetched_at).max(),
             _ => status.and_then(|s| s.last_success_at),
         };
         sources.push(json!({
@@ -64,4 +66,86 @@ pub(crate) async fn feedback_index(
         }));
     }
     render_success(Some(&start), StatusCode::OK, json!({ "sources": sources }))
+}
+
+/// Whether this installation's config has seed placement tests.
+fn placement_configured(config: &camelmailer_config::Config) -> bool {
+    let placement = &config.deliverability_feedback.placement;
+    !placement.seeds.is_empty()
+        && !placement.server.trim().is_empty()
+        && placement.from_address.contains('@')
+}
+
+/// `GET /api/v2/admin/deliverability/placement_tests`: the newest 200
+/// tests, newest first, with the last round.
+pub(crate) async fn placement_tests_index(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+) -> ApiResponse {
+    let configured = placement_configured(&state.config);
+    let Some(store) = state.feedback_store.as_ref() else {
+        return render_success(
+            Some(&start),
+            StatusCode::OK,
+            json!({ "configured": configured, "last_round": null, "placement_tests": [] }),
+        );
+    };
+    let last_round = match store.last_placement_round().await {
+        Ok(round) => round,
+        Err(error) => return render_store_error(Some(&start), error),
+    };
+    match store.list_placement_tests(200).await {
+        Ok(tests) => render_success(
+            Some(&start),
+            StatusCode::OK,
+            json!({ "configured": configured, "last_round": last_round, "placement_tests": tests }),
+        ),
+        Err(error) => render_store_error(Some(&start), error),
+    }
+}
+
+/// `POST /api/v2/admin/deliverability/placement_tests`: request a round now.
+/// A worker sends it within a minute. At most one round per
+/// `deliverability_feedback.placement.min_round_interval_seconds`.
+pub(crate) async fn placement_tests_create(
+    State(state): State<Arc<ApiState>>,
+    start: axum::Extension<RequestStart>,
+) -> ApiResponse {
+    if !placement_configured(&state.config) {
+        return render_error(
+            Some(&start),
+            StatusCode::CONFLICT,
+            "PlacementNotConfigured",
+            "Seed placement tests need deliverability_feedback.placement.server, from_address and at least one seed",
+        );
+    }
+    let Some(store) = state.feedback_store.as_ref() else {
+        return render_error(
+            Some(&start),
+            StatusCode::CONFLICT,
+            "PlacementNotConfigured",
+            "This installation keeps no provider feedback",
+        );
+    };
+    let min_interval = i64::from(
+        state
+            .config
+            .deliverability_feedback
+            .placement
+            .min_round_interval_seconds,
+    );
+    match store.request_placement_round("manual", min_interval).await {
+        Ok(Some(round)) => render_success(
+            Some(&start),
+            StatusCode::ACCEPTED,
+            json!({ "placement_round": round }),
+        ),
+        Ok(None) => render_error(
+            Some(&start),
+            StatusCode::CONFLICT,
+            "PlacementRateLimited",
+            &format!("A placement round was requested less than {min_interval} seconds ago"),
+        ),
+        Err(error) => render_store_error(Some(&start), error),
+    }
 }

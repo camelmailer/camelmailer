@@ -44,8 +44,8 @@ pub use dmarc::{
 };
 pub use dns::{is_valid_helo_hostname, DnsError, DnsResolver, StaticDnsResolver};
 pub use feedback::{
-    FeedbackSnapshot, FeedbackSourceStatus, FeedbackStore, NewFeedbackSnapshot, ProviderSignal,
-    Verdict,
+    FeedbackSnapshot, FeedbackSourceStatus, FeedbackStore, NewFeedbackSnapshot, NewPlacementTest,
+    PlacementResult, PlacementRound, PlacementTest, ProviderSignal, Verdict,
 };
 pub use lifecycle::LifecycleEvent;
 pub use message::{

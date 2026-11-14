@@ -1987,6 +1987,11 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             get(crate::deliverability::feedback_index),
         )
         .route(
+            "/deliverability/placement_tests",
+            get(crate::deliverability::placement_tests_index)
+                .post(crate::deliverability::placement_tests_create),
+        )
+        .route(
             "/ip_pools/{pool_id}/ip_addresses",
             get(resources::ip_addresses_index).post(resources::ip_addresses_create),
         )

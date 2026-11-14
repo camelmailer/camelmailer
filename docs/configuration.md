@@ -579,6 +579,14 @@ deliverability_feedback:
     # data_url_file: /run/secrets/snds_data_url                   # or CAMELMAILER_SNDS_DATA_URL
   fbl:
     suppress_complainants: false      # also suppress complainants of transactional mail
+  placement:                          # seed inbox placement tests; off without seeds
+    server: ""                        # organization/server that sends the tests
+    from_address: ""                  # on a verified domain of that server
+    interval_seconds: 0               # 0 = only on demand
+    min_round_interval_seconds: 3600
+    check_after_seconds: 600
+    max_checks: 3
+    seeds: []                         # provider, address, auth and secret references
 ```
 
 ### `captcha:` registration captcha
