@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils"
 export const INFRASTRUCTURE_SECTIONS: readonly (readonly [href: string, label: string])[] = [
   ["/admin/infrastructure", "Topology"],
   ["/admin/infrastructure/dns", "DNS checks"],
+  ["/admin/infrastructure/ips", "IP metrics & warm-up"],
 ]
 
 export function InfrastructureNav() {
