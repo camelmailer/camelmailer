@@ -80,6 +80,7 @@ pub use template::{
     render as render_template, render_in_layout, wrapper_has_raw_content, RenderError,
 };
 pub use warmup::{
-    SignalVerdict, WarmupAddress, WarmupDecision, WarmupLogEntry, WarmupMode, WarmupProfile,
-    WarmupSignal, WarmupState, WarmupStatus, WarmupStore, WarmupThresholds,
+    GroupLimits, Ramp, SignalVerdict, WarmupAddress, WarmupDecision, WarmupLogEntry, WarmupMode,
+    WarmupProfile, WarmupProfiles, WarmupSignal, WarmupState, WarmupStatus, WarmupStore,
+    WarmupThresholds,
 };

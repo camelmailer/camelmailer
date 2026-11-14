@@ -7941,32 +7941,32 @@ async fn warmup_reservations_settings_and_state_on_postgres() {
         })
         .await
         .unwrap();
-    let profile = WarmupProfile {
-        start: 2,
-        growth: 2.0,
-        cap: 100,
-    };
-    let initial = WarmupState::initial(address.id, ProviderGroup::Google, &profile);
+    let profile = WarmupProfile::uniform(2, 2.0, 100);
+    let initial = WarmupState::initial(
+        address.id,
+        ProviderGroup::google(),
+        &profile.ramp(&ProviderGroup::google()),
+    );
     let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
     let now = chrono::Utc::now();
     for expected in [true, true, false] {
         assert_eq!(
             store
-                .try_reserve_warmup(address.id, ProviderGroup::Google, day, &initial, now)
+                .try_reserve_warmup(address.id, ProviderGroup::google(), day, &initial, now)
                 .await
                 .unwrap(),
             expected
         );
     }
     assert!(store
-        .try_reserve_warmup(address.id, ProviderGroup::Yahoo, day, &initial, now)
+        .try_reserve_warmup(address.id, ProviderGroup::yahoo(), day, &initial, now)
         .await
         .unwrap());
     assert_eq!(
         store.warmup_usage(day).await.unwrap(),
         vec![
-            (address.id, ProviderGroup::Google, 2),
-            (address.id, ProviderGroup::Yahoo, 1)
+            (address.id, ProviderGroup::google(), 2),
+            (address.id, ProviderGroup::yahoo(), 1)
         ]
     );
 
@@ -7975,14 +7975,14 @@ async fn warmup_reservations_settings_and_state_on_postgres() {
         .await
         .unwrap()
         .into_iter()
-        .find(|s| s.provider == ProviderGroup::Google)
+        .find(|s| s.provider == ProviderGroup::google())
         .unwrap();
     assert_eq!(state.version, 1);
     state.status = WarmupStatus::Paused;
     state.paused_until = Some(now + chrono::Duration::hours(1));
     let entry = WarmupLogEntry {
         ip_address_id: address.id,
-        provider: Some(ProviderGroup::Google),
+        provider: Some(ProviderGroup::google()),
         decision: "brake".into(),
         reason: "test".into(),
         allowance_before: Some(2),
@@ -7997,7 +7997,7 @@ async fn warmup_reservations_settings_and_state_on_postgres() {
     assert!(!store
         .try_reserve_warmup(
             address.id,
-            ProviderGroup::Google,
+            ProviderGroup::google(),
             day.succ_opt().unwrap(),
             &initial,
             now
@@ -8018,12 +8018,15 @@ async fn warmup_reservations_settings_and_state_on_postgres() {
         (WarmupMode::Slow, "pool")
     );
     assert!(store
-        .set_address_warmup(address.id, Some(WarmupMode::Custom), Some(profile))
+        .set_address_warmup(address.id, Some(WarmupMode::Custom), Some(profile.clone()))
         .await
         .unwrap());
     let listed = store.warmup_addresses().await.unwrap();
     assert_eq!(listed[0].effective_mode(), (WarmupMode::Custom, "address"));
-    assert_eq!(listed[0].effective_profile(), Some(profile));
+    assert_eq!(
+        listed[0].effective_profile(&camelmailer_core::WarmupProfiles::default()),
+        Some(profile.clone())
+    );
     assert!(store
         .set_address_warmup(address.id, None, None)
         .await

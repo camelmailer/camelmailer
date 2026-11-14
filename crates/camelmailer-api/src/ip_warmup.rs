@@ -51,13 +51,13 @@ fn store(state: &ApiState, start: &RequestStart) -> Result<Arc<dyn WarmupStore>,
 }
 
 fn profile_json(profile: &WarmupProfile) -> Value {
-    json!({ "start": profile.start, "growth": profile.growth, "cap": profile.cap })
+    serde_json::to_value(profile).unwrap_or(Value::Null)
 }
 
 fn log_json(entry: &WarmupLogEntry) -> Value {
     json!({
         "ip_address_id": entry.ip_address_id,
-        "provider": entry.provider.map(|p| p.as_str()),
+        "provider": entry.provider.as_ref().map(|p| p.as_str()),
         "decision": entry.decision,
         "reason": entry.reason,
         "allowance_before": entry.allowance_before,
@@ -68,12 +68,14 @@ fn log_json(entry: &WarmupLogEntry) -> Value {
 
 /// One provider's state as the dashboard shows it.
 fn provider_json(
-    provider: ProviderGroup,
+    provider: &ProviderGroup,
     state: Option<&WarmupState>,
     profile: Option<&WarmupProfile>,
     used_today: i64,
 ) -> Value {
     let now = Utc::now();
+    let ramp = profile.map(|p| p.ramp(provider));
+    let profile = ramp.as_ref();
     let (allowance, status) = match (state, profile) {
         (Some(state), _) => (Some(state.allowance), Some(state.status.as_str())),
         (None, Some(profile)) => (Some(profile.start), Some("not_started")),
@@ -113,21 +115,23 @@ fn address_json(
     states: &[WarmupState],
     usage: &HashMap<(Id, ProviderGroup), i64>,
     log: &[WarmupLogEntry],
+    groups: &[ProviderGroup],
+    profiles: &camelmailer_core::WarmupProfiles,
 ) -> Value {
     let (mode, source) = address.effective_mode();
-    let profile = address.effective_profile();
-    let providers: Vec<Value> = ProviderGroup::ALL
+    let profile = address.effective_profile(profiles);
+    let providers: Vec<Value> = groups
         .iter()
         .map(|provider| {
             let state = states
                 .iter()
                 .find(|s| s.ip_address_id == address.ip_address_id && s.provider == *provider);
             provider_json(
-                *provider,
+                provider,
                 state,
                 profile.as_ref(),
                 usage
-                    .get(&(address.ip_address_id, *provider))
+                    .get(&(address.ip_address_id, provider.clone()))
                     .copied()
                     .unwrap_or(0),
             )
@@ -185,16 +189,27 @@ pub(crate) async fn ip_warmup_index(
         .into_iter()
         .map(|(id, provider, used)| ((id, provider), used))
         .collect();
+    let profiles = crate::warmup_config::profiles_from_config(&state.config.warmup);
+    let groups =
+        crate::warmup_config::provider_groups_from_config(&state.config.provider_groups).names();
+    let storage_incidents: Vec<Value> = log
+        .iter()
+        .filter(|e| e.decision == "storage")
+        .take(20)
+        .map(log_json)
+        .collect();
     let t = &state.config.warmup;
     render_success(
         Some(&start),
         StatusCode::OK,
         json!({
             "profiles": {
-                "slow": profile_json(&WarmupProfile::SLOW),
-                "normal": profile_json(&WarmupProfile::NORMAL),
-                "fast": profile_json(&WarmupProfile::FAST),
+                "slow": profile_json(&profiles.slow),
+                "normal": profile_json(&profiles.normal),
+                "fast": profile_json(&profiles.fast),
             },
+            "provider_groups": groups.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+            "storage_incidents": storage_incidents,
             "thresholds": {
                 "min_volume_fraction": t.min_volume_fraction,
                 "advance_fraction": t.advance_fraction,
@@ -210,7 +225,7 @@ pub(crate) async fn ip_warmup_index(
             },
             "addresses": addresses
                 .iter()
-                .map(|a| address_json(a, &states, &usage, &log))
+                .map(|a| address_json(a, &states, &usage, &log, &groups, &profiles))
                 .collect::<Vec<_>>(),
         }),
     )
@@ -230,7 +245,7 @@ fn parse_body(
             "mode must be off, slow, normal, fast, custom or inherit",
         ));
     };
-    match (mode, body.profile) {
+    match (mode, body.profile.clone()) {
         (WarmupMode::Custom, None) => Err(render_validation_error(
             Some(start),
             "mode custom needs a profile {start, growth, cap}",
@@ -314,7 +329,7 @@ pub(crate) async fn ip_warmup_pool_update(
         Ok(addresses) => addresses,
         Err(error) => return render_store_error(Some(&start), error),
     };
-    match store.set_pool_warmup(id, mode, profile).await {
+    match store.set_pool_warmup(id, mode, profile.clone()).await {
         Ok(true) => {}
         Ok(false) => return render_not_found(Some(&start)),
         Err(error) => return render_store_error(Some(&start), error),
@@ -346,7 +361,7 @@ pub(crate) async fn ip_warmup_pool_update(
 }
 
 async fn single_address(
-    _state: &ApiState,
+    state: &ApiState,
     start: &RequestStart,
     store: &Arc<dyn WarmupStore>,
     id: Id,
@@ -368,11 +383,18 @@ async fn single_address(
                 .map(|(id, provider, used)| ((id, provider), used))
                 .collect();
             match addresses.iter().find(|a| a.ip_address_id == id) {
-                Some(address) => render_success(
-                    Some(start),
-                    StatusCode::OK,
-                    json!({ "address": address_json(address, &states, &usage, &log) }),
-                ),
+                Some(address) => {
+                    let profiles = crate::warmup_config::profiles_from_config(&state.config.warmup);
+                    let groups = crate::warmup_config::provider_groups_from_config(
+                        &state.config.provider_groups,
+                    )
+                    .names();
+                    render_success(
+                        Some(start),
+                        StatusCode::OK,
+                        json!({ "address": address_json(address, &states, &usage, &log, &groups, &profiles) }),
+                    )
+                }
                 None => render_not_found(Some(start)),
             }
         }

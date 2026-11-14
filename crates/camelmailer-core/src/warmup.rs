@@ -29,6 +29,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::delivery_stats::{IpDeliveryStat, ProviderGroup};
 use crate::{Id, StoreError};
@@ -69,46 +70,18 @@ impl WarmupMode {
     }
 }
 
-/// A warm-up ramp: the first day's allowance per provider, the factor it
-/// grows by after each healthy day, and the allowance from which the
-/// address counts as warm (no limit any more).
+/// The ramp of one address with one provider group: the first day's
+/// allowance, the factor it grows by after each healthy day, and the
+/// allowance from which the address counts as warm (no limit any more).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct WarmupProfile {
+pub struct Ramp {
     pub start: i64,
     pub growth: f64,
     pub cap: i64,
 }
 
-impl WarmupProfile {
-    pub const SLOW: WarmupProfile = WarmupProfile {
-        start: 50,
-        growth: 1.3,
-        cap: 20_000,
-    };
-    pub const NORMAL: WarmupProfile = WarmupProfile {
-        start: 200,
-        growth: 1.5,
-        cap: 50_000,
-    };
-    pub const FAST: WarmupProfile = WarmupProfile {
-        start: 500,
-        growth: 2.0,
-        cap: 100_000,
-    };
-
-    /// The profile of `mode`; `custom` needs `custom`. `None` for `off`, or
-    /// `custom` without a profile.
-    pub fn for_mode(mode: WarmupMode, custom: Option<WarmupProfile>) -> Option<WarmupProfile> {
-        match mode {
-            WarmupMode::Off => None,
-            WarmupMode::Slow => Some(Self::SLOW),
-            WarmupMode::Normal => Some(Self::NORMAL),
-            WarmupMode::Fast => Some(Self::FAST),
-            WarmupMode::Custom => custom,
-        }
-    }
-
-    /// Why a custom profile is not usable, if it is not.
+impl Ramp {
+    /// Why a ramp is not usable, if it is not.
     pub fn validate(&self) -> Result<(), String> {
         if !(1..=1_000_000).contains(&self.start) {
             return Err("start must be between 1 and 1000000".into());
@@ -137,6 +110,237 @@ impl WarmupProfile {
             days += 1;
         }
         days
+    }
+}
+
+/// The first day's allowance and the cap of one provider group in a
+/// profile; the growth is the profile's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupLimits {
+    pub start: i64,
+    pub cap: i64,
+}
+
+/// A warm-up profile: a ramp for every provider group. `groups` sets the
+/// first day's allowance and the cap per group; a group it does not name
+/// (`other`, and any group added in the config) uses `start` and `cap`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WarmupProfile {
+    pub start: i64,
+    pub growth: f64,
+    pub cap: i64,
+    #[serde(default)]
+    pub groups: BTreeMap<String, GroupLimits>,
+}
+
+impl WarmupProfile {
+    /// A profile without per-group limits.
+    pub fn uniform(start: i64, growth: f64, cap: i64) -> Self {
+        WarmupProfile {
+            start,
+            growth,
+            cap,
+            groups: BTreeMap::new(),
+        }
+    }
+
+    fn with_groups(start: i64, growth: f64, cap: i64, groups: &[(&str, i64, i64)]) -> Self {
+        WarmupProfile {
+            start,
+            growth,
+            cap,
+            groups: groups
+                .iter()
+                .map(|(name, start, cap)| {
+                    (
+                        name.to_string(),
+                        GroupLimits {
+                            start: *start,
+                            cap: *cap,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The built-in `slow` profile. Microsoft, Apple and T-Online are the
+    /// most cautious with unknown senders, so they start lower.
+    pub fn slow() -> Self {
+        Self::with_groups(
+            50,
+            1.3,
+            20_000,
+            &[
+                ("microsoft", 30, 15_000),
+                ("google", 50, 20_000),
+                ("yahoo", 40, 15_000),
+                ("apple", 30, 10_000),
+                ("united_internet", 30, 12_000),
+                ("t_online", 20, 8_000),
+            ],
+        )
+    }
+
+    /// The built-in `normal` profile.
+    pub fn normal() -> Self {
+        Self::with_groups(
+            200,
+            1.5,
+            50_000,
+            &[
+                ("microsoft", 100, 40_000),
+                ("google", 200, 50_000),
+                ("yahoo", 150, 40_000),
+                ("apple", 100, 20_000),
+                ("united_internet", 100, 30_000),
+                ("t_online", 50, 15_000),
+            ],
+        )
+    }
+
+    /// The built-in `fast` profile.
+    pub fn fast() -> Self {
+        Self::with_groups(
+            500,
+            2.0,
+            100_000,
+            &[
+                ("microsoft", 300, 80_000),
+                ("google", 500, 100_000),
+                ("yahoo", 400, 80_000),
+                ("apple", 250, 40_000),
+                ("united_internet", 250, 60_000),
+                ("t_online", 100, 30_000),
+            ],
+        )
+    }
+
+    /// The ramp of `group` in this profile.
+    pub fn ramp(&self, group: &ProviderGroup) -> Ramp {
+        match self.groups.get(group.as_str()) {
+            Some(limits) => Ramp {
+                start: limits.start,
+                growth: self.growth,
+                cap: limits.cap,
+            },
+            None => Ramp {
+                start: self.start,
+                growth: self.growth,
+                cap: self.cap,
+            },
+        }
+    }
+
+    /// Why a profile is not usable, if it is not.
+    pub fn validate(&self) -> Result<(), String> {
+        Ramp {
+            start: self.start,
+            growth: self.growth,
+            cap: self.cap,
+        }
+        .validate()?;
+        for (name, limits) in &self.groups {
+            if ProviderGroup::parse(name).is_none() {
+                return Err(format!("groups: {name:?} is not a valid group name"));
+            }
+            Ramp {
+                start: limits.start,
+                growth: self.growth,
+                cap: limits.cap,
+            }
+            .validate()
+            .map_err(|e| format!("groups.{name}: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// The built-in profiles as the installation has configured them
+/// (`warmup.profiles`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WarmupProfiles {
+    pub slow: WarmupProfile,
+    pub normal: WarmupProfile,
+    pub fast: WarmupProfile,
+}
+
+impl Default for WarmupProfiles {
+    fn default() -> Self {
+        WarmupProfiles {
+            slow: WarmupProfile::slow(),
+            normal: WarmupProfile::normal(),
+            fast: WarmupProfile::fast(),
+        }
+    }
+}
+
+impl WarmupProfiles {
+    /// The profile of `mode`; `custom` uses `custom`. `None` for `off`, and
+    /// for `custom` without a usable profile.
+    pub fn for_mode(
+        &self,
+        mode: WarmupMode,
+        custom: Option<&WarmupProfile>,
+    ) -> Option<WarmupProfile> {
+        let profile = match mode {
+            WarmupMode::Off => return None,
+            WarmupMode::Slow => self.slow.clone(),
+            WarmupMode::Normal => self.normal.clone(),
+            WarmupMode::Fast => self.fast.clone(),
+            WarmupMode::Custom => custom?.clone(),
+        };
+        profile.validate().is_ok().then_some(profile)
+    }
+
+    /// Override a built-in profile's base values and per-group limits (the
+    /// `warmup.profiles` config). Unknown profile names are ignored.
+    pub fn override_profile(
+        &mut self,
+        name: &str,
+        start: Option<i64>,
+        growth: Option<f64>,
+        cap: Option<i64>,
+        groups: &[(String, i64, i64)],
+    ) {
+        let profile = match name {
+            "slow" => &mut self.slow,
+            "normal" => &mut self.normal,
+            "fast" => &mut self.fast,
+            _ => return,
+        };
+        if let Some(start) = start {
+            profile.start = start;
+        }
+        if let Some(growth) = growth {
+            profile.growth = growth;
+        }
+        if let Some(cap) = cap {
+            profile.cap = cap;
+        }
+        for (group, start, cap) in groups {
+            profile.groups.insert(
+                group.clone(),
+                GroupLimits {
+                    start: *start,
+                    cap: *cap,
+                },
+            );
+        }
+    }
+
+    /// Every profile is usable.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, profile) in [
+            ("slow", &self.slow),
+            ("normal", &self.normal),
+            ("fast", &self.fast),
+        ] {
+            profile
+                .validate()
+                .map_err(|e| format!("warmup.profiles.{name}: {e}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -199,8 +403,8 @@ pub struct WarmupState {
 }
 
 impl WarmupState {
-    /// The state of an address that starts warming up with `profile`.
-    pub fn initial(ip_address_id: Id, provider: ProviderGroup, profile: &WarmupProfile) -> Self {
+    /// The state of an address that starts warming up on `ramp`.
+    pub fn initial(ip_address_id: Id, provider: ProviderGroup, profile: &Ramp) -> Self {
         WarmupState {
             ip_address_id,
             provider,
@@ -333,7 +537,7 @@ fn percent(value: f64) -> String {
 /// back (never below the profile's start).
 fn brake(
     state: &WarmupState,
-    profile: &WarmupProfile,
+    profile: &Ramp,
     thresholds: &WarmupThresholds,
     now: DateTime<Utc>,
     reason: String,
@@ -357,7 +561,7 @@ fn brake(
 /// `version` for its update.
 pub fn evaluate(
     state: &WarmupState,
-    profile: &WarmupProfile,
+    profile: &Ramp,
     day: NaiveDate,
     stat: Option<&IpDeliveryStat>,
     signals: &[WarmupSignal],
@@ -524,7 +728,7 @@ pub fn evaluate(
 /// below the brake limits, or when the address is already paused.
 pub fn intraday_brake(
     state: &WarmupState,
-    profile: &WarmupProfile,
+    profile: &Ramp,
     today: &IpDeliveryStat,
     thresholds: &WarmupThresholds,
     now: DateTime<Utc>,
@@ -572,15 +776,16 @@ impl WarmupAddress {
         }
     }
 
-    /// The profile in force; `None` when warm-up is off (or `custom`
-    /// without a usable profile, which counts as off).
-    pub fn effective_profile(&self) -> Option<WarmupProfile> {
+    /// The profile in force, from the installation's `profiles`; `None`
+    /// when warm-up is off (or `custom` without a usable profile, which
+    /// counts as off).
+    pub fn effective_profile(&self, profiles: &WarmupProfiles) -> Option<WarmupProfile> {
         let (mode, source) = self.effective_mode();
         let custom = match source {
-            "address" => self.address_profile.or(self.pool_profile),
-            _ => self.pool_profile,
+            "address" => self.address_profile.as_ref().or(self.pool_profile.as_ref()),
+            _ => self.pool_profile.as_ref(),
         };
-        WarmupProfile::for_mode(mode, custom).filter(|p| p.validate().is_ok())
+        profiles.for_mode(mode, custom)
     }
 }
 
@@ -653,6 +858,12 @@ pub trait WarmupStore: Send + Sync {
 mod tests {
     use super::*;
 
+    const NORMAL: Ramp = Ramp {
+        start: 200,
+        growth: 1.5,
+        cap: 50_000,
+    };
+
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-11-15T01:00:00Z")
             .unwrap()
@@ -666,7 +877,7 @@ mod tests {
     fn state(allowance: i64) -> WarmupState {
         WarmupState {
             allowance,
-            ..WarmupState::initial(1, ProviderGroup::Microsoft, &WarmupProfile::NORMAL)
+            ..WarmupState::initial(1, ProviderGroup::microsoft(), &NORMAL)
         }
     }
 
@@ -675,7 +886,7 @@ mod tests {
             day: day(),
             source_ip: "203.0.113.5".into(),
             ip_address_id: Some(1),
-            provider: ProviderGroup::Microsoft,
+            provider: ProviderGroup::microsoft(),
             sent,
             deferred,
             bounced,
@@ -691,7 +902,7 @@ mod tests {
     ) -> (WarmupState, WarmupDecision) {
         evaluate(
             state,
-            &WarmupProfile::NORMAL,
+            &NORMAL,
             day(),
             stat,
             signals,
@@ -817,7 +1028,7 @@ mod tests {
         let later = now() + chrono::Duration::hours(25);
         let (held, decision) = evaluate(
             &paused,
-            &WarmupProfile::NORMAL,
+            &NORMAL,
             day(),
             None,
             &[],
@@ -829,7 +1040,7 @@ mod tests {
         assert_eq!(held.paused_until, None);
         let (grown, decision) = evaluate(
             &held,
-            &WarmupProfile::NORMAL,
+            &NORMAL,
             day(),
             Some(&stat(500, 0, 0)),
             &[],
@@ -854,7 +1065,7 @@ mod tests {
         today.policy_blocks = 2;
         assert!(intraday_brake(
             &state(400),
-            &WarmupProfile::NORMAL,
+            &NORMAL,
             &today,
             &WarmupThresholds::default(),
             now()
@@ -864,7 +1075,7 @@ mod tests {
         today.bounced = 3;
         let braked = intraday_brake(
             &state(400),
-            &WarmupProfile::NORMAL,
+            &NORMAL,
             &today,
             &WarmupThresholds::default(),
             now(),
@@ -875,7 +1086,7 @@ mod tests {
         assert!(
             intraday_brake(
                 &braked,
-                &WarmupProfile::NORMAL,
+                &NORMAL,
                 &today,
                 &WarmupThresholds::default(),
                 now()
@@ -887,32 +1098,93 @@ mod tests {
 
     #[test]
     fn profiles_and_estimates() {
-        assert_eq!(WarmupProfile::NORMAL.days_to_warm(200), 14);
-        assert_eq!(WarmupProfile::FAST.days_to_warm(500), 8);
-        assert_eq!(WarmupProfile::NORMAL.days_to_warm(50_000), 0);
-        assert!(WarmupProfile {
+        assert_eq!(NORMAL.days_to_warm(200), 14);
+        let fast = WarmupProfile::fast().ramp(&ProviderGroup::other());
+        assert_eq!(fast.days_to_warm(500), 8);
+        assert_eq!(NORMAL.days_to_warm(50_000), 0);
+        assert!(Ramp {
             start: 10,
             growth: 1.0,
             cap: 100
         }
         .validate()
         .is_err());
-        assert!(WarmupProfile {
+        assert!(Ramp {
             start: 10,
             growth: 1.2,
             cap: 10
         }
         .validate()
         .is_err());
-        assert!(WarmupProfile {
+        assert!(Ramp {
             start: 10,
             growth: 1.2,
             cap: 1000
         }
         .validate()
         .is_ok());
-        assert_eq!(WarmupProfile::for_mode(WarmupMode::Off, None), None);
-        assert_eq!(WarmupProfile::for_mode(WarmupMode::Custom, None), None);
+        let profiles = WarmupProfiles::default();
+        assert!(profiles.validate().is_ok());
+        assert_eq!(profiles.for_mode(WarmupMode::Off, None), None);
+        assert_eq!(profiles.for_mode(WarmupMode::Custom, None), None);
+    }
+
+    #[test]
+    fn every_group_has_its_own_allowance_in_every_profile() {
+        let profiles = WarmupProfiles::default();
+        for profile in [&profiles.slow, &profiles.normal, &profiles.fast] {
+            for group in [
+                "microsoft",
+                "google",
+                "yahoo",
+                "apple",
+                "united_internet",
+                "t_online",
+            ] {
+                assert!(profile.groups.contains_key(group), "{group}");
+            }
+        }
+        let normal = &profiles.normal;
+        assert_eq!(normal.ramp(&ProviderGroup::microsoft()).start, 100);
+        assert_eq!(normal.ramp(&ProviderGroup::t_online()).cap, 15_000);
+        // A group added in the config uses the profile's base values.
+        let seznam = ProviderGroup::parse("seznam").unwrap();
+        assert_eq!(normal.ramp(&seznam), NORMAL);
+        assert_eq!(normal.ramp(&ProviderGroup::other()), NORMAL);
+
+        let mut configured = WarmupProfiles::default();
+        configured.override_profile(
+            "normal",
+            None,
+            Some(1.4),
+            None,
+            &[("seznam".into(), 80, 25_000)],
+        );
+        configured.override_profile("turbo", Some(1), None, None, &[]);
+        let ramp = configured.normal.ramp(&seznam);
+        assert_eq!((ramp.start, ramp.growth, ramp.cap), (80, 1.4, 25_000));
+        assert_eq!(configured.normal.ramp(&ProviderGroup::google()).growth, 1.4);
+        assert!(configured.validate().is_ok());
+        configured.override_profile("slow", None, None, None, &[("bad".into(), 100, 50)]);
+        assert!(configured.validate().is_err());
+    }
+
+    #[test]
+    fn custom_profiles_may_set_group_limits() {
+        let custom: WarmupProfile = serde_json::from_value(serde_json::json!({
+            "start": 10, "growth": 2.0, "cap": 1000,
+            "groups": { "microsoft": { "start": 5, "cap": 500 } }
+        }))
+        .unwrap();
+        assert!(custom.validate().is_ok());
+        assert_eq!(custom.ramp(&ProviderGroup::microsoft()).start, 5);
+        assert_eq!(custom.ramp(&ProviderGroup::google()).start, 10);
+        let bad: WarmupProfile = serde_json::from_value(serde_json::json!({
+            "start": 10, "growth": 2.0, "cap": 1000,
+            "groups": { "Microsoft": { "start": 5, "cap": 500 } }
+        }))
+        .unwrap();
+        assert!(bad.validate().is_err());
     }
 
     #[test]
@@ -929,19 +1201,21 @@ mod tests {
             pool_profile: None,
         };
         assert_eq!(address.effective_mode(), (WarmupMode::Off, "default"));
-        assert_eq!(address.effective_profile(), None);
+        assert_eq!(address.effective_profile(&WarmupProfiles::default()), None);
         address.pool_mode = Some(WarmupMode::Slow);
         assert_eq!(address.effective_mode(), (WarmupMode::Slow, "pool"));
         address.address_mode = Some(WarmupMode::Off);
         assert_eq!(address.effective_mode(), (WarmupMode::Off, "address"));
-        assert_eq!(address.effective_profile(), None);
+        assert_eq!(address.effective_profile(&WarmupProfiles::default()), None);
         address.address_mode = Some(WarmupMode::Custom);
-        address.address_profile = Some(WarmupProfile {
-            start: 10,
-            growth: 1.2,
-            cap: 1000,
-        });
-        assert_eq!(address.effective_profile().unwrap().start, 10);
+        address.address_profile = Some(WarmupProfile::uniform(10, 1.2, 1000));
+        assert_eq!(
+            address
+                .effective_profile(&WarmupProfiles::default())
+                .unwrap()
+                .start,
+            10
+        );
     }
 }
 
@@ -963,9 +1237,9 @@ impl WarmupStore for crate::MemoryStore {
                     ip_pool_id: pool.id,
                     pool_name: pool.name.clone(),
                     address_mode: own.map(|(mode, _)| *mode),
-                    address_profile: own.and_then(|(_, profile)| *profile),
+                    address_profile: own.and_then(|(_, profile)| profile.clone()),
                     pool_mode: pooled.map(|(mode, _)| *mode),
-                    pool_profile: pooled.and_then(|(_, profile)| *profile),
+                    pool_profile: pooled.and_then(|(_, profile)| profile.clone()),
                 })
             })
             .collect();
@@ -1022,7 +1296,7 @@ impl WarmupStore for crate::MemoryStore {
     async fn warmup_states(&self) -> Result<Vec<WarmupState>, StoreError> {
         let inner = self.inner.read().unwrap();
         let mut states: Vec<WarmupState> = inner.warmup_states.values().cloned().collect();
-        states.sort_by_key(|s| (s.ip_address_id, s.provider));
+        states.sort_by_key(|s| (s.ip_address_id, s.provider.clone()));
         Ok(states)
     }
 
@@ -1032,7 +1306,7 @@ impl WarmupStore for crate::MemoryStore {
         entry: Option<&WarmupLogEntry>,
     ) -> Result<bool, StoreError> {
         let mut inner = self.inner.write().unwrap();
-        let key = (state.ip_address_id, state.provider);
+        let key = (state.ip_address_id, state.provider.clone());
         let current = inner.warmup_states.get(&key).map(|s| s.version);
         let matches = match current {
             Some(version) => version == state.version,
@@ -1061,7 +1335,7 @@ impl WarmupStore for crate::MemoryStore {
         let mut inner = self.inner.write().unwrap();
         let state = inner
             .warmup_states
-            .entry((ip_address_id, provider))
+            .entry((ip_address_id, provider.clone()))
             .or_insert_with(|| WarmupState {
                 version: 1,
                 ..initial.clone()
@@ -1072,7 +1346,7 @@ impl WarmupStore for crate::MemoryStore {
         }
         let used = inner
             .warmup_usage
-            .entry((day, ip_address_id, provider))
+            .entry((day, ip_address_id, provider.clone()))
             .or_insert(0);
         if state.status != WarmupStatus::Warm && *used >= state.allowance {
             return Ok(false);
@@ -1090,7 +1364,7 @@ impl WarmupStore for crate::MemoryStore {
             .warmup_usage
             .iter()
             .filter(|((d, _, _), _)| *d == day)
-            .map(|((_, id, provider), used)| (*id, *provider, *used))
+            .map(|((_, id, provider), used)| (*id, provider.clone(), *used))
             .collect();
         usage.sort();
         Ok(usage)
@@ -1153,18 +1427,18 @@ mod memory_tests {
             })
             .await
             .unwrap();
-        let profile = WarmupProfile {
+        let profile = Ramp {
             start: 2,
             growth: 2.0,
             cap: 100,
         };
-        let initial = WarmupState::initial(address.id, ProviderGroup::Google, &profile);
+        let initial = WarmupState::initial(address.id, ProviderGroup::google(), &profile);
         let day = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
         let now = Utc::now();
         for expected in [true, true, false] {
             assert_eq!(
                 store
-                    .try_reserve_warmup(address.id, ProviderGroup::Google, day, &initial, now)
+                    .try_reserve_warmup(address.id, ProviderGroup::google(), day, &initial, now)
                     .await
                     .unwrap(),
                 expected
@@ -1172,20 +1446,20 @@ mod memory_tests {
         }
         // Another provider has its own allowance.
         assert!(store
-            .try_reserve_warmup(address.id, ProviderGroup::Yahoo, day, &initial, now)
+            .try_reserve_warmup(address.id, ProviderGroup::yahoo(), day, &initial, now)
             .await
             .unwrap());
         assert_eq!(
             store.warmup_usage(day).await.unwrap(),
             vec![
-                (address.id, ProviderGroup::Google, 2),
-                (address.id, ProviderGroup::Yahoo, 1)
+                (address.id, ProviderGroup::google(), 2),
+                (address.id, ProviderGroup::yahoo(), 1)
             ]
         );
 
         // Optimistic concurrency on save.
         let mut state = store.warmup_states().await.unwrap()[0].clone();
-        assert_eq!(state.provider, ProviderGroup::Google);
+        assert_eq!(state.provider, ProviderGroup::google());
         state.status = WarmupStatus::Paused;
         state.paused_until = Some(now + chrono::Duration::hours(1));
         assert!(store.save_warmup_state(&state, None).await.unwrap());
@@ -1195,7 +1469,7 @@ mod memory_tests {
         );
         let next_day = day.succ_opt().unwrap();
         assert!(!store
-            .try_reserve_warmup(address.id, ProviderGroup::Google, next_day, &initial, now)
+            .try_reserve_warmup(address.id, ProviderGroup::google(), next_day, &initial, now)
             .await
             .unwrap());
 

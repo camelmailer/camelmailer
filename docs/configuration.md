@@ -574,6 +574,19 @@ warmup:
   defer_seconds: 900            # wait when no address of the pool has room
 ```
 
+The built-in profiles (`slow`, `normal`, `fast`) can be changed, per
+provider group too, including groups added in `provider_groups`:
+
+```yaml
+warmup:
+  profiles:
+    normal:
+      growth: 1.4                       # all groups of this profile
+      groups:
+        microsoft: { start: 80, cap: 30000 }
+        seznam: { start: 80, cap: 25000 }
+```
+
 Every value is checked at start: rates between 0 and 1, the warning levels
 not above the brake levels, `step_back` between 0.1 and 1, `defer_seconds` at
 least 60. How the modes and the brake work is described in

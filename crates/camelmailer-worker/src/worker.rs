@@ -595,6 +595,10 @@ pub enum ProcessOutcome {
     /// its receiving provider. It went back to the queue without an attempt
     /// and is looked at again after `warmup.defer_seconds`.
     WarmupDeferred,
+    /// Warm-up: the warm-up storage could not be read and the message would
+    /// have gone out from an address not known to be warm. It went back to
+    /// the queue without an attempt and is tried again a minute later.
+    WarmupStorageUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -860,7 +864,7 @@ impl Worker {
                 .map(|address| address.ipv4.clone())
                 .unwrap_or_else(|| camelmailer_core::DEFAULT_SOURCE.to_string()),
             ip_address_id: source.map(|address| address.id),
-            provider,
+            provider: provider.clone(),
             kind,
             policy_block: kind != DeliveryKind::Sent && camelmailer_core::is_policy_block(response),
             server_id: message.server_id,
@@ -874,7 +878,7 @@ impl Worker {
         // this provider at once.
         if let (true, Some(address)) = (record.policy_block, source) {
             if self.warmup.profile(address.id).is_some() {
-                self.brake_if_blocked(address, provider, record.day).await;
+                self.brake_if_blocked(address, &provider, record.day).await;
             }
         }
     }
@@ -882,13 +886,13 @@ impl Worker {
     async fn brake_if_blocked(
         &self,
         address: &camelmailer_core::IpAddress,
-        provider: camelmailer_core::ProviderGroup,
+        provider: &camelmailer_core::ProviderGroup,
         day: chrono::NaiveDate,
     ) {
         let today = match DeliveryStatsStore::ip_delivery_stats(&self.store, day).await {
             Ok(stats) => stats
                 .into_iter()
-                .find(|s| s.day == day && s.provider == provider && s.source_ip == address.ipv4),
+                .find(|s| s.day == day && &s.provider == provider && s.source_ip == address.ipv4),
             Err(error) => {
                 tracing::warn!(%error, "could not read today's counters for the warm-up brake");
                 return;
@@ -925,7 +929,7 @@ impl Worker {
                 .into_iter()
                 .map(|a| (a.ip_address_id, a.ipv4))
                 .collect();
-        let no_signals = |_: camelmailer_core::Id, _: camelmailer_core::ProviderGroup| Vec::new();
+        let no_signals = |_: camelmailer_core::Id, _: &camelmailer_core::ProviderGroup| Vec::new();
         let written = self
             .warmup
             .evaluate_day(&self.store, day, &stats, &addresses, &no_signals, now)
@@ -1318,7 +1322,7 @@ impl Worker {
                         &self.store,
                         &chosen,
                         &candidates,
-                        provider,
+                        &provider,
                         chrono::Utc::now(),
                     )
                     .await
@@ -1338,6 +1342,24 @@ impl Worker {
                                 .await?,
                         );
                         return Ok(ProcessOutcome::WarmupDeferred);
+                    }
+                    crate::warmup::Pick::WaitForStorage => {
+                        // The warm-up storage cannot be read and no address
+                        // known to be warm is available: never send from a
+                        // possibly cold address without its limit.
+                        owned(
+                            "queued_messages",
+                            queued.id,
+                            self.queue
+                                .defer(
+                                    queued.id,
+                                    &self.worker_id,
+                                    crate::warmup::STORAGE_RETRY_SECONDS,
+                                    None,
+                                )
+                                .await?,
+                        );
+                        return Ok(ProcessOutcome::WarmupStorageUnavailable);
                     }
                 }
             }

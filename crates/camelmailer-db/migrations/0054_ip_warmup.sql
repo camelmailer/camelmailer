@@ -31,7 +31,7 @@ CREATE TABLE ip_address_warmup (
 
 CREATE TABLE ip_warmup_state (
     ip_address_id BIGINT NOT NULL REFERENCES ip_addresses(id) ON DELETE CASCADE,
-    provider TEXT NOT NULL CHECK (provider IN ('microsoft', 'google', 'yahoo', 'other')),
+    provider TEXT NOT NULL CHECK (provider ~ '^[a-z0-9_]{1,40}$'),
     allowance BIGINT NOT NULL CHECK (allowance > 0),
     status TEXT NOT NULL CHECK (status IN ('ramping', 'holding', 'slowed', 'paused', 'warm')),
     paused_until TIMESTAMPTZ,
@@ -47,7 +47,7 @@ CREATE TABLE ip_warmup_state (
 CREATE TABLE ip_warmup_usage (
     day DATE NOT NULL,
     ip_address_id BIGINT NOT NULL REFERENCES ip_addresses(id) ON DELETE CASCADE,
-    provider TEXT NOT NULL CHECK (provider IN ('microsoft', 'google', 'yahoo', 'other')),
+    provider TEXT NOT NULL CHECK (provider ~ '^[a-z0-9_]{1,40}$'),
     used BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (day, ip_address_id, provider)
 );
@@ -55,7 +55,7 @@ CREATE TABLE ip_warmup_usage (
 CREATE TABLE ip_warmup_log (
     id BIGSERIAL PRIMARY KEY,
     ip_address_id BIGINT NOT NULL REFERENCES ip_addresses(id) ON DELETE CASCADE,
-    provider TEXT CHECK (provider IN ('microsoft', 'google', 'yahoo', 'other')),
+    provider TEXT CHECK (provider ~ '^[a-z0-9_]{1,40}$'),
     decision TEXT NOT NULL,
     reason TEXT NOT NULL,
     allowance_before BIGINT,

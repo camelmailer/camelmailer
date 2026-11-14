@@ -5503,11 +5503,7 @@ async fn beyond_the_warmup_allowance_a_message_waits_without_an_attempt() {
         .set_address_warmup(
             address.id,
             Some(WarmupMode::Custom),
-            Some(WarmupProfile {
-                start: 1,
-                growth: 2.0,
-                cap: 100,
-            }),
+            Some(WarmupProfile::uniform(1, 2.0, 100)),
         )
         .await
         .unwrap();
@@ -5539,7 +5535,7 @@ async fn beyond_the_warmup_allowance_a_message_waits_without_an_attempt() {
     let today = chrono::Utc::now().date_naive();
     assert_eq!(
         s.store.warmup_usage(today).await.unwrap(),
-        vec![(address.id, camelmailer_core::ProviderGroup::Microsoft, 1)]
+        vec![(address.id, camelmailer_core::ProviderGroup::microsoft(), 1)]
     );
 }
 
@@ -5559,11 +5555,7 @@ async fn policy_refusals_brake_the_warmup_during_the_day() {
         .set_address_warmup(
             address.id,
             Some(WarmupMode::Custom),
-            Some(WarmupProfile {
-                start: 20,
-                growth: 2.0,
-                cap: 1000,
-            }),
+            Some(WarmupProfile::uniform(20, 2.0, 1000)),
         )
         .await
         .unwrap();
@@ -5596,4 +5588,85 @@ async fn policy_refusals_brake_the_warmup_during_the_day() {
     );
     let log = s.store.warmup_log(Some(address.id), 10).await.unwrap();
     assert_eq!(log[0].decision, "brake");
+}
+
+/// Decision 1, end to end: while the warm-up storage cannot be read, a
+/// message that would go out from a not-yet-warm address waits without an
+/// attempt and nothing reaches the receiver; once it can be read again the
+/// message is delivered and the outage is in the address's warm-up log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn while_warmup_storage_is_unreadable_a_cold_address_does_not_send() {
+    use camelmailer_core::{WarmupMode, WarmupProfile, WarmupStore};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let address = warmup_pool(&s).await;
+    s.store
+        .set_address_warmup(
+            address.id,
+            Some(WarmupMode::Custom),
+            Some(WarmupProfile::uniform(5, 2.0, 100)),
+        )
+        .await
+        .unwrap();
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    // Load the settings, then make the reservations fail.
+    worker.process_next().await.ok();
+    sqlx::query("DELETE FROM deliveries")
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("UPDATE queued_messages SET retry_after = NULL, attempts = 0, locked_by = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    smtp.received.lock().unwrap().clear();
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM queued_messages")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    if queued == 0 {
+        // The first pass delivered it: queue another one.
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+    }
+    sqlx::query("ALTER TABLE ip_warmup_usage RENAME TO ip_warmup_usage_away")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::WarmupStorageUnavailable
+    );
+    let (attempts, waits): (i32, bool) = sqlx::query_as(
+        "SELECT attempts, retry_after BETWEEN now() + interval '30 seconds' AND now() + interval '90 seconds' FROM queued_messages",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((attempts, waits), (0, true));
+    assert!(!smtp.received.lock().unwrap().iter().any(|l| l == "DATA"));
+
+    sqlx::query("ALTER TABLE ip_warmup_usage_away RENAME TO ip_warmup_usage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE queued_messages SET retry_after = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let log = s.store.warmup_log(Some(address.id), 10).await.unwrap();
+    assert!(log.iter().any(|e| e.decision == "storage"), "{log:?}");
 }

@@ -2628,6 +2628,24 @@ async fn ip_warmup_modes_are_set_per_address_and_pool_and_shown_per_provider() {
     assert_eq!(first["active"], false);
     assert_eq!(first["providers"][0]["allowance"], Value::Null);
     assert_eq!(body["data"]["profiles"]["normal"]["start"], 200);
+    assert_eq!(
+        body["data"]["profiles"]["normal"]["groups"]["microsoft"]["start"],
+        100
+    );
+    assert_eq!(
+        body["data"]["provider_groups"],
+        json!([
+            "microsoft",
+            "google",
+            "yahoo",
+            "apple",
+            "united_internet",
+            "t_online",
+            "other"
+        ])
+    );
+    assert_eq!(first["providers"].as_array().unwrap().len(), 7);
+    assert_eq!(body["data"]["storage_incidents"], json!([]));
 
     // The pool default applies to its addresses.
     let (status, _) = request(

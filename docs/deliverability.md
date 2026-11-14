@@ -295,10 +295,16 @@ the schedule yourself by controlling how much you send through the new pool.
 ## IP metrics
 
 Every outbound SMTP result is counted per UTC day, per source address and per
-receiving provider group: Microsoft, Google, Yahoo and everyone else.
-Consumer domains (gmail.com, outlook.com, hotmail.de, yahoo.co.uk, aol.com and
-the like) are recognised by name; any other domain by its MX host, so a
-company on Microsoft 365 or Google Workspace counts towards that provider.
+receiving provider group. The built-in groups are `microsoft` (Outlook.com,
+Hotmail, Live, Microsoft 365), `google` (Gmail, Workspace), `yahoo` (incl.
+AOL), `apple` (iCloud), `united_internet` (GMX, WEB.DE, mail.com, 1&1 and
+IONOS) and `t_online`; everyone else is `other`. A provider's own consumer
+domains (gmail.com, hotmail.de, gmx.net, t-online.de and the like) are
+recognised by name; any other domain by its MX host, so a company on
+Microsoft 365, Google Workspace or IONOS counts towards that provider. Groups
+are configuration (`provider_groups`, see
+[Configuration](configuration.md#provider_groups-receiving-providers)): a
+provider can be added or adjusted without a code change.
 Counted are accepted, deferred and bounced attempts, policy refusals (blocks
 and reputation refusals such as Microsoft `S3150`, Google `4.7.28`, Yahoo
 `TSS04`) and spam complaints from feedback loops, which are credited to the
@@ -322,21 +328,30 @@ Set a mode on a pool (the default for its addresses) or on one address (which
 wins), in the dashboard or with `PATCH /api/v2/admin/ip_warmup/pools/{id}` /
 `PATCH /api/v2/admin/ip_warmup/addresses/{id}`:
 
-| Mode | First day | Growth per healthy day | Warm at | Healthy days to warm |
-|---|---|---|---|---|
-| `off` | no limit | | | |
-| `slow` | 50 | × 1.3 | 20,000 | 23 |
-| `normal` | 200 | × 1.5 | 50,000 | 14 |
-| `fast` | 500 | × 2.0 | 100,000 | 8 |
-| `custom` | your `start` | your `growth` (1.05 to 3.0) | your `cap` | |
+Every profile gives **every provider group its own ramp**: the first day's
+allowance and the allowance at which the address counts as warm differ per
+group, and the growth per healthy day is the profile's. The built-in values
+(attempts per UTC day):
 
-The figures are attempts per UTC day **per receiving provider group**: an
-address on day one in `normal` may make 200 attempts to Microsoft, 200 to
-Google, 200 to Yahoo and 200 to everyone else. An address can be warm at one
-provider and still cold at another. Switching modes, including to `off` and
-back, keeps the address's current allowance: the ramp continues from where it
-is and never restarts. `inherit` on an address removes its own mode so the
-pool's applies.
+| Group | `slow` (× 1.3) | `normal` (× 1.5) | `fast` (× 2.0) |
+|---|---|---|---|
+| `microsoft` | 30 → 15,000 | 100 → 40,000 | 300 → 80,000 |
+| `google` | 50 → 20,000 | 200 → 50,000 | 500 → 100,000 |
+| `yahoo` | 40 → 15,000 | 150 → 40,000 | 400 → 80,000 |
+| `apple` | 30 → 10,000 | 100 → 20,000 | 250 → 40,000 |
+| `united_internet` | 30 → 12,000 | 100 → 30,000 | 250 → 60,000 |
+| `t_online` | 20 → 8,000 | 50 → 15,000 | 100 → 30,000 |
+| `other` and added groups | 50 → 20,000 | 200 → 50,000 | 500 → 100,000 |
+
+`off` means no limit. `custom` takes a profile `{start, growth, cap}` (growth
+1.05 to 3.0) with optional `groups: {name: {start, cap}}`; groups it does not
+name use `start` and `cap`. The built-in profiles can be changed per group in
+`warmup.profiles`, including for groups added in `provider_groups`.
+
+An address can be warm at one provider and still cold at another. Switching
+modes, including to `off` and back, keeps the address's current allowance:
+the ramp continues from where it is and never restarts. `inherit` on an
+address removes its own mode so the pool's applies.
 
 ### How the ramp moves
 
@@ -381,8 +396,16 @@ when no address of the pool has room does the message wait,
 The allowance is counted atomically across all workers, so several workers
 never overrun it together.
 
-If the warm-up storage cannot be read, the message goes out from the chosen
-address as without warm-up, and the worker logs a warning.
+If the warm-up storage cannot be read, an address the worker last saw fully
+warm for the provider, or one with warm-up off, keeps sending. Mail that would
+go out from an address that is not yet warm waits, without an attempt
+counted, and is tried again every minute until the storage answers. A storage
+error never lets a cold address send without its limit. The worker logs the
+outage as an error (`warm-up storage unavailable`, at most once a minute, for
+log-based alerting) and, once it is over, writes it to the warm-up log of
+every address whose mail waited (decision `storage`, shown on the dashboard).
+If the settings could never be read since the worker started, every pool
+address counts as possibly cold.
 
 ### Watching it
 
