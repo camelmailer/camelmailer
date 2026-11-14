@@ -271,6 +271,13 @@ impl Session {
         self.finished
     }
 
+    /// Whether a mail transaction is open: `MAIL FROM` was accepted and the
+    /// message has not been accepted, refused or reset yet (DATA included).
+    pub fn in_transaction(&self) -> bool {
+        matches!(self.state, State::MailFromReceived | State::RcptToReceived)
+            || matches!(self.input_mode, InputMode::Data)
+    }
+
     /// Whether the transport should upgrade to TLS after flushing the reply.
     pub fn take_start_tls(&mut self) -> bool {
         std::mem::take(&mut self.start_tls)

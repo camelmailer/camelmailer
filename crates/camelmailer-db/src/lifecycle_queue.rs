@@ -96,29 +96,40 @@ impl PgLifecycleQueue {
         }))
     }
 
-    /// Delivered (or given up): remove the row.
-    pub async fn complete(&self, id: i64) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM lifecycle_events WHERE id = $1")
+    /// Delivered (or given up): remove the row, if `worker_id` still holds
+    /// it (another worker may have taken it over after its lease ran out).
+    /// Returns whether it was removed.
+    pub async fn complete(&self, id: i64, worker_id: &str) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query("DELETE FROM lifecycle_events WHERE id = $1 AND locked_by = $2")
             .bind(id)
+            .bind(worker_id)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(done.rows_affected() > 0)
     }
 
-    /// Reschedule with exponential backoff (`2^attempts` minutes, capped).
-    pub async fn retry(&self, id: i64, attempts: i32, error: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    /// Reschedule with exponential backoff (`2^attempts` minutes, capped),
+    /// if `worker_id` still holds the row. Returns whether it was.
+    pub async fn retry(
+        &self,
+        id: i64,
+        attempts: i32,
+        error: &str,
+        worker_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
             "UPDATE lifecycle_events
              SET locked_by = NULL, locked_at = NULL, attempts = attempts + 1,
                  retry_after = now() + make_interval(mins => $2::int), last_error = $3
-             WHERE id = $1",
+             WHERE id = $1 AND locked_by = $4",
         )
         .bind(id)
         .bind(crate::queue::retry_delay_minutes(attempts))
         .bind(error)
+        .bind(worker_id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(done.rows_affected() > 0)
     }
 
     /// Drop every queued event. Used by housekeeping when no lifecycle URL

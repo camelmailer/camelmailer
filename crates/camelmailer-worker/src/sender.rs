@@ -23,8 +23,8 @@
 
 use crate::reverse_dns::ReverseDnsState;
 use crate::smtp_client::{
-    self, AddressFamily, ConnectionSecurity, OutboundSource, SendOutcome, SendParams, SmtpAuth,
-    TlsMode,
+    self, AddressFamily, ConnectionSecurity, DataGate, OutboundSource, SendOutcome, SendParams,
+    SmtpAuth, TlsMode,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -293,6 +293,33 @@ impl SmtpSender {
         source: OutboundSource,
         helo_hostname: Option<&str>,
     ) -> SendOutcome {
+        self.send_gated(
+            domain,
+            mail_from,
+            rcpt_to,
+            raw_message,
+            source,
+            helo_hostname,
+            DataGate::default(),
+        )
+        .await
+    }
+
+    /// Like [`SmtpSender::send_with_helo`], reporting through `data_gate`
+    /// when the message starts to go out (see [`DataGate`]). The same gate
+    /// serves every endpoint tried, so once `DATA` was sent to one of them
+    /// the delivery counts as started for good.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_gated(
+        &self,
+        domain: &str,
+        mail_from: &str,
+        rcpt_to: &str,
+        raw_message: &[u8],
+        source: OutboundSource,
+        helo_hostname: Option<&str>,
+        data_gate: DataGate,
+    ) -> SendOutcome {
         let source = self.effective_source(source);
         let helo_hostname = helo_hostname.unwrap_or(&self.helo_hostname).to_string();
         let endpoints = self.resolve_endpoints(domain).await;
@@ -314,6 +341,7 @@ impl SmtpSender {
                 auth: endpoint.auth.clone(),
                 source: source.clone(),
                 connection_attempt_delay: self.connection_attempt_delay,
+                data_gate: data_gate.clone(),
             };
             let outcome = smtp_client::send_message(&params, raw_message).await;
             match outcome {

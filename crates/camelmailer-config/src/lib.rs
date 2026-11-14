@@ -184,6 +184,11 @@ pub struct WebServer {
     /// Origins allowed to call the HTTP APIs from a browser. Empty (the
     /// default) sends no CORS headers; `["*"]` allows any origin.
     pub cors_origins: Vec<String>,
+    /// On SIGTERM or SIGINT the web server stops accepting connections and
+    /// gives requests in flight this many seconds to finish before it stops
+    /// (env `WEB_SERVER_SHUTDOWN_GRACE_SECONDS`). Keep the process manager's
+    /// stop timeout above it.
+    pub shutdown_grace_seconds: u32,
 }
 
 impl Default for WebServer {
@@ -193,7 +198,48 @@ impl Default for WebServer {
             default_bind_address: "127.0.0.1".into(),
             max_threads: 5,
             cors_origins: vec![],
+            shutdown_grace_seconds: DEFAULT_SERVER_SHUTDOWN_GRACE_SECONDS,
         }
+    }
+}
+
+/// The default grace period of the web and SMTP servers' graceful shutdown.
+pub const DEFAULT_SERVER_SHUTDOWN_GRACE_SECONDS: u32 = 30;
+
+/// `name` as a number of seconds when the variable is set: the override of a
+/// `shutdown_grace_seconds` setting.
+fn grace_override(
+    var: impl Fn(&str) -> Option<String>,
+    name: &str,
+    current: u32,
+) -> Result<u32, ConfigError> {
+    match var(name) {
+        None => Ok(current),
+        Some(value) => value.trim().parse().map_err(|_| {
+            ConfigError::Invalid(format!(
+                "{name} must be a number of seconds (got {value:?})"
+            ))
+        }),
+    }
+}
+
+impl WebServer {
+    /// `shutdown_grace_seconds` with `WEB_SERVER_SHUTDOWN_GRACE_SECONDS`
+    /// applied.
+    pub fn shutdown_grace(&self) -> Result<std::time::Duration, ConfigError> {
+        self.shutdown_grace_with(|name| std::env::var(name).ok())
+    }
+
+    fn shutdown_grace_with(
+        &self,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<std::time::Duration, ConfigError> {
+        let seconds = grace_override(
+            var,
+            "WEB_SERVER_SHUTDOWN_GRACE_SECONDS",
+            self.shutdown_grace_seconds,
+        )?;
+        Ok(std::time::Duration::from_secs(u64::from(seconds)))
     }
 }
 
@@ -1105,6 +1151,12 @@ pub struct SmtpServer {
     /// Additional listeners beyond `default_port` (which always runs in
     /// `smtp` mode). Empty by default: only `default_port` is bound.
     pub listeners: Vec<SmtpListener>,
+    /// On SIGTERM or SIGINT the SMTP server stops accepting connections and
+    /// gives open sessions this many seconds to finish their transaction;
+    /// sessions still open then get `421 4.3.2` and are closed (env
+    /// `SMTP_SERVER_SHUTDOWN_GRACE_SECONDS`). Keep the process manager's stop
+    /// timeout above it.
+    pub shutdown_grace_seconds: u32,
 }
 
 impl Default for SmtpServer {
@@ -1125,7 +1177,28 @@ impl Default for SmtpServer {
             max_message_size: 14,
             log_ip_address_exclusion_matcher: None,
             listeners: vec![],
+            shutdown_grace_seconds: DEFAULT_SERVER_SHUTDOWN_GRACE_SECONDS,
         }
+    }
+}
+
+impl SmtpServer {
+    /// `shutdown_grace_seconds` with `SMTP_SERVER_SHUTDOWN_GRACE_SECONDS`
+    /// applied.
+    pub fn shutdown_grace(&self) -> Result<std::time::Duration, ConfigError> {
+        self.shutdown_grace_with(|name| std::env::var(name).ok())
+    }
+
+    fn shutdown_grace_with(
+        &self,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<std::time::Duration, ConfigError> {
+        let seconds = grace_override(
+            var,
+            "SMTP_SERVER_SHUTDOWN_GRACE_SECONDS",
+            self.shutdown_grace_seconds,
+        )?;
+        Ok(std::time::Duration::from_secs(u64::from(seconds)))
     }
 }
 
@@ -2592,6 +2665,41 @@ smtp_server:
             .unwrap();
         assert!(both.validate().is_err());
         assert!(Config::from_yaml("worker:\n  deliver: newsletters\n").is_err());
+    }
+
+    #[test]
+    fn server_shutdown_grace_defaults_and_env_overrides() {
+        let config = Config::from_yaml("").unwrap();
+        assert_eq!(config.web_server.shutdown_grace_seconds, 30);
+        assert_eq!(config.smtp_server.shutdown_grace_seconds, 30);
+        let config = Config::from_yaml(
+            "web_server:\n  shutdown_grace_seconds: 12\nsmtp_server:\n  shutdown_grace_seconds: 45\n",
+        )
+        .unwrap();
+        let none = |_: &str| None;
+        assert_eq!(
+            config.web_server.shutdown_grace_with(none).unwrap(),
+            std::time::Duration::from_secs(12)
+        );
+        assert_eq!(
+            config.smtp_server.shutdown_grace_with(none).unwrap(),
+            std::time::Duration::from_secs(45)
+        );
+        let env = |name: &str| match name {
+            "WEB_SERVER_SHUTDOWN_GRACE_SECONDS" => Some("5".to_string()),
+            "SMTP_SERVER_SHUTDOWN_GRACE_SECONDS" => Some(" 0 ".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            config.web_server.shutdown_grace_with(env).unwrap(),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.smtp_server.shutdown_grace_with(env).unwrap(),
+            std::time::Duration::ZERO
+        );
+        let bad = |_: &str| Some("soon".to_string());
+        assert!(config.smtp_server.shutdown_grace_with(bad).is_err());
     }
 
     #[test]
