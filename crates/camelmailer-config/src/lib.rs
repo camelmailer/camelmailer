@@ -1114,6 +1114,12 @@ pub struct SmtpClient {
     /// Seconds to wait while the message body is sent and for the reply to
     /// its final dot (RFC 5321: ten minutes).
     pub data_timeout: u32,
+    /// Greet with the `hostname` of the IP-pool address a delivery is bound
+    /// to, so EHLO, the address's PTR and its A record name the same host.
+    /// Falls back to `dns.helo_hostname` (else `camelmailer.smtp_hostname`)
+    /// when the delivery has no pool address or the address has no hostname.
+    /// Off by default, so an installation's EHLO never changes by itself.
+    pub helo_from_ip_address: bool,
 }
 
 impl Default for SmtpClient {
@@ -1122,6 +1128,7 @@ impl Default for SmtpClient {
             open_timeout: 30,
             read_timeout: 300,
             data_timeout: 600,
+            helo_from_ip_address: false,
         }
     }
 }

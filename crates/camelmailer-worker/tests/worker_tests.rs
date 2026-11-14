@@ -4690,3 +4690,147 @@ async fn a_host_aware_worker_still_delivers_past_a_dead_first_address_to_a_slow_
         .iter()
         .any(|line| line == "RCPT TO:<user@dest.example>"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ehlo_uses_the_pool_addresses_hostname_when_asked_to() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    // pool_with names 127.0.0.1 "host-127.0.0.1.example".
+    pool_with(&s, &[("127.0.0.1", 1)]).await;
+
+    for (opt_in, expected) in [
+        (false, "EHLO postal.example.com"),
+        (true, "EHLO host-127.0.0.1.example"),
+    ] {
+        let smtp = mock_smtp("250 Accepted").await;
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+        let mut config = worker_config(smtp.port);
+        config.smtp_client.helo_from_ip_address = opt_in;
+        let worker = Worker::new(&config, s.store.clone());
+        let outcome = worker.process_next().await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, ProcessOutcome::Delivered { .. }),
+            "{outcome:?}"
+        );
+        let seen = smtp.received.lock().unwrap().clone();
+        assert_eq!(seen.first().map(String::as_str), Some(expected), "{seen:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ehlo_falls_back_without_a_pool_address() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let mut config = worker_config(smtp.port);
+    config.smtp_client.helo_from_ip_address = true;
+    config.dns.helo_hostname = Some("out.example.net".into());
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+    let seen = smtp.received.lock().unwrap().clone();
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("EHLO out.example.net")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_aware_worker_greets_with_the_hostname_of_the_address_it_chose() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    // 192.0.2.1 has the better priority but is not on this host; the
+    // host-aware worker binds 127.0.0.1 and must greet with its name, not
+    // with the name of the pool's first address.
+    pool_with(&s, &[("192.0.2.1", 1), ("127.0.0.1", 10)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    // End to end past a refused first address to a receiver that greets
+    // late: the opt-in changes the name only, not how delivery proceeds.
+    let slow = slow_greeting_front(smtp.port, std::time::Duration::from_secs(2)).await;
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.smtp_relays = vec![
+        format!("smtp://127.0.0.1:{}", refused_port().await),
+        format!("smtp://127.0.0.1:{slow}"),
+    ];
+    config.worker.host_aware_pools = true;
+    config.smtp_client.helo_from_ip_address = true;
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+    let seen = smtp.received.lock().unwrap().clone();
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("EHLO host-127.0.0.1.example"),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_pool_hostname_never_reaches_the_wire() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    pool_with(&s, &[("127.0.0.1", 1)]).await;
+
+    // Rows written around the API's check: a CR/LF injection attempt, a bare
+    // label, a trailing dot and an IP literal. Each falls back to
+    // dns.helo_hostname, and no injected command is seen by the receiver.
+    for (host_aware, hostname) in [
+        (false, "out1.example.com\r\nRSET"),
+        (true, "out1.example.com\r\nRSET"),
+        (false, "out1"),
+        (false, "out1.example.com."),
+        (true, "127.0.0.1"),
+    ] {
+        sqlx::query("UPDATE ip_addresses SET hostname = $1")
+            .bind(hostname)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let smtp = mock_smtp("250 Accepted").await;
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+        let mut config = worker_config(smtp.port);
+        config.worker.host_aware_pools = host_aware;
+        config.smtp_client.helo_from_ip_address = true;
+        config.dns.helo_hostname = Some("out.example.net".into());
+        let worker = Worker::new(&config, s.store.clone());
+        let outcome = worker.process_next().await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, ProcessOutcome::Delivered { .. }),
+            "{hostname:?}: {outcome:?}"
+        );
+        let seen = smtp.received.lock().unwrap().clone();
+        assert_eq!(
+            seen.first().map(String::as_str),
+            Some("EHLO out.example.net"),
+            "{hostname:?}: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|line| line == "RSET"),
+            "{hostname:?}: {seen:?}"
+        );
+    }
+}

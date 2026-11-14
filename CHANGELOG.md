@@ -27,6 +27,13 @@ integration tests) is green.
 
 ### Added
 
+- **EHLO from the pool address.** With `smtp_client.helo_from_ip_address:
+  true` the worker greets with the `hostname` of the IP-pool address a
+  delivery is bound to, so EHLO, PTR and A record agree per IP. Falls back to
+  `dns.helo_hostname` (else `smtp_hostname`). Off by default. A stored
+  hostname that is not a fully qualified host name is skipped with a warning
+  and the fallback is used, so CR, LF or spaces never reach the SMTP line.
+
 - **Host-aware IP pools.** With `worker.host_aware_pools: true` a worker
   sends only from the pool addresses its host holds (the addresses on its
   network interfaces, or those listed in `worker.source_addresses`), so workers on several hosts can share
@@ -88,6 +95,12 @@ integration tests) is green.
   same 107-byte cap and 10-second timeout to the header as `smtps`; it used
   to buffer an unterminated first line without limit and wait forever.
   Refused headers are logged as a rate-limited warning.
+
+### Changed
+
+- `POST /api/v2/admin/ip_pools/{id}/ip_addresses` rejects a `hostname` that
+  is not a fully qualified host name (CR/LF, spaces, IP literals, a single
+  label, a trailing dot) with 422. Existing rows are not touched.
 
 ## [0.13.1] - 2026-11-05
 
