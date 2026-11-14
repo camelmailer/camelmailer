@@ -2588,4 +2588,34 @@ smtp_server:
             |name: &str| (name == "WORKER_FOREIGN_POOL_DELAY_SECONDS").then(|| "soon".to_string());
         assert!(Worker::default().with_overrides(junk).is_err());
     }
+
+    #[test]
+    fn provider_feedback_is_off_without_credentials_and_reads_its_group() {
+        let config = Config::from_yaml("").unwrap();
+        let feedback = &config.deliverability_feedback;
+        assert_eq!(feedback.fetch_interval_seconds, 21_600);
+        assert!(feedback.postmaster_tools.domains.is_empty());
+        assert!(feedback.snds.data_url_file.is_none());
+        assert!(!feedback.fbl.suppress_complainants);
+        assert_eq!(
+            feedback.postmaster_tools.api_base_url,
+            "https://gmailpostmastertools.googleapis.com"
+        );
+
+        let config = Config::from_yaml(
+            "deliverability_feedback:\n  postmaster_tools:\n    domains: [example.com]\n    \
+             client_id: id\n    refresh_token_file: /run/secrets/t\n  snds:\n    \
+             data_url_file: /run/secrets/snds\n  fbl:\n    suppress_complainants: true\n",
+        )
+        .unwrap();
+        let feedback = &config.deliverability_feedback;
+        assert_eq!(feedback.postmaster_tools.domains, vec!["example.com"]);
+        assert_eq!(feedback.postmaster_tools.days, 7);
+        assert_eq!(
+            feedback.snds.data_url_file.as_deref(),
+            Some("/run/secrets/snds")
+        );
+        assert!(feedback.fbl.suppress_complainants);
+        assert!(Config::from_yaml("deliverability_feedback:\n  snds:\n    key: x\n").is_err());
+    }
 }
