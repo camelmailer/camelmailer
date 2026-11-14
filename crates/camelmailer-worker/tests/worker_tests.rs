@@ -4778,7 +4778,7 @@ async fn enqueue_records_the_pool_and_the_queue_filters_by_it() {
     assert!(queue.dequeue("elsewhere").await.unwrap().is_none());
     queue.set_source_pools(Some(vec![pool_id as i64]));
     let row = queue.dequeue("here").await.unwrap().expect("own pool");
-    queue.retry(row.id, 0).await.unwrap();
+    assert!(queue.retry(row.id, 0, "here").await.unwrap());
     queue.clear_backoff().await.unwrap();
     queue.set_source_pools(None);
     assert!(queue.dequeue("legacy").await.unwrap().is_some());
@@ -4994,5 +4994,119 @@ async fn an_invalid_pool_hostname_never_reaches_the_wire() {
             !seen.iter().any(|line| line == "RSET"),
             "{hostname:?}: {seen:?}"
         );
+    }
+}
+
+/// Issue #81: the worker lost its row while talking to the receiver (its
+/// lease ran out and another worker took the row over). It must not record
+/// its result over the new owner's: the message, its deliveries and the
+/// queue row stay as the new owner left them, for every SMTP result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_for_a_row_another_worker_took_over_is_not_recorded() {
+    for final_reply in ["250 Accepted", "451 Try later", "550 No such user"] {
+        let base = require_db!();
+        let pool = test_pool_with_connections(&base, 6).await;
+        let s = setup(pool.clone()).await;
+        let smtp = paused_mock_smtp(final_reply).await;
+        let message_id = s
+            .sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+
+        let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+        let task = tokio::spawn(async move { worker.process_next().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            smtp.final_response_ready.notified(),
+        )
+        .await
+        .expect("the delivery reached the final reply");
+        // Another worker takes the row over meanwhile.
+        sqlx::query("UPDATE queued_messages SET locked_by = 'new-owner', locked_at = now()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        smtp.final_response_release.notify_one();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, ProcessOutcome::NotOwner, "{final_reply}");
+        let stored = s
+            .sink
+            .message_by_id(s.server.id, message_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "Pending", "{final_reply}");
+        assert!(s
+            .sink
+            .deliveries_for_message(s.server.id, message_id)
+            .await
+            .unwrap()
+            .is_empty());
+        let (locked_by, attempts): (Option<String>, i32) =
+            sqlx::query_as("SELECT locked_by, attempts FROM queued_messages")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(locked_by.as_deref(), Some("new-owner"), "{final_reply}");
+        assert_eq!(attempts, 0, "{final_reply}");
+        let webhooks: i64 = sqlx::query_scalar("SELECT count(*) FROM webhook_requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(webhooks, 0, "{final_reply}");
+    }
+}
+
+/// Issue #81: a row the worker still holds is recorded exactly as before
+/// the owner check, for every SMTP result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_for_a_row_the_worker_still_holds_is_recorded_as_before() {
+    for (final_reply, status, queued_after) in [
+        ("250 Accepted", "Sent", false),
+        ("451 Try later", "SoftFail", true),
+        ("550 No such user", "HardFail", false),
+    ] {
+        let base = require_db!();
+        let pool = test_pool_with_connections(&base, 6).await;
+        let s = setup(pool.clone()).await;
+        let smtp = mock_smtp(final_reply).await;
+        let message_id = s
+            .sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+        let worker = Worker::new(&worker_config(smtp.port), s.store.clone());
+        worker.process_next().await.unwrap().unwrap();
+        let stored = s
+            .sink
+            .message_by_id(s.server.id, message_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, status, "{final_reply}");
+        let deliveries = s
+            .sink
+            .deliveries_for_message(s.server.id, message_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1, "{final_reply}");
+        assert_eq!(deliveries[0].status, status, "{final_reply}");
+        let rows: Vec<(Option<String>, i32)> =
+            sqlx::query_as("SELECT locked_by, attempts FROM queued_messages")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        if queued_after {
+            assert_eq!(rows, vec![(None, 1)], "{final_reply}");
+        } else {
+            assert!(rows.is_empty(), "{final_reply}");
+        }
     }
 }

@@ -19,7 +19,8 @@ use camelmailer_db::webhook_payload::{
 };
 use camelmailer_db::{
     BounceCorrelationOutcome, BounceOriginal, FeedbackComplaintOutcome, OutboundQueueAction,
-    PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, QueueFilter, StoredMessage,
+    OutboundRecord, PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, QueueFilter,
+    StoredMessage,
 };
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -267,6 +268,18 @@ enum Phase {
     /// on the receiver may already have the message, so a stopped row keeps
     /// its lock for the lease instead of going straight back to the queue.
     Sending,
+}
+
+/// Warn when a queue change matched no row because this worker no longer
+/// holds it (its lease ran out and another worker took it over).
+fn owned(table: &str, id: i64, matched: bool) {
+    if !matched {
+        tracing::warn!(
+            table,
+            id,
+            "another worker took over this row before its result was recorded; left to that worker"
+        );
+    }
 }
 
 /// Lock a mutex even when a panicking thread poisoned it: the sets below
@@ -524,6 +537,11 @@ pub enum ProcessOutcome {
     /// It went back to the queue without an attempt and is retried after
     /// `worker.foreign_pool_delay_seconds`.
     PoolUnavailable,
+    /// The worker no longer held the queue row when it came to record the
+    /// result: its lease ran out and another worker took the row over, or
+    /// the row is gone. Nothing was recorded; the row belongs to its new
+    /// owner.
+    NotOwner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -725,6 +743,50 @@ impl Worker {
         Ok(count)
     }
 
+    /// The outcome of a delivery whose result was handed to
+    /// `record_outbound_delivery`: `outcome` when it was recorded.
+    fn recorded_outcome(
+        &self,
+        recorded: OutboundRecord,
+        message_id: i64,
+        outcome: ProcessOutcome,
+    ) -> ProcessOutcome {
+        match recorded {
+            OutboundRecord::Recorded(_) => outcome,
+            OutboundRecord::AlreadyBounced => ProcessOutcome::AlreadyBounced,
+            OutboundRecord::NotOwner => {
+                tracing::warn!(
+                    message_id,
+                    worker_id = %self.worker_id,
+                    ?outcome,
+                    "another worker took over this message's queue row before its result was recorded; the result was not recorded"
+                );
+                ProcessOutcome::NotOwner
+            }
+        }
+    }
+
+    /// Remove a queue row this worker holds; warns when another worker took
+    /// it over meanwhile and leaves it to that worker.
+    async fn complete_row(&self, id: i64) -> Result<(), sqlx::Error> {
+        owned(
+            "queued_messages",
+            id,
+            self.queue.complete(id, &self.worker_id).await?,
+        );
+        Ok(())
+    }
+
+    /// Reschedule a queue row this worker holds, as [`Worker::complete_row`].
+    async fn retry_row(&self, id: i64, attempts: i32) -> Result<(), sqlx::Error> {
+        owned(
+            "queued_messages",
+            id,
+            self.queue.retry(id, attempts, &self.worker_id).await?,
+        );
+        Ok(())
+    }
+
     /// Log the in-flight rows of `tracked` the heartbeat could not refresh
     /// although they are still in flight; returns how many it refreshed.
     fn warn_lost(&self, table: &str, tracked: &Tracked, asked: &[i64], refreshed: &[i64]) -> u64 {
@@ -893,7 +955,7 @@ impl Worker {
                 .map(|message| (message, None))
         };
         let Some((mut message, server_token)) = loaded else {
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             return Ok(Some(ProcessOutcome::MessageMissing));
         };
 
@@ -916,7 +978,7 @@ impl Worker {
         server_token: Option<&str>,
     ) -> Result<ProcessOutcome, sqlx::Error> {
         if message.status == "Bounced" {
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             tracing::info!(
                 message_id = message.id,
                 "completed stale queue row for already bounced message"
@@ -944,6 +1006,7 @@ impl Worker {
                     message.server_id,
                     message.id,
                     queued.id,
+                    &self.worker_id,
                     "Held",
                     details,
                     "",
@@ -954,11 +1017,7 @@ impl Worker {
                     &payload,
                 )
                 .await?;
-            return Ok(if recorded.is_some() {
-                ProcessOutcome::Held
-            } else {
-                ProcessOutcome::AlreadyBounced
-            });
+            return Ok(self.recorded_outcome(recorded, message.id, ProcessOutcome::Held));
         }
 
         // Rewrite HTML links for click tracking and append an open pixel
@@ -1025,7 +1084,12 @@ impl Worker {
                             "could not read the IP pool; handing the message back"
                         );
                         self.queue
-                            .defer(queued.id, selection.foreign_pool_delay_seconds, None)
+                            .defer(
+                                queued.id,
+                                &self.worker_id,
+                                selection.foreign_pool_delay_seconds,
+                                None,
+                            )
                             .await?;
                         return Ok(ProcessOutcome::PoolUnavailable);
                     }
@@ -1048,6 +1112,7 @@ impl Worker {
                             self.queue
                                 .defer(
                                     queued.id,
+                                    &self.worker_id,
                                     selection.foreign_pool_delay_seconds,
                                     Some(pool_id as i64),
                                 )
@@ -1109,6 +1174,7 @@ impl Worker {
                         message.server_id,
                         message.id,
                         queued.id,
+                        &self.worker_id,
                         "Sent",
                         "message accepted by the remote server",
                         &response,
@@ -1119,14 +1185,17 @@ impl Worker {
                         &payload,
                     )
                     .await?;
-                if recorded.is_none() {
+                if recorded == OutboundRecord::AlreadyBounced {
                     tracing::info!(
                         message_id = message.id,
                         "preserved newer bounced state after outbound SMTP success"
                     );
-                    return Ok(ProcessOutcome::AlreadyBounced);
                 }
-                Ok(ProcessOutcome::Delivered { response })
+                Ok(self.recorded_outcome(
+                    recorded,
+                    message.id,
+                    ProcessOutcome::Delivered { response },
+                ))
             }
             SendOutcome::SoftFail { response } => {
                 if queued.attempts + 1 >= self.max_attempts {
@@ -1141,6 +1210,7 @@ impl Worker {
                             message.server_id,
                             message.id,
                             queued.id,
+                            &self.worker_id,
                             "HardFail",
                             "delivery attempts exhausted",
                             &response,
@@ -1151,11 +1221,11 @@ impl Worker {
                             &payload,
                         )
                         .await?;
-                    Ok(if recorded.is_some() {
-                        ProcessOutcome::Failed { response }
-                    } else {
-                        ProcessOutcome::AlreadyBounced
-                    })
+                    Ok(self.recorded_outcome(
+                        recorded,
+                        message.id,
+                        ProcessOutcome::Failed { response },
+                    ))
                 } else {
                     let payload = self.message_payload(message, &response);
                     let recorded = self
@@ -1164,6 +1234,7 @@ impl Worker {
                             message.server_id,
                             message.id,
                             queued.id,
+                            &self.worker_id,
                             "SoftFail",
                             "temporary delivery failure",
                             &response,
@@ -1178,11 +1249,11 @@ impl Worker {
                             &payload,
                         )
                         .await?;
-                    Ok(if recorded.is_some() {
-                        ProcessOutcome::Delayed { response }
-                    } else {
-                        ProcessOutcome::AlreadyBounced
-                    })
+                    Ok(self.recorded_outcome(
+                        recorded,
+                        message.id,
+                        ProcessOutcome::Delayed { response },
+                    ))
                 }
             }
             SendOutcome::HardFail { response } => {
@@ -1194,6 +1265,7 @@ impl Worker {
                         message.server_id,
                         message.id,
                         queued.id,
+                        &self.worker_id,
                         "HardFail",
                         "message rejected by the remote server",
                         &response,
@@ -1204,11 +1276,13 @@ impl Worker {
                         &payload,
                     )
                     .await?;
-                Ok(if recorded.is_some() {
-                    ProcessOutcome::Failed { response }
-                } else {
-                    ProcessOutcome::AlreadyBounced
-                })
+                Ok(
+                    self.recorded_outcome(
+                        recorded,
+                        message.id,
+                        ProcessOutcome::Failed { response },
+                    ),
+                )
             }
         }
     }
@@ -1299,7 +1373,7 @@ impl Worker {
                     None,
                 )
                 .await?;
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             return Ok(ProcessOutcome::Held);
         }
 
@@ -1336,7 +1410,7 @@ impl Worker {
         let Some(endpoint_url) = endpoint_url else {
             // Accept/Hold routes and bounces: the message is stored; there is
             // nothing to deliver.
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             return Ok(ProcessOutcome::NothingToDo);
         };
 
@@ -1354,10 +1428,10 @@ impl Worker {
             tracing::warn!(%error, endpoint = %endpoint_url, "route endpoint blocked by SSRF guard");
             let response = format!("route endpoint blocked by address guard: {error}");
             return if queued.attempts + 1 >= self.max_attempts {
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 Ok(ProcessOutcome::Failed { response })
             } else {
-                self.queue.retry(queued.id, queued.attempts).await?;
+                self.retry_row(queued.id, queued.attempts).await?;
                 Ok(ProcessOutcome::Delayed { response })
             };
         }
@@ -1376,7 +1450,7 @@ impl Worker {
         let result = self.http.post(&endpoint_url).json(&payload).send().await;
         let success = matches!(&result, Ok(response) if response.status().is_success());
         if success {
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             Ok(ProcessOutcome::Routed)
         } else {
             let response = match result {
@@ -1384,10 +1458,10 @@ impl Worker {
                 Err(error) => format!("endpoint request failed: {error}"),
             };
             if queued.attempts + 1 >= self.max_attempts {
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 Ok(ProcessOutcome::Failed { response })
             } else {
-                self.queue.retry(queued.id, queued.attempts).await?;
+                self.retry_row(queued.id, queued.attempts).await?;
                 Ok(ProcessOutcome::Delayed { response })
             }
         }
@@ -1425,7 +1499,7 @@ impl Worker {
         match correlation {
             BounceCorrelationOutcome::Correlated(_) => {}
             BounceCorrelationOutcome::AlreadyCorrelated => {
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 return Ok(Some(ProcessOutcome::BounceCorrelated));
             }
             BounceCorrelationOutcome::NotMatched if message.route_id.is_none() => {
@@ -1444,7 +1518,7 @@ impl Worker {
             }
             BounceCorrelationOutcome::NotMatched => return Ok(None),
         }
-        self.queue.complete(queued.id).await?;
+        self.complete_row(queued.id).await?;
         Ok(Some(ProcessOutcome::BounceCorrelated))
     }
 
@@ -1462,7 +1536,7 @@ impl Worker {
             Ok(report) => report,
             Err(error) => {
                 tracing::warn!(%error, message_id = message.id, "unparseable DMARC report held");
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 self.sink
                     .record_delivery(
                         message.server_id,
@@ -1504,7 +1578,7 @@ impl Worker {
         };
         match camelmailer_core::ServerStore::store_dmarc_report(&self.store, new).await {
             Ok(stored) => {
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 self.sink
                     .record_delivery(
                         message.server_id,
@@ -1527,10 +1601,10 @@ impl Worker {
                 tracing::warn!(%error, message_id = message.id, "could not store DMARC report");
                 let response = format!("could not store the DMARC report: {error}");
                 if queued.attempts + 1 >= self.max_attempts {
-                    self.queue.complete(queued.id).await?;
+                    self.complete_row(queued.id).await?;
                     Ok(ProcessOutcome::Failed { response })
                 } else {
-                    self.queue.retry(queued.id, queued.attempts).await?;
+                    self.retry_row(queued.id, queued.attempts).await?;
                     Ok(ProcessOutcome::Delayed { response })
                 }
             }
@@ -1553,7 +1627,7 @@ impl Worker {
             Ok(report) => report,
             Err(error) => {
                 tracing::warn!(%error, message_id = message.id, "unparseable ARF report held");
-                self.queue.complete(queued.id).await?;
+                self.complete_row(queued.id).await?;
                 self.sink
                     .record_delivery(
                         message.server_id,
@@ -1591,7 +1665,7 @@ impl Worker {
                 .await
             {
                 Ok(outcome) => {
-                    self.queue.complete(queued.id).await?;
+                    self.complete_row(queued.id).await?;
                     let detail = match outcome {
                         FeedbackComplaintOutcome::Recorded {
                             suppressed: true, ..
@@ -1626,17 +1700,17 @@ impl Worker {
                     tracing::warn!(%error, message_id = message.id, "could not record feedback complaint");
                     let response = format!("could not record the feedback complaint: {error}");
                     if queued.attempts + 1 >= self.max_attempts {
-                        self.queue.complete(queued.id).await?;
+                        self.complete_row(queued.id).await?;
                         Ok(ProcessOutcome::Failed { response })
                     } else {
-                        self.queue.retry(queued.id, queued.attempts).await?;
+                        self.retry_row(queued.id, queued.attempts).await?;
                         Ok(ProcessOutcome::Delayed { response })
                     }
                 }
             }
         } else {
             // Recognised ARF of a non-abuse type. Store and move on.
-            self.queue.complete(queued.id).await?;
+            self.complete_row(queued.id).await?;
             self.sink
                 .record_delivery(
                     message.server_id,
@@ -1777,12 +1851,22 @@ impl Worker {
                 .log_attempt(&request, attempt, None, false, &detail)
                 .await?;
             return if attempt >= WEBHOOK_MAX_ATTEMPTS {
-                self.webhook_queue.complete(request.id).await?;
+                owned(
+                    "webhook_requests",
+                    request.id,
+                    self.webhook_queue
+                        .complete(request.id, &self.worker_id)
+                        .await?,
+                );
                 Ok(Some(WebhookOutcome::GivenUp))
             } else {
-                self.webhook_queue
-                    .retry(request.id, request.attempts)
-                    .await?;
+                owned(
+                    "webhook_requests",
+                    request.id,
+                    self.webhook_queue
+                        .retry(request.id, request.attempts, &self.worker_id)
+                        .await?,
+                );
                 Ok(Some(WebhookOutcome::Retrying))
             };
         }
@@ -1835,16 +1919,32 @@ impl Worker {
             .await?;
 
         if success {
-            self.webhook_queue.complete(request.id).await?;
+            owned(
+                "webhook_requests",
+                request.id,
+                self.webhook_queue
+                    .complete(request.id, &self.worker_id)
+                    .await?,
+            );
             Ok(Some(WebhookOutcome::Delivered))
         } else if attempt >= WEBHOOK_MAX_ATTEMPTS {
-            self.webhook_queue.complete(request.id).await?;
+            owned(
+                "webhook_requests",
+                request.id,
+                self.webhook_queue
+                    .complete(request.id, &self.worker_id)
+                    .await?,
+            );
             tracing::warn!(url = %request.url, "webhook given up after {WEBHOOK_MAX_ATTEMPTS} attempts");
             Ok(Some(WebhookOutcome::GivenUp))
         } else {
-            self.webhook_queue
-                .retry(request.id, request.attempts)
-                .await?;
+            owned(
+                "webhook_requests",
+                request.id,
+                self.webhook_queue
+                    .retry(request.id, request.attempts, &self.worker_id)
+                    .await?,
+            );
             Ok(Some(WebhookOutcome::Retrying))
         }
     }
@@ -1890,21 +1990,37 @@ impl Worker {
             }
         }
         if failures.is_empty() {
-            self.lifecycle_queue.complete(event.id).await?;
+            owned(
+                "lifecycle_events",
+                event.id,
+                self.lifecycle_queue
+                    .complete(event.id, &self.worker_id)
+                    .await?,
+            );
             return Ok(Some(WebhookOutcome::Delivered));
         }
         let detail = failures.join("; ");
         if event.attempts + 1 >= WEBHOOK_MAX_ATTEMPTS {
             tracing::warn!(event = %event.event, id = %event.uuid, %detail,
                 "lifecycle event given up after {WEBHOOK_MAX_ATTEMPTS} attempts");
-            self.lifecycle_queue.complete(event.id).await?;
+            owned(
+                "lifecycle_events",
+                event.id,
+                self.lifecycle_queue
+                    .complete(event.id, &self.worker_id)
+                    .await?,
+            );
             Ok(Some(WebhookOutcome::GivenUp))
         } else {
             tracing::info!(event = %event.event, id = %event.uuid, %detail,
                 "lifecycle event delivery failed, retrying");
-            self.lifecycle_queue
-                .retry(event.id, event.attempts, &detail)
-                .await?;
+            owned(
+                "lifecycle_events",
+                event.id,
+                self.lifecycle_queue
+                    .retry(event.id, event.attempts, &detail, &self.worker_id)
+                    .await?,
+            );
             Ok(Some(WebhookOutcome::Retrying))
         }
     }
