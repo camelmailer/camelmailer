@@ -60,6 +60,15 @@ integration tests) is green.
   reads the PROXY v1 line from the raw socket before the handshake and sends
   the banner over TLS afterwards. A connection without a valid header is
   closed.
+- **PROXY header validation, on every listener.** The client and proxy
+  fields must be IP literals of the announced family and the ports numbers;
+  before, any six words were accepted and a garbage client "address" reached
+  the Received header while SPF and IP credentials silently skipped it.
+  `PROXY UNKNOWN` (balancer health checks) is now accepted with the socket's
+  address instead of being refused. The plain `smtp` listener now applies the
+  same 107-byte cap and 10-second timeout to the header as `smtps`; it used
+  to buffer an unterminated first line without limit and wait forever.
+  Refused headers are logged as a rate-limited warning.
 
 ## [0.13.1] - 2026-11-05
 

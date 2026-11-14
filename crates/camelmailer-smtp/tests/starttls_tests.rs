@@ -171,6 +171,16 @@ async fn start_server_with(
     mode: SmtpListenerMode,
     proxy_protocol: bool,
 ) -> u16 {
+    start_server_full(fixtures, sink, mode, proxy_protocol, None).await
+}
+
+async fn start_server_full(
+    fixtures: &Fixtures,
+    sink: Arc<MemorySink>,
+    mode: SmtpListenerMode,
+    proxy_protocol: bool,
+    proxy_header_timeout: Option<std::time::Duration>,
+) -> u16 {
     // Every server gets its own certificate directory: the tests in this
     // file run concurrently in one process, and a shared path let one test
     // overwrite another's cert/key mid-write, producing a mismatched pair
@@ -193,7 +203,10 @@ async fn start_server_with(
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = SmtpServer::new(config, fixtures.store(), sink);
+    let mut server = SmtpServer::new(config, fixtures.store(), sink);
+    if let Some(timeout) = proxy_header_timeout {
+        server = server.with_proxy_header_timeout(timeout);
+    }
     tokio::spawn(async move {
         server.serve_listeners(vec![(listener, mode)]).await.ok();
     });
@@ -554,4 +567,228 @@ async fn smtps_behind_a_proxy_closes_a_connection_without_a_valid_header() {
         "an invalid PROXY line must not reach TLS"
     );
     assert!(sink.messages().is_empty());
+}
+
+/// Reads until the server closes the connection; returns what it sent.
+/// Panics when the server keeps the connection open past `within`.
+async fn read_until_closed(stream: &mut TcpStream, within: std::time::Duration) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut received = Vec::new();
+    tokio::time::timeout(within, stream.read_to_end(&mut received))
+        .await
+        .expect("the server must close the connection")
+        .ok();
+    String::from_utf8_lossy(&received).into_owned()
+}
+
+/// Sends a whole authenticated transaction and asserts it was accepted.
+async fn send_one_message<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut SmtpTestClient<S>,
+    credential_key: &str,
+) {
+    use base64::Engine;
+    let reply = client.command("EHLO client.example").await;
+    assert!(reply[0].starts_with("250"), "{reply:?}");
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("\0XX\0{credential_key}"));
+    let reply = client.command(&format!("AUTH PLAIN {auth}")).await;
+    assert!(reply[0].starts_with("235 Granted for"), "{reply:?}");
+    assert_eq!(
+        client.command("MAIL FROM:<sender@org.example>").await,
+        vec!["250 OK"]
+    );
+    assert_eq!(
+        client.command("RCPT TO:<user@elsewhere.example>").await,
+        vec!["250 OK"]
+    );
+    assert_eq!(client.command("DATA").await, vec!["354 Go ahead"]);
+    client.send("From: sender@org.example").await;
+    client.send("Subject: Behind a proxy").await;
+    client.send("").await;
+    client.send("Hello.").await;
+    assert_eq!(client.command(".").await, vec!["250 OK"]);
+    client.command("QUIT").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtps_behind_a_proxy_accepts_proxy_unknown_with_the_socket_address() {
+    // A balancer health check sends `PROXY UNKNOWN`; the spec says accept it
+    // and use the socket's own address.
+    let fixtures = Fixtures::new();
+    fixtures.verified_server_domain("org.example");
+    let credential = fixtures.credential(CredentialType::Smtp, "smtps-unknown-key");
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_with(&fixtures, sink.clone(), SmtpListenerMode::Smtps, true).await;
+
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp.write_all(b"PROXY UNKNOWN\r\n").await.unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from("postal.example.com").unwrap();
+    let tls_stream = tls_connector().connect(server_name, tcp).await.unwrap();
+    let mut client = SmtpTestClient::new(tls_stream);
+    assert!(client
+        .read_line()
+        .await
+        .starts_with("220 postal.example.com ESMTP Camelmailer/"));
+    send_one_message(&mut client, &credential.key).await;
+
+    let messages = sink.messages();
+    assert_eq!(messages.len(), 1);
+    let raw = String::from_utf8_lossy(&messages[0].raw_message);
+    assert!(raw.contains("127.0.0.1"), "socket address used: {raw}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtps_behind_a_proxy_closes_a_header_whose_client_is_not_an_ip() {
+    let fixtures = Fixtures::new();
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_with(&fixtures, sink.clone(), SmtpListenerMode::Smtps, true).await;
+    let server_name = rustls::pki_types::ServerName::try_from("postal.example.com").unwrap();
+
+    for header in [
+        &b"PROXY TCP4 evil.example 10.0.70.5 40000 465\r\n"[..],
+        &b"PROXY TCP4 203.0.113.7 10.0.70.5 notaport 465\r\n"[..],
+        &b"PROXY TCP6 203.0.113.7 10.0.70.5 40000 465\r\n"[..],
+    ] {
+        let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tcp.write_all(header).await.unwrap();
+        let handshake = tls_connector().connect(server_name.clone(), tcp).await;
+        assert!(
+            handshake.is_err(),
+            "{} must not reach TLS",
+            String::from_utf8_lossy(header).trim_end()
+        );
+    }
+    assert!(sink.messages().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtps_behind_a_proxy_closes_a_header_past_the_v1_length_cap() {
+    let fixtures = Fixtures::new();
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_with(&fixtures, sink, SmtpListenerMode::Smtps, true).await;
+
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    // 107 bytes with no line end: one more than a v1 header may take.
+    tcp.write_all(&[b'A'; 107]).await.unwrap();
+    let received = read_until_closed(&mut tcp, std::time::Duration::from_secs(5)).await;
+    assert!(
+        received.is_empty(),
+        "nothing in the clear on smtps: {received}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtps_behind_a_proxy_closes_a_connection_that_sends_no_header_in_time() {
+    let fixtures = Fixtures::new();
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_full(
+        &fixtures,
+        sink,
+        SmtpListenerMode::Smtps,
+        true,
+        Some(std::time::Duration::from_millis(200)),
+    )
+    .await;
+
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    // Half a header, then silence.
+    tcp.write_all(b"PROXY TCP4 203.0").await.unwrap();
+    let received = read_until_closed(&mut tcp, std::time::Duration::from_secs(5)).await;
+    assert!(received.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtp_behind_a_proxy_delivers_a_message_with_the_proxied_ip() {
+    // The plain listener behind a balancer, end to end: PROXY line, banner,
+    // STARTTLS, AUTH, one message.
+    let fixtures = Fixtures::new();
+    fixtures.verified_server_domain("org.example");
+    let credential = fixtures.credential(CredentialType::Smtp, "smtp-proxy-key");
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_with(&fixtures, sink.clone(), SmtpListenerMode::Smtp, true).await;
+
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp.write_all(b"PROXY TCP4 203.0.113.9 10.0.70.5 40000 25\r\n")
+        .await
+        .unwrap();
+    let mut client = SmtpTestClient::new(tcp);
+    assert!(client
+        .read_line()
+        .await
+        .starts_with("220 postal.example.com ESMTP Camelmailer/"));
+    client.command("EHLO client.example").await;
+    assert_eq!(
+        client.command("STARTTLS").await[0],
+        "220 Ready to start TLS"
+    );
+    let server_name = rustls::pki_types::ServerName::try_from("postal.example.com").unwrap();
+    let tls_stream = tls_connector()
+        .connect(server_name, client.into_inner())
+        .await
+        .unwrap();
+    let mut client = SmtpTestClient::new(tls_stream);
+    send_one_message(&mut client, &credential.key).await;
+
+    let messages = sink.messages();
+    assert_eq!(messages.len(), 1);
+    let raw = String::from_utf8_lossy(&messages[0].raw_message);
+    assert!(raw.contains("203.0.113.9"), "proxied IP recorded: {raw}");
+    assert!(!raw.contains("127.0.0.1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtp_behind_a_proxy_refuses_bad_headers_with_502_and_closes() {
+    let fixtures = Fixtures::new();
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_with(&fixtures, sink, SmtpListenerMode::Smtp, true).await;
+
+    // A client field that is not an IP.
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp.write_all(b"PROXY TCP4 evil.example 10.0.70.5 40000 25\r\n")
+        .await
+        .unwrap();
+    let received = read_until_closed(&mut tcp, std::time::Duration::from_secs(5)).await;
+    assert_eq!(received, "502 Proxy Error\r\n");
+
+    // A line past the v1 cap: refused at 107 bytes, not buffered forever.
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp.write_all(&[b'A'; 4096]).await.unwrap();
+    let received = read_until_closed(&mut tcp, std::time::Duration::from_secs(5)).await;
+    assert_eq!(received, "502 Proxy Error\r\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtp_behind_a_proxy_closes_a_connection_that_sends_no_header_in_time() {
+    let fixtures = Fixtures::new();
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_full(
+        &fixtures,
+        sink,
+        SmtpListenerMode::Smtp,
+        true,
+        Some(std::time::Duration::from_millis(200)),
+    )
+    .await;
+
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let received = read_until_closed(&mut tcp, std::time::Duration::from_secs(5)).await;
+    assert!(
+        received.is_empty(),
+        "no banner before the header: {received}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtp_behind_a_proxy_answers_proxy_unknown_with_the_banner() {
+    let fixtures = Fixtures::new();
+    let sink = Arc::new(MemorySink::new());
+    let port = start_server_with(&fixtures, sink, SmtpListenerMode::Smtp, true).await;
+
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp.write_all(b"PROXY UNKNOWN\r\n").await.unwrap();
+    let mut client = SmtpTestClient::new(tcp);
+    assert!(client
+        .read_line()
+        .await
+        .starts_with("220 postal.example.com ESMTP Camelmailer/"));
+    assert_eq!(client.command("QUIT").await, vec!["221 Closing Connection"]);
 }

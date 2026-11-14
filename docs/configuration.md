@@ -131,10 +131,23 @@ Without it, every client looks like the balancer's address.
 On `smtp` listeners the line comes before the banner. On `smtps` listeners
 the balancer sends it in the clear in front of the client's TLS handshake;
 the server reads exactly that line from the raw socket, then starts TLS and
-sends the banner over the encrypted stream. A connection without a valid
-header is closed, on every listener, so do not expose a `proxy_protocol`
+sends the banner over the encrypted stream.
+
+Both listener types read the header the same way: at most 107 bytes (the v1
+limit), within 10 seconds of the connection opening. The addresses must be
+literals of the announced family (`TCP4` IPv4, `TCP6` IPv6) and the ports
+numbers. `PROXY UNKNOWN`, which balancers send for their own health checks,
+is accepted and the connection keeps the socket's address. Only v1 (the text
+form) is understood; a balancer sending v2 is refused.
+
+A connection without a valid header is closed, on every listener: an `smtp`
+listener answers `502 Proxy Error` first, an `smtps` listener closes without
+a word because the client expects TLS. So do not expose a `proxy_protocol`
 listener to clients that bypass the balancer: they cannot connect, and
-nothing lets them claim another address.
+nothing lets them claim another address. Refusals are logged as a warning at
+most once a minute (with the number suppressed since), every one at debug
+level: a balancer without `send-proxy`, or with `send-proxy-v2`, shows up
+there.
 
 The switch applies to all listeners of the process. To serve some clients
 directly, run a second `smtp-server` without it.
