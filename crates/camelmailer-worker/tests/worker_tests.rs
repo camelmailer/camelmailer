@@ -3583,6 +3583,72 @@ async fn arf_reports_without_an_engine_unsubscribe_token_still_fire_message_comp
     assert_eq!(original.status, "Sent");
 }
 
+/// Feedback-loop reports are counted per reporting provider and day (a
+/// JMRP report from Hotmail counts for `microsoft`), and with
+/// `deliverability_feedback.fbl.suppress_complainants` the complainant of a
+/// transactional message is suppressed for that message's stream. Off by
+/// default: transactional mail to the complainant keeps flowing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feedback_loop_reports_are_counted_per_provider_and_suppress_only_when_asked() {
+    use camelmailer_core::feedback::{provider, source};
+    use camelmailer_core::{FeedbackStore, ServerStore};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    for (suppress, rcpt) in [(false, "keep@dest.example"), (true, "stop@dest.example")] {
+        let mut config = worker_config(smtp.port);
+        config.deliverability_feedback.fbl.suppress_complainants = suppress;
+        let worker = Worker::new(&config, s.store.clone());
+        let original_id = s
+            .sink
+            .insert_message(&outgoing_message(s.server.id, rcpt))
+            .await
+            .unwrap();
+        assert!(matches!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::Delivered { .. }
+        ));
+        let original = s
+            .sink
+            .message_by_id(s.server.id, original_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut report = outgoing_message(s.server.id, "fbl@org.example");
+        report.scope = MessageScope::Incoming;
+        report.raw_message = String::from_utf8(arf_mail_with_sender_unsubscribe(
+            Some(&original.token),
+            rcpt,
+        ))
+        .unwrap()
+        .replace("From: feedback@isp.example", "From: staff@hotmail.com")
+        .into_bytes();
+        s.sink.insert_message(&report).await.unwrap();
+        assert_eq!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::FeedbackReportIngested
+        );
+        assert_eq!(
+            ServerStore::address_suppressed(&s.store, s.server.id, rcpt, None)
+                .await
+                .unwrap(),
+            suppress,
+            "{rcpt}"
+        );
+    }
+    let counts = s
+        .store
+        .latest_feedback_snapshots(source::FBL)
+        .await
+        .unwrap();
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].provider, provider::MICROSOFT);
+    assert_eq!(counts[0].metrics["complaints"], 2);
+    assert_eq!(counts[0].detail, "2 complaints reported");
+}
+
 // ------------------------------------------------ lifecycle webhooks
 
 /// A receiver that records (headers, body) and answers `status`.

@@ -69,6 +69,9 @@ pub struct ApiState {
     /// when accounts storage is not enabled; the dashboard endpoints then
     /// report the feature unavailable.
     pub org_sso_store: Option<Arc<dyn camelmailer_core::OrgSsoStore>>,
+    /// Provider feedback snapshots (Postmaster Tools, SNDS, feedback loops).
+    /// `None` reports every source as off.
+    pub feedback_store: Option<Arc<dyn camelmailer_core::FeedbackStore>>,
 }
 
 impl ApiState {
@@ -99,6 +102,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            feedback_store: None,
             spf_resolver: None,
         })
     }
@@ -122,6 +126,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            feedback_store: None,
             spf_resolver: None,
         })
     }
@@ -290,6 +295,7 @@ impl ApiState {
             webhook_sender,
             installation_signing_key_pem,
             org_sso_store: None,
+            feedback_store: None,
             spf_resolver: None,
         })
     }
@@ -327,6 +333,17 @@ impl ApiState {
     ) -> Arc<Self> {
         let mut state = (*self).clone();
         state.org_sso_store = Some(org_sso_store);
+        Arc::new(state)
+    }
+
+    /// Attach the provider feedback store. Returns a fresh state, as
+    /// [`ApiState::with_org_sso_store`] does.
+    pub fn with_feedback_store(
+        self: Arc<Self>,
+        feedback_store: Arc<dyn camelmailer_core::FeedbackStore>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.feedback_store = Some(feedback_store);
         Arc::new(state)
     }
 
@@ -1964,6 +1981,10 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/source_addresses",
             get(resources::source_addresses_index),
+        )
+        .route(
+            "/deliverability/feedback",
+            get(crate::deliverability::feedback_index),
         )
         .route(
             "/ip_pools/{pool_id}/ip_addresses",

@@ -582,6 +582,8 @@ pub struct Worker {
     heartbeat_interval: Duration,
     /// `worker.shutdown_grace_seconds`.
     shutdown_grace: Duration,
+    /// `deliverability_feedback.fbl.suppress_complainants`.
+    fbl_suppress_complainants: bool,
 }
 
 impl Worker {
@@ -664,6 +666,7 @@ impl Worker {
             in_flight: InFlight::default(),
             heartbeat_interval: HEARTBEAT_INTERVAL,
             shutdown_grace: Duration::from_secs(u64::from(config.worker.shutdown_grace_seconds)),
+            fbl_suppress_complainants: config.deliverability_feedback.fbl.suppress_complainants,
         }
     }
 
@@ -1584,7 +1587,20 @@ impl Worker {
                 message_tokens: report.message_tokens.clone(),
                 message_id: report.original_message_id.clone(),
                 recipient: report.recipient(),
+                suppress_transactional: self.fbl_suppress_complainants,
             };
+            // Count the complaint for the provider that reported it (JMRP,
+            // CFL, ...). Per-IP crediting comes from the IP metrics. A failure
+            // here never holds up the complaint itself.
+            if let Err(error) = camelmailer_core::FeedbackStore::record_fbl_complaint(
+                &self.store,
+                report.provider(),
+                chrono::Utc::now().date_naive(),
+            )
+            .await
+            {
+                tracing::warn!(%error, provider = report.provider(), "could not count the feedback-loop complaint");
+            }
             match self
                 .sink
                 .record_feedback_complaint(message.server_id, &complaint)
@@ -1594,8 +1610,15 @@ impl Worker {
                     self.queue.complete(queued.id).await?;
                     let detail = match outcome {
                         FeedbackComplaintOutcome::Recorded {
-                            suppressed: true, ..
-                        } => "spam complaint recorded for the broadcast recipient".to_string(),
+                            suppressed: true,
+                            message_id,
+                            ..
+                        } => match message_id {
+                            Some(id) if complaint.unsubscribe_token.is_none() => format!(
+                                "spam complaint recorded for <msg:{id}>; recipient suppressed"
+                            ),
+                            _ => "spam complaint recorded for the broadcast recipient".to_string(),
+                        },
                         FeedbackComplaintOutcome::Recorded {
                             message_id: Some(id),
                             ..

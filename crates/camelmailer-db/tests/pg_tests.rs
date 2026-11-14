@@ -7646,3 +7646,150 @@ async fn an_outgoing_message_is_sent_again_on_request() {
         OutboundRetry::NotFound
     );
 }
+
+/// The Postgres feedback store in lockstep with `MemoryStore`
+/// (`camelmailer_core::feedback` tests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_feedback_snapshots_claims_and_signals() {
+    use camelmailer_core::feedback::{provider, source, subject_kind};
+    use camelmailer_core::{FeedbackStore, NewFeedbackSnapshot, Verdict};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let store = &f.store;
+    let snap = |src: &str, prov: &str, kind: &str, subject: &str, day: u32, verdict: Verdict| {
+        NewFeedbackSnapshot {
+            source: src.into(),
+            provider: prov.into(),
+            subject_kind: kind.into(),
+            subject: subject.into(),
+            data_date: chrono::NaiveDate::from_ymd_opt(2026, 11, day).unwrap(),
+            verdict,
+            detail: format!("{verdict:?}"),
+            metrics: serde_json::json!({ "day": day }),
+        }
+    };
+    store
+        .upsert_feedback_snapshots(&[
+            snap(
+                source::SNDS,
+                provider::MICROSOFT,
+                subject_kind::IP,
+                "192.0.2.1",
+                10,
+                Verdict::Bad,
+            ),
+            snap(
+                source::SNDS,
+                provider::MICROSOFT,
+                subject_kind::IP,
+                "192.0.2.1",
+                11,
+                Verdict::Ok,
+            ),
+            snap(
+                source::SNDS,
+                provider::MICROSOFT,
+                subject_kind::IP,
+                "192.0.2.2",
+                11,
+                Verdict::Warn,
+            ),
+            snap(
+                source::POSTMASTER_TOOLS,
+                provider::GOOGLE,
+                subject_kind::DOMAIN,
+                "example.com",
+                11,
+                Verdict::Bad,
+            ),
+        ])
+        .await
+        .unwrap();
+    store
+        .upsert_feedback_snapshots(&[snap(
+            source::SNDS,
+            provider::MICROSOFT,
+            subject_kind::IP,
+            "192.0.2.2",
+            11,
+            Verdict::Bad,
+        )])
+        .await
+        .unwrap();
+    let latest = store.latest_feedback_snapshots(source::SNDS).await.unwrap();
+    let summary: Vec<(&str, Verdict)> = latest
+        .iter()
+        .map(|s| (s.subject.as_str(), s.verdict))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![("192.0.2.2", Verdict::Bad), ("192.0.2.1", Verdict::Ok)]
+    );
+
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 12).unwrap();
+    store
+        .record_fbl_complaint(provider::MICROSOFT, day)
+        .await
+        .unwrap();
+    store
+        .record_fbl_complaint(provider::MICROSOFT, day)
+        .await
+        .unwrap();
+    let signals = store
+        .latest_provider_signals("192.0.2.1", provider::MICROSOFT)
+        .await
+        .unwrap();
+    let sources: Vec<(&str, &str)> = signals
+        .iter()
+        .map(|s| (s.source.as_str(), s.subject.as_str()))
+        .collect();
+    assert_eq!(sources, vec![("snds", "192.0.2.1"), ("fbl", "microsoft")]);
+    assert_eq!(signals[1].detail, "2 complaints reported");
+    let google = store
+        .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+        .await
+        .unwrap();
+    assert_eq!(google.len(), 1);
+    assert_eq!(google[0].verdict, Verdict::Bad);
+
+    assert!(store
+        .claim_feedback_fetch(source::SNDS, "w1", 60)
+        .await
+        .unwrap());
+    assert!(!store
+        .claim_feedback_fetch(source::SNDS, "w2", 60)
+        .await
+        .unwrap());
+    let later = chrono::Utc::now() + chrono::Duration::hours(1);
+    store
+        .finish_feedback_fetch(source::SNDS, "w2", None, later)
+        .await
+        .unwrap();
+    store
+        .finish_feedback_fetch(source::SNDS, "w1", Some("HTTP 500"), later)
+        .await
+        .unwrap();
+    store
+        .set_feedback_source_enabled(source::SNDS, true)
+        .await
+        .unwrap();
+    let status = &store.feedback_source_statuses().await.unwrap()[0];
+    assert_eq!(status.source, "snds");
+    assert!(status.enabled);
+    assert_eq!(status.last_error.as_deref(), Some("HTTP 500"));
+    assert_eq!(status.consecutive_failures, 1);
+    assert!(status.last_success_at.is_none());
+    assert!(!store
+        .claim_feedback_fetch(source::SNDS, "w2", 60)
+        .await
+        .unwrap());
+
+    // everything above is from 2026-11, far older than one day
+    assert!(store.prune_feedback_snapshots(1).await.unwrap() >= 4);
+    assert!(store
+        .latest_feedback_snapshots(source::SNDS)
+        .await
+        .unwrap()
+        .is_empty());
+}

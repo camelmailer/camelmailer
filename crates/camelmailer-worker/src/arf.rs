@@ -48,6 +48,10 @@ pub struct FeedbackReport {
     /// The embedded original's `To` address, without angle brackets. A
     /// fallback for reports that omit `Original-Rcpt-To`.
     pub original_to: Option<String>,
+    /// The `Reporting-MTA` of the feedback part (RFC 5965 §3.2), if present.
+    pub reporting_mta: Option<String>,
+    /// The report's own `From` address (the feedback loop's sender).
+    pub report_from: Option<String>,
 }
 
 impl FeedbackReport {
@@ -58,6 +62,34 @@ impl FeedbackReport {
             .as_deref()
             .or(self.original_to.as_deref())
             .and_then(bare_address)
+    }
+
+    /// The provider group that sent the report: `microsoft` (JMRP),
+    /// `yahoo` (CFL), `google`, or `other`. Read from the report's sender,
+    /// its `Reporting-MTA` and its `User-Agent`; feedback loops identify
+    /// themselves there, the original message plays no part.
+    pub fn provider(&self) -> &'static str {
+        use camelmailer_core::feedback::provider;
+        let haystack = [
+            self.report_from.as_deref(),
+            self.reporting_mta.as_deref(),
+            self.user_agent.as_deref(),
+        ]
+        .iter()
+        .flatten()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+        let has = |needles: &[&str]| needles.iter().any(|n| haystack.contains(n));
+        if has(&["hotmail", "outlook", "microsoft", "live.com", "msn.com"]) {
+            provider::MICROSOFT
+        } else if has(&["yahoo", "aol.com", "aol "]) {
+            provider::YAHOO
+        } else if has(&["google", "gmail"]) {
+            provider::GOOGLE
+        } else {
+            provider::OTHER
+        }
     }
 }
 
@@ -307,6 +339,10 @@ pub fn extract_feedback(raw_message: &[u8]) -> Result<FeedbackReport, ArfError> 
     let user_agent = header(&feedback_headers, "user-agent")
         .map(|value| value.trim().chars().take(255).collect::<String>())
         .filter(|value| !value.is_empty());
+    let reporting_mta = header(&feedback_headers, "reporting-mta")
+        .map(|value| value.trim().chars().take(255).collect::<String>())
+        .filter(|value| !value.is_empty());
+    let report_from = header_value(raw_message, "from").and_then(|value| bare_address(&value));
 
     // The embedded original message (full body or headers only) carries the
     // List-Unsubscribe header the token rides on, and the engine's own
@@ -347,6 +383,8 @@ pub fn extract_feedback(raw_message: &[u8]) -> Result<FeedbackReport, ArfError> 
         message_tokens,
         original_message_id,
         original_to,
+        reporting_mta,
+        report_from,
     })
 }
 
@@ -397,6 +435,39 @@ mod tests {
           Spam Spam Spam\r\n\
           --part-boundary--\r\n"
             .to_vec()
+    }
+
+    #[test]
+    fn the_reporting_provider_comes_from_the_report_itself() {
+        let report = extract_feedback(&sample_arf()).unwrap();
+        assert_eq!(report.report_from.as_deref(), Some("abuse@isp.example"));
+        assert_eq!(report.provider(), "other");
+
+        // Microsoft JMRP and Yahoo CFL identify themselves by their sender
+        // and reporting MTA.
+        let jmrp = String::from_utf8(sample_arf())
+            .unwrap()
+            .replace("From: abuse@isp.example", "From: staff@hotmail.com")
+            .into_bytes();
+        assert_eq!(extract_feedback(&jmrp).unwrap().provider(), "microsoft");
+        let cfl = String::from_utf8(sample_arf())
+            .unwrap()
+            .replace(
+                "User-Agent: SomeGenerator/1.0",
+                "User-Agent: Yahoo!-Mail-Feedback/2.0",
+            )
+            .into_bytes();
+        assert_eq!(extract_feedback(&cfl).unwrap().provider(), "yahoo");
+        let mta = String::from_utf8(sample_arf())
+            .unwrap()
+            .replace(
+                "Version: 1\r\n",
+                "Version: 1\r\nReporting-MTA: dns; mx.google.com\r\n",
+            )
+            .into_bytes();
+        let report = extract_feedback(&mta).unwrap();
+        assert_eq!(report.reporting_mta.as_deref(), Some("dns; mx.google.com"));
+        assert_eq!(report.provider(), "google");
     }
 
     #[test]

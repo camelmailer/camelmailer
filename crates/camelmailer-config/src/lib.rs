@@ -427,6 +427,107 @@ impl Default for Retention {
     }
 }
 
+/// Provider feedback (`deliverability_feedback`): what the large mailbox
+/// providers report about this installation's mail. Every source is optional
+/// and switched on only by its credentials; a source without them is
+/// disabled, never an error. Secrets are never written into this file: they
+/// come from environment variables or from files (Docker or systemd secrets)
+/// named here. See `docs/deliverability-feedback.md`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeliverabilityFeedback {
+    /// How often a worker fetches the Postmaster Tools and SNDS data, in
+    /// seconds. Both publish once a day; the default is six hours. `0`
+    /// turns the scheduled fetch off. Failures back off exponentially up to
+    /// this interval.
+    pub fetch_interval_seconds: u32,
+    /// How long fetched snapshots and feedback-loop counts are kept.
+    pub snapshot_retention_days: u32,
+    pub postmaster_tools: PostmasterTools,
+    pub snds: Snds,
+    pub fbl: FeedbackLoops,
+}
+
+impl Default for DeliverabilityFeedback {
+    fn default() -> Self {
+        Self {
+            fetch_interval_seconds: 21_600,
+            snapshot_retention_days: 400,
+            postmaster_tools: PostmasterTools::default(),
+            snds: Snds::default(),
+            fbl: FeedbackLoops::default(),
+        }
+    }
+}
+
+/// Google Postmaster Tools API v2
+/// (https://developers.google.com/workspace/gmail/postmaster/reference/rest).
+/// Authorised as a Google account that has the domains verified in
+/// Postmaster Tools, through an OAuth client and a refresh token with the
+/// `https://www.googleapis.com/auth/postmaster.traffic.readonly` scope.
+/// Enabled when `domains`, the client id, the client secret and the refresh
+/// token are all present.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PostmasterTools {
+    /// Domains registered and verified in Postmaster Tools.
+    pub domains: Vec<String>,
+    /// OAuth client id (not secret). Env `CAMELMAILER_POSTMASTER_CLIENT_ID`
+    /// wins.
+    pub client_id: Option<String>,
+    /// File holding the OAuth client secret. Env
+    /// `CAMELMAILER_POSTMASTER_CLIENT_SECRET` wins.
+    pub client_secret_file: Option<String>,
+    /// File holding the refresh token. Env
+    /// `CAMELMAILER_POSTMASTER_REFRESH_TOKEN` wins.
+    pub refresh_token_file: Option<String>,
+    /// How many past days each fetch asks for.
+    pub days: u32,
+    /// API base URL (tests point it at a mock).
+    pub api_base_url: String,
+    /// OAuth token endpoint.
+    pub token_url: String,
+}
+
+impl Default for PostmasterTools {
+    fn default() -> Self {
+        Self {
+            domains: Vec::new(),
+            client_id: None,
+            client_secret_file: None,
+            refresh_token_file: None,
+            days: 7,
+            api_base_url: "https://gmailpostmastertools.googleapis.com".into(),
+            token_url: "https://oauth2.googleapis.com/token".into(),
+        }
+    }
+}
+
+/// Microsoft SNDS automated data access
+/// (https://substrate.office.com/ip-domain-management-snds/SNDS/FAQ). The
+/// SNDS portal shows the data URL, which carries the access key, on its
+/// "Automated Access" page once the feature is switched on. The URL is a
+/// secret. Enabled when it is present.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Snds {
+    /// File holding the SNDS data URL. Env `CAMELMAILER_SNDS_DATA_URL` wins.
+    pub data_url_file: Option<String>,
+}
+
+/// Complaint feedback loops (Microsoft JMRP, Yahoo CFL and any other ARF
+/// feedback loop). Reports reach the installation as inbound mail to a
+/// route address; they are recognised by their ARF envelope (RFC 5965).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FeedbackLoops {
+    /// Also suppress the complainant when the complaint is about
+    /// transactional mail (a message without a broadcast unsubscribe token),
+    /// for the message's stream. Off by default: broadcast complaints are
+    /// always suppressed for their stream, transactional mail keeps flowing.
+    pub suppress_complainants: bool,
+}
+
 /// Installation lifecycle webhooks: organization created/deleted, user
 /// registered, organization usage thresholds. Off while `urls` is empty
 /// (the default). Every request is signed with HMAC-SHA256 over
@@ -1336,6 +1437,7 @@ pub struct Config {
     pub app_mail: AppMail,
     pub billing: Billing,
     pub lifecycle_webhooks: LifecycleWebhooks,
+    pub deliverability_feedback: DeliverabilityFeedback,
     pub captcha: Captcha,
     pub retention: Retention,
     pub legal: Legal,
