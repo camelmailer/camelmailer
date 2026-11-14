@@ -4096,6 +4096,30 @@ pub enum OutboundQueueAction {
     Retry { attempts: i32 },
 }
 
+/// What [`PgMessageSink::record_outbound_delivery`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundRecord {
+    /// The result was recorded as this delivery row.
+    Recorded(i64),
+    /// A terminal DSN had already bounced the message: nothing was recorded
+    /// and the stale queue row was removed.
+    AlreadyBounced,
+    /// The recording worker no longer holds the queue row (its lease ran out
+    /// and another worker took it over, or the row is gone). Nothing was
+    /// recorded; the row belongs to its new owner.
+    NotOwner,
+}
+
+impl OutboundRecord {
+    /// The delivery row, when the result was recorded.
+    pub fn delivery_id(self) -> Option<i64> {
+        match self {
+            Self::Recorded(id) => Some(id),
+            Self::AlreadyBounced | Self::NotOwner => None,
+        }
+    }
+}
+
 fn stored_message_from_row(row: &PgRow) -> StoredMessage {
     StoredMessage {
         id: row.get("id"),
@@ -4647,6 +4671,7 @@ impl PgMessageSink {
         server_id: Id,
         message_id: i64,
         queued_message_id: i64,
+        worker_id: &str,
         status: &str,
         details: &str,
         output: &str,
@@ -4655,8 +4680,15 @@ impl PgMessageSink {
         queue_action: OutboundQueueAction,
         event: &str,
         webhook_payload: &serde_json::Value,
-    ) -> Result<Option<i64>, sqlx::Error> {
+    ) -> Result<OutboundRecord, sqlx::Error> {
         let mut tx = self.store.pool.begin().await?;
+        // The worker must still hold the queue row. The row lock taken here
+        // keeps any other worker from taking it over until the result is
+        // committed; a row another worker took over is left to that worker.
+        if !crate::queue::lock_owned_row(&mut tx, queued_message_id, worker_id).await? {
+            tx.rollback().await?;
+            return Ok(OutboundRecord::NotOwner);
+        }
         set_tenant_context(&mut tx, server_id).await?;
         let updated = sqlx::query(
             "UPDATE messages
@@ -4675,10 +4707,11 @@ impl PgMessageSink {
                 &mut *tx,
                 queued_message_id,
                 Some((message_id, server_id)),
+                Some(worker_id),
             )
             .await?;
             tx.commit().await?;
-            return Ok(None);
+            return Ok(OutboundRecord::AlreadyBounced);
         }
 
         let delivery = sqlx::query(
@@ -4700,6 +4733,7 @@ impl PgMessageSink {
                     &mut *tx,
                     queued_message_id,
                     Some((message_id, server_id)),
+                    Some(worker_id),
                 )
                 .await?;
             }
@@ -4709,6 +4743,7 @@ impl PgMessageSink {
                     queued_message_id,
                     attempts,
                     Some((message_id, server_id)),
+                    Some(worker_id),
                 )
                 .await?;
             }
@@ -4716,7 +4751,7 @@ impl PgMessageSink {
 
         enqueue_webhook_requests(&mut tx, server_id, event, webhook_payload).await?;
         tx.commit().await?;
-        Ok(Some(delivery.get("id")))
+        Ok(OutboundRecord::Recorded(delivery.get("id")))
     }
 
     /// Record an unmatched, unrouted DSN as a terminal failure and remove its
@@ -4763,6 +4798,7 @@ impl PgMessageSink {
             &mut *tx,
             queued_message_id,
             Some((bounce_message_id, server_id)),
+            None,
         )
         .await?;
         tx.commit().await?;

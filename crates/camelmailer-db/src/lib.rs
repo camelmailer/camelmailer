@@ -25,7 +25,8 @@ mod webhook_queue;
 pub use lifecycle_queue::{LifecycleEventRow, PgLifecycleQueue};
 pub use pg_store::{
     BounceCorrelationOutcome, BounceOriginal, Delivery, FeedbackComplaint,
-    FeedbackComplaintOutcome, OutboundQueueAction, PgMessageSink, PgStore, StoredMessage,
+    FeedbackComplaintOutcome, OutboundQueueAction, OutboundRecord, PgMessageSink, PgStore,
+    StoredMessage,
 };
 pub use queue::{resolve_server_permalinks, PgQueue, QueueFilter, QueueKind, QueuedMessageRow};
 pub use retention::{RetentionReport, RetentionTarget};

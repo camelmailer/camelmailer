@@ -5683,6 +5683,7 @@ async fn webhook_delete_during_soft_failure_fanout_preserves_retry_schedule() {
                 server_id,
                 message_id,
                 queued_message_id,
+                "soft-failure-worker",
                 "SoftFail",
                 "temporary delivery failure",
                 "421 Try again later",
@@ -5701,7 +5702,10 @@ async fn webhook_delete_during_soft_failure_fanout_preserves_retry_schedule() {
     wait_for_locked_query(&pool, "DELETE FROM webhooks").await;
 
     release_webhook_insert_barrier(&mut barrier).await;
-    assert!(record_task.await.unwrap().unwrap().is_some());
+    assert!(matches!(
+        record_task.await.unwrap().unwrap(),
+        camelmailer_db::OutboundRecord::Recorded(_)
+    ));
     assert!(delete_task.await.unwrap().unwrap());
 
     let stored = sink
@@ -5838,11 +5842,17 @@ async fn late_outbound_results_cannot_overwrite_a_correlated_bounce() {
             .enqueue(original_id, f.server.id, "dest.example")
             .await
             .unwrap();
+        sqlx::query("UPDATE queued_messages SET locked_by = 'w', locked_at = now() WHERE id = $1")
+            .bind(queued_message_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         assert!(
             sink.record_outbound_delivery(
                 f.server.id,
                 original_id,
                 queued_message_id,
+                "w",
                 status,
                 "stale outbound result",
                 "stale SMTP response",
@@ -5854,7 +5864,7 @@ async fn late_outbound_results_cannot_overwrite_a_correlated_bounce() {
             )
             .await
             .unwrap()
-            .is_none(),
+                == camelmailer_db::OutboundRecord::AlreadyBounced,
             "queued {status} result must lose to the correlated bounce"
         );
         let queue_row_exists: bool =
@@ -7188,11 +7198,26 @@ async fn the_lifecycle_queue_dequeues_retries_and_completes() {
     assert_eq!(row.payload, event.body());
     // Locked: a second worker sees nothing.
     assert!(queue.dequeue("w2").await.unwrap().is_none());
-    queue.retry(row.id, row.attempts, "HTTP 500").await.unwrap();
+    // Only the worker holding the row may reschedule it.
+    assert!(!queue
+        .retry(row.id, row.attempts, "HTTP 500", "w2")
+        .await
+        .unwrap());
+    assert!(queue
+        .retry(row.id, row.attempts, "HTTP 500", "w1")
+        .await
+        .unwrap());
     // Backed off: not ready yet.
     assert!(queue.dequeue("w2").await.unwrap().is_none());
     assert_eq!(queue.pending().await.unwrap()[0].attempts, 1);
-    queue.complete(row.id).await.unwrap();
+    // Released by the retry: w1 no longer holds it.
+    assert!(!queue.complete(row.id, "w1").await.unwrap());
+    sqlx::query("UPDATE lifecycle_events SET retry_after = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let row = queue.dequeue("w2").await.unwrap().unwrap();
+    assert!(queue.complete(row.id, "w2").await.unwrap());
     assert!(queue.pending().await.unwrap().is_empty());
     f.store.enqueue_lifecycle_event(&event.clone()).await.ok();
     assert_eq!(queue.discard_all().await.unwrap(), 1);
@@ -7645,4 +7670,180 @@ async fn an_outgoing_message_is_sent_again_on_request() {
             .unwrap(),
         OutboundRetry::NotFound
     );
+}
+
+/// Issue #81: `complete`, `retry` and `defer` change a queue row only while
+/// the calling worker still holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_changes_need_the_worker_that_holds_the_row() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let mut message = message_for(f.server.id, "user@dest.example");
+    message.scope = MessageScope::Outgoing;
+    sink.insert_message(&message).await.unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    let row = queue.dequeue("w1").await.unwrap().unwrap();
+
+    assert!(!queue.complete(row.id, "w2").await.unwrap());
+    assert!(!queue.retry(row.id, 0, "w2").await.unwrap());
+    assert!(!queue.defer(row.id, "w2", 60, None).await.unwrap());
+    let (locked_by, attempts): (Option<String>, i32) =
+        sqlx::query_as("SELECT locked_by, attempts FROM queued_messages WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((locked_by.as_deref(), attempts), (Some("w1"), 0));
+
+    assert!(queue.retry(row.id, 0, "w1").await.unwrap());
+    queue.clear_backoff().await.unwrap();
+    let row = queue.dequeue("w2").await.unwrap().unwrap();
+    assert!(!queue.complete(row.id, "w1").await.unwrap());
+    assert!(queue.complete(row.id, "w2").await.unwrap());
+    assert_eq!(queue.queue_size().await.unwrap(), 0);
+}
+
+/// Issue #81: `record_outbound_delivery` records nothing for a queue row the
+/// worker no longer holds, and records as before for one it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_outbound_delivery_needs_the_worker_that_holds_the_row() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    let mut message = message_for(f.server.id, "user@dest.example");
+    message.scope = MessageScope::Outgoing;
+    let message_id = sink.insert_message(&message).await.unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    let row = queue.dequeue("w1").await.unwrap().unwrap();
+    let payload = serde_json::json!({ "message": { "id": message_id } });
+
+    for action in [
+        camelmailer_db::OutboundQueueAction::Complete,
+        camelmailer_db::OutboundQueueAction::Retry { attempts: 0 },
+    ] {
+        let recorded = sink
+            .record_outbound_delivery(
+                f.server.id,
+                message_id,
+                row.id,
+                "w2",
+                "Sent",
+                "message accepted by the remote server",
+                "250 OK",
+                true,
+                None,
+                action,
+                "MessageSent",
+                &payload,
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorded, camelmailer_db::OutboundRecord::NotOwner);
+    }
+    let stored = sink
+        .message_by_id(f.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Pending");
+    assert!(sink
+        .deliveries_for_message(f.server.id, message_id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(queue.queue_size().await.unwrap(), 1);
+
+    let recorded = sink
+        .record_outbound_delivery(
+            f.server.id,
+            message_id,
+            row.id,
+            "w1",
+            "SoftFail",
+            "temporary delivery failure",
+            "451 later",
+            false,
+            None,
+            camelmailer_db::OutboundQueueAction::Retry { attempts: 0 },
+            "MessageDelayed",
+            &payload,
+        )
+        .await
+        .unwrap();
+    assert!(recorded.delivery_id().is_some());
+    let (locked_by, attempts): (Option<String>, i32) =
+        sqlx::query_as("SELECT locked_by, attempts FROM queued_messages WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((locked_by, attempts), (None, 1));
+
+    // Released by the retry: the worker that held it cannot record again.
+    let recorded = sink
+        .record_outbound_delivery(
+            f.server.id,
+            message_id,
+            row.id,
+            "w1",
+            "Sent",
+            "message accepted by the remote server",
+            "250 OK",
+            true,
+            None,
+            camelmailer_db::OutboundQueueAction::Complete,
+            "MessageSent",
+            &payload,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recorded, camelmailer_db::OutboundRecord::NotOwner);
+}
+
+/// Issue #81: the webhook queue checks the owner as the delivery queue does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_queue_changes_need_the_worker_that_holds_the_row() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let sink = PgMessageSink::new(f.store.clone());
+    f.store
+        .create_webhook(NewWebhook::all(
+            f.server.id,
+            "events",
+            "https://hooks.example.test/x",
+            false,
+        ))
+        .await
+        .unwrap();
+    let mut message = message_for(f.server.id, "user@dest.example");
+    message.scope = MessageScope::Outgoing;
+    let message_id = sink.insert_message(&message).await.unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    let row = queue.dequeue("w1").await.unwrap().unwrap();
+    sink.record_outbound_delivery(
+        f.server.id,
+        message_id,
+        row.id,
+        "w1",
+        "Sent",
+        "accepted",
+        "250 OK",
+        true,
+        None,
+        camelmailer_db::OutboundQueueAction::Complete,
+        "MessageSent",
+        &serde_json::json!({ "message": { "id": message_id } }),
+    )
+    .await
+    .unwrap();
+    let webhooks = camelmailer_db::PgWebhookQueue::new(pool.clone());
+    let request = webhooks.dequeue("w1").await.unwrap().unwrap();
+    assert!(!webhooks.complete(request.id, "w2").await.unwrap());
+    assert!(!webhooks.retry(request.id, 0, "w2").await.unwrap());
+    assert!(webhooks.retry(request.id, 0, "w1").await.unwrap());
+    assert!(!webhooks.complete(request.id, "w1").await.unwrap());
 }

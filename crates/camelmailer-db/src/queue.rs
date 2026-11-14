@@ -121,45 +121,73 @@ pub(crate) fn retry_delay_minutes(attempts: i32) -> i32 {
 
 /// Queue mutations accept either a pool or the delivery's open transaction.
 /// Delivery callers additionally constrain the row to its message and tenant.
+/// `locked_by`, when given, is the worker that must still hold the row: a row
+/// another worker has taken over (its lease ran out) is left alone. Returns
+/// whether a row was removed.
 pub(crate) async fn complete_message<'e>(
     executor: impl Executor<'e, Database = Postgres>,
     id: i64,
     owner: Option<(i64, Id)>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    locked_by: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
         "DELETE FROM queued_messages WHERE id = $1
          AND ($2::bigint IS NULL OR message_id = $2)
-         AND ($3::bigint IS NULL OR server_id = $3)",
+         AND ($3::bigint IS NULL OR server_id = $3)
+         AND ($4::text IS NULL OR locked_by = $4)",
     )
     .bind(id)
     .bind(owner.map(|(message_id, _)| message_id))
     .bind(owner.map(|(_, server_id)| server_id as i64))
+    .bind(locked_by)
     .execute(executor)
     .await?;
-    Ok(())
+    Ok(done.rows_affected() > 0)
 }
 
+/// Reschedule a row with backoff. `locked_by` as for [`complete_message`];
+/// returns whether a row was rescheduled.
 pub(crate) async fn retry_message<'e>(
     executor: impl Executor<'e, Database = Postgres>,
     id: i64,
     attempts: i32,
     owner: Option<(i64, Id)>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    locked_by: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
         "UPDATE queued_messages
          SET locked_by = NULL, locked_at = NULL, attempts = attempts + 1,
              retry_after = now() + make_interval(mins => $2::int)
          WHERE id = $1
          AND ($3::bigint IS NULL OR message_id = $3)
-         AND ($4::bigint IS NULL OR server_id = $4)",
+         AND ($4::bigint IS NULL OR server_id = $4)
+         AND ($5::text IS NULL OR locked_by = $5)",
     )
     .bind(id)
     .bind(retry_delay_minutes(attempts))
     .bind(owner.map(|(message_id, _)| message_id))
     .bind(owner.map(|(_, server_id)| server_id as i64))
+    .bind(locked_by)
     .execute(executor)
     .await?;
-    Ok(())
+    Ok(done.rows_affected() > 0)
+}
+
+/// Lock the queue row `id` inside `tx` if `worker_id` still holds it, so no
+/// other worker can take it over until the transaction ends. Returns false
+/// when the row is gone or another worker holds it.
+pub(crate) async fn lock_owned_row(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    id: i64,
+    worker_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT id FROM queued_messages WHERE id = $1 AND locked_by = $2 FOR UPDATE")
+            .bind(id)
+            .bind(worker_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(row.is_some())
 }
 
 /// Default stale-lock window (one day, in seconds) when a caller does not
@@ -385,25 +413,30 @@ impl PgQueue {
     /// sends from as resolved now; it replaces the one recorded at enqueue,
     /// so the queue filter of every host-aware worker sees the current pool
     /// and the workers without an address of it stop picking the row up.
+    ///
+    /// Only a row `worker_id` still holds is handed back; returns whether it
+    /// was.
     pub async fn defer(
         &self,
         id: i64,
+        worker_id: &str,
         seconds: i64,
         source_pool_id: Option<i64>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let done = sqlx::query(
             "UPDATE queued_messages
              SET locked_by = NULL, locked_at = NULL,
                  retry_after = now() + make_interval(secs => $2::bigint),
                  source_pool_id = COALESCE($3, source_pool_id)
-             WHERE id = $1",
+             WHERE id = $1 AND locked_by = $4",
         )
         .bind(id)
         .bind(seconds)
         .bind(source_pool_id)
+        .bind(worker_id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(done.rows_affected() > 0)
     }
 
     /// Serve only the part of the queue the filter names.
@@ -580,13 +613,22 @@ impl PgQueue {
     }
 
     /// Delivery finished (successfully or terminally) — remove from queue.
-    pub async fn complete(&self, id: i64) -> Result<(), sqlx::Error> {
-        complete_message(&self.pool, id, None).await
+    /// Only a row `worker_id` still holds is removed: when its lease ran out
+    /// and another worker took it over, the row belongs to that worker.
+    /// Returns whether the row was removed.
+    pub async fn complete(&self, id: i64, worker_id: &str) -> Result<bool, sqlx::Error> {
+        complete_message(&self.pool, id, None, Some(worker_id)).await
     }
 
-    /// Soft failure — unlock and reschedule with exponential backoff.
-    pub async fn retry(&self, id: i64, attempts: i32) -> Result<(), sqlx::Error> {
-        retry_message(&self.pool, id, attempts, None).await
+    /// Soft failure — unlock and reschedule with exponential backoff. Only a
+    /// row `worker_id` still holds; returns whether it was rescheduled.
+    pub async fn retry(
+        &self,
+        id: i64,
+        attempts: i32,
+        worker_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        retry_message(&self.pool, id, attempts, None, Some(worker_id)).await
     }
 
     pub async fn queue_size(&self) -> Result<i64, sqlx::Error> {
