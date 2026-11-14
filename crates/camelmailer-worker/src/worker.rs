@@ -9,7 +9,7 @@ use crate::dkim;
 use crate::inspection::{ClamavInspector, RspamdInspector};
 use crate::sender::SmtpSender;
 use crate::signer::Signer;
-use crate::smtp_client::SendOutcome;
+use crate::smtp_client::{DataGate, SendOutcome};
 use crate::ssrf::SsrfGuard;
 use crate::tracking;
 use base64::Engine;
@@ -260,14 +260,21 @@ mod interface_tests {
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How far the processing of one in-flight row has got.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum Phase {
     /// Loading and preparing; nothing has reached a receiver yet.
     Preparing,
-    /// Talking to the receiver (SMTP, webhook or lifecycle URL). From here
-    /// on the receiver may already have the message, so a stopped row keeps
-    /// its lock for the lease instead of going straight back to the queue.
+    /// An outgoing message on its way to the receiving MX or relay. Until
+    /// its [`DataGate`] is entered (the client is about to send `DATA`) no
+    /// receiver can have the message, and a shutdown may hand the row back.
+    Delivering(DataGate),
+    /// Talking to the receiver (SMTP from `DATA` on, a route, webhook or
+    /// lifecycle URL). From here on the receiver may already have the
+    /// message, so a stopped row keeps its lock for the lease instead of
+    /// going straight back to the queue.
     Sending,
+    /// Handed back to the queue by a shutdown; must not reach a receiver.
+    Released,
 }
 
 /// Warn when a queue change matched no row because this worker no longer
@@ -313,21 +320,50 @@ impl Tracked {
         lock(&self.rows).keys().copied().collect()
     }
 
-    /// The rows in flight that have not reached a receiver yet, the only
-    /// ones that may go back to the queue on shutdown.
-    fn unstarted(&self) -> Vec<i64> {
-        lock(&self.rows)
-            .iter()
-            .filter(|(_, phase)| **phase == Phase::Preparing)
-            .map(|(id, _)| *id)
-            .collect()
+    /// Take the rows in flight that have not reached a receiver yet, the
+    /// only ones that may go back to the queue on shutdown: rows still
+    /// preparing, and outgoing deliveries whose client has not sent `DATA`.
+    /// Their gates are closed in the same step, so none of them can send its
+    /// message afterwards, and they are marked released.
+    fn take_unstarted(&self) -> Vec<i64> {
+        let mut rows = lock(&self.rows);
+        let mut taken = Vec::new();
+        for (id, phase) in rows.iter_mut() {
+            let unstarted = match phase {
+                Phase::Preparing => true,
+                Phase::Delivering(gate) => gate.close(),
+                Phase::Sending | Phase::Released => false,
+            };
+            if unstarted {
+                *phase = Phase::Released;
+                taken.push(*id);
+            }
+        }
+        taken
     }
 
     /// Row `id` is about to reach its receiver.
     fn sending(&self, id: i64) {
         if let Some(phase) = lock(&self.rows).get_mut(&id) {
-            *phase = Phase::Sending;
+            if !matches!(phase, Phase::Released) {
+                *phase = Phase::Sending;
+            }
         }
+    }
+
+    /// Outgoing row `id` is about to be delivered over SMTP. Returns the
+    /// gate its client enters before `DATA`; for a row a shutdown already
+    /// handed back the gate is closed, so its message never goes out.
+    fn delivering(&self, id: i64) -> DataGate {
+        let gate = DataGate::default();
+        match lock(&self.rows).get_mut(&id) {
+            Some(Phase::Released) => {
+                gate.close();
+            }
+            Some(phase) => *phase = Phase::Delivering(gate.clone()),
+            None => {}
+        }
+        gate
     }
 
     fn contains(&self, id: i64) -> bool {
@@ -814,9 +850,9 @@ impl Worker {
     /// whose processing failed half way (say after the receiver's `250`)
     /// must not be sent again straight away.
     pub async fn release_unstarted(&self) -> Result<Released, sqlx::Error> {
-        let messages = self.in_flight.messages.unstarted();
-        let webhooks = self.in_flight.webhooks.unstarted();
-        let lifecycle = self.in_flight.lifecycle.unstarted();
+        let messages = self.in_flight.messages.take_unstarted();
+        let webhooks = self.in_flight.webhooks.take_unstarted();
+        let lifecycle = self.in_flight.lifecycle.take_unstarted();
         Ok(Released {
             messages: self.queue.release(&self.worker_id, &messages).await?,
             webhooks: self
@@ -1152,16 +1188,19 @@ impl Worker {
         )
         .await;
 
-        self.in_flight.messages.sending(queued.id);
+        // Until the client sends DATA a shutdown may hand the row back (the
+        // gate); from DATA on the row keeps its lock for the lease.
+        let data_gate = self.in_flight.messages.delivering(queued.id);
         let outcome = self
             .sender
-            .send_with_helo(
+            .send_gated(
                 &queued.domain,
                 &return_path,
                 &message.rcpt_to,
                 &raw_message,
                 outbound,
                 helo_hostname,
+                data_gate,
             )
             .await;
 
@@ -2406,12 +2445,40 @@ mod tests {
         let sending = tracked.hold(2);
         sending.sending();
         tracked.hold(3).sending();
-        assert_eq!(tracked.unstarted(), vec![1]);
+        assert_eq!(tracked.take_unstarted(), vec![1]);
         let mut all = tracked.ids();
         all.sort_unstable();
         assert_eq!(all, vec![1, 2]);
+        // Taken once: a released row is not handed back twice.
+        assert!(tracked.take_unstarted().is_empty());
         drop(preparing);
-        assert!(tracked.unstarted().is_empty());
+        assert!(tracked.take_unstarted().is_empty());
+    }
+
+    #[test]
+    fn a_delivery_counts_as_unstarted_until_its_client_enters_the_data_gate() {
+        let tracked = Tracked::default();
+        let _before = tracked.hold(1);
+        let before_gate = tracked.delivering(1);
+        let _after = tracked.hold(2);
+        let after_gate = tracked.delivering(2);
+        assert!(after_gate.enter(), "an open gate lets DATA through");
+
+        assert_eq!(tracked.take_unstarted(), vec![1]);
+        assert!(!before_gate.enter(), "a released delivery never sends DATA");
+        assert!(after_gate.data_started());
+        assert!(after_gate.enter(), "a later endpoint may send DATA again");
+    }
+
+    #[test]
+    fn a_row_released_while_preparing_gets_a_closed_gate() {
+        let tracked = Tracked::default();
+        let _held = tracked.hold(7);
+        assert_eq!(tracked.take_unstarted(), vec![7]);
+        let gate = tracked.delivering(7);
+        assert!(!gate.enter());
+        tracked.sending(7);
+        assert!(tracked.take_unstarted().is_empty());
     }
 }
 

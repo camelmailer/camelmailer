@@ -124,6 +124,70 @@ pub struct SendParams {
     /// (`smtp_client.connection_attempt_delay_ms`, RFC 8305 section 5).
     /// Zero connects to one address at a time.
     pub connection_attempt_delay: Duration,
+    /// Tells the worker when the message itself starts to go out (the
+    /// `DATA` command), so a shutdown can hand back a delivery that has not
+    /// got that far. Delivery is unchanged unless the gate is closed.
+    pub data_gate: DataGate,
+}
+
+/// The point of no return of one delivery: the `DATA` command.
+///
+/// Before `DATA` no receiver can have accepted the message, so a delivery
+/// stopped there may go straight back to the queue; from `DATA` on the
+/// receiver may have it. The SMTP client [`DataGate::enter`]s the gate just
+/// before it writes `DATA`, on every endpoint it tries. On shutdown the
+/// worker [`DataGate::close`]s the gate of each delivery in flight: a gate
+/// that was not entered yet closes, the row is released, and a client that
+/// reaches `DATA` afterwards gives up the attempt instead of sending the
+/// message. A gate that was entered stays open, and that row keeps its lock
+/// for the lease. Both are one atomic step, so a row is never released while
+/// its message is going out.
+///
+/// The default gate is never closed, so a delivery without a worker shutdown
+/// behaves exactly as before.
+#[derive(Debug, Clone, Default)]
+pub struct DataGate(Arc<std::sync::atomic::AtomicU8>);
+
+const GATE_BEFORE_DATA: u8 = 0;
+const GATE_DATA_STARTED: u8 = 1;
+const GATE_CLOSED: u8 = 2;
+
+impl DataGate {
+    /// Called by the client just before `DATA`. Returns false when the gate
+    /// was closed (the worker is shutting down and released the row): the
+    /// client must not send the message.
+    pub fn enter(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.0.compare_exchange(
+            GATE_BEFORE_DATA,
+            GATE_DATA_STARTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(current) => current == GATE_DATA_STARTED,
+        }
+    }
+
+    /// Close the gate unless `DATA` was already sent. Returns true when it
+    /// closed it (the delivery has not reached `DATA` and never will).
+    pub fn close(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.0.compare_exchange(
+            GATE_BEFORE_DATA,
+            GATE_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(current) => current == GATE_CLOSED,
+        }
+    }
+
+    /// Whether `DATA` was sent on any endpoint.
+    pub fn data_started(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) == GATE_DATA_STARTED
+    }
 }
 
 /// Where an outgoing connection comes from.
@@ -765,6 +829,14 @@ async fn try_send(
         return Ok(Attempt::Complete(classify(code, response, tls)));
     }
 
+    if !params.data_gate.enter() {
+        // The worker is shutting down and has handed this row back to the
+        // queue: the message must not go out on this connection.
+        let _ = connection.send_line("QUIT").await;
+        return Ok(Attempt::Complete(SendOutcome::SoftFail {
+            response: "worker shutting down; delivery handed back before DATA".into(),
+        }));
+    }
     let (code, response) = connection.command("DATA").await?;
     if code != 354 {
         return Ok(Attempt::Complete(classify(code, response, tls)));
@@ -1377,6 +1449,7 @@ mod tests {
             auth: None,
             source: system(AddressFamily::DualStack),
             connection_attempt_delay: Duration::from_millis(250),
+            data_gate: Default::default(),
         };
         let candidates = vec![
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), closed),
