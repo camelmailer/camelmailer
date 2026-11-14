@@ -97,7 +97,9 @@ What the mailbox providers report about the installation's domains and
 addresses, each source with the time of its last fetch and its last error:
 Google Postmaster Tools (reputation, spam rate), Microsoft SNDS (filter
 result, complaint rate, trap hits), the complaint feedback loops (Microsoft
-JMRP, Yahoo CFL), and inbox placement tests with your own seed mailboxes.
+JMRP, Yahoo CFL), and inbox placement tests with your own seed mailboxes,
+whose every result is kept with its time (filterable history per address and
+provider group; the warm-up brake uses the worst result of the last 24 hours).
 Each source is optional and only appears once it is configured. Setup:
 [Provider feedback](provider-feedback.md).
 
