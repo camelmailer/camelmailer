@@ -78,11 +78,21 @@ fn placement_configured(config: &camelmailer_config::Config) -> bool {
         && placement.from_address.contains('@')
 }
 
-/// `GET /api/v2/admin/deliverability/placement_tests`: the newest 200
-/// tests, newest first, with the last round.
+/// `GET /api/v2/admin/deliverability/placement_tests`: the placement
+/// history, newest first (200 by default, `limit` up to 1000), optionally
+/// for one `ip` and `provider` group, with the last round.
+/// Filters of the placement history.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct PlacementQuery {
+    ip: Option<String>,
+    provider: Option<String>,
+    limit: Option<i64>,
+}
+
 pub(crate) async fn placement_tests_index(
     State(state): State<Arc<ApiState>>,
     start: axum::Extension<RequestStart>,
+    axum::extract::Query(query): axum::extract::Query<PlacementQuery>,
 ) -> ApiResponse {
     let configured = placement_configured(&state.config);
     let Some(store) = state.feedback_store.as_ref() else {
@@ -96,7 +106,12 @@ pub(crate) async fn placement_tests_index(
         Ok(round) => round,
         Err(error) => return render_store_error(Some(&start), error),
     };
-    match store.list_placement_tests(200).await {
+    let filter = camelmailer_core::PlacementFilter {
+        ip: query.ip.filter(|ip| !ip.is_empty()),
+        provider: query.provider.filter(|p| !p.is_empty()),
+        limit: query.limit.unwrap_or(200).clamp(1, 1000),
+    };
+    match store.list_placement_tests(&filter).await {
         Ok(tests) => render_success(
             Some(&start),
             StatusCode::OK,

@@ -20,7 +20,8 @@ CREATE TABLE placement_tests (
     ip TEXT NOT NULL,
     seed_address TEXT NOT NULL,
     seed_provider TEXT NOT NULL,
-    provider TEXT NOT NULL,
+    -- a provider group name; groups are configurable, so only the format
+    provider TEXT NOT NULL CHECK (provider ~ '^[a-z0-9_]+$'),
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'inbox', 'spam', 'missing', 'error')),
     folder TEXT,
@@ -38,3 +39,5 @@ CREATE TABLE placement_tests (
 );
 
 CREATE INDEX idx_placement_tests_due ON placement_tests (check_at) WHERE status = 'pending';
+-- The placement history per IP and provider group, newest first.
+CREATE INDEX idx_placement_tests_history ON placement_tests (ip, provider, checked_at DESC);

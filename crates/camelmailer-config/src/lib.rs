@@ -622,6 +622,12 @@ pub struct Seed {
     pub scope: Option<String>,
     /// The spam folder, when the server does not mark it `\Junk`.
     pub junk_folder: Option<String>,
+    /// The provider group the seed measures (lowercase letters, digits and
+    /// `_`, as in `provider_groups`). Defaults to `google` for gmail,
+    /// `microsoft` for outlook, `yahoo` for yahoo and `other` for imap; set
+    /// it for an `imap` seed at, say, GMX (`united_internet`), T-Online
+    /// (`t_online`) or iCloud (`apple`).
+    pub group: Option<String>,
 }
 
 /// Complaint feedback loops (Microsoft JMRP, Yahoo CFL and any other ARF

@@ -5,6 +5,7 @@ import {
   authSummary,
   formatMetric,
   placementTone,
+  providerLabel,
   sourceState,
   verdictTone,
   worstVerdict,
@@ -86,6 +87,11 @@ describe("placement", () => {
     expect(placementTone("pending").label).toBe("Waiting")
     expect(authSummary({ spf: "pass", dkim: null, dmarc: "fail" })).toBe("spf pass · dmarc fail")
     expect(authSummary({ spf: null, dkim: null, dmarc: null })).toBeNull()
+  })
+
+  it("labels configured provider groups", () => {
+    expect(providerLabel("united_internet")).toBe("GMX / Web.de / 1&1")
+    expect(providerLabel("some_isp")).toBe("some isp")
   })
 
   it("never calls placement stale", () => {

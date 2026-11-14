@@ -56,14 +56,30 @@ pub fn imap_endpoint(seed: &Seed) -> Option<(String, u16, bool)> {
     ))
 }
 
-/// The provider group a seed measures.
-pub fn seed_group(seed: &Seed) -> &'static str {
+/// Whether `name` is a valid provider group name (`[a-z0-9_]+`).
+pub fn valid_group(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// The provider group a seed measures: its `group` when valid, else the
+/// default of its provider.
+pub fn seed_group(seed: &Seed) -> String {
+    if let Some(group) = seed.group.as_deref().map(str::trim) {
+        if valid_group(group) {
+            return group.to_string();
+        }
+        tracing::warn!(seed = %seed.address, group, "invalid seed group; using the provider default");
+    }
     match seed.provider {
         SeedProvider::Gmail => provider::GOOGLE,
         SeedProvider::Outlook => provider::MICROSOFT,
         SeedProvider::Yahoo => provider::YAHOO,
         SeedProvider::Imap => provider::OTHER,
     }
+    .to_string()
 }
 
 fn seed_provider_name(seed: &Seed) -> &'static str {
@@ -495,7 +511,7 @@ impl PlacementRunner {
                     ip: address.ipv4.clone(),
                     seed_address: seed.address.clone(),
                     seed_provider: seed_provider_name(seed).into(),
-                    provider: seed_group(seed).into(),
+                    provider: seed_group(seed),
                     check_at,
                 });
             }
@@ -711,6 +727,16 @@ Authentication-Results: spf=softfail (sender IP is 192.0.2.10) smtp.mailfrom=exa
         );
         assert_eq!(imap_endpoint(&seed(SeedProvider::Imap)), None);
         assert_eq!(seed_group(&seed(SeedProvider::Outlook)), "microsoft");
+        let gmx = Seed {
+            group: Some("united_internet".into()),
+            ..seed(SeedProvider::Imap)
+        };
+        assert_eq!(seed_group(&gmx), "united_internet");
+        let bad = Seed {
+            group: Some("GMX Mail".into()),
+            ..seed(SeedProvider::Imap)
+        };
+        assert_eq!(seed_group(&bad), "other");
     }
 
     #[tokio::test]

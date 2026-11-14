@@ -1290,7 +1290,7 @@ export const adminApi = {
         configured: boolean
         last_round: PlacementRound | null
         placement_tests: PlacementTest[]
-      }>("/api/v2/admin/deliverability/placement_tests"),
+      }>("/api/v2/admin/deliverability/placement_tests?limit=1000"),
     runPlacementTests: () =>
       api.post<{ placement_round: PlacementRound }>(
         "/api/v2/admin/deliverability/placement_tests",

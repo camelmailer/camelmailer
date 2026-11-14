@@ -3,9 +3,10 @@
 
 use async_trait::async_trait;
 use camelmailer_core::feedback::{
-    fbl_detail, newest_per_subject, placement_snapshot, source, subject_kind, FeedbackSnapshot,
-    FeedbackSourceStatus, FeedbackStore, NewFeedbackSnapshot, NewPlacementTest, PlacementResult,
-    PlacementRound, PlacementTest, ProviderSignal, Verdict,
+    fbl_detail, newest_per_subject, placement_summary, source, subject_kind, FeedbackSnapshot,
+    FeedbackSourceStatus, FeedbackStore, NewFeedbackSnapshot, NewPlacementTest, PlacementFilter,
+    PlacementResult, PlacementRound, PlacementTest, ProviderSignal, Verdict,
+    PLACEMENT_SIGNAL_HOURS,
 };
 use camelmailer_core::Id;
 use camelmailer_core::StoreError;
@@ -121,6 +122,11 @@ impl FeedbackStore for PgStore {
         &self,
         source: &str,
     ) -> Result<Vec<FeedbackSnapshot>, StoreError> {
+        if source == source::PLACEMENT {
+            let since = chrono::Utc::now() - chrono::Duration::hours(PLACEMENT_SIGNAL_HOURS);
+            let tests = self.placement_results_since(since, None, None).await?;
+            return Ok(newest_per_subject(placement_summary(&tests)));
+        }
         let rows = sqlx::query(&format!(
             "{NEWEST} WHERE source = $1
              ORDER BY provider, subject_kind, subject, data_date DESC"
@@ -253,7 +259,7 @@ impl FeedbackStore for PgStore {
     ) -> Result<Vec<ProviderSignal>, StoreError> {
         let rows = sqlx::query(&format!(
             "{NEWEST}
-             WHERE provider = $2
+             WHERE provider = $2 AND source <> 'placement'
                AND ((subject_kind = 'ip' AND subject = $1)
                     OR subject_kind IN ('domain', 'provider'))
              ORDER BY provider, subject_kind, subject, data_date DESC"
@@ -263,24 +269,41 @@ impl FeedbackStore for PgStore {
         .fetch_all(self.pool())
         .await
         .map_err(sqlx_error)?;
-        Ok(
-            newest_per_subject(rows.iter().map(snapshot_from_row).collect())
-                .into_iter()
-                .map(ProviderSignal::from)
-                .collect(),
-        )
+        let mut snapshots: Vec<FeedbackSnapshot> = rows.iter().map(snapshot_from_row).collect();
+        let since = chrono::Utc::now() - chrono::Duration::hours(PLACEMENT_SIGNAL_HOURS);
+        let tests = self
+            .placement_results_since(since, Some(ip), Some(provider))
+            .await?;
+        snapshots.extend(placement_summary(&tests));
+        Ok(newest_per_subject(snapshots)
+            .into_iter()
+            .map(ProviderSignal::from)
+            .collect())
     }
 
     async fn prune_feedback_snapshots(&self, days: u32) -> Result<u64, StoreError> {
-        let done = sqlx::query(
+        let snapshots = sqlx::query(
             "DELETE FROM feedback_snapshots
              WHERE data_date < (now() AT TIME ZONE 'UTC')::date - $1::int",
         )
         .bind(days as i32)
         .execute(self.pool())
         .await
+        .map_err(sqlx_error)?
+        .rows_affected();
+        // The placement history goes with its rounds (ON DELETE CASCADE).
+        let tests: i64 = sqlx::query_scalar(
+            "WITH old AS (
+                 DELETE FROM placement_rounds
+                 WHERE requested_at < now() - make_interval(days => $1::int)
+                 RETURNING id)
+             SELECT count(*) FROM placement_tests WHERE round_id IN (SELECT id FROM old)",
+        )
+        .bind(days as i32)
+        .fetch_one(self.pool())
+        .await
         .map_err(sqlx_error)?;
-        Ok(done.rows_affected())
+        Ok(snapshots + tests as u64)
     }
 
     async fn request_placement_round(
@@ -419,13 +442,13 @@ impl FeedbackStore for PgStore {
         id: i64,
         result: &PlacementResult,
     ) -> Result<(), StoreError> {
-        let row = sqlx::query(
+        sqlx::query(
             "UPDATE placement_tests
              SET status = $2, folder = $3, spf = $4, dkim = $5, dmarc = $6,
                  received_ip = $7, helo = $8, detail = $9, checks = checks + 1,
                  checked_at = now(), claimed_until = NULL,
                  check_at = COALESCE($10, check_at)
-             WHERE id = $1 RETURNING *",
+             WHERE id = $1",
         )
         .bind(id)
         .bind(&result.status)
@@ -437,25 +460,48 @@ impl FeedbackStore for PgStore {
         .bind(&result.helo)
         .bind(&result.detail)
         .bind(result.check_again_at)
-        .fetch_optional(self.pool())
+        .execute(self.pool())
         .await
         .map_err(sqlx_error)?;
-        if let Some(snapshot) = row
-            .as_ref()
-            .map(test_from_row)
-            .and_then(|test| placement_snapshot(&test, result))
-        {
-            self.upsert_feedback_snapshots(&[snapshot]).await?;
-        }
         Ok(())
     }
 
-    async fn list_placement_tests(&self, limit: i64) -> Result<Vec<PlacementTest>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM placement_tests ORDER BY id DESC LIMIT $1")
-            .bind(limit)
-            .fetch_all(self.pool())
-            .await
-            .map_err(sqlx_error)?;
+    async fn list_placement_tests(
+        &self,
+        filter: &PlacementFilter,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM placement_tests
+             WHERE ($1::text IS NULL OR ip = $1) AND ($2::text IS NULL OR provider = $2)
+             ORDER BY id DESC LIMIT $3",
+        )
+        .bind(filter.ip.as_deref())
+        .bind(filter.provider.as_deref())
+        .bind(filter.limit)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(rows.iter().map(test_from_row).collect())
+    }
+
+    async fn placement_results_since(
+        &self,
+        since: DateTime<Utc>,
+        ip: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM placement_tests
+             WHERE status IN ('inbox', 'spam', 'missing') AND checked_at >= $1
+               AND ($2::text IS NULL OR ip = $2) AND ($3::text IS NULL OR provider = $3)
+             ORDER BY id",
+        )
+        .bind(since)
+        .bind(ip)
+        .bind(provider)
+        .fetch_all(self.pool())
+        .await
+        .map_err(sqlx_error)?;
         Ok(rows.iter().map(test_from_row).collect())
     }
 

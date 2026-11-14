@@ -13,8 +13,16 @@ export const SOURCE_LABELS: Record<FeedbackSource["source"], { title: string; pr
 export const PROVIDER_LABELS: Record<string, string> = {
   google: "Google",
   microsoft: "Microsoft",
-  yahoo: "Yahoo",
+  yahoo: "Yahoo / AOL",
+  apple: "Apple iCloud",
+  united_internet: "GMX / Web.de / 1&1",
+  t_online: "T-Online",
   other: "Other",
+}
+
+/** A provider group's label; configured groups without one read as named. */
+export function providerLabel(group: string): string {
+  return PROVIDER_LABELS[group] ?? group.replaceAll("_", " ")
 }
 
 /** The pill tone of a verdict. */

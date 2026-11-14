@@ -230,6 +230,34 @@ pub struct PlacementResult {
     pub check_again_at: Option<DateTime<Utc>>,
 }
 
+/// Which placement tests to list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementFilter {
+    pub ip: Option<String>,
+    pub provider: Option<String>,
+    pub limit: i64,
+}
+
+impl Default for PlacementFilter {
+    fn default() -> Self {
+        Self {
+            ip: None,
+            provider: None,
+            limit: 200,
+        }
+    }
+}
+
+impl PlacementFilter {
+    pub fn matches(&self, test: &PlacementTest) -> bool {
+        self.ip.as_deref().is_none_or(|ip| test.ip == ip)
+            && self.provider.as_deref().is_none_or(|p| test.provider == p)
+    }
+}
+
+/// How far back the placement signal looks.
+pub const PLACEMENT_SIGNAL_HOURS: i64 = 24;
+
 /// Storage for provider feedback. Implemented in lockstep by `MemoryStore`
 /// and the Postgres store.
 #[async_trait]
@@ -336,16 +364,28 @@ pub trait FeedbackStore: Send + Sync {
         lease_seconds: i64,
     ) -> Result<Vec<PlacementTest>, StoreError>;
 
-    /// Record a lookup. A final result (anything but pending) also becomes
-    /// a `placement` snapshot of the test's IP and provider for the day.
+    /// Record a lookup. Every test row stays as the placement history.
     async fn record_placement_result(
         &self,
         id: i64,
         result: &PlacementResult,
     ) -> Result<(), StoreError>;
 
-    /// The newest tests, newest first.
-    async fn list_placement_tests(&self, limit: i64) -> Result<Vec<PlacementTest>, StoreError>;
+    /// The newest tests matching `filter`, newest first: the placement
+    /// history.
+    async fn list_placement_tests(
+        &self,
+        filter: &PlacementFilter,
+    ) -> Result<Vec<PlacementTest>, StoreError>;
+
+    /// Final placement results (inbox, spam, missing) checked since `since`,
+    /// optionally for one IP and provider group.
+    async fn placement_results_since(
+        &self,
+        since: DateTime<Utc>,
+        ip: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<Vec<PlacementTest>, StoreError>;
 
     // -- complaint handling per mail server
 
@@ -498,6 +538,11 @@ impl FeedbackStore for MemoryStore {
         &self,
         source: &str,
     ) -> Result<Vec<FeedbackSnapshot>, StoreError> {
+        if source == source::PLACEMENT {
+            let since = Utc::now() - chrono::Duration::hours(PLACEMENT_SIGNAL_HOURS);
+            let tests = self.placement_results_since(since, None, None).await?;
+            return Ok(newest_per_subject(placement_summary(&tests)));
+        }
         let inner = self.inner.read().unwrap();
         let rows = inner
             .feedback
@@ -620,14 +665,19 @@ impl FeedbackStore for MemoryStore {
         ip: &str,
         provider: &str,
     ) -> Result<Vec<ProviderSignal>, StoreError> {
+        let since = Utc::now() - chrono::Duration::hours(PLACEMENT_SIGNAL_HOURS);
+        let tests = self
+            .placement_results_since(since, Some(ip), Some(provider))
+            .await?;
         let inner = self.inner.read().unwrap();
-        let rows = inner
+        let mut rows: Vec<FeedbackSnapshot> = inner
             .feedback
             .snapshots
             .iter()
-            .filter(|s| applies_to(s, ip, provider))
+            .filter(|s| s.source != source::PLACEMENT && applies_to(s, ip, provider))
             .cloned()
             .collect();
+        rows.extend(placement_summary(&tests));
         Ok(newest_per_subject(rows)
             .into_iter()
             .map(ProviderSignal::from)
@@ -637,9 +687,13 @@ impl FeedbackStore for MemoryStore {
     async fn prune_feedback_snapshots(&self, days: u32) -> Result<u64, StoreError> {
         let mut inner = self.inner.write().unwrap();
         let cutoff = Utc::now().date_naive() - chrono::Duration::days(i64::from(days));
-        let before = inner.feedback.snapshots.len();
+        let before = inner.feedback.snapshots.len() + inner.feedback.tests.len();
         inner.feedback.snapshots.retain(|s| s.data_date >= cutoff);
-        Ok((before - inner.feedback.snapshots.len()) as u64)
+        inner
+            .feedback
+            .tests
+            .retain(|(t, _, _)| t.created_at.date_naive() >= cutoff);
+        Ok((before - inner.feedback.snapshots.len() - inner.feedback.tests.len()) as u64)
     }
 
     async fn request_placement_round(
@@ -771,7 +825,7 @@ impl FeedbackStore for MemoryStore {
         id: i64,
         result: &PlacementResult,
     ) -> Result<(), StoreError> {
-        let snapshot = {
+        {
             let mut inner = self.inner.write().unwrap();
             let Some((test, check_at, lease)) =
                 inner.feedback.tests.iter_mut().find(|(t, _, _)| t.id == id)
@@ -792,25 +846,45 @@ impl FeedbackStore for MemoryStore {
             if let Some(at) = result.check_again_at {
                 *check_at = at;
             }
-            placement_snapshot(test, result)
-        };
-        if let Some(snapshot) = snapshot {
-            self.upsert_feedback_snapshots(&[snapshot]).await?;
         }
         Ok(())
     }
 
-    async fn list_placement_tests(&self, limit: i64) -> Result<Vec<PlacementTest>, StoreError> {
+    async fn list_placement_tests(
+        &self,
+        filter: &PlacementFilter,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
         let inner = self.inner.read().unwrap();
         let mut tests: Vec<PlacementTest> = inner
             .feedback
             .tests
             .iter()
             .map(|(t, _, _)| t.clone())
+            .filter(|t| filter.matches(t))
             .collect();
         tests.sort_by_key(|t| std::cmp::Reverse(t.id));
-        tests.truncate(limit.max(0) as usize);
+        tests.truncate(filter.limit.max(0) as usize);
         Ok(tests)
+    }
+
+    async fn placement_results_since(
+        &self,
+        since: DateTime<Utc>,
+        ip: Option<&str>,
+        provider: Option<&str>,
+    ) -> Result<Vec<PlacementTest>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        Ok(inner
+            .feedback
+            .tests
+            .iter()
+            .map(|(t, _, _)| t)
+            .filter(|t| placement_verdict(&t.status).is_some())
+            .filter(|t| t.checked_at.is_some_and(|at| at >= since))
+            .filter(|t| ip.is_none_or(|ip| t.ip == ip))
+            .filter(|t| provider.is_none_or(|p| t.provider == p))
+            .cloned()
+            .collect())
     }
 
     async fn server_complaint_suppression(
@@ -861,37 +935,71 @@ impl FeedbackStore for MemoryStore {
     }
 }
 
-/// The snapshot a final placement result leaves: inbox is ok, spam bad,
-/// missing a warning (filtered before the mailbox, or not delivered yet).
-pub fn placement_snapshot(
-    test: &PlacementTest,
-    result: &PlacementResult,
-) -> Option<NewFeedbackSnapshot> {
-    let (verdict, what) = match result.status.as_str() {
-        placement_status::INBOX => (Verdict::Ok, "in the inbox"),
-        placement_status::SPAM => (Verdict::Bad, "in the spam folder"),
-        placement_status::MISSING => (Verdict::Warn, "not found"),
-        _ => return None,
-    };
-    Some(NewFeedbackSnapshot {
-        source: source::PLACEMENT.into(),
-        provider: test.provider.clone(),
-        subject_kind: subject_kind::IP.into(),
-        subject: test.ip.clone(),
-        data_date: Utc::now().date_naive(),
-        verdict,
-        detail: format!("test to {} {what}", test.seed_address),
-        metrics: serde_json::json!({
-            "seed": test.seed_address,
-            "status": result.status,
-            "folder": result.folder,
-            "spf": result.spf,
-            "dkim": result.dkim,
-            "dmarc": result.dmarc,
-            "received_ip": result.received_ip,
-            "helo": result.helo,
-        }),
-    })
+/// The verdict of a final placement result: inbox is ok; spam and missing
+/// (filtered before the mailbox, or rejected) are bad. `None` while pending
+/// or after an error.
+pub fn placement_verdict(status: &str) -> Option<Verdict> {
+    match status {
+        placement_status::INBOX => Some(Verdict::Ok),
+        placement_status::SPAM | placement_status::MISSING => Some(Verdict::Bad),
+        _ => None,
+    }
+}
+
+/// One `placement` signal per (provider group, IP) from final results: the
+/// WORST result counts, so a single test in the spam folder brakes that
+/// provider even when another seed of the group saw the inbox.
+pub fn placement_summary(tests: &[PlacementTest]) -> Vec<FeedbackSnapshot> {
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<&PlacementTest>> =
+        Default::default();
+    for test in tests {
+        if placement_verdict(&test.status).is_some() {
+            groups
+                .entry((test.provider.clone(), test.ip.clone()))
+                .or_default()
+                .push(test);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|((provider, ip), tests)| {
+            let count = |status: &str| tests.iter().filter(|t| t.status == status).count();
+            let (inbox, spam, missing) = (
+                count(placement_status::INBOX),
+                count(placement_status::SPAM),
+                count(placement_status::MISSING),
+            );
+            let verdict = tests
+                .iter()
+                .filter_map(|t| placement_verdict(&t.status))
+                .max()
+                .unwrap_or(Verdict::Unknown);
+            let newest = tests
+                .iter()
+                .filter_map(|t| t.checked_at)
+                .max()
+                .unwrap_or_else(Utc::now);
+            let worst_seed = tests
+                .iter()
+                .filter(|t| placement_verdict(&t.status) == Some(verdict))
+                .max_by_key(|t| t.checked_at)
+                .map(|t| format!(", worst at {} ({})", t.seed_address, t.status))
+                .unwrap_or_default();
+            FeedbackSnapshot {
+                source: source::PLACEMENT.into(),
+                provider,
+                subject_kind: subject_kind::IP.into(),
+                subject: ip,
+                data_date: newest.date_naive(),
+                verdict,
+                detail: format!(
+                    "last {PLACEMENT_SIGNAL_HOURS} h: {inbox} inbox, {spam} spam, {missing} missing{worst_seed}"
+                ),
+                metrics: serde_json::json!({ "inbox": inbox, "spam": spam, "missing": missing }),
+                fetched_at: newest,
+            }
+        })
+        .collect()
 }
 
 /// The detail line of a feedback-loop count.
@@ -1118,7 +1226,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let listed = store.list_placement_tests(10).await.unwrap();
+        let listed = store
+            .list_placement_tests(&PlacementFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(listed[0].checks, 1);
         assert_eq!(listed[1].status, "spam");
         // the pending one is due again; the spam one is final
@@ -1135,11 +1249,90 @@ mod tests {
         assert_eq!(google.len(), 1);
         assert_eq!(google[0].source, "placement");
         assert_eq!(google[0].verdict, Verdict::Bad);
+
+        // A later inbox result of the same provider does not hide the spam
+        // result of the last 24 hours, and the history keeps both.
+        let more = store
+            .create_placement_tests(&[new("t3", "google")])
+            .await
+            .unwrap();
+        store
+            .record_placement_result(
+                more[0].id,
+                &PlacementResult {
+                    status: placement_status::INBOX.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let google = store
+            .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+            .await
+            .unwrap();
+        assert_eq!(google[0].verdict, Verdict::Bad);
+        let history = store
+            .list_placement_tests(&PlacementFilter {
+                provider: Some("google".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 2);
         assert!(store
             .latest_provider_signals("192.0.2.1", provider::MICROSOFT)
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn the_worst_placement_result_wins_per_provider_and_ip() {
+        let test = |id: i64, provider: &str, ip: &str, status: &str| PlacementTest {
+            id,
+            round_id: 1,
+            token: format!("t{id}"),
+            server_id: 1,
+            message_id: None,
+            ip_pool_id: 1,
+            ip_address_id: 1,
+            ip: ip.into(),
+            seed_address: format!("seed{id}@x.example"),
+            seed_provider: "imap".into(),
+            provider: provider.into(),
+            status: status.into(),
+            folder: None,
+            spf: None,
+            dkim: None,
+            dmarc: None,
+            received_ip: None,
+            helo: None,
+            detail: String::new(),
+            checks: 1,
+            created_at: Utc::now(),
+            checked_at: Some(Utc::now()),
+        };
+        let summary = placement_summary(&[
+            test(1, "google", "192.0.2.1", "inbox"),
+            test(2, "google", "192.0.2.1", "spam"),
+            test(3, "microsoft", "192.0.2.1", "inbox"),
+            test(4, "united_internet", "192.0.2.1", "missing"),
+            test(5, "yahoo", "192.0.2.1", "pending"),
+        ]);
+        let verdicts: Vec<(&str, Verdict)> = summary
+            .iter()
+            .map(|s| (s.provider.as_str(), s.verdict))
+            .collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                ("google", Verdict::Bad),
+                ("microsoft", Verdict::Ok),
+                ("united_internet", Verdict::Bad)
+            ]
+        );
+        assert!(summary[0].detail.contains("1 inbox, 1 spam, 0 missing"));
+        assert!(summary[0].detail.contains("seed2@x.example (spam)"));
     }
 
     #[tokio::test]

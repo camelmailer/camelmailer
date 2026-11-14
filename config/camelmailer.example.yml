@@ -262,6 +262,11 @@ deliverability_feedback:
     #   client_id: 00000000-0000-0000-0000-000000000000
     #   client_secret_file: /run/secrets/seed_outlook_client_secret
     #   refresh_token_file: /run/secrets/seed_outlook_refresh_token
+    # - provider: imap               # any other provider, e.g. GMX
+    #   address: seed@gmx.de
+    #   imap_host: imap.gmx.net
+    #   group: united_internet       # the provider group this seed measures
+    #   password_file: /run/secrets/seed_gmx
 
 # Captcha at self-registration (POST /api/v2/auth/register). `cap` speaks
 # the Cap siteverify contract (https://trycap.dev). The endpoint includes

@@ -44,7 +44,7 @@ reads:
 | Postmaster Tools | spam rate below 0.1 % | spam rate from 0.1 %, or any rejects for low IP or domain reputation | spam rate from 0.3 % |
 | SNDS | filter result green | filter result yellow, complaint rate from 0.3 %, or trap hits | filter result red |
 | Feedback loops | (a count; rated against the IP's volume by the warm-up) | | |
-| Placement tests | found in the inbox | not found | found in the spam folder |
+| Placement tests | every test of the last 24 h in the inbox | | any test of the last 24 h in the spam folder or not found |
 
 The thresholds come from the providers: Google asks senders to keep the spam
 rate in Postmaster Tools below 0.10 % and never to reach 0.30 %
@@ -205,6 +205,14 @@ measurement and works against the providers' rules.
    | Gmail | `imap.gmail.com:993` | an app password (needs 2-Step Verification) or OAuth2 (`XOAUTH2`, scope `https://mail.google.com/`), [Google](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol) |
    | Outlook.com | `outlook.office365.com:993` | OAuth2 only (`XOAUTH2`, scope `https://outlook.office.com/IMAP.AccessAsUser.All offline_access`). Microsoft ended password sign-in for IMAP on 2024-09-16, [Microsoft](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth) |
    | Yahoo | `imap.mail.yahoo.com:993` | an app password, [Yahoo](https://help.yahoo.com/kb/SLN4075.html) |
+   | Others (GMX, Web.de, T-Online, iCloud, ...) | the provider's IMAP server, `provider: imap` with `imap_host` | what the provider requires (often an app password) |
+
+   Each seed measures one provider group: `google` for gmail, `microsoft`
+   for outlook, `yahoo` for yahoo, `other` for imap. Set `group` on an
+   `imap` seed to measure another configured group, for example
+   `united_internet` for a GMX or Web.de seed, `t_online` or `apple`. Group
+   names are lowercase letters, digits and `_`, the same names as the
+   provider groups of the IP metrics and the warm-up.
 
    For Outlook.com, register an app in Microsoft Entra ("Personal Microsoft
    accounts" allowed), add the delegated permission `IMAP.AccessAsUser.All`
@@ -278,11 +286,24 @@ follows:
 Tell your recipients in your privacy policy that spam complaints are
 processed to stop further mail to them.
 
+### Placement history
+
+Every test is kept with its result and the time it was checked, until
+`deliverability_feedback.snapshot_retention_days` (400). The Provider
+feedback page lists the history and filters it by IP, provider group and
+result; `GET /api/v2/admin/deliverability/placement_tests?ip=…&provider=…`
+returns the same (newest first, up to 1000).
+
+For the warm-up, the WORST result of the last 24 hours per IP and provider
+group counts: one test in the spam folder, or one that never arrived, makes
+the signal `bad` even when another seed of the same group saw the inbox.
+Only when every test of the last 24 hours reached the inbox is it `ok`.
+
 ## Use by the warm-up
 
 The verdicts are stored so that the adaptive warm-up can read the newest
 signals of one IP and provider group in a single query
 (`FeedbackStore::latest_provider_signals`): SNDS rows of that IP, plus the
 domain-wide Postmaster Tools rows and the provider-wide feedback-loop counts
-of that provider. Connecting them to the warm-up brake is a separate change;
+of that provider, plus the worst placement result of the last 24 hours. Connecting them to the warm-up brake is a separate change;
 until then the signals are shown and change nothing about delivery.

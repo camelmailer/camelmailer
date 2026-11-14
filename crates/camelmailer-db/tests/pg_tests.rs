@@ -7917,7 +7917,13 @@ async fn placement_rounds_tests_and_signals() {
         )
         .await
         .unwrap();
-    let listed = store.list_placement_tests(10).await.unwrap();
+    let listed = store
+        .list_placement_tests(&camelmailer_core::PlacementFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert_eq!(listed[0].id, tests[1].id);
     assert_eq!(listed[0].checks, 1);
     assert_eq!(listed[1].status, "spam");
@@ -7935,4 +7941,41 @@ async fn placement_rounds_tests_and_signals() {
     assert_eq!(google.len(), 1);
     assert_eq!(google[0].source, "placement");
     assert_eq!(google[0].verdict, Verdict::Bad);
+
+    // The worst result of the last 24 hours counts; the history keeps all.
+    let more = store
+        .create_placement_tests(&[new("t3", "google")])
+        .await
+        .unwrap();
+    store
+        .record_placement_result(
+            more[0].id,
+            &PlacementResult {
+                status: placement_status::INBOX.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let google = store
+        .latest_provider_signals("192.0.2.1", provider::GOOGLE)
+        .await
+        .unwrap();
+    assert_eq!(google[0].verdict, Verdict::Bad);
+    assert!(
+        google[0].detail.contains("1 inbox, 1 spam"),
+        "{}",
+        google[0].detail
+    );
+    let history = store
+        .list_placement_tests(&camelmailer_core::PlacementFilter {
+            ip: Some("192.0.2.1".into()),
+            provider: Some("google".into()),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    let summary = store.latest_feedback_snapshots("placement").await.unwrap();
+    assert_eq!(summary.len(), 1, "one row per provider and IP");
 }

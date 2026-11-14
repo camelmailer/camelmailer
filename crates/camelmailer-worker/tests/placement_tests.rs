@@ -253,7 +253,13 @@ async fn a_round_sends_from_each_address_and_finds_inbox_and_spam_read_only() {
         .unwrap()
         .is_none());
     runner.run_once().await.unwrap();
-    let tests = store.list_placement_tests(10).await.unwrap();
+    let tests = store
+        .list_placement_tests(&camelmailer_core::PlacementFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     assert_eq!(tests.len(), 2, "one address times two seeds");
     assert!(tests
         .iter()
@@ -314,7 +320,13 @@ async fn a_round_sends_from_each_address_and_finds_inbox_and_spam_read_only() {
         .unwrap();
     runner.run_once().await.unwrap();
 
-    let results = store.list_placement_tests(10).await.unwrap();
+    let results = store
+        .list_placement_tests(&camelmailer_core::PlacementFilter {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     let result = |id: i64| results.iter().find(|t| t.id == id).unwrap();
     assert_eq!(result(a.id).status, "inbox");
     assert_eq!(result(a.id).folder.as_deref(), Some("INBOX"));

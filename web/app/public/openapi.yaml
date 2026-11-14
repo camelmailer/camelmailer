@@ -3149,7 +3149,7 @@ paths:
                                 type: object
                                 properties:
                                   source: { type: string }
-                                  provider: { type: string, enum: [google, microsoft, yahoo, other] }
+                                  provider: { type: string, pattern: "^[a-z0-9_]+$" }
                                   subject_kind: { type: string, enum: [domain, ip, provider] }
                                   subject: { type: string }
                                   data_date: { type: string, format: date }
@@ -3160,13 +3160,18 @@ paths:
   /api/v2/admin/deliverability/placement_tests:
     get:
       tags: [Instance]
-      summary: Seed placement tests
+      summary: Seed placement history
       description: >-
-        The newest 200 inbox placement tests, newest first: one test message per sending IP to
-        every configured seed mailbox, looked up read-only over IMAP. `configured` says whether
-        `deliverability_feedback.placement` has a server, a sender and seeds. Global
-        administrators only.
+        Every inbox placement test with its result and time, newest first: one test message
+        per sending IP to every configured seed mailbox, looked up read-only over IMAP.
+        `configured` says whether `deliverability_feedback.placement` has a server, a sender
+        and seeds. The warm-up reads the worst result of the last 24 hours per IP and provider
+        group. Global administrators only.
       security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: ip, in: query, required: false, schema: { type: string } }
+        - { name: provider, in: query, required: false, description: A provider group name., schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
       responses:
         "200":
           description: The tests
@@ -3197,7 +3202,7 @@ paths:
                             ip: { type: string }
                             seed_address: { type: string }
                             seed_provider: { type: string, enum: [gmail, outlook, yahoo, imap] }
-                            provider: { type: string, enum: [google, microsoft, yahoo, other] }
+                            provider: { type: string, pattern: "^[a-z0-9_]+$" }
                             status: { type: string, enum: [pending, inbox, spam, missing, error] }
                             folder: { type: string, nullable: true }
                             spf: { type: string, nullable: true }

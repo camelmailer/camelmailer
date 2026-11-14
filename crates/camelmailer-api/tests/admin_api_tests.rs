@@ -1287,6 +1287,16 @@ async fn placement_rounds_are_requested_on_demand_once_per_interval() {
     assert_eq!(body["data"]["configured"], true);
     assert_eq!(body["data"]["last_round"]["trigger"], "manual");
     assert_eq!(body["data"]["placement_tests"], json!([]));
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/deliverability/placement_tests?ip=192.0.2.1&provider=united_internet&limit=5000",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["placement_tests"], json!([]));
 
     let (status, _) = request(
         &app,

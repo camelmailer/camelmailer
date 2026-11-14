@@ -26,7 +26,7 @@ import {
   authSummary,
   formatMetric,
   placementTone,
-  PROVIDER_LABELS,
+  providerLabel,
   SOURCE_LABELS,
   sourceState,
   VERDICT_LABELS,
@@ -78,7 +78,7 @@ function SnapshotTable({ source }: { source: FeedbackSource }) {
       cell: ({ row }) => (
         <span className="block truncate font-mono text-xs font-medium">
           {row.original.subject_kind === "provider"
-            ? (PROVIDER_LABELS[row.original.subject] ?? row.original.subject)
+            ? providerLabel(row.original.subject)
             : row.original.subject}
         </span>
       ),
@@ -214,9 +214,17 @@ function PlacementCard() {
       id: "ip",
       header: "IP",
       accessorFn: (r) => r.ip,
+      filterFn: (row, _id, value) => row.original.ip === value,
       cell: ({ row }) => (
         <span className="block truncate font-mono text-xs font-medium">{row.original.ip}</span>
       ),
+    },
+    {
+      id: "provider",
+      header: "Provider",
+      accessorFn: (r) => r.provider,
+      filterFn: (row, _id, value) => row.original.provider === value,
+      cell: ({ row }) => <span>{providerLabel(row.original.provider)}</span>,
     },
     {
       id: "seed_address",
@@ -228,6 +236,7 @@ function PlacementCard() {
       id: "status",
       header: "Result",
       accessorFn: (r) => r.status,
+      filterFn: (row, _id, value) => row.original.status === value,
       cell: ({ row }) => {
         const pill = placementTone(row.original.status)
         return <StatusPill status={pill.label} tone={pill.tone} />
@@ -254,20 +263,24 @@ function PlacementCard() {
       ),
     },
     {
-      id: "created_at",
-      header: "Sent",
-      accessorFn: (r) => r.created_at,
+      id: "checked_at",
+      header: "Checked",
+      accessorFn: (r) => r.checked_at ?? r.created_at,
       cell: ({ row }) => (
-        <span className="text-muted-foreground">{relativeTime(row.original.created_at)}</span>
+        <span className="text-muted-foreground" title={row.original.checked_at ?? row.original.created_at}>
+          {relativeTime(row.original.checked_at ?? row.original.created_at)}
+        </span>
       ),
     },
   ]
+  const history = tests.data?.placement_tests ?? []
+  const distinct = (values: string[]) => Array.from(new Set(values)).sort()
   const configured = tests.data?.configured ?? false
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex flex-wrap items-center gap-2 text-base">
-          Seed placement tests
+          Seed placement history
           <Button
             size="sm"
             variant="outline"
@@ -282,7 +295,8 @@ function PlacementCard() {
         <p className="text-sm text-muted-foreground">
           One test message from every sending IP to each of your seed mailboxes, then a read-only
           look into the inbox and the spam folder. Nothing in the seed mailboxes is opened, clicked,
-          answered or moved.
+          answered or moved. Every result is kept; the warm-up reads the worst result of the last
+          24 hours per IP and provider.
           {!configured && " Configure seeds in deliverability_feedback.placement to use it."}
           {tests.data?.last_round &&
             ` Last round requested ${relativeTime(tests.data.last_round.requested_at)}.`}
@@ -292,10 +306,24 @@ function PlacementCard() {
         <CardContent>
           <DataTable
             columns={columns}
-            data={tests.data?.placement_tests ?? []}
+            data={history}
             loading={tests.isLoading}
             searchKeys={["ip", "seed_address"]}
+            initialPageSize={20}
             filters={[
+              {
+                columnId: "provider",
+                label: "Provider",
+                options: distinct(history.map((t) => t.provider)).map((p) => ({
+                  label: providerLabel(p),
+                  value: p,
+                })),
+              },
+              {
+                columnId: "ip",
+                label: "IP",
+                options: distinct(history.map((t) => t.ip)).map((ip) => ({ label: ip, value: ip })),
+              },
               {
                 columnId: "status",
                 label: "Result",
