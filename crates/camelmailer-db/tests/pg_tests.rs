@@ -7847,3 +7847,73 @@ async fn webhook_queue_changes_need_the_worker_that_holds_the_row() {
     assert!(webhooks.retry(request.id, 0, "w1").await.unwrap());
     assert!(!webhooks.complete(request.id, "w1").await.unwrap());
 }
+
+/// `DeliveryStatsStore` on Postgres behaves like the MemoryStore test in
+/// camelmailer-core: counters per day/address/provider, complaints credited
+/// through the message source, pruning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_counters_add_up_and_complaints_reach_the_sending_address() {
+    use camelmailer_core::{DeliveryKind, DeliveryStatsStore, IpDeliveryRecord, ProviderGroup};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let store = PgStore::new(pool.clone());
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
+    let record = |kind, message_id, policy_block| IpDeliveryRecord {
+        day,
+        source_ip: "203.0.113.5".into(),
+        ip_address_id: Some(3),
+        provider: ProviderGroup::Microsoft,
+        kind,
+        policy_block,
+        server_id: 1,
+        message_id,
+    };
+    store
+        .record_ip_delivery(&record(DeliveryKind::Sent, 1, false))
+        .await
+        .unwrap();
+    store
+        .record_ip_delivery(&record(DeliveryKind::Sent, 2, false))
+        .await
+        .unwrap();
+    store
+        .record_ip_delivery(&record(DeliveryKind::Bounced, 3, true))
+        .await
+        .unwrap();
+    store
+        .record_ip_delivery(&record(DeliveryKind::Deferred, 4, false))
+        .await
+        .unwrap();
+    let mut google = record(DeliveryKind::Sent, 5, false);
+    google.provider = ProviderGroup::Google;
+    store.record_ip_delivery(&google).await.unwrap();
+
+    let at = chrono::DateTime::parse_from_rfc3339("2026-11-15T08:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let credited = store.record_ip_complaint(2, at).await.unwrap().unwrap();
+    assert_eq!(credited.provider, ProviderGroup::Microsoft);
+    assert_eq!(credited.ip_address_id, Some(3));
+    assert!(store.record_ip_complaint(3, at).await.unwrap().is_none());
+
+    let stats = store
+        .ip_delivery_stats(chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stats.len(), 3);
+    let ms = stats
+        .iter()
+        .find(|s| s.provider == ProviderGroup::Microsoft && s.day == day)
+        .unwrap();
+    assert_eq!(
+        (ms.sent, ms.deferred, ms.bounced, ms.policy_blocks),
+        (2, 1, 1, 1)
+    );
+    assert_eq!(stats.iter().map(|s| s.complaints).sum::<i64>(), 1);
+
+    let removed = store
+        .prune_delivery_stats(chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(), at)
+        .await
+        .unwrap();
+    assert_eq!(removed, 2 + 3);
+}

@@ -6,6 +6,7 @@ pub mod dkim;
 pub mod dmarc;
 pub mod inspection;
 pub mod outbound;
+pub mod provider;
 pub mod reverse_dns;
 pub mod sender;
 pub mod signer;

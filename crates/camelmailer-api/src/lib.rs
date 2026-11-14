@@ -24,6 +24,7 @@ mod workspace;
 mod xmldsig;
 
 mod insights;
+mod ip_metrics;
 mod lifecycle;
 mod quota;
 

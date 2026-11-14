@@ -279,6 +279,23 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) org_sso_connections: HashMap<Id, crate::org_sso::OrgSsoConnection>,
     /// Email domains organizations have claimed for SSO login routing.
     pub(crate) org_email_domains: HashMap<Id, crate::org_sso::OrgEmailDomain>,
+    /// Delivery counters per (day, source address, provider).
+    pub(crate) ip_delivery_stats: std::collections::BTreeMap<
+        (
+            chrono::NaiveDate,
+            String,
+            crate::delivery_stats::ProviderGroup,
+        ),
+        crate::delivery_stats::IpDeliveryStat,
+    >,
+    /// The address that sent each accepted message, and when.
+    pub(crate) message_sources: HashMap<
+        i64,
+        (
+            crate::delivery_stats::IpComplaint,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >,
 }
 
 pub(crate) struct MemoryIdempotencyRecord {

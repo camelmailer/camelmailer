@@ -69,6 +69,9 @@ pub struct ApiState {
     /// when accounts storage is not enabled; the dashboard endpoints then
     /// report the feature unavailable.
     pub org_sso_store: Option<Arc<dyn camelmailer_core::OrgSsoStore>>,
+    /// Delivery counters per sending address and provider (IP metrics,
+    /// warm-up). `None` answers the IP metrics with no data.
+    pub delivery_stats: Option<Arc<dyn camelmailer_core::DeliveryStatsStore>>,
 }
 
 impl ApiState {
@@ -99,6 +102,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            delivery_stats: None,
             spf_resolver: None,
         })
     }
@@ -122,6 +126,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            delivery_stats: None,
             spf_resolver: None,
         })
     }
@@ -290,6 +295,7 @@ impl ApiState {
             webhook_sender,
             installation_signing_key_pem,
             org_sso_store: None,
+            delivery_stats: None,
             spf_resolver: None,
         })
     }
@@ -327,6 +333,17 @@ impl ApiState {
     ) -> Arc<Self> {
         let mut state = (*self).clone();
         state.org_sso_store = Some(org_sso_store);
+        Arc::new(state)
+    }
+
+    /// Attach the delivery counters (IP metrics). Same shape as
+    /// [`ApiState::with_org_sso_store`].
+    pub fn with_delivery_stats(
+        self: Arc<Self>,
+        delivery_stats: Arc<dyn camelmailer_core::DeliveryStatsStore>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.delivery_stats = Some(delivery_stats);
         Arc::new(state)
     }
 
@@ -1965,6 +1982,7 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             "/source_addresses",
             get(resources::source_addresses_index),
         )
+        .route("/ip_metrics", get(crate::ip_metrics::ip_metrics_index))
         .route(
             "/ip_pools/{pool_id}/ip_addresses",
             get(resources::ip_addresses_index).post(resources::ip_addresses_create),
