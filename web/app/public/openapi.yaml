@@ -3116,6 +3116,73 @@ paths:
                                   ipv6: { type: string, nullable: true }
                                   hostname: { type: string }
                                   priority: { type: integer }
+  /api/v2/admin/dns_checks:
+    get:
+      tags: [Instance]
+      summary: DNS checks with the exact expected records
+      description: >-
+        Checks the DNS the installation depends on and names the exact record each check
+        expects: A/AAAA of `cluster.inbound_hostname` on the load balancer (or the live SMTP
+        nodes), PTR, forward-confirmed reverse DNS and EHLO of every sending address (IP pool
+        addresses and the `cluster.public_addresses` of live workers), then by domain role: the
+        return-path domain (SPF against every sending address, MX on the installation), every
+        verified sending domain (at most 100: SPF against every sending address, the DKIM record
+        at `<selector>._domainkey.<domain>` carrying the key the worker signs with, a DMARC record
+        with `p=none` as a warning), every domain with an inbound route (MX on the installation),
+        and the tracking host name. Each check has `status` ok / warn / fail, `found`, `expected` and copyable
+        `instructions`; `instructions` at the top level lists every record to set once. Read-only.
+        The result is reused for 60 seconds unless `refresh=1`. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: refresh, in: query, required: false, schema: { type: string, enum: ["1", "true"] } }
+      responses:
+        "200":
+          description: The checks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data: { $ref: "#/components/schemas/DnsCheckRun" }
+  /api/v2/admin/dns_checks/candidate:
+    get:
+      tags: [Instance]
+      summary: DNS checks for a planned sending address
+      description: >-
+        The checks a new address must pass before it goes into an IP pool: A/AAAA of `hostname`,
+        PTR, forward-confirmed reverse DNS, EHLO match (`hostname` is what it will greet with) and
+        SPF coverage of the return-path and tenant domains. `ready` is true when every check
+        passes. Read-only: it never changes DNS or pools. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - { name: ipv4, in: query, required: false, schema: { type: string } }
+        - { name: ipv6, in: query, required: false, schema: { type: string } }
+        - { name: hostname, in: query, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The checks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    allOf:
+                      - $ref: "#/components/schemas/DnsCheckRun"
+                      - type: object
+                        properties:
+                          ready: { type: boolean }
+                          candidate:
+                            type: object
+                            properties:
+                              ipv4: { type: string, nullable: true }
+                              ipv6: { type: string, nullable: true }
+                              hostname: { type: string }
+        "422": { $ref: "#/components/responses/ValidationError" }
   /api/v2/admin/admin_api_keys:
     get:
       tags: [Instance]
@@ -3278,6 +3345,40 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
   schemas:
+    DnsCheckRun:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            ok: { type: integer }
+            warn: { type: integer }
+            fail: { type: integer }
+        instructions: { type: array, items: { type: string } }
+        truncated_domains: { type: integer }
+        checked_at: { type: string, format: date-time }
+        cached: { type: boolean }
+        groups:
+          type: array
+          items:
+            type: object
+            properties:
+              group: { type: string, enum: [address, hostname, domain] }
+              subject: { type: string }
+              status: { type: string, enum: [ok, warn, fail] }
+              checks:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    group: { type: string }
+                    subject: { type: string }
+                    kind: { type: string, enum: [a, ptr, fcrdns, ehlo, spf, dkim, dmarc, mx, resolves] }
+                    status: { type: string, enum: [ok, warn, fail] }
+                    found: { type: array, items: { type: string } }
+                    expected: { type: array, items: { type: string } }
+                    instructions: { type: array, items: { type: string } }
+                    detail: { type: string }
     OrganizationUsage:
       type: object
       properties:

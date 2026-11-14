@@ -27,6 +27,7 @@ camelmailer-worker = { path = "crates/camelmailer-worker" }
 argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
 hickory-resolver = "0.26"
+futures-util = "0.3"
 idna = "1"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 rcgen = "0.14"

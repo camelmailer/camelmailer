@@ -406,6 +406,7 @@ dependencies = [
  "camelmailer-core",
  "chrono",
  "flate2",
+ "futures-util",
  "hickory-resolver",
  "http-body-util",
  "ipnet",

@@ -69,6 +69,10 @@ pub struct ApiState {
     /// when accounts storage is not enabled; the dashboard endpoints then
     /// report the feature unavailable.
     pub org_sso_store: Option<Arc<dyn camelmailer_core::OrgSsoStore>>,
+    /// Lookups for the infrastructure DNS checks; `None` uses hickory.
+    pub dns_check_resolver: Option<Arc<dyn crate::dns_checks::DnsCheckResolver>>,
+    /// The last full DNS check run, reused for a minute.
+    pub dns_checks_cache: Arc<crate::dns_checks::DnsChecksCache>,
 }
 
 impl ApiState {
@@ -100,6 +104,8 @@ impl ApiState {
             installation_signing_key_pem: None,
             org_sso_store: None,
             spf_resolver: None,
+            dns_check_resolver: None,
+            dns_checks_cache: Arc::default(),
         })
     }
 
@@ -123,6 +129,8 @@ impl ApiState {
             installation_signing_key_pem: None,
             org_sso_store: None,
             spf_resolver: None,
+            dns_check_resolver: None,
+            dns_checks_cache: Arc::default(),
         })
     }
 
@@ -291,6 +299,8 @@ impl ApiState {
             installation_signing_key_pem,
             org_sso_store: None,
             spf_resolver: None,
+            dns_check_resolver: None,
+            dns_checks_cache: Arc::default(),
         })
     }
 
@@ -309,6 +319,17 @@ impl ApiState {
     /// sending domain's policy rather than compare its text. Same shape as
     /// [`ApiState::with_org_sso_store`]: the state is immutable behind an
     /// `Arc`, so this returns a fresh one.
+    /// Use `resolver` for the infrastructure DNS checks (tests).
+    pub fn with_dns_check_resolver(
+        self: Arc<Self>,
+        resolver: Arc<dyn crate::dns_checks::DnsCheckResolver>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.dns_check_resolver = Some(resolver);
+        state.dns_checks_cache = Arc::default();
+        Arc::new(state)
+    }
+
     pub fn with_spf_resolver(
         self: Arc<Self>,
         spf_resolver: Arc<dyn camelmailer_core::SpfResolver>,
@@ -1966,6 +1987,11 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             get(resources::source_addresses_index),
         )
         .route("/cluster", get(crate::cluster_api::cluster_show))
+        .route("/dns_checks", get(crate::dns_checks::dns_checks_index))
+        .route(
+            "/dns_checks/candidate",
+            get(crate::dns_checks::dns_checks_candidate),
+        )
         .route(
             "/ip_pools/{pool_id}/ip_addresses",
             get(resources::ip_addresses_index).post(resources::ip_addresses_create),
