@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-14
+
 ### Changed
 
 - **Behaviour change: servers without an IP pool use IPv6 first again.**
@@ -141,7 +143,10 @@ integration tests) is green.
   address instead of being refused. The plain `smtp` listener now applies the
   same 107-byte cap and 10-second timeout to the header as `smtps`; it used
   to buffer an unterminated first line without limit and wait forever.
-  Refused headers are logged as a rate-limited warning.
+  Refused headers are logged as a rate-limited warning. This applies to
+  every installation with `smtp_server.proxy_protocol: true`, with no switch
+  back: a balancer that sends a malformed header now has its connections
+  closed.
 
 ## [0.13.1] - 2026-11-05
 
@@ -1498,7 +1503,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/camelmailer/camelmailer/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/camelmailer/camelmailer/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/camelmailer/camelmailer/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/camelmailer/camelmailer/compare/v0.11.0...v0.12.0
