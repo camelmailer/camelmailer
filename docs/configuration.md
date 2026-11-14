@@ -365,6 +365,16 @@ The lease defaults to `queued_message_lock_stale_days` (one day). Set
 lost host moving again within minutes; values below 90 are raised to 90. The
 same lease applies to the webhook queue and the lifecycle outbox.
 
+**Recommended: a lease of about 300 seconds.** The one-day default is kept
+only so an upgrade changes nothing. With it, a delivery stopped while talking
+to the receiver (a restart, a deploy, a reboot) waits a whole day before it is
+tried again. Five minutes is long enough to cover a worker that misses a few
+heartbeats under load (they run every 30 seconds) and short enough that such
+a delivery moves again soon after the worker comes back. Shorter leases add
+no duplicate sends while the worker can reach the database, because the
+heartbeat keeps a live worker's rows; they only make a stalled worker lose
+its rows sooner.
+
 On SIGTERM or SIGINT the worker stops taking new work and gives the
 deliveries in flight `shutdown_grace_seconds` to finish. Whatever is still
 running then is stopped:

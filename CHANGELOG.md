@@ -23,6 +23,9 @@ integration tests) is green.
   every 30 seconds, so a live worker never loses a row however long a
   delivery takes, and only the rows of a worker that died are taken over.
   Applies to the delivery queue, the webhook queue and the lifecycle outbox.
+  Unset, the one-day lease stays; about 300 seconds is recommended, so a
+  delivery stopped mid-conversation by a restart moves again within minutes
+  rather than a day (`docs/configuration.md`).
 - **Graceful worker shutdown.** On SIGTERM or SIGINT the worker stops taking
   new work, waits `worker.shutdown_grace_seconds` (default 8, below Docker's
   default stop timeout of 10 s) for what is in flight, and then stops the
