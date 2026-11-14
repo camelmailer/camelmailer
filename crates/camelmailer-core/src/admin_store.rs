@@ -319,6 +319,20 @@ pub trait AdminStore: Send + Sync {
     /// first, then by address.
     async fn list_source_address_checks(&self) -> Result<Vec<SourceAddressCheck>, StoreError>;
 
+    /// Register a process in the cluster topology, or refresh its entry:
+    /// `last_seen_at` becomes now, `details` and `version` are replaced, and
+    /// a stopped entry with the same id is live again.
+    async fn register_node(&self, node: &NodeRegistration) -> Result<(), StoreError>;
+    /// Mark a process as stopped (graceful shutdown).
+    async fn mark_node_stopped(&self, instance_id: &str, role: &str) -> Result<(), StoreError>;
+    /// Every registered process, by node name, role and start time.
+    async fn list_cluster_nodes(&self) -> Result<Vec<ClusterNode>, StoreError>;
+    /// Remove entries not seen for `days` days; returns how many.
+    async fn prune_cluster_nodes(&self, days: u32) -> Result<u64, StoreError>;
+    /// The queue rows each worker holds right now (delivery queue, webhook
+    /// queue, lifecycle outbox), by lock id.
+    async fn cluster_leases(&self) -> Result<Vec<NodeLeases>, StoreError>;
+
     /// Assign (or clear) a server's outbound IP pool.
     async fn set_server_ip_pool(
         &self,
@@ -1409,6 +1423,75 @@ impl AdminStore for crate::store::MemoryStore {
                 .then_with(|| a.address.cmp(&b.address))
         });
         Ok(checks)
+    }
+
+    async fn register_node(&self, node: &NodeRegistration) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let now = chrono::Utc::now();
+        let key = (node.instance_id.clone(), node.role.clone());
+        let started_at = inner
+            .cluster_nodes
+            .get(&key)
+            .map(|existing| existing.started_at)
+            .unwrap_or(now);
+        inner.cluster_nodes.insert(
+            key,
+            ClusterNode {
+                instance_id: node.instance_id.clone(),
+                role: node.role.clone(),
+                node_name: node.node_name.clone(),
+                version: node.version.clone(),
+                details: node.details.clone(),
+                started_at,
+                last_seen_at: now,
+                stopped_at: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn mark_node_stopped(&self, instance_id: &str, role: &str) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(node) = inner
+            .cluster_nodes
+            .get_mut(&(instance_id.to_string(), role.to_string()))
+        {
+            node.stopped_at = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn list_cluster_nodes(&self) -> Result<Vec<ClusterNode>, StoreError> {
+        let mut nodes: Vec<ClusterNode> = self
+            .inner
+            .read()
+            .unwrap()
+            .cluster_nodes
+            .values()
+            .cloned()
+            .collect();
+        nodes.sort_by(|a, b| {
+            a.node_name
+                .cmp(&b.node_name)
+                .then_with(|| a.role.cmp(&b.role))
+                .then_with(|| a.started_at.cmp(&b.started_at))
+        });
+        Ok(nodes)
+    }
+
+    async fn prune_cluster_nodes(&self, days: u32) -> Result<u64, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(days));
+        let before = inner.cluster_nodes.len();
+        inner
+            .cluster_nodes
+            .retain(|_, node| node.last_seen_at >= cutoff);
+        Ok((before - inner.cluster_nodes.len()) as u64)
+    }
+
+    async fn cluster_leases(&self) -> Result<Vec<NodeLeases>, StoreError> {
+        // The in-memory store has no delivery queues.
+        Ok(Vec::new())
     }
 
     async fn set_server_ip_pool(

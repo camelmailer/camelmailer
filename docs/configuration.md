@@ -101,6 +101,7 @@ smtp_server:
   tls_certificate_path: $config-file-root/smtp.cert
   tls_private_key_path: $config-file-root/smtp.key
   proxy_protocol: false       # enable behind HAProxy/NLB
+  shutdown_grace_seconds: 30  # default; env SMTP_SERVER_SHUTDOWN_GRACE_SECONDS
   listeners:                  # additional ports (default: none)
     - { port: 587, mode: smtp }
     - { port: 465, mode: smtps }
@@ -178,6 +179,32 @@ disabled.
 
 The server logs a warning at startup for as long as the window is open, so an
 installation cannot forget it is in this state.
+
+#### Graceful shutdown of the web and SMTP servers
+
+On SIGTERM or SIGINT both servers stop accepting connections and finish
+what is in flight before they stop, then mark their entry in the cluster
+topology stopped (see `cluster:` below):
+
+| | Grace period | What happens |
+|---|---|---|
+| SMTP | `smtp_server.shutdown_grace_seconds` (30; env `SMTP_SERVER_SHUTDOWN_GRACE_SECONDS`) | New connections are refused. A session in the middle of a transaction (from `MAIL FROM` to the end of `DATA`) finishes it; once its message is accepted or refused it gets `421 4.3.2 <smtp_hostname> Service shutting down, closing transmission channel` and is closed. When the grace period is over, every session still open gets the same `421` at once and is closed. |
+| Web | `web_server.shutdown_grace_seconds` (30; env `WEB_SERVER_SHUTDOWN_GRACE_SECONDS`) | New connections are refused, idle keep-alive connections are closed, requests in flight finish. When the grace period is over the server stops. |
+
+No accepted message is lost: the SMTP server queues a message before it
+answers `250`, so a message cut off by the grace period was never
+acknowledged and the client sends it again (to another node behind the load
+balancer, or later). The server stops as soon as nothing is left open, so
+the grace period is an upper bound, not a wait.
+
+The process manager's stop timeout must stay above the grace period, or the
+process is killed before it finishes. The compose file runs both servers
+with `init: true` and `stop_grace_period: 40s`; for systemd the default
+`TimeoutStopSec` of 90 seconds is enough. Docker without a
+`stop_grace_period` kills after 10 seconds: lower the grace periods or set
+one. Behind a load balancer, take the node out of the pool (or let its
+health check fail) before stopping it, so no new connections are routed to
+it while it drains.
 
 ### `dns:` — the records you publish
 
@@ -568,6 +595,37 @@ provider_groups:
 
 An entry with a built-in name replaces that group; any other name adds one,
 tried after the built-in groups. `other` cannot be configured.
+### `cluster:` topology and public addresses
+
+Every web, SMTP and worker process registers itself in the database and
+refreshes its entry every `heartbeat_interval_seconds`. The infrastructure
+dashboard and `GET /api/v2/admin/cluster` show the result: each process with
+its node name, role, version and last heartbeat, and for a worker the queue
+rows it holds (its lock id is its registration id). An entry not refreshed
+for `node_stale_seconds` shows as stale; a process that shuts down
+gracefully (SIGTERM or SIGINT) marks its entry stopped, so only a process
+that was killed or crashed goes stale. Entries not seen for seven days are removed. A failed registration is
+logged and retried on the next heartbeat; it never stops a process.
+
+```yaml
+cluster:
+  node_name: mail-1                  # default: the host name; env CAMELMAILER_NODE_NAME
+  load_balancer_address: 203.0.113.5 # the public address in front of the nodes
+  inbound_hostname: mail.example.com # MX target, A/AAAA on the load balancer
+  public_addresses: [203.0.113.10, "2001:db8::10"]   # env CAMELMAILER_PUBLIC_ADDRESSES
+  heartbeat_interval_seconds: 30     # at least 5
+  node_stale_seconds: 90             # at least twice the heartbeat interval
+```
+
+`load_balancer_address` and `inbound_hostname` describe the installation for
+the dashboard and its DNS checks. `public_addresses` lists the addresses
+receivers see for servers without an IP pool. Set it where the process only
+sees a private address, for example inside a Docker network, where the
+worker would otherwise check the reverse DNS of `172.18.0.5`. The reverse-DNS
+check then uses the listed address of each family instead of the detected
+one; a family that is not listed is still detected. With
+`smtp_client.skip_family_without_reverse_dns: true` the family decision
+follows the listed address too, which is the address the receiver judges.
 
 ### `lifecycle_webhooks:` installation events
 

@@ -1129,6 +1129,346 @@ async fn source_addresses_list_the_reverse_dns_results_for_global_admins() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn cluster_shows_the_registered_processes_and_pools_for_global_admins() {
+    let (app, state) = build_app().await;
+    let (status, body) =
+        request(&app, "GET", "/api/v2/admin/cluster", Some(GLOBAL_KEY), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["nodes"], json!([]));
+    assert_eq!(body["data"]["mixed_versions"], false);
+    assert_eq!(
+        body["data"]["cluster"]["load_balancer_address"],
+        Value::Null
+    );
+
+    for (id, role, version) in [
+        ("worker-a", "worker", "0.15.0"),
+        ("smtp-a", "smtp", "0.14.0"),
+    ] {
+        state
+            .store
+            .register_node(&camelmailer_core::NodeRegistration {
+                instance_id: id.into(),
+                role: role.into(),
+                node_name: "mail-1".into(),
+                version: version.into(),
+                details: json!({ "public_addresses": ["49.13.35.233"] }),
+            })
+            .await
+            .unwrap();
+    }
+    state
+        .store
+        .mark_node_stopped("smtp-a", "smtp")
+        .await
+        .unwrap();
+    let pool = state.store.create_ip_pool("Outbound", true).await.unwrap();
+    state
+        .store
+        .create_ip_address(camelmailer_core::admin_store::NewIpAddress {
+            ip_pool_id: pool.id,
+            ipv4: "49.13.35.233".into(),
+            ipv6: None,
+            hostname: "out1.mail.example.com".into(),
+            priority: 100,
+        })
+        .await
+        .unwrap();
+
+    let (_, body) = request(&app, "GET", "/api/v2/admin/cluster", Some(GLOBAL_KEY), None).await;
+    let nodes = body["data"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    let smtp = nodes.iter().find(|n| n["role"] == "smtp").unwrap();
+    let worker = nodes.iter().find(|n| n["role"] == "worker").unwrap();
+    assert_eq!(smtp["status"], "stopped");
+    assert_eq!(worker["status"], "live");
+    assert_eq!(worker["leases"]["queued_messages"], 0);
+    assert_eq!(worker["details"]["public_addresses"][0], "49.13.35.233");
+    // Only one live version: the stopped SMTP process does not count.
+    assert_eq!(body["data"]["mixed_versions"], false);
+    let addresses = &body["data"]["ip_pools"][0]["addresses"];
+    assert_eq!(addresses[0]["hostname"], "out1.mail.example.com");
+
+    let (status, _) = request(&app, "GET", "/api/v2/admin/cluster", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A fixed DNS table for the DNS-check endpoints.
+#[derive(Default)]
+struct FixedDns {
+    ips: std::collections::HashMap<String, Vec<std::net::IpAddr>>,
+    ptr: std::collections::HashMap<std::net::IpAddr, Vec<String>>,
+    lookups: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl camelmailer_api::dns_checks::DnsCheckResolver for FixedDns {
+    async fn txt(&self, _: &str) -> Result<Vec<String>, camelmailer_core::DnsError> {
+        Ok(Vec::new())
+    }
+    async fn ip_addresses(
+        &self,
+        name: &str,
+    ) -> Result<Vec<std::net::IpAddr>, camelmailer_core::DnsError> {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.ips.get(name).cloned().unwrap_or_default())
+    }
+    async fn mx_hosts(&self, _: &str) -> Result<Vec<String>, camelmailer_core::DnsError> {
+        Ok(Vec::new())
+    }
+    async fn ptr(
+        &self,
+        address: std::net::IpAddr,
+    ) -> Result<Vec<String>, camelmailer_core::DnsError> {
+        Ok(self.ptr.get(&address).cloned().unwrap_or_default())
+    }
+}
+
+async fn build_dns_app(dns: Arc<FixedDns>) -> (Router, Arc<ApiState>) {
+    let store = Arc::new(MemoryStore::new());
+    let base = ApiState::new(store, Some(GLOBAL_KEY.to_string()));
+    let mut state = (*base).clone();
+    state.config.cluster.inbound_hostname = Some("mail.example.com".into());
+    state.config.cluster.load_balancer_address = Some("198.51.100.5".into());
+    state.config.smtp_client.helo_from_ip_address = true;
+    let state = Arc::new(state).with_dns_check_resolver(dns);
+    (build_router(state.clone()), state)
+}
+
+#[tokio::test]
+async fn dns_checks_report_the_records_to_set_and_cache_the_run() {
+    let ip = |v: &str| v.parse::<std::net::IpAddr>().unwrap();
+    let mut dns = FixedDns::default();
+    dns.ips
+        .insert("mail.example.com".into(), vec![ip("198.51.100.5")]);
+    dns.ptr
+        .insert(ip("203.0.113.10"), vec!["out1.mail.example.com".into()]);
+    dns.ips
+        .insert("out1.mail.example.com".into(), vec![ip("203.0.113.10")]);
+    let dns = Arc::new(dns);
+    let (app, state) = build_dns_app(dns.clone()).await;
+    let pool = state.store.create_ip_pool("Outbound", true).await.unwrap();
+    for (ipv4, hostname) in [
+        ("203.0.113.10", "out1.mail.example.com"),
+        ("203.0.113.20", "out2.mail.example.com"),
+    ] {
+        state
+            .store
+            .create_ip_address(camelmailer_core::admin_store::NewIpAddress {
+                ip_pool_id: pool.id,
+                ipv4: ipv4.into(),
+                ipv6: None,
+                hostname: hostname.into(),
+                priority: 100,
+            })
+            .await
+            .unwrap();
+    }
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/dns_checks",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["cached"], false);
+    let groups = body["data"]["groups"].as_array().unwrap();
+    assert_eq!(groups[0]["subject"], "mail.example.com");
+    assert_eq!(groups[0]["status"], "ok");
+    assert_eq!(groups[1]["subject"], "203.0.113.10");
+    assert_eq!(groups[1]["status"], "ok");
+    assert_eq!(groups[2]["subject"], "203.0.113.20");
+    assert_eq!(groups[2]["status"], "fail");
+    assert_eq!(
+        body["data"]["instructions"],
+        json!([
+            "set PTR 203.0.113.20 → out2.mail.example.com (at the provider of the address)",
+            "set A out2.mail.example.com → 203.0.113.20, TTL 300"
+        ])
+    );
+
+    // A second call within the minute is served from the cache ...
+    let lookups = dns.lookups.load(std::sync::atomic::Ordering::SeqCst);
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/dns_checks",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(body["data"]["cached"], true);
+    assert_eq!(
+        dns.lookups.load(std::sync::atomic::Ordering::SeqCst),
+        lookups
+    );
+    // ... unless a refresh is asked for.
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/dns_checks?refresh=1",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(body["data"]["cached"], false);
+    assert!(dns.lookups.load(std::sync::atomic::Ordering::SeqCst) > lookups);
+
+    let (status, _) = request(&app, "GET", "/api/v2/admin/dns_checks", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn dns_checks_cover_dkim_dmarc_and_inbound_mx_by_domain_role() {
+    let (app, state) = build_dns_app(Arc::new(FixedDns::default())).await;
+    let org = state
+        .store
+        .create_organization(camelmailer_core::admin_store::NewOrganization {
+            name: "Acme".into(),
+            permalink: "acme".into(),
+        })
+        .await
+        .unwrap();
+    let server = state
+        .store
+        .create_server(camelmailer_core::admin_store::NewServer {
+            organization_id: org.id,
+            name: "Live".into(),
+            permalink: "live".into(),
+            mode: camelmailer_core::ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let sending = state
+        .store
+        .create_server_domain(server.id, "send.example", None)
+        .await
+        .unwrap();
+    state
+        .store
+        .set_domain_verified(sending.id, true)
+        .await
+        .unwrap();
+    // A domain with an inbound route, not verified for sending.
+    let inbound = state
+        .store
+        .create_server_domain(server.id, "in.example", None)
+        .await
+        .unwrap();
+    state
+        .store
+        .create_route_record(camelmailer_core::admin_store::NewRoute {
+            server_id: server.id,
+            domain_id: Some(inbound.id),
+            name: "support".into(),
+            mode: camelmailer_core::RouteMode::Accept,
+            endpoint_url: None,
+        })
+        .await
+        .unwrap();
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/dns_checks",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = body["data"]["groups"].as_array().unwrap();
+    let kinds = |subject: &str| -> Vec<(String, String)> {
+        groups
+            .iter()
+            .find(|g| g["subject"] == subject)
+            .map(|g| {
+                g["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| {
+                        (
+                            c["kind"].as_str().unwrap().to_string(),
+                            c["status"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The sending domain: DKIM (no key in this test installation: a
+    // warning) and DMARC (missing: a failure). No SPF check without a
+    // sending address.
+    assert_eq!(
+        kinds("send.example"),
+        vec![
+            ("dkim".to_string(), "warn".to_string()),
+            ("dmarc".to_string(), "fail".to_string())
+        ]
+    );
+    // The inbound domain: only its MX, and missing is a failure.
+    assert_eq!(
+        kinds("in.example"),
+        vec![("mx".to_string(), "fail".to_string())]
+    );
+    let instructions: Vec<&str> = body["data"]["instructions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(instructions.contains(&"set MX in.example → 10 mail.example.com, TTL 300"));
+    assert!(instructions
+        .iter()
+        .any(|i| i.starts_with("set TXT _dmarc.send.example → \"v=DMARC1; p=none;")));
+}
+
+#[tokio::test]
+async fn the_candidate_check_guides_a_new_address_until_it_is_ready() {
+    let ip = |v: &str| v.parse::<std::net::IpAddr>().unwrap();
+    let (app, _) = build_dns_app(Arc::new(FixedDns::default())).await;
+    let path =
+        "/api/v2/admin/dns_checks/candidate?ipv4=167.233.189.226&hostname=out2.mail.example.com";
+    let (status, body) = request(&app, "GET", path, Some(GLOBAL_KEY), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["ready"], false);
+    assert_eq!(
+        body["data"]["instructions"],
+        json!([
+            "set A out2.mail.example.com → 167.233.189.226, TTL 300",
+            "set PTR 167.233.189.226 → out2.mail.example.com (at the provider of the address)"
+        ])
+    );
+
+    let mut dns = FixedDns::default();
+    dns.ips
+        .insert("out2.mail.example.com".into(), vec![ip("167.233.189.226")]);
+    dns.ptr
+        .insert(ip("167.233.189.226"), vec!["out2.mail.example.com".into()]);
+    let (app, _) = build_dns_app(Arc::new(dns)).await;
+    let (_, body) = request(&app, "GET", path, Some(GLOBAL_KEY), None).await;
+    assert_eq!(body["data"]["ready"], true);
+    assert_eq!(
+        body["data"]["candidate"]["hostname"],
+        "out2.mail.example.com"
+    );
+
+    for bad in [
+        "/api/v2/admin/dns_checks/candidate?hostname=out2.mail.example.com",
+        "/api/v2/admin/dns_checks/candidate?ipv4=2001:db8::1&hostname=out2.mail.example.com",
+        "/api/v2/admin/dns_checks/candidate?ipv4=203.0.113.1&hostname=out2",
+        "/api/v2/admin/dns_checks/candidate?ipv4=203.0.113.1&hostname=a%0D%0Ab.example.com",
+    ] {
+        let (status, _) = request(&app, "GET", bad, Some(GLOBAL_KEY), None).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+    }
+}
+
 // ------------------------------------------------ P0: server config + keys
 
 #[tokio::test]

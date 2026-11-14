@@ -7848,6 +7848,65 @@ async fn webhook_queue_changes_need_the_worker_that_holds_the_row() {
     assert!(!webhooks.complete(request.id, "w1").await.unwrap());
 }
 
+/// The cluster topology: registration upserts and keeps started_at, a
+/// graceful stop is recorded and undone by the next registration, old
+/// entries are pruned, and the leases each worker holds are counted per
+/// queue by its lock id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cluster_nodes_register_stop_prune_and_count_leases() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let node = camelmailer_core::NodeRegistration {
+        instance_id: "worker-abc".into(),
+        role: "worker".into(),
+        node_name: "mail-1".into(),
+        version: "0.15.0".into(),
+        details: serde_json::json!({ "threads": 4 }),
+    };
+    f.store.register_node(&node).await.unwrap();
+    let first = f.store.list_cluster_nodes().await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].details["threads"], 4);
+
+    f.store
+        .mark_node_stopped("worker-abc", "worker")
+        .await
+        .unwrap();
+    assert!(f.store.list_cluster_nodes().await.unwrap()[0]
+        .stopped_at
+        .is_some());
+    let mut again = node.clone();
+    again.version = "0.15.1".into();
+    f.store.register_node(&again).await.unwrap();
+    let listed = f.store.list_cluster_nodes().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].stopped_at.is_none());
+    assert_eq!(listed[0].version, "0.15.1");
+    assert_eq!(listed[0].started_at, first[0].started_at);
+
+    // A row the worker holds in the delivery queue.
+    let sink = PgMessageSink::new(f.store.clone());
+    let mut message = message_for(f.server.id, "user@dest.example");
+    message.scope = MessageScope::Outgoing;
+    sink.insert_message(&message).await.unwrap();
+    let queue = camelmailer_db::PgQueue::new(pool.clone());
+    queue.dequeue("worker-abc").await.unwrap().unwrap();
+    let leases = f.store.cluster_leases().await.unwrap();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].locked_by, "worker-abc");
+    assert_eq!(leases[0].queued_messages, 1);
+    assert_eq!(leases[0].webhook_requests, 0);
+    assert!(leases[0].oldest_lock_at.is_some());
+
+    sqlx::query("UPDATE cluster_nodes SET last_seen_at = now() - interval '8 days'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(f.store.prune_cluster_nodes(7).await.unwrap(), 1);
+    assert!(f.store.list_cluster_nodes().await.unwrap().is_empty());
+}
+
 /// `DeliveryStatsStore` on Postgres behaves like the MemoryStore test in
 /// camelmailer-core: counters per day/address/provider, complaints credited
 /// through the message source, pruning.

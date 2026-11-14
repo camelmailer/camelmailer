@@ -58,6 +58,9 @@ web_server:
   #   - https://mail-admin.example.com
   default_port: 5000
   default_bind_address: 127.0.0.1   # containers override via BIND_ADDRESS
+  # On SIGTERM: no new connections, requests in flight finish within this
+  # many seconds (env WEB_SERVER_SHUTDOWN_GRACE_SECONDS).
+  shutdown_grace_seconds: 30
 
 smtp_server:
   default_port: 25
@@ -75,6 +78,9 @@ smtp_server:
   # the client address. Turn it back on once the log stays quiet.
   # auth_requires_tls: false
   # proxy_protocol: true            # behind HAProxy etc.
+  # On SIGTERM: no new connections, open transactions finish within this
+  # many seconds, the rest get 421 (env SMTP_SERVER_SHUTDOWN_GRACE_SECONDS).
+  shutdown_grace_seconds: 30
   # Additional listeners besides default_port (which always speaks plain
   # SMTP with optional STARTTLS). mode "smtp" behaves like default_port;
   # mode "smtps" is implicit TLS from the first byte (port 465) and
@@ -274,3 +280,16 @@ scim:
 #   - name: seznam
 #     domains: [seznam.cz, email.cz]   # exact, or brand.* for any TLD
 #     mx_patterns: [seznam.cz]         # the host and every host under it
+# Cluster topology (the infrastructure dashboard). Every web, SMTP and
+# worker process registers under node_name and refreshes its entry every
+# heartbeat_interval_seconds. Nothing here changes how mail is received or
+# delivered.
+cluster:
+  node_name: ""                      # default: the host name (env CAMELMAILER_NODE_NAME)
+  # load_balancer_address: 203.0.113.5   # the public address in front of the SMTP/web nodes
+  # inbound_hostname: mail.example.com   # what MX records point at (A/AAAA on the LB)
+  # public_addresses: [203.0.113.10, "2001:db8::10"]   # this host's public addresses for
+  #                                    # servers without an IP pool, when the process only sees
+  #                                    # a private one (Docker); env CAMELMAILER_PUBLIC_ADDRESSES
+  heartbeat_interval_seconds: 30
+  node_stale_seconds: 90

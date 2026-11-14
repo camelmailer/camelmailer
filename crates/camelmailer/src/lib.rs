@@ -29,8 +29,11 @@ use camelmailer_core::{AdminStore, MemorySink, MemoryStore, MessageSink, Store, 
 use camelmailer_db::{PgMessageSink, PgStore};
 use camelmailer_smtp::SmtpServer;
 use camelmailer_worker::Worker;
+use std::future::IntoFuture;
 use std::process::ExitCode;
 use std::sync::Arc;
+
+pub mod cluster;
 
 pub use camelmailer_api;
 pub use camelmailer_config;
@@ -116,13 +119,24 @@ fn run_async(future: impl std::future::Future<Output = std::io::Result<()>>) -> 
 }
 
 fn load_config() -> camelmailer_config::Config {
-    match camelmailer_config::Config::load_from_env() {
+    let loaded = camelmailer_config::Config::load_from_env().and_then(|mut config| {
+        // CAMELMAILER_NODE_NAME and CAMELMAILER_PUBLIC_ADDRESSES, so one
+        // config file can serve several hosts.
+        config.cluster = config.cluster.with_env_overrides()?;
+        Ok(config)
+    });
+    match loaded {
         Ok(config) => config,
         Err(error) => {
             eprintln!("configuration error: {error}");
             std::process::exit(1);
         }
     }
+}
+
+/// The heartbeat interval of the cluster registration.
+fn heartbeat_interval(config: &camelmailer_config::Config) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(config.cluster.heartbeat_interval_seconds))
 }
 
 fn postgres_enabled(config: &camelmailer_config::Config) -> bool {
@@ -380,6 +394,7 @@ pub async fn web_server_with(extensions: Extensions) -> std::io::Result<()> {
     tokio::spawn(run_campaign_scheduler(state.clone()));
 
     let mut router = build_app(state.clone(), tracking);
+    let cluster_state = state.clone();
     if let Some(routes) = &extensions.routes {
         router = router.merge(routes(state.clone()));
     }
@@ -397,9 +412,66 @@ pub async fn web_server_with(extensions: Extensions) -> std::io::Result<()> {
     let bind_address = std::env::var("BIND_ADDRESS")
         .unwrap_or_else(|_| config.web_server.default_bind_address.clone());
 
+    let grace = config
+        .web_server
+        .shutdown_grace()
+        .map_err(std::io::Error::other)?;
     let listener = tokio::net::TcpListener::bind((bind_address.as_str(), port)).await?;
     tracing::info!(%bind_address, port, "camelmailer web server listening");
-    axum::serve(listener, router).await
+    cluster::registered(
+        cluster_state.store.clone(),
+        cluster::registration(
+            &config.cluster,
+            cluster::instance_id("web"),
+            "web",
+            serde_json::json!({ "port": port, "shutdown_grace_seconds": grace.as_secs() }),
+        ),
+        heartbeat_interval(&config),
+        serve_web_until(
+            listener,
+            router,
+            camelmailer_worker::shutdown_signal(),
+            grace,
+        ),
+    )
+    .await
+}
+
+/// Serve `router` until `shutdown` resolves (SIGTERM or SIGINT in
+/// production), then shut down gracefully: stop accepting connections, let
+/// requests in flight finish for up to `grace`, and stop.
+pub async fn serve_web_until(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+    grace: std::time::Duration,
+) -> std::io::Result<()> {
+    let (draining_tx, mut draining) = tokio::sync::watch::channel(false);
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = draining.wait_for(|draining| *draining).await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    tokio::pin!(shutdown);
+    tokio::select! {
+        result = &mut server => return result,
+        _ = &mut shutdown => {}
+    }
+    tracing::info!(
+        grace_seconds = grace.as_secs(),
+        "web server shutting down: no new connections, requests in flight finish"
+    );
+    let _ = draining_tx.send(true);
+    match tokio::time::timeout(grace, &mut server).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                "web server shutdown grace period over; stopping with requests still open"
+            );
+            Ok(())
+        }
+    }
 }
 
 pub async fn worker() -> std::io::Result<()> {
@@ -428,12 +500,29 @@ pub async fn worker() -> std::io::Result<()> {
         source_addresses = ?settings.source_addresses,
         "worker delivery scope"
     );
-    Arc::new(
-        Worker::new(&config, store)
-            .with_delivery(filter, settings.threads)
-            .with_source_selection(&settings),
+    let worker = Worker::new(&config, store.clone())
+        .with_delivery(filter, settings.threads)
+        .with_source_selection(&settings);
+    // The worker registers under its queue lock id, so the dashboard can
+    // tell which node holds which leases.
+    let node = cluster::registration(
+        &config.cluster,
+        worker.worker_id().to_string(),
+        "worker",
+        serde_json::json!({
+            "threads": settings.threads,
+            "host_aware_pools": settings.host_aware_pools,
+            "source_addresses": settings.source_addresses,
+            "shutdown_grace_seconds": settings.shutdown_grace_seconds,
+        }),
+    );
+    let admin: Arc<dyn AdminStore> = Arc::new(store);
+    cluster::registered(
+        admin,
+        node,
+        heartbeat_interval(&config),
+        Arc::new(worker).run(),
     )
-    .run()
     .await
     .map_err(std::io::Error::other)
 }
@@ -468,13 +557,48 @@ async fn worker_queue_filter(
 
 pub async fn smtp_server() -> std::io::Result<()> {
     let config = load_config();
-    let (store, sink): (Arc<dyn Store>, Arc<dyn MessageSink>) = if postgres_enabled(&config) {
-        let store = connect_pg(&config).await?;
-        (Arc::new(store.clone()), Arc::new(PgMessageSink::new(store)))
-    } else {
-        tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
-        (Arc::new(MemoryStore::new()), Arc::new(MemorySink::new()))
-    };
+    let (store, sink, admin): (Arc<dyn Store>, Arc<dyn MessageSink>, Arc<dyn AdminStore>) =
+        if postgres_enabled(&config) {
+            let store = connect_pg(&config).await?;
+            (
+                Arc::new(store.clone()),
+                Arc::new(PgMessageSink::new(store.clone())),
+                Arc::new(store),
+            )
+        } else {
+            tracing::warn!("postgres is not enabled; using in-memory storage (non-persistent)");
+            let memory = Arc::new(MemoryStore::new());
+            (memory.clone(), Arc::new(MemorySink::new()), memory)
+        };
+    let mut listeners = vec![serde_json::json!({
+        "port": config.smtp_server.default_port,
+        "mode": "smtp",
+    })];
+    listeners.extend(config.smtp_server.listeners.iter().map(|listener| {
+        serde_json::json!({
+            "port": listener.port,
+            "mode": match listener.mode {
+                camelmailer_config::SmtpListenerMode::Smtp => "smtp",
+                camelmailer_config::SmtpListenerMode::Smtps => "smtps",
+            },
+        })
+    }));
+    let grace = config
+        .smtp_server
+        .shutdown_grace()
+        .map_err(std::io::Error::other)?;
+    let node = cluster::registration(
+        &config.cluster,
+        cluster::instance_id("smtp"),
+        "smtp",
+        serde_json::json!({
+            "listeners": listeners,
+            "proxy_protocol": config.smtp_server.proxy_protocol,
+            "tls_enabled": config.smtp_server.tls_enabled,
+            "shutdown_grace_seconds": grace.as_secs(),
+        }),
+    );
+    let interval = heartbeat_interval(&config);
     if config.smtp_server.tls_enabled && !config.smtp_server.auth_requires_tls {
         // Say it on every boot. The setting is a migration window, and a
         // window nobody is reminded of stays open.
@@ -484,7 +608,16 @@ pub async fn smtp_server() -> std::io::Result<()> {
              STARTTLS; each such AUTH is logged"
         );
     }
-    SmtpServer::new(config, store, sink).run().await
+    // On SIGTERM or SIGINT: no new connections, open transactions finish,
+    // the rest get 421 after the grace period; the node is marked stopped.
+    let server = SmtpServer::new(config, store, sink).with_shutdown_grace(grace);
+    cluster::registered(
+        admin,
+        node,
+        interval,
+        server.run_until(camelmailer_worker::shutdown_signal()),
+    )
+    .await
 }
 
 fn print_usage() {
@@ -505,4 +638,90 @@ fn print_usage() {
     println!("Other tools:");
     println!();
     println!(" * version - show the current Camelmailer version");
+}
+
+#[cfg(test)]
+mod web_shutdown_tests {
+    use super::serve_web_until;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A router with one request that takes `delay` to answer.
+    fn slow_router(delay: Duration) -> axum::Router {
+        axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || async move {
+                tokio::time::sleep(delay).await;
+                "done"
+            }),
+        )
+    }
+
+    async fn get(port: u16) -> std::io::Result<String> {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await?;
+        Ok(response)
+    }
+
+    async fn start(
+        delay: Duration,
+        grace: Duration,
+    ) -> (
+        u16,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_web_until(
+            listener,
+            slow_router(delay),
+            async move {
+                let _ = stopped.await;
+            },
+            grace,
+        ));
+        (port, stop, server)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_in_flight_finishes_and_new_connections_are_refused() {
+        let (port, stop, server) = start(Duration::from_millis(400), Duration::from_secs(10)).await;
+        let in_flight = tokio::spawn(get(port));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "no new connections once the shutdown began"
+        );
+        let response = in_flight.await.unwrap().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("done"));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stops once the request finished")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_grace_period_bounds_the_wait() {
+        let (port, stop, server) = start(Duration::from_secs(30), Duration::from_millis(200)).await;
+        let _in_flight = tokio::spawn(get(port));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("stops after the grace period")
+            .unwrap()
+            .unwrap();
+    }
 }
