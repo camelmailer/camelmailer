@@ -40,7 +40,8 @@ send your first message in about five minutes, then read
 |---|---|
 | [Sending domains](domains.md) | Adding a domain, DKIM (per-domain key with installation fallback), SPF, and DNS verification |
 | [DMARC monitoring](dmarc.md) | Domain health checks and DMARC aggregate report ingestion |
-| [Deliverability and IP pools](deliverability.md) | IP pools, the stream then server then default resolution order, and warmup guidance |
+| [Deliverability and IP pools](deliverability.md) | IP pools, the stream then server then default resolution order, IP metrics, and the adaptive warm-up |
+| [Provider feedback](provider-feedback.md) | Google Postmaster Tools, Microsoft SNDS, feedback loops (JMRP, CFL) and seed inbox placement: setup, signals, privacy |
 
 ## Receiving and integrating
 
@@ -54,6 +55,8 @@ send your first message in about five minutes, then read
 
 | Page | What it covers |
 |---|---|
+| [High availability](high-availability.md) | Several nodes behind a load balancer: PROXY protocol, worker leases, heartbeats and graceful shutdown, which processes may run more than once, the DNS model, failure modes and rollback |
+| [Infrastructure dashboard](infrastructure-dashboard.md) | Topology, DNS checks with the exact records to set, the add server / add IP wizard, IP metrics and warm-up, provider feedback |
 | [Administration and abuse monitoring](administration.md) | The instance overview, per-organization traffic, the flags worth watching, suspending a server, and deleting a tenant |
 
 ## Account and cloud

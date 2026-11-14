@@ -96,6 +96,10 @@ streams](docs/streams.md), [templates](docs/templates.md) and
 [sending domains](docs/domains.md), [DMARC](docs/dmarc.md) and
 [IP pools](docs/deliverability.md); and integration through
 [inbound routing](docs/inbound.md) and [webhooks](docs/webhooks.md).
+Running several nodes behind a load balancer is described in
+[high availability](docs/high-availability.md), and the topology, DNS checks,
+IP metrics and warm-up views in the
+[infrastructure dashboard](docs/infrastructure-dashboard.md).
 
 ## How it's built
 
