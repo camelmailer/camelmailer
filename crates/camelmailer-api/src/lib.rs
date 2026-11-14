@@ -8,6 +8,7 @@ pub mod captcha;
 mod cluster_api;
 pub mod cors;
 pub mod dns;
+pub mod dns_checks;
 mod memberships;
 pub mod oidc;
 pub mod org_sso_api;
