@@ -84,7 +84,17 @@ pub struct Camelmailer {
     pub smtp_relays: Vec<String>,
     /// IP addresses to trust for proxying requests (in addition to localhost)
     pub trusted_proxies: Vec<String>,
+    /// How long a queued message, webhook request or lifecycle event may
+    /// stay locked before another worker takes it over, in days. Superseded
+    /// by `queued_message_lock_stale_seconds` when that is set.
     pub queued_message_lock_stale_days: u32,
+    /// The same lock lease in seconds. When set it replaces
+    /// `queued_message_lock_stale_days`. A worker refreshes the locks it
+    /// holds every 30 seconds while it works, so a live worker never loses a
+    /// row however long its delivery takes; only the rows of a worker that
+    /// died are taken over once the lease runs out. Values below 90 are
+    /// raised to 90 (three heartbeats). Unset by default.
+    pub queued_message_lock_stale_seconds: Option<u32>,
     #[serde(default = "default_true")]
     pub batch_queued_messages: bool,
     pub batch_queued_messages_limit: u32,
@@ -111,6 +121,29 @@ pub struct Camelmailer {
     pub message_retention_days: u32,
 }
 
+/// Default `worker.shutdown_grace_seconds`: below Docker's default stop
+/// timeout of 10 s, so a worker without a configured `stop_grace_period`
+/// still finishes its shutdown before it is killed.
+pub const DEFAULT_SHUTDOWN_GRACE_SECONDS: u32 = 8;
+
+/// The shortest lock lease a worker accepts: three heartbeats.
+pub const MIN_QUEUE_LOCK_LEASE_SECONDS: u32 = 90;
+
+impl Camelmailer {
+    /// The effective lock lease in seconds: `queued_message_lock_stale_seconds`
+    /// when set (at least [`MIN_QUEUE_LOCK_LEASE_SECONDS`]), otherwise
+    /// `queued_message_lock_stale_days` (at least one day).
+    pub fn queue_lock_lease_seconds(&self) -> u32 {
+        match self.queued_message_lock_stale_seconds {
+            Some(seconds) => seconds.max(MIN_QUEUE_LOCK_LEASE_SECONDS),
+            None => self
+                .queued_message_lock_stale_days
+                .max(1)
+                .saturating_mul(86_400),
+        }
+    }
+}
+
 impl Default for Camelmailer {
     fn default() -> Self {
         Self {
@@ -131,6 +164,7 @@ impl Default for Camelmailer {
             smtp_relays: vec![],
             trusted_proxies: vec![],
             queued_message_lock_stale_days: 1,
+            queued_message_lock_stale_seconds: None,
             batch_queued_messages: true,
             batch_queued_messages_limit: 100,
             admin_api_key: None,
@@ -611,6 +645,31 @@ pub struct Worker {
     /// Which mail this worker delivers: `all`, `transactional` or `bulk`
     /// (broadcast streams and campaigns).
     pub deliver: WorkerDeliver,
+    /// Choose the source address among the pool addresses this host holds,
+    /// so workers on several hosts can share a pool, each sending from its
+    /// own addresses. Off: every worker uses the pool's first address, as
+    /// before.
+    pub host_aware_pools: bool,
+    /// With `host_aware_pools`: the addresses this host may send from. Empty
+    /// takes the addresses configured on this host's network interfaces,
+    /// re-read every 30 s.
+    /// List them where an address is configured on the interface but routed
+    /// to another host.
+    pub source_addresses: Vec<String>,
+    /// With `host_aware_pools`: how long a message whose pool has no address
+    /// on this host is left for the other hosts before this worker looks at
+    /// it again. No attempt is counted. At least 1 (env
+    /// `WORKER_FOREIGN_POOL_DELAY_SECONDS`).
+    pub foreign_pool_delay_seconds: u32,
+    /// On SIGTERM or SIGINT the worker stops taking new work and waits this
+    /// many seconds for the deliveries it has in flight. Whatever is still
+    /// running then is stopped: rows that had not reached a receiver go back
+    /// to the queue without counting an attempt, the rest keep their lock
+    /// until the lease runs out. Keep it below the stop timeout of the
+    /// process manager (Docker: `stop_grace_period`, default 10 s), which is
+    /// why the default is 8: the worker then finishes its shutdown before
+    /// Docker would kill it, even with no stop timeout configured.
+    pub shutdown_grace_seconds: u32,
 }
 
 impl Default for Worker {
@@ -622,6 +681,10 @@ impl Default for Worker {
             servers: Vec::new(),
             exclude_servers: Vec::new(),
             deliver: WorkerDeliver::All,
+            host_aware_pools: false,
+            source_addresses: Vec::new(),
+            foreign_pool_delay_seconds: 30,
+            shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
         }
     }
 }
@@ -669,6 +732,27 @@ impl Worker {
         if let Some(value) = var("WORKER_EXCLUDE_SERVERS") {
             worker.exclude_servers = list(value);
         }
+        if let Some(value) = var("WORKER_HOST_AWARE_POOLS") {
+            worker.host_aware_pools = match value.trim() {
+                "true" | "1" => true,
+                "false" | "0" | "" => false,
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "WORKER_HOST_AWARE_POOLS must be true or false (got {other:?})"
+                    )))
+                }
+            };
+        }
+        if let Some(value) = var("WORKER_SOURCE_ADDRESSES") {
+            worker.source_addresses = list(value);
+        }
+        if let Some(value) = var("WORKER_FOREIGN_POOL_DELAY_SECONDS") {
+            worker.foreign_pool_delay_seconds = value.trim().parse().map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "WORKER_FOREIGN_POOL_DELAY_SECONDS must be a number (got {value:?})"
+                ))
+            })?;
+        }
         if let Some(value) = var("WORKER_DELIVER") {
             worker.deliver = match value.trim() {
                 "all" => WorkerDeliver::All,
@@ -686,9 +770,21 @@ impl Worker {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        for address in &self.source_addresses {
+            if address.parse::<std::net::IpAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "worker.source_addresses takes IP addresses (got {address:?})"
+                )));
+            }
+        }
         if self.threads == 0 {
             return Err(ConfigError::Invalid(
                 "worker.threads must be at least 1".into(),
+            ));
+        }
+        if self.foreign_pool_delay_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "worker.foreign_pool_delay_seconds must be at least 1".into(),
             ));
         }
         for entry in self.servers.iter().chain(&self.exclude_servers) {
@@ -1109,6 +1205,12 @@ pub struct SmtpClient {
     /// Seconds to wait while the message body is sent and for the reply to
     /// its final dot (RFC 5321: ten minutes).
     pub data_timeout: u32,
+    /// Greet with the `hostname` of the IP-pool address a delivery is bound
+    /// to, so EHLO, the address's PTR and its A record name the same host.
+    /// Falls back to `dns.helo_hostname` (else `camelmailer.smtp_hostname`)
+    /// when the delivery has no pool address or the address has no hostname.
+    /// Off by default, so an installation's EHLO never changes by itself.
+    pub helo_from_ip_address: bool,
 }
 
 impl Default for SmtpClient {
@@ -1121,6 +1223,7 @@ impl Default for SmtpClient {
             open_timeout: 30,
             read_timeout: 300,
             data_timeout: 600,
+            helo_from_ip_address: false,
         }
     }
 }
@@ -1596,6 +1699,10 @@ mod tests {
         assert_eq!(config.worker.threads, 2);
         assert!(config.worker.servers.is_empty());
         assert_eq!(config.worker.deliver, WorkerDeliver::All);
+        // Below Docker's default stop timeout of 10 s, so the worker is not
+        // killed mid-shutdown when no stop_grace_period is configured.
+        assert_eq!(config.worker.shutdown_grace_seconds, 8);
+        assert!(config.worker.shutdown_grace_seconds < 10);
 
         assert_eq!(config.main_db.host, "localhost");
         assert_eq!(config.main_db.port, 3306);
@@ -2339,5 +2446,44 @@ smtp_server:
         assert!(Worker::default().with_overrides(bad).is_err());
         let zero = |name: &str| (name == "WORKER_THREADS").then(|| "0".to_string());
         assert!(Worker::default().with_overrides(zero).is_err());
+    }
+
+    #[test]
+    fn host_aware_pool_settings_come_from_the_environment() {
+        let env = |name: &str| match name {
+            "WORKER_HOST_AWARE_POOLS" => Some("true".to_string()),
+            "WORKER_SOURCE_ADDRESSES" => Some("203.0.113.5, 2001:db8::5".to_string()),
+            _ => None,
+        };
+        let worker = Worker::default().with_overrides(env).unwrap();
+        assert!(worker.host_aware_pools);
+        assert_eq!(worker.source_addresses, vec!["203.0.113.5", "2001:db8::5"]);
+        assert_eq!(worker.foreign_pool_delay_seconds, 30);
+        assert!(!Worker::default().host_aware_pools);
+
+        let bad_flag = |name: &str| (name == "WORKER_HOST_AWARE_POOLS").then(|| "yes".to_string());
+        assert!(Worker::default().with_overrides(bad_flag).is_err());
+        let bad_address =
+            |name: &str| (name == "WORKER_SOURCE_ADDRESSES").then(|| "out1.example".to_string());
+        assert!(Worker::default().with_overrides(bad_address).is_err());
+    }
+
+    #[test]
+    fn the_foreign_pool_delay_comes_from_the_environment_and_must_be_positive() {
+        let delay =
+            |name: &str| (name == "WORKER_FOREIGN_POOL_DELAY_SECONDS").then(|| "90".to_string());
+        assert_eq!(
+            Worker::default()
+                .with_overrides(delay)
+                .unwrap()
+                .foreign_pool_delay_seconds,
+            90
+        );
+        let zero =
+            |name: &str| (name == "WORKER_FOREIGN_POOL_DELAY_SECONDS").then(|| "0".to_string());
+        assert!(Worker::default().with_overrides(zero).is_err());
+        let junk =
+            |name: &str| (name == "WORKER_FOREIGN_POOL_DELAY_SECONDS").then(|| "soon".to_string());
+        assert!(Worker::default().with_overrides(junk).is_err());
     }
 }

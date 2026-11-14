@@ -3048,6 +3048,15 @@ pub(crate) async fn ip_addresses_create(
             "param is missing or the value is empty: hostname",
         );
     };
+    // The hostname can become the EHLO name (smtp_client.helo_from_ip_address)
+    // and is written into an SMTP command, so only a fully qualified host name
+    // is stored: no CR/LF or spaces, no IP literal, no trailing dot.
+    if !camelmailer_core::is_valid_helo_hostname(&hostname) {
+        return render_validation_error(
+            Some(&start),
+            "Hostname must be a fully qualified host name (such as out1.example.com)",
+        );
+    }
     from_result(
         &start,
         state

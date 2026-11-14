@@ -278,7 +278,23 @@ impl SmtpSender {
         raw_message: &[u8],
         source: OutboundSource,
     ) -> SendOutcome {
+        self.send_with_helo(domain, mail_from, rcpt_to, raw_message, source, None)
+            .await
+    }
+
+    /// Like [`SmtpSender::send`], greeting with `helo_hostname` instead of the
+    /// configured name when it is given.
+    pub async fn send_with_helo(
+        &self,
+        domain: &str,
+        mail_from: &str,
+        rcpt_to: &str,
+        raw_message: &[u8],
+        source: OutboundSource,
+        helo_hostname: Option<&str>,
+    ) -> SendOutcome {
         let source = self.effective_source(source);
+        let helo_hostname = helo_hostname.unwrap_or(&self.helo_hostname).to_string();
         let endpoints = self.resolve_endpoints(domain).await;
         let mut last = SendOutcome::SoftFail {
             response: format!("no delivery endpoints for {domain}"),
@@ -287,7 +303,7 @@ impl SmtpSender {
             let params = SendParams {
                 host: endpoint.host.clone(),
                 port: endpoint.port,
-                helo_hostname: self.helo_hostname.clone(),
+                helo_hostname: helo_hostname.clone(),
                 mail_from: mail_from.to_string(),
                 rcpt_to: rcpt_to.to_string(),
                 timeout: self.timeout,

@@ -2424,6 +2424,27 @@ impl camelmailer_core::ServerStore for PgStore {
         Ok(row.map(|row| row.get::<String, _>("ipv4")))
     }
 
+    async fn source_addresses_for(
+        &self,
+        server_id: Id,
+        stream_id: Option<Id>,
+    ) -> Result<Vec<IpAddress>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT a.* FROM ip_addresses a
+             WHERE a.ip_pool_id = COALESCE(
+                 (SELECT ms.ip_pool_id FROM message_streams ms
+                  WHERE ms.id = $2 AND ms.server_id = $1),
+                 (SELECT s.ip_pool_id FROM servers s WHERE s.id = $1))
+             ORDER BY a.priority, a.id",
+        )
+        .bind(server_id as i64)
+        .bind(stream_id.map(|id| id as i64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Self::sqlx_error)?;
+        Ok(rows.iter().map(ip_address_from_row).collect())
+    }
+
     async fn inbound_messages(
         &self,
         server_id: Id,
@@ -4196,16 +4217,22 @@ async fn insert_message_in_tx(
         .unwrap_or_default();
     // Mail on a broadcast stream (campaigns included) is bulk: the worker
     // delivers a server's transactional mail first.
+    // Outgoing mail records the pool it sends from (stream pool, else server
+    // pool), so a worker can skip the pools its host holds no address of.
     sqlx::query(
-        "INSERT INTO queued_messages (message_id, server_id, domain, bulk)
+        "INSERT INTO queued_messages (message_id, server_id, domain, bulk, source_pool_id)
          VALUES ($1, $2, $3, coalesce(
              (SELECT stream_type = 'broadcast' FROM message_streams WHERE id = $4),
-             false))",
+             false),
+             CASE WHEN $5 THEN COALESCE(
+                 (SELECT ip_pool_id FROM message_streams WHERE id = $4 AND server_id = $2),
+                 (SELECT ip_pool_id FROM servers WHERE id = $2)) END)",
     )
     .bind(message_id)
     .bind(message.server_id as i64)
     .bind(destination_domain)
     .bind(message.stream_id.map(|id| id as i64))
+    .bind(message.scope == camelmailer_core::MessageScope::Outgoing)
     .execute(&mut **tx)
     .await?;
 
@@ -5377,10 +5404,14 @@ impl PgMessageSink {
             .await?;
         if !in_queue {
             sqlx::query(
-                "INSERT INTO queued_messages (message_id, server_id, domain, bulk)
+                "INSERT INTO queued_messages (message_id, server_id, domain, bulk, source_pool_id)
                  SELECT m.id, $2, coalesce(split_part(m.rcpt_to, '@', 2), ''), coalesce(
                      (SELECT stream_type = 'broadcast' FROM message_streams WHERE id = m.stream_id),
-                     false)
+                     false),
+                     COALESCE(
+                         (SELECT ip_pool_id FROM message_streams
+                          WHERE id = m.stream_id AND server_id = $2),
+                         (SELECT ip_pool_id FROM servers WHERE id = $2))
                  FROM messages m WHERE m.id = $1",
             )
             .bind(message_id)

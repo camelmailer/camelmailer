@@ -4100,3 +4100,899 @@ async fn deleting_a_user_anonymises_their_audit_events() {
     assert_eq!(user_id, None);
     assert_eq!(email, None);
 }
+
+/// Start `worker.run_until` in the background with a shutdown it controls.
+fn run_in_background(
+    worker: Worker,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), camelmailer_worker::LoopFailed>>,
+) {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(Arc::new(worker).run_until(async move {
+        let _ = stopped.await;
+    }));
+    (stop, handle)
+}
+
+async fn queue_row_state(pool: &PgPool) -> Option<(Option<String>, i32)> {
+    sqlx::query_as::<_, (Option<String>, i32)>("SELECT locked_by, attempts FROM queued_messages")
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+/// The remote has the whole message and holds its `250` when the grace
+/// period runs out. It may well accept it, so the row must not go straight
+/// back to the queue (a duplicate); it keeps its lock for the lease, as
+/// after a crash, with no attempt counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_keeps_a_delivery_stopped_after_its_data_locked_for_the_lease() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = paused_mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_shutdown_grace(std::time::Duration::from_millis(300));
+    let worker_id = worker.worker_id().to_string();
+    let (stop, handle) = run_in_background(worker);
+
+    // The remote holds its reply, so the delivery is in flight.
+    smtp.final_response_ready.notified().await;
+    assert_eq!(
+        queue_row_state(&pool).await,
+        Some((Some(worker_id.clone()), 0)),
+        "the delivery holds its row"
+    );
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("the worker stops within its grace period")
+        .unwrap()
+        .unwrap();
+
+    // Still locked by the stopped worker, no attempt counted: another worker
+    // takes it once the lease runs out, not now.
+    assert_eq!(
+        queue_row_state(&pool).await,
+        Some((Some(worker_id.clone()), 0))
+    );
+    assert!(PgQueue::new(pool.clone())
+        .dequeue("another-worker")
+        .await
+        .unwrap()
+        .is_none());
+    smtp.final_response_release.notify_one();
+}
+
+/// The receiver accepted the message, but recording that failed. The row
+/// stays locked by this worker; a shutdown must not hand it back for an
+/// immediate resend of a delivered message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_keeps_a_row_whose_recording_failed_after_the_250() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    // Recording the delivery fails after the remote's 250.
+    sqlx::query(
+        "CREATE FUNCTION fail_delivery() RETURNS trigger LANGUAGE plpgsql AS
+         $$ BEGIN RAISE EXCEPTION 'recording failed'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_delivery BEFORE INSERT ON deliveries
+         FOR EACH ROW EXECUTE FUNCTION fail_delivery()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_shutdown_grace(std::time::Duration::from_secs(5));
+    let worker_id = worker.worker_id().to_string();
+    let (stop, handle) = run_in_background(worker);
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !smtp.received.lock().unwrap().iter().any(|line| line == ".") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the remote received the message");
+    // Let the worker run into the failed recording.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("the worker stops")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(queue_row_state(&pool).await, Some((Some(worker_id), 0)));
+    let deliveries = smtp
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.to_ascii_uppercase().starts_with("MAIL FROM"))
+        .count();
+    assert_eq!(deliveries, 1, "sent exactly once");
+}
+
+/// A shutdown that arrives while the main loop is delivering a message lets
+/// that delivery finish, but starts no webhook request after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_starts_no_webhook_after_the_running_delivery() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = paused_mock_smtp("250 Accepted").await;
+    let hook = mock_http(axum::http::StatusCode::OK).await;
+    let webhook = s
+        .store
+        .create_webhook(NewWebhook::all(s.server.id, "hook", &hook.url, false))
+        .await
+        .unwrap();
+    camelmailer_db::PgWebhookQueue::new(pool.clone())
+        .enqueue(
+            s.server.id,
+            webhook.id,
+            "u-1",
+            "MessageSent",
+            &hook.url,
+            "{}",
+            false,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    let message_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    // One loop only, so the delivery and the webhooks share the main loop.
+    let mut config = worker_config(smtp.port);
+    config.worker.threads = 1;
+    let worker = Worker::new(&config, s.store.clone())
+        .with_shutdown_grace(std::time::Duration::from_secs(10));
+    let (stop, handle) = run_in_background(worker);
+
+    smtp.final_response_ready.notified().await;
+    stop.send(()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    smtp.final_response_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+        .await
+        .expect("the worker stops")
+        .unwrap()
+        .unwrap();
+
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Sent", "the running delivery finished");
+    assert!(
+        hook.requests.lock().unwrap().is_empty(),
+        "no webhook was sent after the shutdown request"
+    );
+    let unattempted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM webhook_requests WHERE attempts = 0 AND locked_by IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        unattempted >= 1,
+        "the queued webhook waits for the next worker"
+    );
+}
+
+/// A receiver that holds its greeting back for `delay` (as Hornetsecurity
+/// does), then accepts the message.
+async fn slow_greeting_mock_smtp(delay: std::time::Duration) -> MockSmtp {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let captured = captured.clone();
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                tokio::time::sleep(delay).await;
+                write_half
+                    .write_all(b"220 slow.example ESMTP\r\n")
+                    .await
+                    .ok();
+                let mut in_data = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let trimmed = line.trim_end().to_string();
+                    captured.lock().unwrap().push(trimmed.clone());
+                    if in_data {
+                        if trimmed == "." {
+                            in_data = false;
+                            write_half.write_all(b"250 Queued\r\n").await.ok();
+                        }
+                        continue;
+                    }
+                    let upper = trimmed.to_ascii_uppercase();
+                    let reply: &str = if upper.starts_with("EHLO") {
+                        "250-slow.example\r\n250 OK"
+                    } else if upper.starts_with("DATA") {
+                        in_data = true;
+                        "354 Go ahead"
+                    } else if upper.starts_with("QUIT") {
+                        write_half.write_all(b"221 Bye\r\n").await.ok();
+                        return;
+                    } else {
+                        "250 OK"
+                    };
+                    write_half
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await
+                        .ok();
+                }
+            });
+        }
+    });
+    MockSmtp { port, received }
+}
+
+/// End to end through the long-running worker (`run_until`, the path the
+/// binary takes): the first endpoint refuses the connection, the second holds
+/// its greeting back longer than the connect timeout. The message is still
+/// delivered, once, and the worker shuts down cleanly with nothing locked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_running_worker_delivers_past_a_dead_first_endpoint_to_a_slow_greeting() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let dead_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let slow = slow_greeting_mock_smtp(std::time::Duration::from_millis(1500)).await;
+    let message_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(slow.port);
+    config.camelmailer.smtp_relays = vec![
+        format!("smtp://127.0.0.1:{dead_port}"),
+        format!("smtp://127.0.0.1:{}", slow.port),
+    ];
+    // Shorter than the held-back greeting: the greeting is read with the
+    // read timeout, not the connect timeout.
+    config.smtp_client.open_timeout = 1;
+    config.camelmailer.queued_message_lock_stale_seconds = Some(90);
+    let worker = Worker::new(&config, s.store.clone())
+        .with_heartbeat_interval(std::time::Duration::from_millis(200));
+    let (stop, handle) = run_in_background(worker);
+
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let stored = s
+                .sink
+                .message_by_id(s.server.id, message_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if stored.status == "Sent" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the message is delivered");
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+        .await
+        .expect("the worker stops")
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    let mails = slow
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.to_ascii_uppercase().starts_with("MAIL FROM"))
+        .count();
+    assert_eq!(mails, 1, "delivered once, by the second endpoint");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_lets_a_delivery_finish_within_the_grace_period() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = paused_mock_smtp("250 Accepted").await;
+    let message_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_shutdown_grace(std::time::Duration::from_secs(10));
+    let (stop, handle) = run_in_background(worker);
+
+    smtp.final_response_ready.notified().await;
+    stop.send(()).unwrap();
+    // The remote answers only after the shutdown was requested.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    smtp.final_response_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+        .await
+        .expect("the worker stops")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_heartbeat_keeps_a_long_delivery_from_being_taken_over() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = paused_mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.queued_message_lock_stale_seconds = Some(300);
+    let worker = Worker::new(&config, s.store.clone())
+        .with_heartbeat_interval(std::time::Duration::from_millis(100))
+        .with_shutdown_grace(std::time::Duration::from_millis(300));
+    let (stop, handle) = run_in_background(worker);
+
+    smtp.final_response_ready.notified().await;
+    // Pretend the delivery has run for an hour, far past the lease.
+    sqlx::query("UPDATE queued_messages SET locked_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let age_seconds: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM now() - locked_at)::float8 FROM queued_messages",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        age_seconds < 5.0,
+        "the heartbeat refreshed the lock ({age_seconds} s old)"
+    );
+    let other = PgQueue::with_stale_lock_seconds(pool.clone(), 300);
+    assert!(
+        other.dequeue("another-host").await.unwrap().is_none(),
+        "a live delivery is not taken over"
+    );
+
+    stop.send(()).unwrap();
+    handle.await.unwrap().unwrap();
+    smtp.final_response_release.notify_one();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_in_seconds_replaces_the_one_in_days() {
+    let mut config = camelmailer_config::Config::default();
+    assert_eq!(config.camelmailer.queue_lock_lease_seconds(), 86_400);
+    config.camelmailer.queued_message_lock_stale_seconds = Some(300);
+    assert_eq!(config.camelmailer.queue_lock_lease_seconds(), 300);
+    config.camelmailer.queued_message_lock_stale_seconds = Some(10);
+    assert_eq!(config.camelmailer.queue_lock_lease_seconds(), 90);
+}
+
+/// Put the test server into a new IP pool with the given (address, priority)
+/// entries. Returns the pool id.
+async fn pool_with(s: &Setup, addresses: &[(&str, i32)]) -> camelmailer_core::Id {
+    let pool = s.store.create_ip_pool("pool", false).await.unwrap();
+    for (ipv4, priority) in addresses {
+        s.store
+            .create_ip_address(camelmailer_core::NewIpAddress {
+                ip_pool_id: pool.id,
+                ipv4: (*ipv4).into(),
+                ipv6: None,
+                hostname: format!("host-{ipv4}.example"),
+                priority: *priority,
+            })
+            .await
+            .unwrap();
+    }
+    s.store
+        .set_server_ip_pool(s.server.id, Some(pool.id))
+        .await
+        .unwrap();
+    pool.id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_aware_worker_sends_from_the_pool_address_its_host_holds() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    // 192.0.2.1 (TEST-NET-1) is never local; it has the better priority, so
+    // the legacy choice picks it and fails to bind.
+    pool_with(&s, &[("192.0.2.1", 1), ("127.0.0.1", 10)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let legacy = Worker::new(&worker_config(smtp.port), s.store.clone());
+    let outcome = legacy.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delayed { .. }),
+        "{outcome:?}"
+    );
+
+    s.queue.clear_backoff().await.unwrap();
+    let mut config = worker_config(smtp.port);
+    config.worker.host_aware_pools = true;
+    let host_aware = Worker::new(&config, s.store.clone());
+    let outcome = host_aware.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pool_without_a_local_address_is_left_to_other_hosts_without_an_attempt() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let pool_id = pool_with(&s, &[("192.0.2.1", 1)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.worker.host_aware_pools = true;
+    let worker = Worker::new(&config, s.store.clone());
+    // The queue's pool filter already skips the row: this host holds no
+    // address of its pool.
+    assert!(worker.process_next().await.unwrap().is_none());
+
+    // A row queued without a pool (before the column existed) is dequeued,
+    // then handed back without an attempt.
+    sqlx::query("UPDATE queued_messages SET source_pool_id = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::ForeignPool);
+    let (locked_by, attempts, wait): (Option<String>, i32, f64) = sqlx::query_as(
+        "SELECT locked_by, attempts, extract(epoch FROM retry_after - now())::float8
+         FROM queued_messages",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(locked_by.is_none());
+    assert_eq!(attempts, 0);
+    assert!(
+        wait > 20.0 && wait <= 30.0,
+        "retry in about 30 s, got {wait}"
+    );
+    assert!(smtp.received.lock().unwrap().is_empty(), "nothing was sent");
+
+    // The hand-back recorded the pool, so the queue filter skips the row from
+    // now on instead of every foreign worker bouncing it every 30 s.
+    let recorded: Option<i64> = sqlx::query_scalar("SELECT source_pool_id FROM queued_messages")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, Some(pool_id as i64));
+    s.queue.clear_backoff().await.unwrap();
+    assert!(worker.process_next().await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_whose_server_moved_to_another_pool_is_still_delivered() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    // Queued while the server sent from a pool no host holds ...
+    let old_pool = pool_with(&s, &[("192.0.2.1", 1)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    // ... then the server moved to a pool this host holds.
+    let new_pool = pool_with(&s, &[("127.0.0.1", 1)]).await;
+    assert_ne!(old_pool, new_pool);
+
+    let mut config = worker_config(smtp.port);
+    config.worker.host_aware_pools = true;
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().expect("row is served");
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_of_a_deleted_pool_is_still_delivered() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let gone = pool_with(&s, &[("192.0.2.1", 1)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    // Deleting the pool sets servers.ip_pool_id to NULL; the queue row keeps
+    // the old id (no foreign key).
+    assert!(s.store.delete_ip_pool(gone).await.unwrap());
+
+    let mut config = worker_config(smtp.port);
+    config.worker.host_aware_pools = true;
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().expect("row is served");
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pool_that_cannot_be_read_hands_the_row_back_unlocked() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    pool_with(&s, &[("127.0.0.1", 1)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    // Make every pool read fail.
+    sqlx::query("ALTER TABLE ip_addresses RENAME TO ip_addresses_unavailable")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut config = worker_config(smtp.port);
+    config.worker.host_aware_pools = true;
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert_eq!(outcome, ProcessOutcome::PoolUnavailable);
+    let (locked_by, attempts, wait): (Option<String>, i32, f64) = sqlx::query_as(
+        "SELECT locked_by, attempts, extract(epoch FROM retry_after - now())::float8
+         FROM queued_messages",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        locked_by.is_none(),
+        "not left locked until the stale reclaim"
+    );
+    assert_eq!(attempts, 0);
+    assert!(
+        wait > 20.0 && wait <= 30.0,
+        "retry in about 30 s, got {wait}"
+    );
+    assert!(smtp.received.lock().unwrap().is_empty(), "nothing was sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listed_source_addresses_replace_discovery() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    pool_with(&s, &[("127.0.0.1", 1)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    // 127.0.0.1 is bindable, but the list says this host sends from another
+    // address: an address configured here yet routed elsewhere stays unused.
+    let mut config = worker_config(smtp.port);
+    config.worker.host_aware_pools = true;
+    config.worker.source_addresses = vec!["198.51.100.7".into()];
+    let worker = Worker::new(&config, s.store.clone());
+    assert!(worker.process_next().await.unwrap().is_none());
+
+    config.worker.source_addresses = vec!["127.0.0.1".into()];
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enqueue_records_the_pool_and_the_queue_filters_by_it() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let pool_id = pool_with(&s, &[("192.0.2.1", 1)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let recorded: Option<i64> = sqlx::query_scalar("SELECT source_pool_id FROM queued_messages")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, Some(pool_id as i64));
+
+    let queue = PgQueue::new(pool.clone());
+    queue.set_source_pools(Some(vec![pool_id as i64 + 1000]));
+    assert!(queue.dequeue("elsewhere").await.unwrap().is_none());
+    queue.set_source_pools(Some(vec![pool_id as i64]));
+    let row = queue.dequeue("here").await.unwrap().expect("own pool");
+    queue.retry(row.id, 0).await.unwrap();
+    queue.clear_backoff().await.unwrap();
+    queue.set_source_pools(None);
+    assert!(queue.dequeue("legacy").await.unwrap().is_some());
+}
+
+/// A front for a mock SMTP server that waits `delay` after accepting before
+/// it connects through, so the receiver's greeting arrives late (a slow
+/// receiver, such as a filtering service that tarpits new connections).
+async fn slow_greeting_front(target_port: u16, delay: std::time::Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut inbound, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let Ok(mut upstream) =
+                    tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await
+                else {
+                    return;
+                };
+                tokio::io::copy_bidirectional(&mut inbound, &mut upstream)
+                    .await
+                    .ok();
+            });
+        }
+    });
+    port
+}
+
+/// A local port nothing listens on: a connection to it is refused.
+async fn refused_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_aware_worker_still_delivers_past_a_dead_first_address_to_a_slow_receiver() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let slow = slow_greeting_front(smtp.port, std::time::Duration::from_secs(2)).await;
+    pool_with(&s, &[("192.0.2.1", 1), ("127.0.0.1", 10)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    // The first address refuses the connection; the worker moves on to the
+    // next one, which greets only after two seconds.
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.smtp_relays = vec![
+        format!("smtp://127.0.0.1:{}", refused_port().await),
+        format!("smtp://127.0.0.1:{slow}"),
+    ];
+    config.worker.host_aware_pools = true;
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    assert!(smtp
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line == "RCPT TO:<user@dest.example>"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ehlo_uses_the_pool_addresses_hostname_when_asked_to() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    // pool_with names 127.0.0.1 "host-127.0.0.1.example".
+    pool_with(&s, &[("127.0.0.1", 1)]).await;
+
+    for (opt_in, expected) in [
+        (false, "EHLO postal.example.com"),
+        (true, "EHLO host-127.0.0.1.example"),
+    ] {
+        let smtp = mock_smtp("250 Accepted").await;
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+        let mut config = worker_config(smtp.port);
+        config.smtp_client.helo_from_ip_address = opt_in;
+        let worker = Worker::new(&config, s.store.clone());
+        let outcome = worker.process_next().await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, ProcessOutcome::Delivered { .. }),
+            "{outcome:?}"
+        );
+        let seen = smtp.received.lock().unwrap().clone();
+        assert_eq!(seen.first().map(String::as_str), Some(expected), "{seen:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ehlo_falls_back_without_a_pool_address() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let mut config = worker_config(smtp.port);
+    config.smtp_client.helo_from_ip_address = true;
+    config.dns.helo_hostname = Some("out.example.net".into());
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+    let seen = smtp.received.lock().unwrap().clone();
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("EHLO out.example.net")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_aware_worker_greets_with_the_hostname_of_the_address_it_chose() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    // 192.0.2.1 has the better priority but is not on this host; the
+    // host-aware worker binds 127.0.0.1 and must greet with its name, not
+    // with the name of the pool's first address.
+    pool_with(&s, &[("192.0.2.1", 1), ("127.0.0.1", 10)]).await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    // End to end past a refused first address to a receiver that greets
+    // late: the opt-in changes the name only, not how delivery proceeds.
+    let slow = slow_greeting_front(smtp.port, std::time::Duration::from_secs(2)).await;
+    let mut config = worker_config(smtp.port);
+    config.camelmailer.smtp_relays = vec![
+        format!("smtp://127.0.0.1:{}", refused_port().await),
+        format!("smtp://127.0.0.1:{slow}"),
+    ];
+    config.worker.host_aware_pools = true;
+    config.smtp_client.helo_from_ip_address = true;
+    let worker = Worker::new(&config, s.store.clone());
+    let outcome = worker.process_next().await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ProcessOutcome::Delivered { .. }),
+        "{outcome:?}"
+    );
+    let seen = smtp.received.lock().unwrap().clone();
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("EHLO host-127.0.0.1.example"),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_pool_hostname_never_reaches_the_wire() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    pool_with(&s, &[("127.0.0.1", 1)]).await;
+
+    // Rows written around the API's check: a CR/LF injection attempt, a bare
+    // label, a trailing dot and an IP literal. Each falls back to
+    // dns.helo_hostname, and no injected command is seen by the receiver.
+    for (host_aware, hostname) in [
+        (false, "out1.example.com\r\nRSET"),
+        (true, "out1.example.com\r\nRSET"),
+        (false, "out1"),
+        (false, "out1.example.com."),
+        (true, "127.0.0.1"),
+    ] {
+        sqlx::query("UPDATE ip_addresses SET hostname = $1")
+            .bind(hostname)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let smtp = mock_smtp("250 Accepted").await;
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+        let mut config = worker_config(smtp.port);
+        config.worker.host_aware_pools = host_aware;
+        config.smtp_client.helo_from_ip_address = true;
+        config.dns.helo_hostname = Some("out.example.net".into());
+        let worker = Worker::new(&config, s.store.clone());
+        let outcome = worker.process_next().await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, ProcessOutcome::Delivered { .. }),
+            "{hostname:?}: {outcome:?}"
+        );
+        let seen = smtp.received.lock().unwrap().clone();
+        assert_eq!(
+            seen.first().map(String::as_str),
+            Some("EHLO out.example.net"),
+            "{hostname:?}: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|line| line == "RSET"),
+            "{hostname:?}: {seen:?}"
+        );
+    }
+}

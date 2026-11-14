@@ -41,6 +41,16 @@ integration tests) is green.
   whatever the family. A server whose pool has no usable address (empty,
   or an address that does not parse) also keeps the 0.13 order and never
   falls back to `dual_stack`.
+- A panic while processing one queued message, webhook request or lifecycle
+  event no longer takes a worker loop down. The row goes back with one
+  attempt counted and waits its backoff, but at least the lock lease, so a
+  message that trips a bug cannot cycle through the workers. A worker loop or
+  the lock heartbeat that ends on its own still stops the whole worker with
+  an error, so the process manager restarts it. Before, a loop that ended
+  disappeared silently and the worker ran on with fewer delivery loops.
+- `POST /api/v2/admin/ip_pools/{id}/ip_addresses` rejects a `hostname` that
+  is not a fully qualified host name (CR/LF, spaces, IP literals, a single
+  label, a trailing dot) with 422. Existing rows are not touched.
 
 ### Added
 
@@ -64,6 +74,74 @@ integration tests) is green.
 - **`smtp_client.skip_family_without_reverse_dns`** (default `false`):
   `dual_stack` and `prefer_ipv4` leave out a family whose source address
   failed the check while the other family's did not.
+- **EHLO from the pool address.** With `smtp_client.helo_from_ip_address:
+  true` the worker greets with the `hostname` of the IP-pool address a
+  delivery is bound to, so EHLO, PTR and A record agree per IP. Falls back to
+  `dns.helo_hostname` (else `smtp_hostname`). Off by default. A stored
+  hostname that is not a fully qualified host name is skipped with a warning
+  and the fallback is used, so CR, LF or spaces never reach the SMTP line.
+
+- **Host-aware IP pools.** With `worker.host_aware_pools: true` a worker
+  sends only from the pool addresses its host holds (the addresses on its
+  network interfaces, or those listed in `worker.source_addresses`), so workers on several hosts can share
+  a pool and send at the same time, each from its own IP. Ties in priority
+  are spread by a stable hash of the recipient domain. Mail whose pool has no
+  address on the host is skipped at dequeue, or handed back without an
+  attempt, with its pool recorded, and retried after
+  `worker.foreign_pool_delay_seconds` (env
+  `WORKER_FOREIGN_POOL_DELAY_SECONDS`). Mail whose recorded pool is stale (the
+  pool was deleted, or the server or stream moved) is taken by any worker and
+  re-resolved. Off by default; without it every worker uses the pool's first
+  address as before.
+- `ServerStore::source_addresses_for` returns every address of the pool a
+  message sends from.
+- Outgoing queue rows record the IP pool they send from
+  (`queued_messages.source_pool_id`, migration `0050`).
+- `ProcessOutcome::ForeignPool` for a message handed back to another host,
+  `ProcessOutcome::PoolUnavailable` for one handed back because its pool
+  could not be read.
+- **Delivery leases in seconds, with a heartbeat.** New
+  `camelmailer.queued_message_lock_stale_seconds` replaces the lease in days
+  when set (minimum 90). A worker refreshes the locks of the rows it works on
+  every 30 seconds, so a live worker never loses a row however long a
+  delivery takes, and only the rows of a worker that died are taken over.
+  Applies to the delivery queue, the webhook queue and the lifecycle outbox.
+  Unset, the one-day lease stays; about 300 seconds is recommended, so a
+  delivery stopped mid-conversation by a restart moves again within minutes
+  rather than a day (`docs/configuration.md`).
+- **Graceful worker shutdown.** On SIGTERM or SIGINT the worker stops taking
+  new work, waits `worker.shutdown_grace_seconds` (default 8, below Docker's
+  default stop timeout of 10 s) for what is in flight, and then stops the
+  rest. Rows that had not reached a receiver go back to the queue without
+  counting an attempt; a delivery stopped while talking to the receiver, and
+  a row whose processing failed half way, keep their lock for the lease as
+  after a crash, so nothing a receiver may already have accepted is sent
+  again early.
+
+### Fixed
+
+- **A restarted worker no longer strands its deliveries for a day.** The
+  worker installed no signal handler, so in a container without an init it
+  ignored SIGTERM and was killed after the stop timeout, leaving up to
+  `worker.threads` messages and one webhook locked until the one-day stale
+  window ran out. The compose file now runs the worker with `init: true` and
+  `stop_grace_period: 30s`.
+- **PROXY protocol on implicit TLS (port 465).** With
+  `smtp_server.proxy_protocol: true` an `smtps` listener ran the TLS
+  handshake first and then expected the PROXY line inside the encrypted
+  stream, so every connection through a load balancer failed. The server now
+  reads the PROXY v1 line from the raw socket before the handshake and sends
+  the banner over TLS afterwards. A connection without a valid header is
+  closed.
+- **PROXY header validation, on every listener.** The client and proxy
+  fields must be IP literals of the announced family and the ports numbers;
+  before, any six words were accepted and a garbage client "address" reached
+  the Received header while SPF and IP credentials silently skipped it.
+  `PROXY UNKNOWN` (balancer health checks) is now accepted with the socket's
+  address instead of being refused. The plain `smtp` listener now applies the
+  same 107-byte cap and 10-second timeout to the header as `smtps`; it used
+  to buffer an unterminated first line without limit and wait forever.
+  Refused headers are logged as a rate-limited warning.
 
 ## [0.13.1] - 2026-11-05
 
