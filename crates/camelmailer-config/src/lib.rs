@@ -1356,7 +1356,27 @@ pub struct Config {
     pub rspamd: Rspamd,
     pub clamav: Clamav,
     pub warmup: Warmup,
+    /// Receiving provider groups for the IP metrics and the warm-up, merged
+    /// into the built-in ones (microsoft, google, yahoo, apple,
+    /// united_internet, t_online): an entry with a built-in name replaces
+    /// that group, any other name adds one. Whatever matches no group is
+    /// `other`.
+    pub provider_groups: Vec<ProviderGroupConfig>,
 }
+
+/// One receiving provider group (`provider_groups`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderGroupConfig {
+    /// `[a-z0-9_]`, at most 40 characters.
+    pub name: String,
+    /// Recipient domains of the provider's own mail service: `example.com`
+    /// exactly, or `brand.*` for the brand under any top-level domain.
+    pub domains: Vec<String>,
+    /// MX hosts: `example.net` matches it and every host under it.
+    pub mx_patterns: Vec<String>,
+}
+
 
 /// Adaptive IP warm-up (`warmup`). Warm-up itself is off until a pool or a
 /// pool address is given a mode (dashboard or
@@ -1586,6 +1606,26 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.worker.validate()?;
         self.warmup.validate()?;
+        for group in &self.provider_groups {
+            let valid = !group.name.is_empty()
+                && group.name.len() <= 40
+                && group
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if !valid || group.name == "other" {
+                return Err(ConfigError::Invalid(format!(
+                    "provider_groups: {:?} is not a valid group name ([a-z0-9_], at most 40 characters, not \"other\")",
+                    group.name
+                )));
+            }
+            if group.domains.is_empty() && group.mx_patterns.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "provider_groups: {} needs domains or mx_patterns",
+                    group.name
+                )));
+            }
+        }
         if !matches!(self.camelmailer.web_protocol.as_str(), "http" | "https") {
             return Err(ConfigError::Invalid(format!(
                 "camelmailer.web_protocol must be http or https (got {:?})",
@@ -2603,5 +2643,27 @@ smtp_server:
         let junk =
             |name: &str| (name == "WORKER_FOREIGN_POOL_DELAY_SECONDS").then(|| "soon".to_string());
         assert!(Worker::default().with_overrides(junk).is_err());
+    }
+}
+
+#[cfg(test)]
+mod provider_group_tests {
+    use super::*;
+
+    #[test]
+    fn provider_groups_are_read_and_checked() {
+        let config = Config::from_yaml(
+            "provider_groups:\n  - name: seznam\n    domains: [seznam.cz]\n    mx_patterns: [seznam.cz]\n",
+        )
+        .unwrap();
+        assert_eq!(config.provider_groups[0].name, "seznam");
+        assert!(config.validate().is_ok());
+        for bad in [
+            "provider_groups:\n  - name: Seznam\n    domains: [seznam.cz]\n",
+            "provider_groups:\n  - name: other\n    domains: [x.cz]\n",
+            "provider_groups:\n  - name: empty\n",
+        ] {
+            assert!(Config::from_yaml(bad).unwrap().validate().is_err(), "{bad}");
+        }
     }
 }

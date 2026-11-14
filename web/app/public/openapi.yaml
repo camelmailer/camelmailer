@@ -3091,7 +3091,7 @@ paths:
                                   - $ref: "#/components/schemas/IpMetricTotals"
                                   - type: object
                                     properties:
-                                      provider: { type: string, enum: [microsoft, google, yahoo, other] }
+                                      provider: { type: string, description: "Provider group (built-in: microsoft, google, yahoo, apple, united_internet, t_online, other; more via provider_groups)" }
                             daily:
                               type: array
                               items:

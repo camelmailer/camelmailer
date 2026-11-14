@@ -2563,7 +2563,7 @@ async fn ip_metrics_add_up_the_delivery_counters_for_global_admins() {
                 day: chrono::Utc::now().date_naive(),
                 source_ip: "203.0.113.5".into(),
                 ip_address_id: Some(address.id),
-                provider: ProviderGroup::Microsoft,
+                provider: ProviderGroup::microsoft(),
                 kind,
                 policy_block: false,
                 server_id: 1,

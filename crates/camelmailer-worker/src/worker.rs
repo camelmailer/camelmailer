@@ -739,7 +739,9 @@ impl Worker {
             in_flight: InFlight::default(),
             heartbeat_interval: HEARTBEAT_INTERVAL,
             shutdown_grace: Duration::from_secs(u64::from(config.worker.shutdown_grace_seconds)),
-            providers: crate::provider::ProviderClassifier::default(),
+            providers: crate::provider::ProviderClassifier::default().with_groups(
+                crate::provider::ProviderClassifier::groups_from_config(&config.provider_groups),
+            ),
             warmup: crate::warmup::WarmupGate::new(&config.warmup),
         }
     }

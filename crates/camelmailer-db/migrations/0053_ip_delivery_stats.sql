@@ -16,7 +16,7 @@
 CREATE TABLE ip_delivery_stats (
     day DATE NOT NULL,
     source_ip TEXT NOT NULL,
-    provider TEXT NOT NULL CHECK (provider IN ('microsoft', 'google', 'yahoo', 'other')),
+    provider TEXT NOT NULL CHECK (provider ~ '^[a-z0-9_]{1,40}$'),
     ip_address_id BIGINT,
     sent BIGINT NOT NULL DEFAULT 0,
     deferred BIGINT NOT NULL DEFAULT 0,
@@ -32,7 +32,7 @@ CREATE TABLE message_sources (
     server_id BIGINT NOT NULL,
     source_ip TEXT NOT NULL,
     ip_address_id BIGINT,
-    provider TEXT NOT NULL CHECK (provider IN ('microsoft', 'google', 'yahoo', 'other')),
+    provider TEXT NOT NULL CHECK (provider ~ '^[a-z0-9_]{1,40}$'),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

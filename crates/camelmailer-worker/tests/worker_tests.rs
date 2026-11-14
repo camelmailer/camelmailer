@@ -5395,7 +5395,7 @@ async fn outbound_results_are_counted_per_address_and_provider() {
         let stat = &stats[0];
         assert_eq!(stat.source_ip, "127.0.0.1");
         assert_eq!(stat.ip_address_id, Some(address.id));
-        assert_eq!(stat.provider, ProviderGroup::Microsoft, "{reply}");
+        assert_eq!(stat.provider, ProviderGroup::microsoft(), "{reply}");
         assert_eq!(
             (stat.sent, stat.deferred, stat.bounced, stat.policy_blocks),
             (sent, deferred, bounced, blocks),
@@ -5435,7 +5435,7 @@ async fn a_delivery_without_a_pool_counts_under_the_default_source() {
         .unwrap();
     assert_eq!(stats.len(), 1);
     assert_eq!(stats[0].source_ip, camelmailer_core::DEFAULT_SOURCE);
-    assert_eq!(stats[0].provider, camelmailer_core::ProviderGroup::Google);
+    assert_eq!(stats[0].provider, camelmailer_core::ProviderGroup::google());
     assert_eq!(stats[0].ip_address_id, None);
 }
 
