@@ -15,6 +15,96 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-14
+
+### Changed
+
+- **Behaviour change: spam complaints suppress the complainant by default.**
+  `deliverability_feedback.fbl.suppress_complainants` now defaults to `true`:
+  a feedback-loop complaint about transactional mail suppresses the
+  recipient for that message's stream. Each mail server can choose
+  otherwise (`GET`/`PATCH …/servers/{server}/complaint_settings`, and a
+  "Spam complaints" section on the server settings page). Complaint
+  suppressions are filterable on the Suppressions page and removed with
+  Reactivate. Raw ARF reports (they contain recipient data) are emptied after
+  `retention.feedback_report_days` (30); the complaint, its suppression and
+  the counts stay.
+- **Web and SMTP servers drain on SIGTERM.** They stop accepting
+  connections; running HTTP requests and SMTP transactions finish within
+  `web_server.shutdown_grace_seconds` / `smtp_server.shutdown_grace_seconds`
+  (30 s). After the grace, open SMTP sessions get `421 4.3.2 Service shutting
+  down` and are closed. A message is queued before its `250` is written, so
+  nothing a client saw accepted is lost. Keep the process manager's stop
+  timeout above the grace; the compose file sets `init: true` and
+  `stop_grace_period: 40s` for web and smtp.
+- A worker records the result of a delivery only while it still holds the
+  queue row (#81). `record_outbound_delivery`, and complete/retry/defer on the
+  delivery queue, the webhook queue and the lifecycle outbox, check
+  `locked_by`; a worker that lost its row records nothing and logs a warning
+  (`ProcessOutcome::NotOwner`).
+- Graceful worker shutdown hands back deliveries that have not sent `DATA`
+  yet (connecting, EHLO, STARTTLS, `MAIL FROM`, `RCPT TO`) at once, without an
+  attempt (#82). The release and the `DATA` command exclude each other, so a
+  released delivery never sends its message. A delivery past `DATA` keeps its
+  lock for the lease as before.
+
+### Added
+
+- **Cluster registry.** Every web, SMTP and worker process registers with its
+  node name, role, version and public addresses and heartbeats; a worker
+  registers under its lock id, so leases map to nodes. New config group
+  `cluster` (`node_name`, `load_balancer_address`, `inbound_hostname`,
+  `public_addresses`, `heartbeat_interval_seconds`, `node_stale_seconds`).
+  `GET /api/v2/admin/cluster`. The reverse-DNS check uses
+  `cluster.public_addresses` when set (instead of a container's private
+  address).
+- **DNS checks with the exact records to set**
+  (`GET /api/v2/admin/dns_checks`, `…/dns_checks/candidate`): A/AAAA of the
+  inbound hostname, PTR and forward-confirmed reverse DNS of every sending
+  address, EHLO name equal to the PTR name, MX of domains with an inbound
+  route and of the return-path domain, and for every verified sending domain
+  SPF covering every sending address, the DKIM key the worker signs with and
+  a DMARC record. Each check has a copyable instruction.
+- **Infrastructure dashboard** (Admin > Infrastructure): topology, DNS checks,
+  the add server / add IP wizard, IP metrics and warm-up, provider feedback.
+- **IP metrics**: outbound results per day, sending address and receiving
+  provider group, with policy refusals and complaints counted apart
+  (`GET /api/v2/admin/ip_metrics`). Provider groups are configurable
+  (`provider_groups`): built in `microsoft`, `google`, `yahoo` (incl. AOL),
+  `apple`, `united_internet` (GMX, WEB.DE, mail.com, 1&1, IONOS), `t_online`,
+  and `other`.
+- **Adaptive IP warm-up, off by default.** Modes `off`, `slow`, `normal`,
+  `fast`, `custom` per pool or address, an allowance per provider group in
+  every profile, judged nightly (advance, hold, slow, brake) and braking at
+  once on a run of policy refusals; overflow goes to another address of the
+  pool with room, otherwise the message waits without an attempt. Provider
+  feedback (Postmaster Tools spam rate, SNDS, feedback loops, seed placement)
+  brakes, slows or allows the next step. If the warm-up storage cannot be
+  read, only addresses known to be warm send. New config group `warmup`;
+  `GET /api/v2/admin/ip_warmup`, `…/log`, `PATCH …/addresses/{id}`,
+  `…/pools/{id}`.
+- **Provider feedback**: Google Postmaster Tools v2, Microsoft SNDS and
+  feedback-loop counts, fetched on a schedule by one worker
+  (`deliverability_feedback`; each source is off until its credentials are
+  configured). `GET /api/v2/admin/deliverability/feedback`.
+- **Inbox placement tests** with your own seed mailboxes (read-only IMAP,
+  never opens, clicks, replies or moves mail), on a schedule (off by default)
+  or on demand; every result is kept with its time.
+
+### Migrations
+
+`0052` cluster_nodes, `0053` ip_delivery_stats and message_sources, `0054`
+warm-up tables, `0055` provider feedback (incl. server_feedback_settings and
+feedback_reports), `0056` placement tests. All add tables; none changes an
+existing column. Run `initialize` before the new version starts.
+
+### Rollback
+
+0.14.0 runs against the 0.15 schema and ignores the new tables. To leave only
+warm-up, set every address and pool to `off`. To keep transactional mail to
+complainants flowing, set `deliverability_feedback.fbl.suppress_complainants:
+false` (or per server).
+
 ## [0.14.0] - 2026-11-14
 
 ### Changed
@@ -1503,7 +1593,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/camelmailer/camelmailer/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/camelmailer/camelmailer/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/camelmailer/camelmailer/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/camelmailer/camelmailer/compare/v0.12.0...v0.13.0
