@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   candidateProblems,
+  checkLabel,
   candidateQuery,
   hostRows,
   instructionsText,
@@ -96,6 +97,12 @@ describe("DNS check helpers", () => {
       "set PTR 203.0.113.20 → out2.mail.example.com (at the provider of the address)\n" +
         "set A out2.mail.example.com → 203.0.113.20, TTL 300",
     )
+  })
+
+  it("names every check kind, DKIM and DMARC included", () => {
+    expect(checkLabel("dkim")).toBe("DKIM")
+    expect(checkLabel("dmarc")).toBe("DMARC")
+    expect(checkLabel("fcrdns")).toBe("Forward-confirmed rDNS")
   })
 
   it("builds the candidate query without empty fields", () => {
