@@ -281,6 +281,43 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) org_sso_connections: HashMap<Id, crate::org_sso::OrgSsoConnection>,
     /// Email domains organizations have claimed for SSO login routing.
     pub(crate) org_email_domains: HashMap<Id, crate::org_sso::OrgEmailDomain>,
+    /// Delivery counters per (day, source address, provider).
+    pub(crate) ip_delivery_stats: std::collections::BTreeMap<
+        (
+            chrono::NaiveDate,
+            String,
+            crate::delivery_stats::ProviderGroup,
+        ),
+        crate::delivery_stats::IpDeliveryStat,
+    >,
+    /// Warm-up mode and profile set on an address / a pool.
+    pub(crate) warmup_address_settings: HashMap<
+        Id,
+        (
+            crate::warmup::WarmupMode,
+            Option<crate::warmup::WarmupProfile>,
+        ),
+    >,
+    pub(crate) warmup_pool_settings: HashMap<
+        Id,
+        (
+            crate::warmup::WarmupMode,
+            Option<crate::warmup::WarmupProfile>,
+        ),
+    >,
+    pub(crate) warmup_states:
+        HashMap<(Id, crate::delivery_stats::ProviderGroup), crate::warmup::WarmupState>,
+    pub(crate) warmup_usage:
+        HashMap<(chrono::NaiveDate, Id, crate::delivery_stats::ProviderGroup), i64>,
+    pub(crate) warmup_log: Vec<crate::warmup::WarmupLogEntry>,
+    /// The address that sent each accepted message, and when.
+    pub(crate) message_sources: HashMap<
+        i64,
+        (
+            crate::delivery_stats::IpComplaint,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >,
 }
 
 pub(crate) struct MemoryIdempotencyRecord {

@@ -288,8 +288,133 @@ A brand-new sending IP has no reputation, and providers throttle unknown
 senders that suddenly push high volume. Warm a new pool by starting with a
 low daily volume of your most engaged recipients and increasing it
 gradually over days to weeks, watching your DMARC pass rate and bounce and
-complaint figures as you go. Camelmailer does not pace this for you; it is
-a schedule you run by controlling how much you send through the new pool.
+complaint figures as you go. Camelmailer can pace this for you per address
+and provider (see [Adaptive IP warm-up](#adaptive-ip-warm-up)), or you run
+the schedule yourself by controlling how much you send through the new pool.
+
+## IP metrics
+
+Every outbound SMTP result is counted per UTC day, per source address and per
+receiving provider group. The built-in groups are `microsoft` (Outlook.com,
+Hotmail, Live, Microsoft 365), `google` (Gmail, Workspace), `yahoo` (incl.
+AOL), `apple` (iCloud), `united_internet` (GMX, WEB.DE, mail.com, 1&1 and
+IONOS) and `t_online`; everyone else is `other`. A provider's own consumer
+domains (gmail.com, hotmail.de, gmx.net, t-online.de and the like) are
+recognised by name; any other domain by its MX host, so a company on
+Microsoft 365, Google Workspace or IONOS counts towards that provider. Groups
+are configuration (`provider_groups`, see
+[Configuration](configuration.md#provider_groups-receiving-providers)): a
+provider can be added or adjusted without a code change.
+Counted are accepted, deferred and bounced attempts, policy refusals (blocks
+and reputation refusals such as Microsoft `S3150`, Google `4.7.28`, Yahoo
+`TSS04`) and spam complaints from feedback loops, which are credited to the
+address that sent the complained-about message. Mail from servers without a
+pool is counted under `default`.
+
+`GET /api/v2/admin/ip_metrics?days=7` returns the counters per address, per
+provider, per day and per pool, with deferral, bounce and policy-block rates
+over all attempts and the complaint rate over accepted messages. Counting
+runs after a delivery's result is recorded and never changes the delivery.
+Counters are kept for 400 days.
+
+## Adaptive IP warm-up
+
+Warm-up is **off by default**. While no pool and no address has a mode, the
+worker never consults it and delivery is exactly as without it.
+
+### Modes
+
+Set a mode on a pool (the default for its addresses) or on one address (which
+wins), in the dashboard or with `PATCH /api/v2/admin/ip_warmup/pools/{id}` /
+`PATCH /api/v2/admin/ip_warmup/addresses/{id}`:
+
+Every profile gives **every provider group its own ramp**: the first day's
+allowance and the allowance at which the address counts as warm differ per
+group, and the growth per healthy day is the profile's. The built-in values
+(attempts per UTC day):
+
+| Group | `slow` (× 1.3) | `normal` (× 1.5) | `fast` (× 2.0) |
+|---|---|---|---|
+| `microsoft` | 30 → 15,000 | 100 → 40,000 | 300 → 80,000 |
+| `google` | 50 → 20,000 | 200 → 50,000 | 500 → 100,000 |
+| `yahoo` | 40 → 15,000 | 150 → 40,000 | 400 → 80,000 |
+| `apple` | 30 → 10,000 | 100 → 20,000 | 250 → 40,000 |
+| `united_internet` | 30 → 12,000 | 100 → 30,000 | 250 → 60,000 |
+| `t_online` | 20 → 8,000 | 50 → 15,000 | 100 → 30,000 |
+| `other` and added groups | 50 → 20,000 | 200 → 50,000 | 500 → 100,000 |
+
+`off` means no limit. `custom` takes a profile `{start, growth, cap}` (growth
+1.05 to 3.0) with optional `groups: {name: {start, cap}}`; groups it does not
+name use `start` and `cap`. The built-in profiles can be changed per group in
+`warmup.profiles`, including for groups added in `provider_groups`.
+
+An address can be warm at one provider and still cold at another. Switching
+modes, including to `off` and back, keeps the address's current allowance:
+the ramp continues from where it is and never restarts. `inherit` on an
+address removes its own mode so the pool's applies.
+
+### How the ramp moves
+
+Shortly after midnight UTC a worker judges the previous day of every warming
+address with every provider it sent to, once, and logs the decision with its
+reason:
+
+- **Advance**: the address used at least 90 % of its allowance
+  (`warmup.advance_fraction`) and everything was healthy. The allowance grows
+  by the mode's factor. At the cap the address is **warm** and has no limit
+  any more.
+- **Hold**: the address used less than that. Below half of the allowance
+  (`min_volume_fraction`) the day was too quiet to judge; between the two it
+  did not prove the next step. The allowance stays.
+- **Slow**: deferrals from that provider reached 5 % of the attempts
+  (`deferral_rate_slow`), or complaints reached the warning level of 0.1 % of
+  accepted mail (`complaint_rate_warn`). The allowance stays and the status
+  says why.
+- **Brake**: policy refusals reached 3 and 1 % of the attempts
+  (`policy_blocks_brake`, `policy_block_rate_brake`), bounces reached 5 %
+  (`bounce_rate_brake`), or complaints reached 0.3 % (`complaint_rate_brake`).
+  The address stops sending to that provider for 24 hours (`pause_hours`) and
+  its allowance is halved (`step_back`), never below the mode's first day.
+  After the pause it holds for one day before it grows again.
+
+Policy refusals also brake **during the day**: as soon as the day's refusals
+from an address to a provider reach the brake limits, that provider is paused
+at once, without waiting for midnight. Policy refusals are the replies that
+speak about the sender rather than the recipient: Microsoft `S3150`/`S3140`
+and `5.7.606`/`5.7.511`, Google `4.7.28` and `5.7.1`, Yahoo `TSS04`/`TSS09`
+and blocklist wording.
+
+### Where the volume goes
+
+Before a message goes out, the worker asks the address source selection chose
+whether it has room left today for the message's provider. If not, the next
+address of the same pool that has room takes it (lowest priority number
+first); an address with warm-up off counts as warm and always has room. Only
+when no address of the pool has room does the message wait,
+`warmup.defer_seconds` (900) at a time, without an attempt counted. With
+`worker.host_aware_pools` only the addresses this host holds are considered.
+The allowance is counted atomically across all workers, so several workers
+never overrun it together.
+
+If the warm-up storage cannot be read, an address the worker last saw fully
+warm for the provider, or one with warm-up off, keeps sending. Mail that would
+go out from an address that is not yet warm waits, without an attempt
+counted, and is tried again every minute until the storage answers. A storage
+error never lets a cold address send without its limit. The worker logs the
+outage as an error (`warm-up storage unavailable`, at most once a minute, for
+log-based alerting) and, once it is over, writes it to the warm-up log of
+every address whose mail waited (decision `storage`, shown on the dashboard).
+If the settings could never be read since the worker started, every pool
+address counts as possibly cold.
+
+### Watching it
+
+`GET /api/v2/admin/ip_warmup` (and the dashboard) shows per address the mode
+and where it comes from, and per provider the allowance, today's use, the
+status (`not_started`, `ramping`, `holding`, `slowed`, `paused`, `warm`), the
+last decision and the last brake with their reasons, the progress towards the
+cap and an estimate of the healthy days until warm.
+`GET /api/v2/admin/ip_warmup/log` lists every decision and mode change.
 
 ### Publish matching reverse DNS
 
@@ -323,7 +448,7 @@ dashboard does not by itself guarantee inbox placement.
 | EHLO / HELO hostname | The installation-level `dns.helo_hostname` (else `smtp_hostname`); with `smtp_client.helo_from_ip_address: true`, the `hostname` of the pool address the delivery is bound to |
 | IPv6 source sending | Bound for IPv6 connections when the pool sets an `address_family`; otherwise only `ipv4` is bound |
 | Pool `default` flag | A label in the admin UI; source resolution reads a server's or stream's assigned pool, so assign a pool explicitly for it to take effect |
-| IP warmup pacing | Operational; you control volume ramp, the product does not throttle |
+| IP warmup pacing | Off by default; with a warm-up mode per pool or address the worker paces each address per provider and brakes on bad signals (see above) |
 
 Read that last column as the work that stays with you. Camelmailer places
 mail on the IPs and with the signatures you configure, and it keeps your

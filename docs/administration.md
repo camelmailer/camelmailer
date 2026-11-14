@@ -297,8 +297,10 @@ on and names each expected record exactly:
 | `ptr` | every sending address | a PTR record carrying the name the worker greets with |
 | `fcrdns` | every sending address | the PTR name resolves back to the address |
 | `ehlo` | every sending address | the EHLO name (the pool address's `hostname` with `smtp_client.helo_from_ip_address`, else `dns.helo_hostname`) equals the PTR name |
-| `spf` | the return-path domain, verified tenant domains | every sending address passes; the instruction is the full TXT record with the missing `ip4:`/`ip6:` mechanisms |
-| `mx` | the return-path domain (fail), tenant domains with an inbound route (warn) | MX on `dns.mx_records`, else on the inbound host name |
+| `spf` | the return-path domain, every verified sending domain | every sending address passes; the instruction is the full TXT record with the missing `ip4:`/`ip6:` mechanisms |
+| `dkim` | every verified sending domain | the TXT record at `<dns.dkim_identifier>._domainkey.<domain>` carries the public key the worker signs with (the domain's own key, else the installation key); fail when missing or different |
+| `dmarc` | every verified sending domain | a single `v=DMARC1` record at `_dmarc.<domain>`; fail when missing, warning at `p=none` (the instruction raises it to `p=quarantine`) |
+| `mx` | the return-path domain, every domain with an inbound route | MX on the inbound host name or `dns.mx_records`, or on a host that resolves to the inbound addresses; fail otherwise |
 | `resolves` | `dns.track_domain` | resolves |
 
 Every check carries `found`, `expected` and `instructions` such as

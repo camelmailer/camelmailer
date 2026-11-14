@@ -68,7 +68,7 @@ export type CheckStatus = "ok" | "warn" | "fail"
 export type DnsCheck = {
   group: "address" | "hostname" | "domain"
   subject: string
-  kind: "a" | "ptr" | "fcrdns" | "ehlo" | "spf" | "mx" | "resolves"
+  kind: "a" | "ptr" | "fcrdns" | "ehlo" | "spf" | "dkim" | "dmarc" | "mx" | "resolves"
   status: CheckStatus
   found: string[]
   expected: string[]
@@ -127,6 +127,8 @@ const CHECK_LABELS: Record<DnsCheck["kind"], string> = {
   fcrdns: "Forward-confirmed rDNS",
   ehlo: "EHLO name = PTR name",
   spf: "SPF",
+  dkim: "DKIM",
+  dmarc: "DMARC",
   mx: "MX",
   resolves: "Resolves",
 }

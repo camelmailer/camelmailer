@@ -184,6 +184,11 @@ pub struct WebServer {
     /// Origins allowed to call the HTTP APIs from a browser. Empty (the
     /// default) sends no CORS headers; `["*"]` allows any origin.
     pub cors_origins: Vec<String>,
+    /// On SIGTERM or SIGINT the web server stops accepting connections and
+    /// gives requests in flight this many seconds to finish before it stops
+    /// (env `WEB_SERVER_SHUTDOWN_GRACE_SECONDS`). Keep the process manager's
+    /// stop timeout above it.
+    pub shutdown_grace_seconds: u32,
 }
 
 impl Default for WebServer {
@@ -193,7 +198,48 @@ impl Default for WebServer {
             default_bind_address: "127.0.0.1".into(),
             max_threads: 5,
             cors_origins: vec![],
+            shutdown_grace_seconds: DEFAULT_SERVER_SHUTDOWN_GRACE_SECONDS,
         }
+    }
+}
+
+/// The default grace period of the web and SMTP servers' graceful shutdown.
+pub const DEFAULT_SERVER_SHUTDOWN_GRACE_SECONDS: u32 = 30;
+
+/// `name` as a number of seconds when the variable is set: the override of a
+/// `shutdown_grace_seconds` setting.
+fn grace_override(
+    var: impl Fn(&str) -> Option<String>,
+    name: &str,
+    current: u32,
+) -> Result<u32, ConfigError> {
+    match var(name) {
+        None => Ok(current),
+        Some(value) => value.trim().parse().map_err(|_| {
+            ConfigError::Invalid(format!(
+                "{name} must be a number of seconds (got {value:?})"
+            ))
+        }),
+    }
+}
+
+impl WebServer {
+    /// `shutdown_grace_seconds` with `WEB_SERVER_SHUTDOWN_GRACE_SECONDS`
+    /// applied.
+    pub fn shutdown_grace(&self) -> Result<std::time::Duration, ConfigError> {
+        self.shutdown_grace_with(|name| std::env::var(name).ok())
+    }
+
+    fn shutdown_grace_with(
+        &self,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<std::time::Duration, ConfigError> {
+        let seconds = grace_override(
+            var,
+            "WEB_SERVER_SHUTDOWN_GRACE_SECONDS",
+            self.shutdown_grace_seconds,
+        )?;
+        Ok(std::time::Duration::from_secs(u64::from(seconds)))
     }
 }
 
@@ -1105,6 +1151,12 @@ pub struct SmtpServer {
     /// Additional listeners beyond `default_port` (which always runs in
     /// `smtp` mode). Empty by default: only `default_port` is bound.
     pub listeners: Vec<SmtpListener>,
+    /// On SIGTERM or SIGINT the SMTP server stops accepting connections and
+    /// gives open sessions this many seconds to finish their transaction;
+    /// sessions still open then get `421 4.3.2` and are closed (env
+    /// `SMTP_SERVER_SHUTDOWN_GRACE_SECONDS`). Keep the process manager's stop
+    /// timeout above it.
+    pub shutdown_grace_seconds: u32,
 }
 
 impl Default for SmtpServer {
@@ -1125,7 +1177,28 @@ impl Default for SmtpServer {
             max_message_size: 14,
             log_ip_address_exclusion_matcher: None,
             listeners: vec![],
+            shutdown_grace_seconds: DEFAULT_SERVER_SHUTDOWN_GRACE_SECONDS,
         }
+    }
+}
+
+impl SmtpServer {
+    /// `shutdown_grace_seconds` with `SMTP_SERVER_SHUTDOWN_GRACE_SECONDS`
+    /// applied.
+    pub fn shutdown_grace(&self) -> Result<std::time::Duration, ConfigError> {
+        self.shutdown_grace_with(|name| std::env::var(name).ok())
+    }
+
+    fn shutdown_grace_with(
+        &self,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<std::time::Duration, ConfigError> {
+        let seconds = grace_override(
+            var,
+            "SMTP_SERVER_SHUTDOWN_GRACE_SECONDS",
+            self.shutdown_grace_seconds,
+        )?;
+        Ok(std::time::Duration::from_secs(u64::from(seconds)))
     }
 }
 
@@ -1523,7 +1596,211 @@ pub struct Config {
     pub smtp_client: SmtpClient,
     pub rspamd: Rspamd,
     pub clamav: Clamav,
+    pub warmup: Warmup,
     pub cluster: Cluster,
+    /// Receiving provider groups for the IP metrics and the warm-up, merged
+    /// into the built-in ones (microsoft, google, yahoo, apple,
+    /// united_internet, t_online): an entry with a built-in name replaces
+    /// that group, any other name adds one. Whatever matches no group is
+    /// `other`.
+    pub provider_groups: Vec<ProviderGroupConfig>,
+}
+
+/// One receiving provider group (`provider_groups`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderGroupConfig {
+    /// `[a-z0-9_]`, at most 40 characters.
+    pub name: String,
+    /// Recipient domains of the provider's own mail service: `example.com`
+    /// exactly, or `brand.*` for the brand under any top-level domain.
+    pub domains: Vec<String>,
+    /// MX hosts: `example.net` matches it and every host under it.
+    pub mx_patterns: Vec<String>,
+}
+
+/// Adaptive IP warm-up (`warmup`). Warm-up itself is off until a pool or a
+/// pool address is given a mode (dashboard or
+/// `PATCH /api/v2/admin/ip_warmup/...`); these are the limits it judges by.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Warmup {
+    /// Below this share of its allowance an address's day is too quiet to
+    /// judge, and the ramp holds.
+    pub min_volume_fraction: f64,
+    /// The share of its allowance an address must have used, with healthy
+    /// results, for the allowance to grow.
+    pub advance_fraction: f64,
+    /// Deferral rate (of attempts to one provider) from which the ramp
+    /// stops growing.
+    pub deferral_rate_slow: f64,
+    /// Bounce rate (of attempts) from which the ramp brakes.
+    pub bounce_rate_brake: f64,
+    /// Policy refusals (blocks, reputation refusals) that brake: at least
+    /// this many, and at least `policy_block_rate_brake` of the attempts.
+    pub policy_blocks_brake: i64,
+    pub policy_block_rate_brake: f64,
+    /// Complaint rate (of accepted messages) that slows, and that brakes.
+    /// Google's sender guidelines: stay below 0.1 %, never reach 0.3 %.
+    pub complaint_rate_warn: f64,
+    pub complaint_rate_brake: f64,
+    /// How long a brake stops an address from sending to that provider.
+    pub pause_hours: i64,
+    /// The factor a brake steps the allowance back by (0.1 to 1).
+    pub step_back: f64,
+    /// How long a message waits when no address of its pool has room left
+    /// today. No attempt is counted.
+    pub defer_seconds: u32,
+    /// Changes to the built-in profiles `slow`, `normal` and `fast`: the base
+    /// ramp (used by `other` and by groups the profile does not name) and the
+    /// first day's allowance and cap per provider group.
+    pub profiles: std::collections::BTreeMap<String, WarmupProfileConfig>,
+}
+
+/// Changes to one built-in warm-up profile (`warmup.profiles.<name>`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WarmupProfileConfig {
+    pub start: Option<i64>,
+    pub growth: Option<f64>,
+    pub cap: Option<i64>,
+    /// Per provider group: `{ start, cap }`.
+    pub groups: std::collections::BTreeMap<String, WarmupGroupLimits>,
+}
+
+/// The first day's allowance and the cap of one provider group.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WarmupGroupLimits {
+    pub start: i64,
+    pub cap: i64,
+}
+
+impl Warmup {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let fractions = [
+            ("min_volume_fraction", self.min_volume_fraction),
+            ("advance_fraction", self.advance_fraction),
+            ("deferral_rate_slow", self.deferral_rate_slow),
+            ("bounce_rate_brake", self.bounce_rate_brake),
+            ("policy_block_rate_brake", self.policy_block_rate_brake),
+            ("complaint_rate_warn", self.complaint_rate_warn),
+            ("complaint_rate_brake", self.complaint_rate_brake),
+        ];
+        for (name, value) in fractions {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(ConfigError::Invalid(format!(
+                    "warmup.{name} must be between 0 and 1 (got {value})"
+                )));
+            }
+        }
+        if self.min_volume_fraction > self.advance_fraction {
+            return Err(ConfigError::Invalid(
+                "warmup.min_volume_fraction must not be above warmup.advance_fraction".into(),
+            ));
+        }
+        if self.complaint_rate_warn > self.complaint_rate_brake {
+            return Err(ConfigError::Invalid(
+                "warmup.complaint_rate_warn must not be above warmup.complaint_rate_brake".into(),
+            ));
+        }
+        if !(0.1..=1.0).contains(&self.step_back) {
+            return Err(ConfigError::Invalid(format!(
+                "warmup.step_back must be between 0.1 and 1 (got {})",
+                self.step_back
+            )));
+        }
+        for (name, profile) in &self.profiles {
+            if !matches!(name.as_str(), "slow" | "normal" | "fast") {
+                return Err(ConfigError::Invalid(format!(
+                    "warmup.profiles: {name:?} is not a built-in profile (slow, normal, fast)"
+                )));
+            }
+            if profile.start.is_some_and(|v| !(1..=1_000_000).contains(&v))
+                || profile.growth.is_some_and(|v| !(1.05..=3.0).contains(&v))
+                || profile.cap.is_some_and(|v| !(2..=10_000_000).contains(&v))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "warmup.profiles.{name}: start 1 to 1000000, growth 1.05 to 3.0, cap up to 10000000"
+                )));
+            }
+            for (group, limits) in &profile.groups {
+                let valid_name = !group.is_empty()
+                    && group.len() <= 40
+                    && group
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                if !valid_name
+                    || limits.start < 1
+                    || limits.cap <= limits.start
+                    || limits.cap > 10_000_000
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "warmup.profiles.{name}.groups.{group}: needs a valid group name, start >= 1 and cap above start"
+                    )));
+                }
+            }
+        }
+        if self.pause_hours < 1 || self.policy_blocks_brake < 1 || self.defer_seconds < 60 {
+            return Err(ConfigError::Invalid(
+                "warmup.pause_hours and warmup.policy_blocks_brake must be at least 1, \
+                 warmup.defer_seconds at least 60"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+
+    #[test]
+    fn warmup_limits_are_validated() {
+        assert!(Config::default().validate().is_ok());
+        let mut config = Config::default();
+        config.warmup.complaint_rate_warn = 0.01;
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("warmup:\n  pause_hours: 48\n  defer_seconds: 600\n").unwrap();
+        assert_eq!(config.warmup.pause_hours, 48);
+        assert_eq!(config.warmup.advance_fraction, 0.9);
+        assert!(config.validate().is_ok());
+        assert!(Config::from_yaml("warmup:\n  unknown: 1\n").is_err());
+        let config = Config::from_yaml(
+            "warmup:\n  profiles:\n    normal:\n      growth: 1.4\n      groups:\n        seznam: { start: 80, cap: 25000 }\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.warmup.profiles["normal"].groups["seznam"].cap, 25000);
+        for bad in [
+            "warmup:\n  profiles:\n    turbo: { start: 10 }\n",
+            "warmup:\n  profiles:\n    slow: { growth: 5 }\n",
+            "warmup:\n  profiles:\n    slow:\n      groups:\n        x: { start: 10, cap: 5 }\n",
+        ] {
+            assert!(Config::from_yaml(bad).unwrap().validate().is_err(), "{bad}");
+        }
+    }
+}
+
+impl Default for Warmup {
+    fn default() -> Self {
+        Self {
+            min_volume_fraction: 0.5,
+            advance_fraction: 0.9,
+            deferral_rate_slow: 0.05,
+            bounce_rate_brake: 0.05,
+            policy_blocks_brake: 3,
+            policy_block_rate_brake: 0.01,
+            complaint_rate_warn: 0.001,
+            complaint_rate_brake: 0.003,
+            pause_hours: 24,
+            step_back: 0.5,
+            defer_seconds: 900,
+            profiles: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 impl Config {
@@ -1637,6 +1914,27 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.worker.validate()?;
+        self.warmup.validate()?;
+        for group in &self.provider_groups {
+            let valid = !group.name.is_empty()
+                && group.name.len() <= 40
+                && group
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if !valid || group.name == "other" {
+                return Err(ConfigError::Invalid(format!(
+                    "provider_groups: {:?} is not a valid group name ([a-z0-9_], at most 40 characters, not \"other\")",
+                    group.name
+                )));
+            }
+            if group.domains.is_empty() && group.mx_patterns.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "provider_groups: {} needs domains or mx_patterns",
+                    group.name
+                )));
+            }
+        }
         self.cluster.validate()?;
         if !matches!(self.camelmailer.web_protocol.as_str(), "http" | "https") {
             return Err(ConfigError::Invalid(format!(
@@ -2595,6 +2893,41 @@ smtp_server:
     }
 
     #[test]
+    fn server_shutdown_grace_defaults_and_env_overrides() {
+        let config = Config::from_yaml("").unwrap();
+        assert_eq!(config.web_server.shutdown_grace_seconds, 30);
+        assert_eq!(config.smtp_server.shutdown_grace_seconds, 30);
+        let config = Config::from_yaml(
+            "web_server:\n  shutdown_grace_seconds: 12\nsmtp_server:\n  shutdown_grace_seconds: 45\n",
+        )
+        .unwrap();
+        let none = |_: &str| None;
+        assert_eq!(
+            config.web_server.shutdown_grace_with(none).unwrap(),
+            std::time::Duration::from_secs(12)
+        );
+        assert_eq!(
+            config.smtp_server.shutdown_grace_with(none).unwrap(),
+            std::time::Duration::from_secs(45)
+        );
+        let env = |name: &str| match name {
+            "WEB_SERVER_SHUTDOWN_GRACE_SECONDS" => Some("5".to_string()),
+            "SMTP_SERVER_SHUTDOWN_GRACE_SECONDS" => Some(" 0 ".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            config.web_server.shutdown_grace_with(env).unwrap(),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.smtp_server.shutdown_grace_with(env).unwrap(),
+            std::time::Duration::ZERO
+        );
+        let bad = |_: &str| Some("soon".to_string());
+        assert!(config.smtp_server.shutdown_grace_with(bad).is_err());
+    }
+
+    #[test]
     fn cluster_defaults_and_validation() {
         let config = Config::from_yaml("").unwrap();
         assert_eq!(config.cluster.heartbeat_interval_seconds, 30);
@@ -2706,5 +3039,27 @@ smtp_server:
         let junk =
             |name: &str| (name == "WORKER_FOREIGN_POOL_DELAY_SECONDS").then(|| "soon".to_string());
         assert!(Worker::default().with_overrides(junk).is_err());
+    }
+}
+
+#[cfg(test)]
+mod provider_group_tests {
+    use super::*;
+
+    #[test]
+    fn provider_groups_are_read_and_checked() {
+        let config = Config::from_yaml(
+            "provider_groups:\n  - name: seznam\n    domains: [seznam.cz]\n    mx_patterns: [seznam.cz]\n",
+        )
+        .unwrap();
+        assert_eq!(config.provider_groups[0].name, "seznam");
+        assert!(config.validate().is_ok());
+        for bad in [
+            "provider_groups:\n  - name: Seznam\n    domains: [seznam.cz]\n",
+            "provider_groups:\n  - name: other\n    domains: [x.cz]\n",
+            "provider_groups:\n  - name: empty\n",
+        ] {
+            assert!(Config::from_yaml(bad).unwrap().validate().is_err(), "{bad}");
+        }
     }
 }

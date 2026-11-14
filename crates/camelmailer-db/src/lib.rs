@@ -13,19 +13,22 @@
 //! table owner subject to the policy.
 
 mod auth_pg;
+mod delivery_stats_pg;
 mod lifecycle_queue;
 mod org_sso_pg;
 mod pg_store;
 mod queue;
 mod retention;
 mod tracking;
+mod warmup_pg;
 pub mod webhook_payload;
 mod webhook_queue;
 
 pub use lifecycle_queue::{LifecycleEventRow, PgLifecycleQueue};
 pub use pg_store::{
     BounceCorrelationOutcome, BounceOriginal, Delivery, FeedbackComplaint,
-    FeedbackComplaintOutcome, OutboundQueueAction, PgMessageSink, PgStore, StoredMessage,
+    FeedbackComplaintOutcome, OutboundQueueAction, OutboundRecord, PgMessageSink, PgStore,
+    StoredMessage,
 };
 pub use queue::{resolve_server_permalinks, PgQueue, QueueFilter, QueueKind, QueuedMessageRow};
 pub use retention::{RetentionReport, RetentionTarget};

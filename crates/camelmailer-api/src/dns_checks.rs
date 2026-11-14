@@ -16,12 +16,19 @@
 //!   PTR record, the PTR name resolves back to the address (forward-confirmed
 //!   reverse DNS), and the name the worker greets with (EHLO) is that PTR
 //!   name;
-//! - the SPF policy of the return-path domain and of every verified tenant
-//!   domain lets every sending address pass, with the exact `ip4:`/`ip6:`
-//!   mechanisms to add when it does not;
-//! - the return-path domain's MX leads back to the installation, tenant
-//!   domains with an inbound route have their MX on the installation (a
-//!   warning only), and the tracking host name resolves.
+//! - by role of each domain:
+//!   - the return-path domain: SPF lets every sending address pass, and its
+//!     MX leads back to the installation;
+//!   - every verified sending (tenant) domain: SPF lets every sending
+//!     address pass (with the exact `ip4:`/`ip6:` mechanisms to add), the
+//!     DKIM record at `<selector>._domainkey.<domain>` carries the public key
+//!     the worker signs with (the domain's own key, else the installation
+//!     key), and a DMARC record exists at `_dmarc.<domain>` (`p=none` is a
+//!     warning);
+//!   - every tenant domain with an inbound route: its MX points at the
+//!     installation (the inbound host name or `dns.mx_records`, or a host
+//!     that resolves to the inbound addresses);
+//! - the tracking host name resolves.
 //!
 //! Lookups are bounded: each one has a timeout, at most [`CONCURRENCY`]
 //! subjects are checked at once, and the full result is kept for
@@ -96,7 +103,8 @@ pub struct DnsCheck {
     pub group: &'static str,
     /// The address, host name or domain.
     pub subject: String,
-    /// `a`, `ptr`, `fcrdns`, `ehlo`, `spf`, `mx` or `resolves`.
+    /// `a`, `ptr`, `fcrdns`, `ehlo`, `spf`, `dkim`, `dmarc`, `mx` or
+    /// `resolves`.
     pub kind: &'static str,
     pub status: CheckStatus,
     /// What DNS answers today.
@@ -122,6 +130,21 @@ pub struct SendingAddress {
     pub pool: Option<String>,
 }
 
+/// A verified domain mail is sent from, with what its DKIM and DMARC
+/// records must say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendingDomain {
+    pub name: String,
+    /// `<selector>._domainkey.<domain>`.
+    pub dkim_name: String,
+    /// The `p=` value the worker signs with: the domain's own key, else the
+    /// installation key; `None` when neither exists.
+    pub dkim_public_key: Option<String>,
+    /// A `mailto:` address whose route stores DMARC reports, when the
+    /// server has one.
+    pub dmarc_rua: Option<String>,
+}
+
 /// A domain whose SPF policy must authorise the sending addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpfDomain {
@@ -142,6 +165,8 @@ pub struct DnsPlan {
     /// The host names the MX of the return-path domain and of inbound
     /// tenant domains may point at.
     pub mx_targets: Vec<String>,
+    /// Verified sending domains (DKIM and DMARC are checked for each).
+    pub sending_domains: Vec<SendingDomain>,
     pub return_path_domain: Option<String>,
     /// Tenant domains with an inbound route.
     pub inbound_domains: Vec<String>,
@@ -491,14 +516,34 @@ async fn mx_check(
     resolver: &dyn DnsCheckResolver,
     domain: &str,
     targets: &[String],
-    failing: CheckStatus,
+    target_addresses: &[IpAddr],
     what: &str,
 ) -> DnsCheck {
+    let failing = CheckStatus::Fail;
     let (status, found, detail) = match resolver.mx_hosts(domain).await {
         Err(error) => (CheckStatus::Warn, Vec::new(), lookup_detail(&error)),
         Ok(hosts) => {
             let hosts = lower(hosts);
-            if targets.is_empty() {
+            // An MX host with another name that resolves to the inbound
+            // addresses reaches the installation too.
+            let mut via_address = false;
+            if !hosts.iter().any(|h| targets.contains(h)) && !target_addresses.is_empty() {
+                for host in &hosts {
+                    if let Ok(addresses) = resolver.ip_addresses(host).await {
+                        if addresses.iter().any(|a| target_addresses.contains(a)) {
+                            via_address = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if via_address {
+                (
+                    CheckStatus::Ok,
+                    hosts,
+                    format!("{what} reaches this installation (the MX host resolves to its inbound address)"),
+                )
+            } else if targets.is_empty() {
                 (
                     CheckStatus::Warn,
                     hosts,
@@ -530,6 +575,174 @@ async fn mx_check(
         } else {
             Vec::new()
         },
+        detail,
+    }
+}
+
+/// Does the DKIM record of `domain` carry the key the worker signs with?
+pub async fn dkim_check(resolver: &dyn DnsCheckResolver, domain: &SendingDomain) -> DnsCheck {
+    let expected_record = domain
+        .dkim_public_key
+        .as_deref()
+        .map(|key| format!("v=DKIM1; k=rsa; p={key}"));
+    let instruction = expected_record
+        .as_deref()
+        .map(|record| format!("set TXT {} → \"{record}\", TTL {TTL}", domain.dkim_name));
+    let (status, found, detail) = match resolver.txt(&domain.dkim_name).await {
+        Err(error) => (CheckStatus::Warn, Vec::new(), lookup_detail(&error)),
+        Ok(records) => {
+            let records: Vec<String> = records
+                .into_iter()
+                .filter(|r| camelmailer_core::dmarc::dkim_public_key_of_record(r).is_some())
+                .collect();
+            match domain.dkim_public_key.as_deref() {
+                None => (
+                    CheckStatus::Warn,
+                    records,
+                    "neither the domain nor the installation has a DKIM key, so mail from it is not signed".to_string(),
+                ),
+                Some(_) if records.is_empty() => (
+                    CheckStatus::Fail,
+                    records,
+                    format!("no DKIM record at {}; receivers cannot verify the signature", domain.dkim_name),
+                ),
+                Some(expected) => {
+                    let matches = records.iter().any(|r| {
+                        camelmailer_core::dmarc::dkim_public_key_of_record(r).as_deref()
+                            == Some(expected)
+                    });
+                    if matches {
+                        (CheckStatus::Ok, records, "the published key is the one the worker signs with".into())
+                    } else {
+                        (
+                            CheckStatus::Fail,
+                            records,
+                            "the published key is not the one the worker signs with; signatures fail".into(),
+                        )
+                    }
+                }
+            }
+        }
+    };
+    DnsCheck {
+        group: "domain",
+        subject: domain.name.clone(),
+        kind: "dkim",
+        status,
+        found,
+        expected: expected_record.into_iter().collect(),
+        instructions: if status == CheckStatus::Fail {
+            instruction.into_iter().collect()
+        } else {
+            Vec::new()
+        },
+        detail: if status == CheckStatus::Fail {
+            format!("{detail} (most DNS providers split a TXT value longer than 255 characters into several strings; that is fine)")
+        } else {
+            detail
+        },
+    }
+}
+
+/// The DMARC record with `p=` set to `policy`: the existing record with its
+/// policy tag replaced (or added), or a new one.
+pub fn dmarc_record_with(existing: Option<&str>, policy: &str, rua: &str) -> String {
+    match existing {
+        None => format!("v=DMARC1; p={policy}; rua={rua}"),
+        Some(record) => {
+            let mut replaced = false;
+            let mut tags: Vec<String> = record
+                .split(';')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(|tag| {
+                    if tag.to_ascii_lowercase().starts_with("p=") {
+                        replaced = true;
+                        format!("p={policy}")
+                    } else {
+                        tag.to_string()
+                    }
+                })
+                .collect();
+            if !replaced {
+                let at = 1.min(tags.len());
+                tags.insert(at, format!("p={policy}"));
+            }
+            tags.join("; ")
+        }
+    }
+}
+
+/// Is there a DMARC record, and does it ask receivers to act?
+pub async fn dmarc_check(resolver: &dyn DnsCheckResolver, domain: &SendingDomain) -> DnsCheck {
+    let name = format!("_dmarc.{}", domain.name);
+    let rua = domain
+        .dmarc_rua
+        .clone()
+        .unwrap_or_else(|| "mailto:<a mailbox that receives DMARC reports>".into());
+    let (status, found, detail, record) = match resolver.txt(&name).await {
+        Err(error) => (CheckStatus::Warn, Vec::new(), lookup_detail(&error), None),
+        Ok(records) => {
+            let records: Vec<String> = records
+                .into_iter()
+                .filter(|r| camelmailer_core::dmarc::is_dmarc_record(r))
+                .collect();
+            let first = records.first().cloned();
+            let policy = first
+                .as_deref()
+                .and_then(camelmailer_core::dmarc::parse_dmarc_record)
+                .and_then(|p| p.p);
+            if records.is_empty() {
+                (
+                    CheckStatus::Fail,
+                    records,
+                    format!(
+                        "no DMARC record at {name}; Gmail and Yahoo require one from bulk senders"
+                    ),
+                    Some(dmarc_record_with(None, "none", &rua)),
+                )
+            } else if records.len() > 1 {
+                let count = records.len();
+                (
+                    CheckStatus::Fail,
+                    records,
+                    format!("{count} DMARC records at {name}; receivers ignore the policy, keep exactly one"),
+                    None,
+                )
+            } else {
+                match policy.as_deref() {
+                    None => (
+                        CheckStatus::Fail,
+                        records,
+                        "the DMARC record has no valid p= tag (none, quarantine or reject)".into(),
+                        Some(dmarc_record_with(first.as_deref(), "none", &rua)),
+                    ),
+                    Some("none") => (
+                        CheckStatus::Warn,
+                        records,
+                        "the DMARC policy is p=none: receivers only report; raise it to quarantine once the reports show your mail passes".into(),
+                        Some(dmarc_record_with(first.as_deref(), "quarantine", &rua)),
+                    ),
+                    Some(_) => (
+                        CheckStatus::Ok,
+                        records,
+                        "a DMARC policy is published".into(),
+                        None,
+                    ),
+                }
+            }
+        }
+    };
+    DnsCheck {
+        group: "domain",
+        subject: domain.name.clone(),
+        kind: "dmarc",
+        status,
+        found,
+        expected: vec!["v=DMARC1 with p=quarantine or p=reject".into()],
+        instructions: record
+            .map(|record| vec![format!("set TXT {name} → \"{record}\", TTL {TTL}")])
+            .unwrap_or_default(),
         detail,
     }
 }
@@ -600,6 +813,14 @@ pub async fn run_checks(resolver: &dyn DnsCheckResolver, plan: &DnsPlan) -> Vec<
             }
         }));
     }
+    for domain in &plan.sending_domains {
+        jobs.push(Box::pin(async move {
+            vec![
+                dkim_check(resolver, domain).await,
+                dmarc_check(resolver, domain).await,
+            ]
+        }));
+    }
     if let Some(domain) = &plan.return_path_domain {
         jobs.push(Box::pin(async move {
             vec![
@@ -607,7 +828,7 @@ pub async fn run_checks(resolver: &dyn DnsCheckResolver, plan: &DnsPlan) -> Vec<
                     resolver,
                     domain,
                     &plan.mx_targets,
-                    CheckStatus::Fail,
+                    &plan.inbound_targets,
                     "bounce mail to the return path",
                 )
                 .await,
@@ -621,7 +842,7 @@ pub async fn run_checks(resolver: &dyn DnsCheckResolver, plan: &DnsPlan) -> Vec<
                     resolver,
                     domain,
                     &plan.mx_targets,
-                    CheckStatus::Warn,
+                    &plan.inbound_targets,
                     "inbound mail",
                 )
                 .await,
@@ -781,16 +1002,15 @@ pub async fn build_plan(state: &ApiState) -> Result<DnsPlan, camelmailer_core::S
         }
     }
 
-    plan.mx_targets = if config.dns.mx_records.is_empty() {
-        plan.inbound_hostname.iter().cloned().collect()
-    } else {
-        config
-            .dns
-            .mx_records
-            .iter()
-            .map(|m| m.trim_end_matches('.').to_ascii_lowercase())
-            .collect()
-    };
+    // The inbound host name first (the record the instructions suggest),
+    // then the configured MX names.
+    plan.mx_targets = plan.inbound_hostname.iter().cloned().collect();
+    for record in &config.dns.mx_records {
+        let record = record.trim_end_matches('.').to_ascii_lowercase();
+        if !record.is_empty() && !plan.mx_targets.contains(&record) {
+            plan.mx_targets.push(record);
+        }
+    }
     if config.dns.return_path_envelope {
         if let Some(domain) = config.dns.normalized_return_path_domain() {
             plan.spf_domains.push(SpfDomain {
@@ -806,13 +1026,31 @@ pub async fn build_plan(state: &ApiState) -> Result<DnsPlan, camelmailer_core::S
     'organizations: for organization in store.list_organizations().await? {
         for server in store.servers_for_organization(organization.id).await? {
             let routes = store.list_routes(server.id).await?;
-            for domain in store.list_domains(server.id).await? {
+            let domains = store.list_domains(server.id).await?;
+            // The address of the route that stores DMARC reports, as the
+            // domain health check suggests it.
+            let dmarc_rua = routes
+                .iter()
+                .find(|r| {
+                    r.endpoint_url.as_deref()
+                        == Some(camelmailer_core::dmarc::DMARC_REPORTS_ENDPOINT)
+                })
+                .and_then(|route| {
+                    let domain = match route.domain_id {
+                        Some(id) => domains.iter().find(|d| d.id == id).map(|d| d.name.clone()),
+                        None => server.inbound_domain.clone(),
+                    };
+                    domain.map(|domain| format!("mailto:{}@{domain}", route.name))
+                });
+            for domain in domains {
+                let name = domain.name.to_ascii_lowercase();
+                if routes.iter().any(|r| r.domain_id == Some(domain.id))
+                    && inbound.len() < MAX_TENANT_DOMAINS
+                {
+                    inbound.insert(name.clone());
+                }
                 if !domain.verified {
                     continue;
-                }
-                let name = domain.name.to_ascii_lowercase();
-                if routes.iter().any(|r| r.domain_id == Some(domain.id)) {
-                    inbound.insert(name.clone());
                 }
                 if seen.contains(&name) {
                     continue;
@@ -825,6 +1063,16 @@ pub async fn build_plan(state: &ApiState) -> Result<DnsPlan, camelmailer_core::S
                     continue;
                 }
                 seen.insert(name.clone());
+                plan.sending_domains.push(SendingDomain {
+                    dkim_name: format!("{}._domainkey.{name}", config.dns.dkim_identifier),
+                    dkim_public_key: domain
+                        .dkim_private_key
+                        .as_deref()
+                        .and_then(crate::resources::dkim_public_key_b64)
+                        .or_else(|| state.installation_dkim_public_key.clone()),
+                    dmarc_rua: dmarc_rua.clone(),
+                    name: name.clone(),
+                });
                 plan.spf_domains.push(SpfDomain {
                     name,
                     role: "tenant",
@@ -832,7 +1080,8 @@ pub async fn build_plan(state: &ApiState) -> Result<DnsPlan, camelmailer_core::S
             }
         }
     }
-    plan.inbound_domains = inbound.into_iter().filter(|d| seen.contains(d)).collect();
+    // Every domain with an inbound route, verified or not, must receive here.
+    plan.inbound_domains = inbound.into_iter().collect();
     let track = config.dns.track_domain.trim().to_ascii_lowercase();
     if !track.is_empty() && !track.ends_with(".example.com") && track != "track.postal.example.com"
     {
@@ -1187,6 +1436,7 @@ pub(crate) mod tests {
                 role: "return_path",
             }],
             mx_targets: vec!["mail.example.com".into()],
+            sending_domains: vec![],
             return_path_domain: Some("rp.example.com".into()),
             inbound_domains: vec!["tenant.example".into()],
             track_hostname: Some("track.example.org".into()),
@@ -1194,9 +1444,10 @@ pub(crate) mod tests {
         };
         let checks = run_checks(&dns, &plan).await;
         let doc = checks_json(&checks, &plan);
-        assert_eq!(doc["summary"]["fail"], 0);
-        // tenant MX missing: a warning with the record; tracking lookup failed: a warning
-        assert_eq!(doc["summary"]["warn"], 2);
+        // tenant MX missing: a failure with the record (the domain has an
+        // inbound route); tracking lookup failed: a warning
+        assert_eq!(doc["summary"]["fail"], 1);
+        assert_eq!(doc["summary"]["warn"], 1);
         assert_eq!(
             doc["instructions"],
             json!(["set MX tenant.example → 10 mail.example.com, TTL 300"])
@@ -1237,6 +1488,130 @@ pub(crate) mod tests {
         assert_eq!(
             check.instructions,
             vec!["set A mail.example.com → 198.51.100.5, TTL 300"]
+        );
+    }
+
+    fn sending_domain(key: Option<&str>) -> SendingDomain {
+        SendingDomain {
+            name: "tenant.example".into(),
+            dkim_name: "camelmailer._domainkey.tenant.example".into(),
+            dkim_public_key: key.map(String::from),
+            dmarc_rua: Some("mailto:dmarc@inbound.tenant.example".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn dkim_must_carry_the_signing_key() {
+        let mut dns = FakeDns::default();
+        // missing
+        let check = dkim_check(&dns, &sending_domain(Some("MIIBkey"))).await;
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(
+            check.instructions,
+            vec!["set TXT camelmailer._domainkey.tenant.example → \"v=DKIM1; k=rsa; p=MIIBkey\", TTL 300"]
+        );
+        // another key
+        dns.txt.insert(
+            "camelmailer._domainkey.tenant.example".into(),
+            vec!["v=DKIM1; k=rsa; p=MIIBother".into()],
+        );
+        let check = dkim_check(&dns, &sending_domain(Some("MIIBkey"))).await;
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.found, vec!["v=DKIM1; k=rsa; p=MIIBother"]);
+        // the right key
+        dns.txt.insert(
+            "camelmailer._domainkey.tenant.example".into(),
+            vec!["v=DKIM1; k=rsa; p=MIIBkey".into()],
+        );
+        let check = dkim_check(&dns, &sending_domain(Some("MIIBkey"))).await;
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.instructions.is_empty());
+        // no key anywhere: a warning, nothing to publish
+        let check = dkim_check(&dns, &sending_domain(None)).await;
+        assert_eq!(check.status, CheckStatus::Warn);
+    }
+
+    #[tokio::test]
+    async fn dmarc_is_required_and_p_none_is_a_warning() {
+        let mut dns = FakeDns::default();
+        let domain = sending_domain(None);
+        let check = dmarc_check(&dns, &domain).await;
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(
+            check.instructions,
+            vec!["set TXT _dmarc.tenant.example → \"v=DMARC1; p=none; rua=mailto:dmarc@inbound.tenant.example\", TTL 300"]
+        );
+        dns.txt.insert(
+            "_dmarc.tenant.example".into(),
+            vec!["v=DMARC1; p=none; rua=mailto:r@x.example".into()],
+        );
+        let check = dmarc_check(&dns, &domain).await;
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(
+            check.instructions,
+            vec!["set TXT _dmarc.tenant.example → \"v=DMARC1; p=quarantine; rua=mailto:r@x.example\", TTL 300"]
+        );
+        dns.txt.insert(
+            "_dmarc.tenant.example".into(),
+            vec!["v=DMARC1; p=reject".into()],
+        );
+        assert_eq!(dmarc_check(&dns, &domain).await.status, CheckStatus::Ok);
+        dns.txt.insert(
+            "_dmarc.tenant.example".into(),
+            vec!["v=DMARC1; p=reject".into(), "v=DMARC1; p=none".into()],
+        );
+        assert_eq!(dmarc_check(&dns, &domain).await.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn the_dmarc_policy_is_replaced_in_place() {
+        assert_eq!(
+            dmarc_record_with(
+                Some("v=DMARC1; p=none; rua=mailto:a@b.example; pct=100"),
+                "quarantine",
+                "x"
+            ),
+            "v=DMARC1; p=quarantine; rua=mailto:a@b.example; pct=100"
+        );
+        assert_eq!(
+            dmarc_record_with(Some("v=DMARC1; rua=mailto:a@b.example"), "none", "x"),
+            "v=DMARC1; p=none; rua=mailto:a@b.example"
+        );
+        assert_eq!(
+            dmarc_record_with(None, "none", "mailto:r@x.example"),
+            "v=DMARC1; p=none; rua=mailto:r@x.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inbound_mx_on_another_name_counts_when_it_resolves_to_the_installation() {
+        let mut dns = FakeDns::default();
+        dns.mx
+            .insert("tenant.example".into(), vec!["mx.tenant.example".into()]);
+        dns.ips
+            .insert("mx.tenant.example".into(), vec![ip("198.51.100.5")]);
+        let targets = vec!["mail.example.com".to_string()];
+        let check = mx_check(
+            &dns,
+            "tenant.example",
+            &targets,
+            &[ip("198.51.100.5")],
+            "inbound mail",
+        )
+        .await;
+        assert_eq!(check.status, CheckStatus::Ok);
+        let check = mx_check(
+            &dns,
+            "tenant.example",
+            &targets,
+            &[ip("198.51.100.9")],
+            "inbound mail",
+        )
+        .await;
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(
+            check.instructions,
+            vec!["set MX tenant.example → 10 mail.example.com, TTL 300"]
         );
     }
 

@@ -1324,6 +1324,111 @@ async fn dns_checks_report_the_records_to_set_and_cache_the_run() {
 }
 
 #[tokio::test]
+async fn dns_checks_cover_dkim_dmarc_and_inbound_mx_by_domain_role() {
+    let (app, state) = build_dns_app(Arc::new(FixedDns::default())).await;
+    let org = state
+        .store
+        .create_organization(camelmailer_core::admin_store::NewOrganization {
+            name: "Acme".into(),
+            permalink: "acme".into(),
+        })
+        .await
+        .unwrap();
+    let server = state
+        .store
+        .create_server(camelmailer_core::admin_store::NewServer {
+            organization_id: org.id,
+            name: "Live".into(),
+            permalink: "live".into(),
+            mode: camelmailer_core::ServerMode::Live,
+        })
+        .await
+        .unwrap();
+    let sending = state
+        .store
+        .create_server_domain(server.id, "send.example", None)
+        .await
+        .unwrap();
+    state
+        .store
+        .set_domain_verified(sending.id, true)
+        .await
+        .unwrap();
+    // A domain with an inbound route, not verified for sending.
+    let inbound = state
+        .store
+        .create_server_domain(server.id, "in.example", None)
+        .await
+        .unwrap();
+    state
+        .store
+        .create_route_record(camelmailer_core::admin_store::NewRoute {
+            server_id: server.id,
+            domain_id: Some(inbound.id),
+            name: "support".into(),
+            mode: camelmailer_core::RouteMode::Accept,
+            endpoint_url: None,
+        })
+        .await
+        .unwrap();
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/dns_checks",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = body["data"]["groups"].as_array().unwrap();
+    let kinds = |subject: &str| -> Vec<(String, String)> {
+        groups
+            .iter()
+            .find(|g| g["subject"] == subject)
+            .map(|g| {
+                g["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| {
+                        (
+                            c["kind"].as_str().unwrap().to_string(),
+                            c["status"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The sending domain: DKIM (no key in this test installation: a
+    // warning) and DMARC (missing: a failure). No SPF check without a
+    // sending address.
+    assert_eq!(
+        kinds("send.example"),
+        vec![
+            ("dkim".to_string(), "warn".to_string()),
+            ("dmarc".to_string(), "fail".to_string())
+        ]
+    );
+    // The inbound domain: only its MX, and missing is a failure.
+    assert_eq!(
+        kinds("in.example"),
+        vec![("mx".to_string(), "fail".to_string())]
+    );
+    let instructions: Vec<&str> = body["data"]["instructions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(instructions.contains(&"set MX in.example → 10 mail.example.com, TTL 300"));
+    assert!(instructions
+        .iter()
+        .any(|i| i.starts_with("set TXT _dmarc.send.example → \"v=DMARC1; p=none;")));
+}
+
+#[tokio::test]
 async fn the_candidate_check_guides_a_new_address_until_it_is_ready() {
     let ip = |v: &str| v.parse::<std::net::IpAddr>().unwrap();
     let (app, _) = build_dns_app(Arc::new(FixedDns::default())).await;
@@ -2754,4 +2859,224 @@ async fn spf_compares_text_when_the_declared_record_is_not_only_addresses() {
         text.starts_with("add include:spf.postal.example.com"),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn ip_metrics_add_up_the_delivery_counters_for_global_admins() {
+    use camelmailer_core::{DeliveryKind, DeliveryStatsStore, IpDeliveryRecord, ProviderGroup};
+    let memory = Arc::new(MemoryStore::new());
+    let state = ApiState::new(memory.clone(), Some(GLOBAL_KEY.to_string()))
+        .with_delivery_stats(memory.clone());
+    let app = build_router(state.clone());
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/ip_metrics",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["days"], 7);
+    assert_eq!(body["data"]["addresses"], json!([]));
+
+    let pool = state.store.create_ip_pool("Main", true).await.unwrap();
+    let address = state
+        .store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: pool.id,
+            ipv4: "203.0.113.5".into(),
+            ipv6: None,
+            hostname: "out1.example.com".into(),
+            priority: 100,
+        })
+        .await
+        .unwrap();
+    for (kind, message_id) in [
+        (DeliveryKind::Sent, 1),
+        (DeliveryKind::Sent, 2),
+        (DeliveryKind::Deferred, 3),
+    ] {
+        memory
+            .record_ip_delivery(&IpDeliveryRecord {
+                day: chrono::Utc::now().date_naive(),
+                source_ip: "203.0.113.5".into(),
+                ip_address_id: Some(address.id),
+                provider: ProviderGroup::microsoft(),
+                kind,
+                policy_block: false,
+                server_id: 1,
+                message_id,
+            })
+            .await
+            .unwrap();
+    }
+
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/ip_metrics?days=1",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    let first = &body["data"]["addresses"][0];
+    assert_eq!(first["source_ip"], "203.0.113.5");
+    assert_eq!(first["hostname"], "out1.example.com");
+    assert_eq!(first["pool"]["id"], pool.id);
+    assert_eq!(first["today"]["sent"], 2);
+    assert_eq!(first["providers"][0]["provider"], "microsoft");
+    assert_eq!(body["data"]["pools"][0]["totals"]["deferred"], 1);
+
+    let (status, _) = request(&app, "GET", "/api/v2/admin/ip_metrics", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn ip_warmup_modes_are_set_per_address_and_pool_and_shown_per_provider() {
+    let memory = Arc::new(MemoryStore::new());
+    let state = ApiState::new(memory.clone(), Some(GLOBAL_KEY.to_string()))
+        .with_warmup_store(memory.clone());
+    let app = build_router(state.clone());
+    let pool = state.store.create_ip_pool("Main", true).await.unwrap();
+    let address = state
+        .store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: pool.id,
+            ipv4: "203.0.113.5".into(),
+            ipv6: None,
+            hostname: "out1.example.com".into(),
+            priority: 100,
+        })
+        .await
+        .unwrap();
+
+    // Off by default.
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/ip_warmup",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first = &body["data"]["addresses"][0];
+    assert_eq!(first["mode"], "off");
+    assert_eq!(first["mode_source"], "default");
+    assert_eq!(first["active"], false);
+    assert_eq!(first["providers"][0]["allowance"], Value::Null);
+    assert_eq!(body["data"]["profiles"]["normal"]["start"], 200);
+    assert_eq!(
+        body["data"]["profiles"]["normal"]["groups"]["microsoft"]["start"],
+        100
+    );
+    assert_eq!(
+        body["data"]["provider_groups"],
+        json!([
+            "microsoft",
+            "google",
+            "yahoo",
+            "apple",
+            "united_internet",
+            "t_online",
+            "other"
+        ])
+    );
+    assert_eq!(first["providers"].as_array().unwrap().len(), 7);
+    assert_eq!(body["data"]["storage_incidents"], json!([]));
+
+    // The pool default applies to its addresses.
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/v2/admin/ip_warmup/pools/{}", pool.id),
+        Some(GLOBAL_KEY),
+        Some(json!({ "mode": "slow" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/ip_warmup",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    let first = &body["data"]["addresses"][0];
+    assert_eq!(first["mode"], "slow");
+    assert_eq!(first["mode_source"], "pool");
+    assert_eq!(first["providers"][1]["provider"], "google");
+    assert_eq!(first["providers"][1]["allowance"], 50);
+    assert_eq!(first["providers"][1]["status"], "not_started");
+    assert_eq!(first["providers"][1]["eta_days"], 23);
+
+    // A custom profile on the address wins; invalid ones are refused.
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/v2/admin/ip_warmup/addresses/{}", address.id),
+        Some(GLOBAL_KEY),
+        Some(json!({ "mode": "custom" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/v2/admin/ip_warmup/addresses/{}", address.id),
+        Some(GLOBAL_KEY),
+        Some(json!({ "mode": "custom", "profile": { "start": 10, "growth": 9.0, "cap": 100 } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        &format!("/api/v2/admin/ip_warmup/addresses/{}", address.id),
+        Some(GLOBAL_KEY),
+        Some(json!({ "mode": "custom", "profile": { "start": 10, "growth": 2.0, "cap": 160 } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let shown = &body["data"]["address"];
+    assert_eq!(shown["mode"], "custom");
+    assert_eq!(shown["mode_source"], "address");
+    assert_eq!(shown["providers"][0]["allowance"], 10);
+    assert_eq!(shown["eta_days"], 4);
+    assert_eq!(shown["recent_decisions"][0]["decision"], "mode");
+
+    // Unknown mode and unknown address.
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        &format!("/api/v2/admin/ip_warmup/addresses/{}", address.id),
+        Some(GLOBAL_KEY),
+        Some(json!({ "mode": "turbo" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        "/api/v2/admin/ip_warmup/addresses/9999",
+        Some(GLOBAL_KEY),
+        Some(json!({ "mode": "slow" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/ip_warmup/log",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert!(body["data"]["log"].as_array().unwrap().len() >= 2);
+    let (status, _) = request(&app, "GET", "/api/v2/admin/ip_warmup", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
