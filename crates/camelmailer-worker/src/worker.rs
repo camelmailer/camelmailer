@@ -978,10 +978,46 @@ impl Worker {
                 .into_iter()
                 .map(|a| (a.ip_address_id, a.ipv4))
                 .collect();
-        let no_signals = |_: camelmailer_core::Id, _: &camelmailer_core::ProviderGroup| Vec::new();
+        // Outside verdicts (Postmaster Tools, SNDS, feedback loops, seed
+        // placement) per warming address and provider, read up front.
+        let mut signals: HashMap<
+            (camelmailer_core::Id, camelmailer_core::ProviderGroup),
+            Vec<camelmailer_core::WarmupSignal>,
+        > = HashMap::new();
+        for state in camelmailer_core::WarmupStore::warmup_states(&self.store).await? {
+            if self.warmup.profile(state.ip_address_id).is_none() {
+                continue;
+            }
+            let Some(ipv4) = addresses.get(&state.ip_address_id) else {
+                continue;
+            };
+            match camelmailer_core::FeedbackStore::latest_provider_signals(
+                &self.store,
+                ipv4,
+                state.provider.as_str(),
+            )
+            .await
+            {
+                Ok(found) => {
+                    signals.insert(
+                        (state.ip_address_id, state.provider.clone()),
+                        crate::warmup::warmup_signals(&found, day),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, ipv4, "could not read provider signals for the warm-up")
+                }
+            }
+        }
+        let lookup = |id: camelmailer_core::Id, provider: &camelmailer_core::ProviderGroup| {
+            signals
+                .get(&(id, provider.clone()))
+                .cloned()
+                .unwrap_or_default()
+        };
         let written = self
             .warmup
-            .evaluate_day(&self.store, day, &stats, &addresses, &no_signals, now)
+            .evaluate_day(&self.store, day, &stats, &addresses, &lookup, now)
             .await?;
         Ok(written.len())
     }

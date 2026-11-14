@@ -67,6 +67,43 @@ pub fn thresholds_from(config: &camelmailer_config::Warmup) -> WarmupThresholds 
     }
 }
 
+/// How old (in days before the judged day) a provider signal may be and
+/// still count. Postmaster Tools and SNDS publish with a delay of a day or
+/// two; older data says little about the address today.
+pub const SIGNAL_MAX_AGE_DAYS: i64 = 3;
+
+/// The provider feedback that applies to one address and provider, as
+/// warm-up signals: `bad` brakes, `warn` slows, `ok` lets a healthy day
+/// advance (the decision reason names the sources). Readings without a
+/// verdict (`unknown`) and readings older than [`SIGNAL_MAX_AGE_DAYS`]
+/// before `day` are left out.
+pub fn warmup_signals(
+    found: &[camelmailer_core::ProviderSignal],
+    day: NaiveDate,
+) -> Vec<WarmupSignal> {
+    use camelmailer_core::{SignalVerdict, Verdict};
+    found
+        .iter()
+        .filter(|signal| signal.data_date >= day - chrono::Duration::days(SIGNAL_MAX_AGE_DAYS))
+        .filter_map(|signal| {
+            let verdict = match signal.verdict {
+                Verdict::Unknown => return None,
+                Verdict::Ok => SignalVerdict::Ok,
+                Verdict::Warn => SignalVerdict::Warn,
+                Verdict::Bad => SignalVerdict::Bad,
+            };
+            Some(WarmupSignal {
+                source: signal.source.clone(),
+                verdict,
+                detail: format!(
+                    "{} {}: {} (data of {})",
+                    signal.subject_kind, signal.subject, signal.detail, signal.data_date
+                ),
+            })
+        })
+        .collect()
+}
+
 /// What warm-up says about a delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pick {
@@ -502,6 +539,43 @@ mod tests {
             );
         }
         addresses
+    }
+
+    #[test]
+    fn provider_feedback_becomes_warmup_signals_when_fresh_and_judged() {
+        use camelmailer_core::{ProviderSignal, SignalVerdict, Verdict};
+        let day = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
+        let signal = |source: &str, verdict, data_date| ProviderSignal {
+            source: source.into(),
+            subject_kind: "ip".into(),
+            subject: "203.0.113.5".into(),
+            verdict,
+            detail: "filter result RED".into(),
+            data_date,
+            observed_at: Utc::now(),
+        };
+        let found = vec![
+            signal("snds", Verdict::Bad, day),
+            signal("postmaster_tools", Verdict::Warn, day.pred_opt().unwrap()),
+            signal("fbl", Verdict::Unknown, day),
+            signal("placement", Verdict::Ok, day),
+            signal("snds", Verdict::Bad, day - chrono::Duration::days(10)),
+        ];
+        let signals = warmup_signals(&found, day);
+        assert_eq!(
+            signals
+                .iter()
+                .map(|s| (s.source.as_str(), s.verdict))
+                .collect::<Vec<_>>(),
+            vec![
+                ("snds", SignalVerdict::Bad),
+                ("postmaster_tools", SignalVerdict::Warn),
+                ("placement", SignalVerdict::Ok)
+            ]
+        );
+        assert!(signals[0]
+            .detail
+            .contains("ip 203.0.113.5: filter result RED"));
     }
 
     #[tokio::test]
