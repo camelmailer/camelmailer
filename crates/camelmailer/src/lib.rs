@@ -339,6 +339,7 @@ pub async fn build_state(
         )
         .with_org_sso_store(pg.clone())
         .with_delivery_stats(pg.clone())
+        .with_warmup_store(pg.clone())
         .with_spf_resolver(spf_resolver);
         let tracking: Arc<dyn TrackingStore> = pg;
         Ok((state, Some(tracking)))
@@ -354,7 +355,8 @@ pub async fn build_state(
             Some(billing),
         )
         .with_org_sso_store(memory.clone())
-        .with_delivery_stats(memory)
+        .with_delivery_stats(memory.clone())
+        .with_warmup_store(memory)
         .with_spf_resolver(spf_resolver);
         Ok((state, None))
     }

@@ -5438,3 +5438,162 @@ async fn a_delivery_without_a_pool_counts_under_the_default_source() {
     assert_eq!(stats[0].provider, camelmailer_core::ProviderGroup::Google);
     assert_eq!(stats[0].ip_address_id, None);
 }
+
+async fn warmup_pool(s: &Setup) -> camelmailer_core::IpAddress {
+    let ip_pool = s.store.create_ip_pool("pool", true).await.unwrap();
+    let address = s
+        .store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: ip_pool.id,
+            ipv4: "127.0.0.1".into(),
+            ipv6: None,
+            hostname: "mx.example".into(),
+            priority: 10,
+        })
+        .await
+        .unwrap();
+    s.store
+        .set_server_ip_pool(s.server.id, Some(ip_pool.id))
+        .await
+        .unwrap();
+    address
+}
+
+/// Warm-up off (the default): nothing is reserved or limited, and every
+/// message goes out from the pool address as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_warmup_off_nothing_is_limited() {
+    use camelmailer_core::WarmupStore;
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    warmup_pool(&s).await;
+    for _ in 0..5 {
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+    }
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    for _ in 0..5 {
+        assert!(matches!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::Delivered { .. }
+        ));
+    }
+    let today = chrono::Utc::now().date_naive();
+    assert!(s.store.warmup_usage(today).await.unwrap().is_empty());
+    assert!(s.store.warmup_states().await.unwrap().is_empty());
+}
+
+/// Warm-up on: once the address's allowance for the provider is used up and
+/// no other address of the pool has room, the message waits without an
+/// attempt and nothing reaches the receiver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn beyond_the_warmup_allowance_a_message_waits_without_an_attempt() {
+    use camelmailer_core::{WarmupMode, WarmupProfile, WarmupStore};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    let address = warmup_pool(&s).await;
+    s.store
+        .set_address_warmup(
+            address.id,
+            Some(WarmupMode::Custom),
+            Some(WarmupProfile {
+                start: 1,
+                growth: 2.0,
+                cap: 100,
+            }),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+    }
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::WarmupDeferred
+    );
+    let (locked_by, attempts, waits): (Option<String>, i32, bool) = sqlx::query_as(
+        "SELECT locked_by, attempts, retry_after > now() + interval '10 minutes' FROM queued_messages",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((locked_by, attempts, waits), (None, 0, true));
+    let received = smtp.received.lock().unwrap().clone();
+    assert_eq!(received.iter().filter(|l| l.as_str() == "DATA").count(), 1);
+    let today = chrono::Utc::now().date_naive();
+    assert_eq!(
+        s.store.warmup_usage(today).await.unwrap(),
+        vec![(address.id, camelmailer_core::ProviderGroup::Microsoft, 1)]
+    );
+}
+
+/// Warm-up on: a run of policy refusals brakes the address for that provider
+/// at once (paused, allowance stepped back, logged), and the next message to
+/// that provider waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_refusals_brake_the_warmup_during_the_day() {
+    use camelmailer_core::{WarmupMode, WarmupProfile, WarmupStatus, WarmupStore};
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp =
+        mock_smtp("550 5.7.1 Unfortunately, messages from [127.0.0.1] weren't sent. (S3150)").await;
+    let address = warmup_pool(&s).await;
+    s.store
+        .set_address_warmup(
+            address.id,
+            Some(WarmupMode::Custom),
+            Some(WarmupProfile {
+                start: 20,
+                growth: 2.0,
+                cap: 1000,
+            }),
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+    }
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    for _ in 0..3 {
+        assert!(matches!(
+            worker.process_next().await.unwrap().unwrap(),
+            ProcessOutcome::Failed { .. }
+        ));
+    }
+    let states = s.store.warmup_states().await.unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].status, WarmupStatus::Paused);
+    assert_eq!(states[0].allowance, 20, "never below the start");
+    assert!(states[0]
+        .last_brake_reason
+        .as_deref()
+        .unwrap()
+        .contains("3 policy refusals"));
+    assert_eq!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::WarmupDeferred
+    );
+    let log = s.store.warmup_log(Some(address.id), 10).await.unwrap();
+    assert_eq!(log[0].decision, "brake");
+}

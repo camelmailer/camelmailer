@@ -7917,3 +7917,126 @@ async fn delivery_counters_add_up_and_complaints_reach_the_sending_address() {
         .unwrap();
     assert_eq!(removed, 2 + 3);
 }
+
+/// `WarmupStore` on Postgres, in lockstep with the MemoryStore test in
+/// camelmailer-core: reservations stop at the allowance and while paused,
+/// optimistic concurrency, inherited settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn warmup_reservations_settings_and_state_on_postgres() {
+    use camelmailer_core::{
+        ProviderGroup, WarmupLogEntry, WarmupMode, WarmupProfile, WarmupState, WarmupStatus,
+        WarmupStore,
+    };
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let store = PgStore::new(pool.clone());
+    let ip_pool = store.create_ip_pool("Main", true).await.unwrap();
+    let address = store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: ip_pool.id,
+            ipv4: "203.0.113.5".into(),
+            ipv6: None,
+            hostname: "out1.example.com".into(),
+            priority: 100,
+        })
+        .await
+        .unwrap();
+    let profile = WarmupProfile {
+        start: 2,
+        growth: 2.0,
+        cap: 100,
+    };
+    let initial = WarmupState::initial(address.id, ProviderGroup::Google, &profile);
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
+    let now = chrono::Utc::now();
+    for expected in [true, true, false] {
+        assert_eq!(
+            store
+                .try_reserve_warmup(address.id, ProviderGroup::Google, day, &initial, now)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+    assert!(store
+        .try_reserve_warmup(address.id, ProviderGroup::Yahoo, day, &initial, now)
+        .await
+        .unwrap());
+    assert_eq!(
+        store.warmup_usage(day).await.unwrap(),
+        vec![
+            (address.id, ProviderGroup::Google, 2),
+            (address.id, ProviderGroup::Yahoo, 1)
+        ]
+    );
+
+    let mut state = store
+        .warmup_states()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.provider == ProviderGroup::Google)
+        .unwrap();
+    assert_eq!(state.version, 1);
+    state.status = WarmupStatus::Paused;
+    state.paused_until = Some(now + chrono::Duration::hours(1));
+    let entry = WarmupLogEntry {
+        ip_address_id: address.id,
+        provider: Some(ProviderGroup::Google),
+        decision: "brake".into(),
+        reason: "test".into(),
+        allowance_before: Some(2),
+        allowance_after: Some(2),
+        created_at: now,
+    };
+    assert!(store.save_warmup_state(&state, Some(&entry)).await.unwrap());
+    assert!(
+        !store.save_warmup_state(&state, None).await.unwrap(),
+        "stale version"
+    );
+    assert!(!store
+        .try_reserve_warmup(
+            address.id,
+            ProviderGroup::Google,
+            day.succ_opt().unwrap(),
+            &initial,
+            now
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        store.warmup_log(Some(address.id), 10).await.unwrap().len(),
+        1
+    );
+
+    assert!(store
+        .set_pool_warmup(ip_pool.id, Some(WarmupMode::Slow), None)
+        .await
+        .unwrap());
+    assert_eq!(
+        store.warmup_addresses().await.unwrap()[0].effective_mode(),
+        (WarmupMode::Slow, "pool")
+    );
+    assert!(store
+        .set_address_warmup(address.id, Some(WarmupMode::Custom), Some(profile))
+        .await
+        .unwrap());
+    let listed = store.warmup_addresses().await.unwrap();
+    assert_eq!(listed[0].effective_mode(), (WarmupMode::Custom, "address"));
+    assert_eq!(listed[0].effective_profile(), Some(profile));
+    assert!(store
+        .set_address_warmup(address.id, None, None)
+        .await
+        .unwrap());
+    assert_eq!(
+        store.warmup_addresses().await.unwrap()[0].effective_mode(),
+        (WarmupMode::Slow, "pool")
+    );
+    assert!(!store.set_address_warmup(99_999, None, None).await.unwrap());
+    assert!(!store.set_pool_warmup(99_999, None, None).await.unwrap());
+    let removed = store
+        .prune_warmup(day.succ_opt().unwrap(), now + chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    assert_eq!(removed, 2 + 1);
+}

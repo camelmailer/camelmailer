@@ -27,6 +27,7 @@ pub mod store;
 pub mod template;
 pub mod testing;
 pub mod token;
+pub mod warmup;
 
 pub use admin_store::{
     AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewSenderAddress,
@@ -77,4 +78,8 @@ pub use spf::{
 pub use store::{MemoryStore, Store};
 pub use template::{
     render as render_template, render_in_layout, wrapper_has_raw_content, RenderError,
+};
+pub use warmup::{
+    SignalVerdict, WarmupAddress, WarmupDecision, WarmupLogEntry, WarmupMode, WarmupProfile,
+    WarmupSignal, WarmupState, WarmupStatus, WarmupStore, WarmupThresholds,
 };

@@ -72,6 +72,9 @@ pub struct ApiState {
     /// Delivery counters per sending address and provider (IP metrics,
     /// warm-up). `None` answers the IP metrics with no data.
     pub delivery_stats: Option<Arc<dyn camelmailer_core::DeliveryStatsStore>>,
+    /// Adaptive warm-up settings and state. `None` answers the warm-up
+    /// endpoints with 503.
+    pub warmup_store: Option<Arc<dyn camelmailer_core::WarmupStore>>,
 }
 
 impl ApiState {
@@ -103,6 +106,7 @@ impl ApiState {
             installation_signing_key_pem: None,
             org_sso_store: None,
             delivery_stats: None,
+            warmup_store: None,
             spf_resolver: None,
         })
     }
@@ -127,6 +131,7 @@ impl ApiState {
             installation_signing_key_pem: None,
             org_sso_store: None,
             delivery_stats: None,
+            warmup_store: None,
             spf_resolver: None,
         })
     }
@@ -296,6 +301,7 @@ impl ApiState {
             installation_signing_key_pem,
             org_sso_store: None,
             delivery_stats: None,
+            warmup_store: None,
             spf_resolver: None,
         })
     }
@@ -344,6 +350,17 @@ impl ApiState {
     ) -> Arc<Self> {
         let mut state = (*self).clone();
         state.delivery_stats = Some(delivery_stats);
+        Arc::new(state)
+    }
+
+    /// Attach the warm-up store. Same shape as
+    /// [`ApiState::with_org_sso_store`].
+    pub fn with_warmup_store(
+        self: Arc<Self>,
+        warmup_store: Arc<dyn camelmailer_core::WarmupStore>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.warmup_store = Some(warmup_store);
         Arc::new(state)
     }
 
@@ -1983,6 +2000,16 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             get(resources::source_addresses_index),
         )
         .route("/ip_metrics", get(crate::ip_metrics::ip_metrics_index))
+        .route("/ip_warmup", get(crate::ip_warmup::ip_warmup_index))
+        .route("/ip_warmup/log", get(crate::ip_warmup::ip_warmup_log))
+        .route(
+            "/ip_warmup/addresses/{id}",
+            axum::routing::patch(crate::ip_warmup::ip_warmup_address_update),
+        )
+        .route(
+            "/ip_warmup/pools/{id}",
+            axum::routing::patch(crate::ip_warmup::ip_warmup_pool_update),
+        )
         .route(
             "/ip_pools/{pool_id}/ip_addresses",
             get(resources::ip_addresses_index).post(resources::ip_addresses_create),

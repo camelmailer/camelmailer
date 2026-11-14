@@ -265,3 +265,19 @@ saml:
 scim:
   enabled: false
   # bearer_token: "<long random secret>"   # required when enabled
+
+# Adaptive IP warm-up. Off until a pool or a pool address gets a mode
+# (dashboard: Infrastructure > IP metrics & warm-up). These are the limits it
+# judges by; the defaults suit most installations.
+warmup:
+  min_volume_fraction: 0.5      # below this share of the allowance: hold
+  advance_fraction: 0.9         # share of the allowance needed to grow
+  deferral_rate_slow: 0.05      # deferrals that stop the growth
+  bounce_rate_brake: 0.05       # bounces that brake
+  policy_blocks_brake: 3        # policy refusals that brake (count ...)
+  policy_block_rate_brake: 0.01 # ... and share of attempts)
+  complaint_rate_warn: 0.001    # 0.1 %: slow (Google's guideline)
+  complaint_rate_brake: 0.003   # 0.3 %: brake
+  pause_hours: 24               # how long a brake pauses the provider
+  step_back: 0.5                # allowance factor after a brake
+  defer_seconds: 900            # wait when no address of the pool has room

@@ -3108,6 +3108,147 @@ paths:
                             id: { type: integer }
                             name: { type: string }
                             totals: { $ref: "#/components/schemas/IpMetricTotals" }
+  /api/v2/admin/ip_warmup:
+    get:
+      tags: [Instance]
+      summary: Warm-up state of every pool address
+      description: >-
+        Adaptive IP warm-up, off by default. For every pool address: the mode in force (`off`,
+        `slow`, `normal`, `fast`, `custom`) and where it comes from (`address`, `pool` or
+        `default`), the profile, and per receiving provider group (`microsoft`, `google`, `yahoo`,
+        `other`) the daily allowance, today's use, the status (`not_started`, `ramping`,
+        `holding`, `slowed`, `paused`, `warm`), the last decision and brake with their reasons, the
+        progress towards the cap and an estimate of the healthy days until warm. Also the built-in
+        profiles, the configured thresholds (`warmup` config group) and recent decisions. Global
+        administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200":
+          description: The warm-up state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      profiles:
+                        type: object
+                        additionalProperties: { $ref: "#/components/schemas/WarmupProfile" }
+                      thresholds: { type: object, additionalProperties: true }
+                      addresses:
+                        type: array
+                        items: { $ref: "#/components/schemas/WarmupAddress" }
+  /api/v2/admin/ip_warmup/log:
+    get:
+      tags: [Instance]
+      summary: Warm-up decision log
+      description: >-
+        Every warm-up decision (`advance`, `hold`, `slow`, `brake`, `warm`) and mode change
+        (`mode`), newest first, with its reason. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - name: ip_address_id
+          in: query
+          schema: { type: integer }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200":
+          description: The log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      log:
+                        type: array
+                        items: { $ref: "#/components/schemas/WarmupLogEntry" }
+  /api/v2/admin/ip_warmup/addresses/{id}:
+    patch:
+      tags: [Instance]
+      summary: Set the warm-up mode of a pool address
+      description: >-
+        `inherit` removes the address's own mode, so the pool's applies. `custom` needs a profile
+        (start 1 to 1000000, growth 1.05 to 3.0, cap above start). Changing the mode keeps the
+        current allowance: the ramp continues and never restarts. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetWarmup" }
+      responses:
+        "200":
+          description: The address with its new mode
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      address: { $ref: "#/components/schemas/WarmupAddress" }
+        "404": { description: No such pool address }
+        "422": { description: Unknown mode or invalid profile }
+  /api/v2/admin/ip_warmup/pools/{id}:
+    patch:
+      tags: [Instance]
+      summary: Set the default warm-up mode of an IP pool
+      description: >-
+        The mode every address of the pool uses unless it sets its own. `inherit` removes it (off).
+        Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SetWarmup" }
+      responses:
+        "200":
+          description: The pool's mode
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      ip_pool:
+                        type: object
+                        properties:
+                          id: { type: integer }
+                          mode: { type: string, nullable: true }
+                          profile:
+                            allOf: [{ $ref: "#/components/schemas/WarmupProfile" }]
+                            nullable: true
+        "404": { description: No such pool }
+        "422": { description: Unknown mode or invalid profile }
   /api/v2/admin/admin_api_keys:
     get:
       tags: [Instance]
@@ -3270,6 +3411,71 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
   schemas:
+    WarmupProfile:
+      type: object
+      properties:
+        start: { type: integer }
+        growth: { type: number }
+        cap: { type: integer }
+    SetWarmup:
+      type: object
+      required: [mode]
+      properties:
+        mode: { type: string, enum: ["off", slow, normal, fast, custom, inherit] }
+        profile: { $ref: "#/components/schemas/WarmupProfile" }
+    WarmupLogEntry:
+      type: object
+      properties:
+        ip_address_id: { type: integer }
+        provider: { type: string, nullable: true, enum: [microsoft, google, yahoo, other] }
+        decision: { type: string, enum: [advance, hold, slow, brake, warm, mode] }
+        reason: { type: string }
+        allowance_before: { type: integer, nullable: true }
+        allowance_after: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+    WarmupAddress:
+      type: object
+      properties:
+        ip_address_id: { type: integer }
+        ipv4: { type: string }
+        hostname: { type: string }
+        pool:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            mode: { type: string, nullable: true }
+        mode: { type: string, enum: ["off", slow, normal, fast, custom] }
+        mode_source: { type: string, enum: [address, pool, default] }
+        address_mode: { type: string, nullable: true }
+        active: { type: boolean }
+        profile:
+          allOf: [{ $ref: "#/components/schemas/WarmupProfile" }]
+          nullable: true
+        eta_days: { type: integer, nullable: true }
+        providers:
+          type: array
+          items:
+            type: object
+            properties:
+              provider: { type: string, enum: [microsoft, google, yahoo, other] }
+              allowance: { type: integer, nullable: true }
+              used_today: { type: integer }
+              status:
+                type: string
+                nullable: true
+                enum: [not_started, ramping, holding, slowed, paused, warm]
+              paused: { type: boolean }
+              paused_until: { type: string, format: date-time, nullable: true }
+              last_reason: { type: string, nullable: true }
+              last_brake_reason: { type: string, nullable: true }
+              last_brake_at: { type: string, format: date-time, nullable: true }
+              evaluated_day: { type: string, format: date, nullable: true }
+              progress: { type: number, nullable: true }
+              eta_days: { type: integer, nullable: true }
+        recent_decisions:
+          type: array
+          items: { $ref: "#/components/schemas/WarmupLogEntry" }
     IpMetricTotals:
       type: object
       properties:

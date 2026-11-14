@@ -13,6 +13,7 @@ pub mod signer;
 pub mod smtp_client;
 pub mod ssrf;
 pub mod tracking;
+pub mod warmup;
 pub mod worker;
 
 pub use sender::SmtpSender;

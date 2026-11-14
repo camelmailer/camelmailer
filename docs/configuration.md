@@ -550,6 +550,35 @@ out when both fail, and `ipv4_only` and `ipv6_only` are never changed. It
 is off by default: the check runs once an hour, so a fixed PTR record takes
 effect at the next check, and a record that breaks is not noticed sooner.
 
+### `warmup:` adaptive IP warm-up
+
+Warm-up is off until a pool or a pool address is given a mode in the
+dashboard (Infrastructure, IP metrics & warm-up) or with
+`PATCH /api/v2/admin/ip_warmup/addresses/{id}` /
+`PATCH /api/v2/admin/ip_warmup/pools/{id}`. With every address off the worker
+never consults it, and delivery is unchanged. This group only sets the limits
+it judges by:
+
+```yaml
+warmup:
+  min_volume_fraction: 0.5      # below this share of the allowance: hold
+  advance_fraction: 0.9         # share of the allowance needed to grow
+  deferral_rate_slow: 0.05      # deferrals (of attempts) that stop the growth
+  bounce_rate_brake: 0.05       # bounces (of attempts) that brake
+  policy_blocks_brake: 3        # policy refusals that brake: at least this many
+  policy_block_rate_brake: 0.01 # and at least this share of the attempts
+  complaint_rate_warn: 0.001    # complaints (of accepted mail): slow
+  complaint_rate_brake: 0.003   # complaints: brake
+  pause_hours: 24               # a brake pauses the address for that provider
+  step_back: 0.5                # and multiplies its allowance by this
+  defer_seconds: 900            # wait when no address of the pool has room
+```
+
+Every value is checked at start: rates between 0 and 1, the warning levels
+not above the brake levels, `step_back` between 0.1 and 1, `defer_seconds` at
+least 60. How the modes and the brake work is described in
+[deliverability.md](deliverability.md#adaptive-ip-warm-up).
+
 ### `lifecycle_webhooks:` installation events
 
 Forwards installation-wide events to outside systems such as a billing or

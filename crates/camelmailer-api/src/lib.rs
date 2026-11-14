@@ -25,6 +25,7 @@ mod xmldsig;
 
 mod insights;
 mod ip_metrics;
+mod ip_warmup;
 mod lifecycle;
 mod quota;
 

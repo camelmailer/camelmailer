@@ -1355,6 +1355,123 @@ pub struct Config {
     pub smtp_client: SmtpClient,
     pub rspamd: Rspamd,
     pub clamav: Clamav,
+    pub warmup: Warmup,
+}
+
+/// Adaptive IP warm-up (`warmup`). Warm-up itself is off until a pool or a
+/// pool address is given a mode (dashboard or
+/// `PATCH /api/v2/admin/ip_warmup/...`); these are the limits it judges by.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Warmup {
+    /// Below this share of its allowance an address's day is too quiet to
+    /// judge, and the ramp holds.
+    pub min_volume_fraction: f64,
+    /// The share of its allowance an address must have used, with healthy
+    /// results, for the allowance to grow.
+    pub advance_fraction: f64,
+    /// Deferral rate (of attempts to one provider) from which the ramp
+    /// stops growing.
+    pub deferral_rate_slow: f64,
+    /// Bounce rate (of attempts) from which the ramp brakes.
+    pub bounce_rate_brake: f64,
+    /// Policy refusals (blocks, reputation refusals) that brake: at least
+    /// this many, and at least `policy_block_rate_brake` of the attempts.
+    pub policy_blocks_brake: i64,
+    pub policy_block_rate_brake: f64,
+    /// Complaint rate (of accepted messages) that slows, and that brakes.
+    /// Google's sender guidelines: stay below 0.1 %, never reach 0.3 %.
+    pub complaint_rate_warn: f64,
+    pub complaint_rate_brake: f64,
+    /// How long a brake stops an address from sending to that provider.
+    pub pause_hours: i64,
+    /// The factor a brake steps the allowance back by (0.1 to 1).
+    pub step_back: f64,
+    /// How long a message waits when no address of its pool has room left
+    /// today. No attempt is counted.
+    pub defer_seconds: u32,
+}
+
+impl Warmup {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let fractions = [
+            ("min_volume_fraction", self.min_volume_fraction),
+            ("advance_fraction", self.advance_fraction),
+            ("deferral_rate_slow", self.deferral_rate_slow),
+            ("bounce_rate_brake", self.bounce_rate_brake),
+            ("policy_block_rate_brake", self.policy_block_rate_brake),
+            ("complaint_rate_warn", self.complaint_rate_warn),
+            ("complaint_rate_brake", self.complaint_rate_brake),
+        ];
+        for (name, value) in fractions {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(ConfigError::Invalid(format!(
+                    "warmup.{name} must be between 0 and 1 (got {value})"
+                )));
+            }
+        }
+        if self.min_volume_fraction > self.advance_fraction {
+            return Err(ConfigError::Invalid(
+                "warmup.min_volume_fraction must not be above warmup.advance_fraction".into(),
+            ));
+        }
+        if self.complaint_rate_warn > self.complaint_rate_brake {
+            return Err(ConfigError::Invalid(
+                "warmup.complaint_rate_warn must not be above warmup.complaint_rate_brake".into(),
+            ));
+        }
+        if !(0.1..=1.0).contains(&self.step_back) {
+            return Err(ConfigError::Invalid(format!(
+                "warmup.step_back must be between 0.1 and 1 (got {})",
+                self.step_back
+            )));
+        }
+        if self.pause_hours < 1 || self.policy_blocks_brake < 1 || self.defer_seconds < 60 {
+            return Err(ConfigError::Invalid(
+                "warmup.pause_hours and warmup.policy_blocks_brake must be at least 1, \
+                 warmup.defer_seconds at least 60"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+
+    #[test]
+    fn warmup_limits_are_validated() {
+        assert!(Config::default().validate().is_ok());
+        let mut config = Config::default();
+        config.warmup.complaint_rate_warn = 0.01;
+        assert!(config.validate().is_err());
+        let config =
+            Config::from_yaml("warmup:\n  pause_hours: 48\n  defer_seconds: 600\n").unwrap();
+        assert_eq!(config.warmup.pause_hours, 48);
+        assert_eq!(config.warmup.advance_fraction, 0.9);
+        assert!(config.validate().is_ok());
+        assert!(Config::from_yaml("warmup:\n  unknown: 1\n").is_err());
+    }
+}
+
+impl Default for Warmup {
+    fn default() -> Self {
+        Self {
+            min_volume_fraction: 0.5,
+            advance_fraction: 0.9,
+            deferral_rate_slow: 0.05,
+            bounce_rate_brake: 0.05,
+            policy_blocks_brake: 3,
+            policy_block_rate_brake: 0.01,
+            complaint_rate_warn: 0.001,
+            complaint_rate_brake: 0.003,
+            pause_hours: 24,
+            step_back: 0.5,
+            defer_seconds: 900,
+        }
+    }
 }
 
 impl Config {
@@ -1468,6 +1585,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.worker.validate()?;
+        self.warmup.validate()?;
         if !matches!(self.camelmailer.web_protocol.as_str(), "http" | "https") {
             return Err(ConfigError::Invalid(format!(
                 "camelmailer.web_protocol must be http or https (got {:?})",

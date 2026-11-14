@@ -20,6 +20,7 @@ mod pg_store;
 mod queue;
 mod retention;
 mod tracking;
+mod warmup_pg;
 pub mod webhook_payload;
 mod webhook_queue;
 
