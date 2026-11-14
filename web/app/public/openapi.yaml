@@ -3183,6 +3183,79 @@ paths:
                               ipv6: { type: string, nullable: true }
                               hostname: { type: string }
         "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v2/admin/ip_metrics:
+    get:
+      tags: [Instance]
+      summary: Delivery counters per sending address
+      description: >-
+        Outbound SMTP results counted per UTC day, per source address (the IPv4 value of the
+        IP-pool address a delivery was bound to, or `default` for servers without a pool) and per
+        receiving provider group (`microsoft`, `google`, `yahoo`, `other`). Deferral, bounce and
+        policy-block rates are shares of all attempts; the complaint rate is per accepted message.
+        Pools sum the addresses they hold. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      parameters:
+        - name: days
+          in: query
+          description: Days to cover, today included (1 to 90, default 7).
+          schema: { type: integer, minimum: 1, maximum: 90, default: 7 }
+      responses:
+        "200":
+          description: The counters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      days: { type: integer }
+                      since: { type: string, format: date }
+                      until: { type: string, format: date }
+                      addresses:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            source_ip: { type: string }
+                            ip_address_id: { type: integer, nullable: true }
+                            default_source: { type: boolean }
+                            pool:
+                              type: object
+                              nullable: true
+                              properties:
+                                id: { type: integer }
+                                name: { type: string }
+                            hostname: { type: string, nullable: true }
+                            totals: { $ref: "#/components/schemas/IpMetricTotals" }
+                            today: { $ref: "#/components/schemas/IpMetricTotals" }
+                            providers:
+                              type: array
+                              items:
+                                allOf:
+                                  - $ref: "#/components/schemas/IpMetricTotals"
+                                  - type: object
+                                    properties:
+                                      provider: { type: string, description: "Provider group (built-in: microsoft, google, yahoo, apple, united_internet, t_online, other; more via provider_groups)" }
+                            daily:
+                              type: array
+                              items:
+                                allOf:
+                                  - $ref: "#/components/schemas/IpMetricTotals"
+                                  - type: object
+                                    properties:
+                                      day: { type: string, format: date }
+                      pools:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: integer }
+                            name: { type: string }
+                            totals: { $ref: "#/components/schemas/IpMetricTotals" }
   /api/v2/admin/admin_api_keys:
     get:
       tags: [Instance]
@@ -3345,6 +3418,19 @@ components:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
 
   schemas:
+    IpMetricTotals:
+      type: object
+      properties:
+        sent: { type: integer }
+        deferred: { type: integer }
+        bounced: { type: integer }
+        policy_blocks: { type: integer }
+        complaints: { type: integer }
+        attempts: { type: integer }
+        deferral_rate: { type: number, nullable: true }
+        bounce_rate: { type: number, nullable: true }
+        policy_block_rate: { type: number, nullable: true }
+        complaint_rate: { type: number, nullable: true }
     DnsCheckRun:
       type: object
       properties:

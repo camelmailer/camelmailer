@@ -14,6 +14,7 @@ use crate::ssrf::SsrfGuard;
 use crate::tracking;
 use base64::Engine;
 use camelmailer_core::{AdminStore, RouteMode};
+use camelmailer_core::{DeliveryKind, DeliveryStatsStore, IpDeliveryRecord};
 use camelmailer_db::webhook_payload::{
     postal_webhook_message_id, postal_webhook_subject, postal_webhook_timestamp,
 };
@@ -254,6 +255,15 @@ mod interface_tests {
         assert!(!selection.reported.lock().unwrap().contains(&7));
     }
 }
+
+/// How long the per-address delivery counters are kept (IP metrics,
+/// warm-up history).
+const DELIVERY_STATS_DAYS: i64 = 400;
+
+/// How long the worker remembers which address sent an accepted message, so
+/// a feedback-loop complaint can be counted against it. Feedback loops
+/// report within hours to a few days.
+const MESSAGE_SOURCE_DAYS: i64 = 30;
 
 /// How often a worker refreshes the locks of the rows it is working on. The
 /// shortest lease the queues accept is three of these.
@@ -636,6 +646,8 @@ pub struct Worker {
     heartbeat_interval: Duration,
     /// `worker.shutdown_grace_seconds`.
     shutdown_grace: Duration,
+    /// Classifies recipient domains by mailbox provider for the counters.
+    providers: crate::provider::ProviderClassifier,
 }
 
 impl Worker {
@@ -718,12 +730,25 @@ impl Worker {
             in_flight: InFlight::default(),
             heartbeat_interval: HEARTBEAT_INTERVAL,
             shutdown_grace: Duration::from_secs(u64::from(config.worker.shutdown_grace_seconds)),
+            providers: crate::provider::ProviderClassifier::default().with_groups(
+                crate::provider::ProviderClassifier::groups_from_config(&config.provider_groups),
+            ),
         }
     }
 
     /// The id this process locks rows with (`locked_by`).
     pub fn worker_id(&self) -> &str {
         &self.worker_id
+    }
+
+    /// Classify recipient domains with `providers` (tests use a fixed MX
+    /// lookup).
+    pub fn with_provider_classifier(
+        mut self,
+        providers: crate::provider::ProviderClassifier,
+    ) -> Self {
+        self.providers = providers;
+        self
     }
 
     /// Override how often the heartbeat runs (tests; the default is
@@ -799,6 +824,40 @@ impl Worker {
                 );
                 ProcessOutcome::NotOwner
             }
+        }
+    }
+
+    /// Count one outbound SMTP result against the address it was sent from
+    /// and the receiving provider (`ip_delivery_stats`), once the result is
+    /// recorded. Counting never changes the delivery: a failure is logged
+    /// and ignored.
+    async fn count_delivery(
+        &self,
+        recorded: OutboundRecord,
+        source: Option<&camelmailer_core::IpAddress>,
+        domain: &str,
+        message: &StoredMessage,
+        kind: DeliveryKind,
+        response: &str,
+    ) {
+        if !matches!(recorded, OutboundRecord::Recorded(_)) {
+            return;
+        }
+        let provider = self.providers.classify(domain).await;
+        let record = IpDeliveryRecord {
+            day: chrono::Utc::now().date_naive(),
+            source_ip: source
+                .map(|address| address.ipv4.clone())
+                .unwrap_or_else(|| camelmailer_core::DEFAULT_SOURCE.to_string()),
+            ip_address_id: source.map(|address| address.id),
+            provider,
+            kind,
+            policy_block: kind != DeliveryKind::Sent && camelmailer_core::is_policy_block(response),
+            server_id: message.server_id,
+            message_id: message.id,
+        };
+        if let Err(error) = DeliveryStatsStore::record_ip_delivery(&self.store, &record).await {
+            tracing::warn!(%error, message_id = message.id, "could not count the delivery");
         }
     }
 
@@ -1230,6 +1289,15 @@ impl Worker {
                         "preserved newer bounced state after outbound SMTP success"
                     );
                 }
+                self.count_delivery(
+                    recorded,
+                    source.as_ref(),
+                    &queued.domain,
+                    message,
+                    DeliveryKind::Sent,
+                    &response,
+                )
+                .await;
                 Ok(self.recorded_outcome(
                     recorded,
                     message.id,
@@ -1260,6 +1328,15 @@ impl Worker {
                             &payload,
                         )
                         .await?;
+                    self.count_delivery(
+                        recorded,
+                        source.as_ref(),
+                        &queued.domain,
+                        message,
+                        DeliveryKind::Deferred,
+                        &response,
+                    )
+                    .await;
                     Ok(self.recorded_outcome(
                         recorded,
                         message.id,
@@ -1288,6 +1365,15 @@ impl Worker {
                             &payload,
                         )
                         .await?;
+                    self.count_delivery(
+                        recorded,
+                        source.as_ref(),
+                        &queued.domain,
+                        message,
+                        DeliveryKind::Deferred,
+                        &response,
+                    )
+                    .await;
                     Ok(self.recorded_outcome(
                         recorded,
                         message.id,
@@ -1315,6 +1401,15 @@ impl Worker {
                         &payload,
                     )
                     .await?;
+                self.count_delivery(
+                    recorded,
+                    source.as_ref(),
+                    &queued.domain,
+                    message,
+                    DeliveryKind::Bounced,
+                    &response,
+                )
+                .await;
                 Ok(
                     self.recorded_outcome(
                         recorded,
@@ -1705,6 +1800,23 @@ impl Worker {
             {
                 Ok(outcome) => {
                     self.complete_row(queued.id).await?;
+                    if let FeedbackComplaintOutcome::Recorded {
+                        message_id: Some(id),
+                        ..
+                    } = &outcome
+                    {
+                        // Count the complaint against the address that sent
+                        // the message (best effort, like every counter).
+                        if let Err(error) = DeliveryStatsStore::record_ip_complaint(
+                            &self.store,
+                            *id,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(%error, message_id = id, "could not count the complaint");
+                        }
+                    }
                     let detail = match outcome {
                         FeedbackComplaintOutcome::Recorded {
                             suppressed: true, ..
@@ -2183,6 +2295,21 @@ impl Worker {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "pruned expired send-limit counters"),
             Err(error) => tracing::error!(%error, "send-counter pruning error"),
+        }
+
+        // Delivery counters older than DELIVERY_STATS_DAYS, and the record
+        // of which address sent a message once a complaint about it can no
+        // longer be expected (MESSAGE_SOURCE_DAYS).
+        match DeliveryStatsStore::prune_delivery_stats(
+            &self.store,
+            now.date_naive() - chrono::Duration::days(DELIVERY_STATS_DAYS),
+            now - chrono::Duration::days(MESSAGE_SOURCE_DAYS),
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(pruned) => tracing::info!(pruned, "pruned delivery counters"),
+            Err(error) => tracing::error!(%error, "delivery-counter pruning error"),
         }
 
         // Without a lifecycle URL nothing can deliver the outbox (usage

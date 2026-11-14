@@ -8,6 +8,7 @@ pub mod admin_store;
 pub mod auth;
 pub mod auth_store;
 pub mod bounce;
+pub mod delivery_stats;
 pub mod dmarc;
 pub mod dns;
 pub mod hashing;
@@ -37,6 +38,10 @@ pub use auth::{
 };
 pub use auth_store::AuthStore;
 pub use bounce::BounceCategory;
+pub use delivery_stats::{
+    is_policy_block, DeliveryKind, DeliveryStatsStore, IpComplaint, IpDeliveryRecord,
+    IpDeliveryStat, ProviderGroup, ProviderGroupRule, ProviderGroups, DEFAULT_SOURCE,
+};
 pub use dmarc::{
     DmarcFilter, DmarcRecordRow, DmarcReport, DmarcSourceStat, DmarcSummary, NewDmarcRecord,
     NewDmarcReport, DMARC_REPORTS_ENDPOINT,

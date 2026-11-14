@@ -577,6 +577,24 @@ out when both fail, and `ipv4_only` and `ipv6_only` are never changed. It
 is off by default: the check runs once an hour, so a fixed PTR record takes
 effect at the next check, and a record that breaks is not noticed sooner.
 
+### `provider_groups:` receiving providers
+
+The IP metrics (and the warm-up) count every delivery per receiving provider
+group. Built in: `microsoft` (Outlook.com, Hotmail, Live, Microsoft 365),
+`google` (Gmail, Workspace), `yahoo` (incl. AOL), `apple` (iCloud),
+`united_internet` (GMX, WEB.DE, mail.com, 1&1 and IONOS) and `t_online`;
+everyone else is `other`. A recipient domain is matched against `domains`
+first, then the domain's lowest MX host against `mx_patterns`.
+
+```yaml
+provider_groups:
+  - name: seznam                     # [a-z0-9_], at most 40 characters
+    domains: [seznam.cz, email.cz]   # exact, or brand.* for any TLD
+    mx_patterns: [seznam.cz]         # the host and every host under it
+```
+
+An entry with a built-in name replaces that group; any other name adds one,
+tried after the built-in groups. `other` cannot be configured.
 ### `cluster:` topology and public addresses
 
 Every web, SMTP and worker process registers itself in the database and

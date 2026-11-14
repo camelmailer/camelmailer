@@ -272,6 +272,14 @@ scim:
   enabled: false
   # bearer_token: "<long random secret>"   # required when enabled
 
+# Receiving provider groups for IP metrics and warm-up. Built in: microsoft,
+# google, yahoo (incl. AOL), apple (iCloud), united_internet (GMX, WEB.DE,
+# mail.com, 1&1/IONOS), t_online; the rest is "other". Same name replaces a
+# built-in group, a new name adds one.
+# provider_groups:
+#   - name: seznam
+#     domains: [seznam.cz, email.cz]   # exact, or brand.* for any TLD
+#     mx_patterns: [seznam.cz]         # the host and every host under it
 # Cluster topology (the infrastructure dashboard). Every web, SMTP and
 # worker process registers under node_name and refreshes its entry every
 # heartbeat_interval_seconds. Nothing here changes how mail is received or

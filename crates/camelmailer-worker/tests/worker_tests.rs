@@ -5323,3 +5323,118 @@ async fn the_data_gate_only_observes_unless_it_is_closed() {
     assert!(lines.iter().any(|l| l.starts_with("RCPT TO")));
     assert!(!lines.iter().any(|l| l == "DATA"));
 }
+
+fn fixed_providers() -> camelmailer_worker::provider::ProviderClassifier {
+    camelmailer_worker::provider::ProviderClassifier::with_lookup(Arc::new(|domain: String| {
+        Box::pin(async move {
+            (domain == "dest.example")
+                .then(|| "dest-example.mail.protection.outlook.com".to_string())
+        })
+    }))
+}
+
+/// IP metrics: every outbound SMTP result is counted against the pool
+/// address it was bound to and the receiving provider; policy refusals are
+/// counted apart; an accepted message remembers its source so a later
+/// complaint is credited to that address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outbound_results_are_counted_per_address_and_provider() {
+    use camelmailer_core::{DeliveryStatsStore, ProviderGroup};
+    for (reply, sent, deferred, bounced, blocks) in [
+        ("250 Accepted", 1, 0, 0, 0),
+        ("451 4.3.0 Try later", 0, 1, 0, 0),
+        (
+            "421 4.7.0 [TSS04] Messages from 127.0.0.1 temporarily deferred",
+            0,
+            1,
+            0,
+            1,
+        ),
+        (
+            "550 5.7.1 Unfortunately, messages weren't sent. (S3150)",
+            0,
+            0,
+            1,
+            1,
+        ),
+        ("550 5.1.1 No such user", 0, 0, 1, 0),
+    ] {
+        let base = require_db!();
+        let pool = test_pool(&base).await;
+        let s = setup(pool).await;
+        let smtp = mock_smtp(reply).await;
+        let ip_pool = s.store.create_ip_pool("pool", true).await.unwrap();
+        let address = s
+            .store
+            .create_ip_address(camelmailer_core::NewIpAddress {
+                ip_pool_id: ip_pool.id,
+                ipv4: "127.0.0.1".into(),
+                ipv6: None,
+                hostname: "mx.example".into(),
+                priority: 10,
+            })
+            .await
+            .unwrap();
+        s.store
+            .set_server_ip_pool(s.server.id, Some(ip_pool.id))
+            .await
+            .unwrap();
+        let message_id = s
+            .sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+
+        let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+            .with_provider_classifier(fixed_providers());
+        worker.process_next().await.unwrap().unwrap();
+
+        let today = chrono::Utc::now().date_naive();
+        let stats = s.store.ip_delivery_stats(today).await.unwrap();
+        assert_eq!(stats.len(), 1, "{reply}");
+        let stat = &stats[0];
+        assert_eq!(stat.source_ip, "127.0.0.1");
+        assert_eq!(stat.ip_address_id, Some(address.id));
+        assert_eq!(stat.provider, ProviderGroup::microsoft(), "{reply}");
+        assert_eq!(
+            (stat.sent, stat.deferred, stat.bounced, stat.policy_blocks),
+            (sent, deferred, bounced, blocks),
+            "{reply}"
+        );
+        let credited = s
+            .store
+            .record_ip_complaint(message_id, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(credited.is_some(), sent == 1, "{reply}");
+    }
+}
+
+/// Without an IP pool the result is counted under the `default` source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_without_a_pool_counts_under_the_default_source() {
+    use camelmailer_core::DeliveryStatsStore;
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@gmail.com"))
+        .await
+        .unwrap();
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_provider_classifier(fixed_providers());
+    assert!(matches!(
+        worker.process_next().await.unwrap().unwrap(),
+        ProcessOutcome::Delivered { .. }
+    ));
+    let stats = s
+        .store
+        .ip_delivery_stats(chrono::Utc::now().date_naive())
+        .await
+        .unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].source_ip, camelmailer_core::DEFAULT_SOURCE);
+    assert_eq!(stats[0].provider, camelmailer_core::ProviderGroup::google());
+    assert_eq!(stats[0].ip_address_id, None);
+}

@@ -69,6 +69,9 @@ pub struct ApiState {
     /// when accounts storage is not enabled; the dashboard endpoints then
     /// report the feature unavailable.
     pub org_sso_store: Option<Arc<dyn camelmailer_core::OrgSsoStore>>,
+    /// Delivery counters per sending address and provider (IP metrics,
+    /// warm-up). `None` answers the IP metrics with no data.
+    pub delivery_stats: Option<Arc<dyn camelmailer_core::DeliveryStatsStore>>,
     /// Lookups for the infrastructure DNS checks; `None` uses hickory.
     pub dns_check_resolver: Option<Arc<dyn crate::dns_checks::DnsCheckResolver>>,
     /// The last full DNS check run, reused for a minute.
@@ -103,6 +106,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            delivery_stats: None,
             spf_resolver: None,
             dns_check_resolver: None,
             dns_checks_cache: Arc::default(),
@@ -128,6 +132,7 @@ impl ApiState {
             webhook_sender: Arc::new(crate::webhook_send::ReqwestWebhookSender::new()),
             installation_signing_key_pem: None,
             org_sso_store: None,
+            delivery_stats: None,
             spf_resolver: None,
             dns_check_resolver: None,
             dns_checks_cache: Arc::default(),
@@ -298,6 +303,7 @@ impl ApiState {
             webhook_sender,
             installation_signing_key_pem,
             org_sso_store: None,
+            delivery_stats: None,
             spf_resolver: None,
             dns_check_resolver: None,
             dns_checks_cache: Arc::default(),
@@ -348,6 +354,17 @@ impl ApiState {
     ) -> Arc<Self> {
         let mut state = (*self).clone();
         state.org_sso_store = Some(org_sso_store);
+        Arc::new(state)
+    }
+
+    /// Attach the delivery counters (IP metrics). Same shape as
+    /// [`ApiState::with_org_sso_store`].
+    pub fn with_delivery_stats(
+        self: Arc<Self>,
+        delivery_stats: Arc<dyn camelmailer_core::DeliveryStatsStore>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.delivery_stats = Some(delivery_stats);
         Arc::new(state)
     }
 
@@ -1986,6 +2003,7 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             "/source_addresses",
             get(resources::source_addresses_index),
         )
+        .route("/ip_metrics", get(crate::ip_metrics::ip_metrics_index))
         .route("/cluster", get(crate::cluster_api::cluster_show))
         .route("/dns_checks", get(crate::dns_checks::dns_checks_index))
         .route(

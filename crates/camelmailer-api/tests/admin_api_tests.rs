@@ -2860,3 +2860,75 @@ async fn spf_compares_text_when_the_declared_record_is_not_only_addresses() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn ip_metrics_add_up_the_delivery_counters_for_global_admins() {
+    use camelmailer_core::{DeliveryKind, DeliveryStatsStore, IpDeliveryRecord, ProviderGroup};
+    let memory = Arc::new(MemoryStore::new());
+    let state = ApiState::new(memory.clone(), Some(GLOBAL_KEY.to_string()))
+        .with_delivery_stats(memory.clone());
+    let app = build_router(state.clone());
+
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/ip_metrics",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["days"], 7);
+    assert_eq!(body["data"]["addresses"], json!([]));
+
+    let pool = state.store.create_ip_pool("Main", true).await.unwrap();
+    let address = state
+        .store
+        .create_ip_address(camelmailer_core::NewIpAddress {
+            ip_pool_id: pool.id,
+            ipv4: "203.0.113.5".into(),
+            ipv6: None,
+            hostname: "out1.example.com".into(),
+            priority: 100,
+        })
+        .await
+        .unwrap();
+    for (kind, message_id) in [
+        (DeliveryKind::Sent, 1),
+        (DeliveryKind::Sent, 2),
+        (DeliveryKind::Deferred, 3),
+    ] {
+        memory
+            .record_ip_delivery(&IpDeliveryRecord {
+                day: chrono::Utc::now().date_naive(),
+                source_ip: "203.0.113.5".into(),
+                ip_address_id: Some(address.id),
+                provider: ProviderGroup::microsoft(),
+                kind,
+                policy_block: false,
+                server_id: 1,
+                message_id,
+            })
+            .await
+            .unwrap();
+    }
+
+    let (_, body) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/ip_metrics?days=1",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    let first = &body["data"]["addresses"][0];
+    assert_eq!(first["source_ip"], "203.0.113.5");
+    assert_eq!(first["hostname"], "out1.example.com");
+    assert_eq!(first["pool"]["id"], pool.id);
+    assert_eq!(first["today"]["sent"], 2);
+    assert_eq!(first["providers"][0]["provider"], "microsoft");
+    assert_eq!(body["data"]["pools"][0]["totals"]["deferred"], 1);
+
+    let (status, _) = request(&app, "GET", "/api/v2/admin/ip_metrics", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
