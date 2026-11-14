@@ -3944,7 +3944,7 @@ fn run_in_background(
     worker: Worker,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
-    tokio::task::JoinHandle<Result<(), sqlx::Error>>,
+    tokio::task::JoinHandle<Result<(), camelmailer_worker::LoopFailed>>,
 ) {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(Arc::new(worker).run_until(async move {
@@ -3960,8 +3960,12 @@ async fn queue_row_state(pool: &PgPool) -> Option<(Option<String>, i32)> {
         .unwrap()
 }
 
+/// The remote has the whole message and holds its `250` when the grace
+/// period runs out. It may well accept it, so the row must not go straight
+/// back to the queue (a duplicate); it keeps its lock for the lease, as
+/// after a crash, with no attempt counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shutdown_hands_an_unfinished_delivery_back_without_an_attempt() {
+async fn shutdown_keeps_a_delivery_stopped_after_its_data_locked_for_the_lease() {
     let base = require_db!();
     let pool = test_pool_with_connections(&base, 6).await;
     let s = setup(pool.clone()).await;
@@ -3980,7 +3984,7 @@ async fn shutdown_hands_an_unfinished_delivery_back_without_an_attempt() {
     smtp.final_response_ready.notified().await;
     assert_eq!(
         queue_row_state(&pool).await,
-        Some((Some(worker_id), 0)),
+        Some((Some(worker_id.clone()), 0)),
         "the delivery holds its row"
     );
 
@@ -3991,15 +3995,279 @@ async fn shutdown_hands_an_unfinished_delivery_back_without_an_attempt() {
         .unwrap()
         .unwrap();
 
-    // Unlocked, no attempt counted, no backoff: the next worker takes it now.
-    assert_eq!(queue_row_state(&pool).await, Some((None, 0)));
-    let retry_after: Option<chrono::DateTime<chrono::Utc>> =
-        sqlx::query_scalar("SELECT retry_after FROM queued_messages")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(retry_after.is_none());
+    // Still locked by the stopped worker, no attempt counted: another worker
+    // takes it once the lease runs out, not now.
+    assert_eq!(
+        queue_row_state(&pool).await,
+        Some((Some(worker_id.clone()), 0))
+    );
+    assert!(PgQueue::new(pool.clone())
+        .dequeue("another-worker")
+        .await
+        .unwrap()
+        .is_none());
     smtp.final_response_release.notify_one();
+}
+
+/// The receiver accepted the message, but recording that failed. The row
+/// stays locked by this worker; a shutdown must not hand it back for an
+/// immediate resend of a delivered message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_keeps_a_row_whose_recording_failed_after_the_250() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    // Recording the delivery fails after the remote's 250.
+    sqlx::query(
+        "CREATE FUNCTION fail_delivery() RETURNS trigger LANGUAGE plpgsql AS
+         $$ BEGIN RAISE EXCEPTION 'recording failed'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_delivery BEFORE INSERT ON deliveries
+         FOR EACH ROW EXECUTE FUNCTION fail_delivery()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let worker = Worker::new(&worker_config(smtp.port), s.store.clone())
+        .with_shutdown_grace(std::time::Duration::from_secs(5));
+    let worker_id = worker.worker_id().to_string();
+    let (stop, handle) = run_in_background(worker);
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !smtp.received.lock().unwrap().iter().any(|line| line == ".") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the remote received the message");
+    // Let the worker run into the failed recording.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("the worker stops")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(queue_row_state(&pool).await, Some((Some(worker_id), 0)));
+    let deliveries = smtp
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.to_ascii_uppercase().starts_with("MAIL FROM"))
+        .count();
+    assert_eq!(deliveries, 1, "sent exactly once");
+}
+
+/// A shutdown that arrives while the main loop is delivering a message lets
+/// that delivery finish, but starts no webhook request after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_starts_no_webhook_after_the_running_delivery() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let smtp = paused_mock_smtp("250 Accepted").await;
+    let hook = mock_http(axum::http::StatusCode::OK).await;
+    let webhook = s
+        .store
+        .create_webhook(NewWebhook::all(s.server.id, "hook", &hook.url, false))
+        .await
+        .unwrap();
+    camelmailer_db::PgWebhookQueue::new(pool.clone())
+        .enqueue(
+            s.server.id,
+            webhook.id,
+            "u-1",
+            "MessageSent",
+            &hook.url,
+            "{}",
+            false,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    let message_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    // One loop only, so the delivery and the webhooks share the main loop.
+    let mut config = worker_config(smtp.port);
+    config.worker.threads = 1;
+    let worker = Worker::new(&config, s.store.clone())
+        .with_shutdown_grace(std::time::Duration::from_secs(10));
+    let (stop, handle) = run_in_background(worker);
+
+    smtp.final_response_ready.notified().await;
+    stop.send(()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    smtp.final_response_release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+        .await
+        .expect("the worker stops")
+        .unwrap()
+        .unwrap();
+
+    let stored = s
+        .sink
+        .message_by_id(s.server.id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, "Sent", "the running delivery finished");
+    assert!(
+        hook.requests.lock().unwrap().is_empty(),
+        "no webhook was sent after the shutdown request"
+    );
+    let unattempted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM webhook_requests WHERE attempts = 0 AND locked_by IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        unattempted >= 1,
+        "the queued webhook waits for the next worker"
+    );
+}
+
+/// A receiver that holds its greeting back for `delay` (as Hornetsecurity
+/// does), then accepts the message.
+async fn slow_greeting_mock_smtp(delay: std::time::Duration) -> MockSmtp {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let captured = captured.clone();
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                tokio::time::sleep(delay).await;
+                write_half
+                    .write_all(b"220 slow.example ESMTP\r\n")
+                    .await
+                    .ok();
+                let mut in_data = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let trimmed = line.trim_end().to_string();
+                    captured.lock().unwrap().push(trimmed.clone());
+                    if in_data {
+                        if trimmed == "." {
+                            in_data = false;
+                            write_half.write_all(b"250 Queued\r\n").await.ok();
+                        }
+                        continue;
+                    }
+                    let upper = trimmed.to_ascii_uppercase();
+                    let reply: &str = if upper.starts_with("EHLO") {
+                        "250-slow.example\r\n250 OK"
+                    } else if upper.starts_with("DATA") {
+                        in_data = true;
+                        "354 Go ahead"
+                    } else if upper.starts_with("QUIT") {
+                        write_half.write_all(b"221 Bye\r\n").await.ok();
+                        return;
+                    } else {
+                        "250 OK"
+                    };
+                    write_half
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await
+                        .ok();
+                }
+            });
+        }
+    });
+    MockSmtp { port, received }
+}
+
+/// End to end through the long-running worker (`run_until`, the path the
+/// binary takes): the first endpoint refuses the connection, the second holds
+/// its greeting back longer than the connect timeout. The message is still
+/// delivered, once, and the worker shuts down cleanly with nothing locked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_running_worker_delivers_past_a_dead_first_endpoint_to_a_slow_greeting() {
+    let base = require_db!();
+    let pool = test_pool_with_connections(&base, 6).await;
+    let s = setup(pool.clone()).await;
+    let dead_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let slow = slow_greeting_mock_smtp(std::time::Duration::from_millis(1500)).await;
+    let message_id = s
+        .sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+
+    let mut config = worker_config(slow.port);
+    config.camelmailer.smtp_relays = vec![
+        format!("smtp://127.0.0.1:{dead_port}"),
+        format!("smtp://127.0.0.1:{}", slow.port),
+    ];
+    // Shorter than the held-back greeting: the greeting is read with the
+    // read timeout, not the connect timeout.
+    config.smtp_client.open_timeout = 1;
+    config.camelmailer.queued_message_lock_stale_seconds = Some(90);
+    let worker = Worker::new(&config, s.store.clone())
+        .with_heartbeat_interval(std::time::Duration::from_millis(200));
+    let (stop, handle) = run_in_background(worker);
+
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let stored = s
+                .sink
+                .message_by_id(s.server.id, message_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if stored.status == "Sent" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the message is delivered");
+
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+        .await
+        .expect("the worker stops")
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.queue.queue_size().await.unwrap(), 0);
+    let mails = slow
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.to_ascii_uppercase().starts_with("MAIL FROM"))
+        .count();
+    assert_eq!(mails, 1, "delivered once, by the second endpoint");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

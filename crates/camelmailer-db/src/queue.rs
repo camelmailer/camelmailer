@@ -184,9 +184,35 @@ pub(crate) fn clamp_lease_seconds(seconds: i64) -> i64 {
 }
 
 /// Refresh `locked_at` of the rows `worker_id` holds among `ids`, in `table`
-/// (`queued_messages`, `webhook_requests` or `lifecycle_events`). Rows another
-/// worker has taken over are left alone.
+/// (`queued_messages`, `webhook_requests` or `lifecycle_events`), and return
+/// the ids it refreshed. Rows another worker has taken over are left alone
+/// and missing from the result, so the caller can tell it lost them.
 pub(crate) async fn heartbeat_rows(
+    pool: &PgPool,
+    table: &str,
+    worker_id: &str,
+    ids: &[i64],
+) -> Result<Vec<i64>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "UPDATE {table} SET locked_at = now() WHERE locked_by = $1 AND id = ANY($2) RETURNING id"
+    );
+    sqlx::query_scalar(&sql)
+        .bind(worker_id)
+        .bind(ids)
+        .fetch_all(pool)
+        .await
+}
+
+/// Unlock the rows among `ids` that `worker_id` still holds in `table`,
+/// without touching their attempt count or backoff, so another worker picks
+/// them up straight away. Used on a graceful shutdown, and only for rows
+/// whose processing had not reached the receiver yet: a row is never handed
+/// back by owner alone, because a row whose delivery failed half way (say
+/// after the receiver's `250`) must keep its lock for the lease.
+pub(crate) async fn release_rows(
     pool: &PgPool,
     table: &str,
     worker_id: &str,
@@ -195,7 +221,9 @@ pub(crate) async fn heartbeat_rows(
     if ids.is_empty() {
         return Ok(0);
     }
-    let sql = format!("UPDATE {table} SET locked_at = now() WHERE locked_by = $1 AND id = ANY($2)");
+    let sql = format!(
+        "UPDATE {table} SET locked_by = NULL, locked_at = NULL WHERE locked_by = $1 AND id = ANY($2)"
+    );
     Ok(sqlx::query(&sql)
         .bind(worker_id)
         .bind(ids)
@@ -204,17 +232,33 @@ pub(crate) async fn heartbeat_rows(
         .rows_affected())
 }
 
-/// Unlock every row `worker_id` holds in `table` without touching its attempt
-/// count or backoff, so another worker picks it up straight away. Used on a
-/// graceful shutdown.
-pub(crate) async fn release_rows(
+/// Put back the rows among `ids` that `worker_id` holds in `table` after
+/// their processing panicked: one attempt is counted and the row waits the
+/// usual backoff, but never less than the lease, so a row that crashes the
+/// worker comes back no sooner than it would have with its lock kept, and
+/// ever later after that.
+pub(crate) async fn defer_rows(
     pool: &PgPool,
     table: &str,
     worker_id: &str,
+    ids: &[i64],
+    lease_seconds: i64,
 ) -> Result<u64, sqlx::Error> {
-    let sql = format!("UPDATE {table} SET locked_by = NULL, locked_at = NULL WHERE locked_by = $1");
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!(
+        "UPDATE {table}
+         SET locked_by = NULL, locked_at = NULL, attempts = attempts + 1,
+             retry_after = now() + GREATEST(
+                 make_interval(mins => power(2, LEAST(GREATEST(attempts, 0), 10))::int),
+                 make_interval(secs => $3::bigint))
+         WHERE locked_by = $1 AND id = ANY($2)"
+    );
     Ok(sqlx::query(&sql)
         .bind(worker_id)
+        .bind(ids)
+        .bind(lease_seconds)
         .execute(pool)
         .await?
         .rows_affected())
@@ -329,16 +373,30 @@ impl PgQueue {
     }
 
     /// Keep the locks `worker_id` holds on `ids` fresh, so no other worker
-    /// takes them over while the delivery runs. Returns how many rows were
-    /// refreshed.
-    pub async fn heartbeat(&self, worker_id: &str, ids: &[i64]) -> Result<u64, sqlx::Error> {
+    /// takes them over while the delivery runs. Returns the ids it
+    /// refreshed; an id missing from the result is a row this worker lost.
+    pub async fn heartbeat(&self, worker_id: &str, ids: &[i64]) -> Result<Vec<i64>, sqlx::Error> {
         heartbeat_rows(&self.pool, "queued_messages", worker_id, ids).await
     }
 
-    /// Hand back every message `worker_id` holds, without counting an attempt
-    /// or adding backoff. Returns how many rows were released.
-    pub async fn release_all(&self, worker_id: &str) -> Result<u64, sqlx::Error> {
-        release_rows(&self.pool, "queued_messages", worker_id).await
+    /// Hand back the messages among `ids` that `worker_id` holds, without
+    /// counting an attempt or adding backoff. Returns how many rows were
+    /// released.
+    pub async fn release(&self, worker_id: &str, ids: &[i64]) -> Result<u64, sqlx::Error> {
+        release_rows(&self.pool, "queued_messages", worker_id, ids).await
+    }
+
+    /// Put back messages whose processing panicked: one attempt more, and a
+    /// wait of the backoff but at least the lease.
+    pub async fn defer_panicked(&self, worker_id: &str, ids: &[i64]) -> Result<u64, sqlx::Error> {
+        defer_rows(
+            &self.pool,
+            "queued_messages",
+            worker_id,
+            ids,
+            self.stale_lock_seconds,
+        )
+        .await
     }
 
     pub async fn enqueue(

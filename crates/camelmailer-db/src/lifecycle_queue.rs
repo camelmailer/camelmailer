@@ -43,14 +43,29 @@ impl PgLifecycleQueue {
         }
     }
 
-    /// Keep the locks `worker_id` holds on `ids` fresh.
-    pub async fn heartbeat(&self, worker_id: &str, ids: &[i64]) -> Result<u64, sqlx::Error> {
+    /// Keep the locks `worker_id` holds on `ids` fresh; returns the ids it
+    /// refreshed.
+    pub async fn heartbeat(&self, worker_id: &str, ids: &[i64]) -> Result<Vec<i64>, sqlx::Error> {
         crate::queue::heartbeat_rows(&self.pool, "lifecycle_events", worker_id, ids).await
     }
 
-    /// Hand back every event `worker_id` holds without counting an attempt.
-    pub async fn release_all(&self, worker_id: &str) -> Result<u64, sqlx::Error> {
-        crate::queue::release_rows(&self.pool, "lifecycle_events", worker_id).await
+    /// Hand back the events among `ids` that `worker_id` holds, without
+    /// counting an attempt.
+    pub async fn release(&self, worker_id: &str, ids: &[i64]) -> Result<u64, sqlx::Error> {
+        crate::queue::release_rows(&self.pool, "lifecycle_events", worker_id, ids).await
+    }
+
+    /// Put back events whose processing panicked: one attempt more, and a
+    /// wait of the backoff but at least the lease.
+    pub async fn defer_panicked(&self, worker_id: &str, ids: &[i64]) -> Result<u64, sqlx::Error> {
+        crate::queue::defer_rows(
+            &self.pool,
+            "lifecycle_events",
+            worker_id,
+            ids,
+            self.stale_lock_seconds,
+        )
+        .await
     }
 
     /// Lock and return the next ready event, reclaiming stale locks.

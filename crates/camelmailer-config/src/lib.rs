@@ -121,6 +121,11 @@ pub struct Camelmailer {
     pub message_retention_days: u32,
 }
 
+/// Default `worker.shutdown_grace_seconds`: below Docker's default stop
+/// timeout of 10 s, so a worker without a configured `stop_grace_period`
+/// still finishes its shutdown before it is killed.
+pub const DEFAULT_SHUTDOWN_GRACE_SECONDS: u32 = 8;
+
 /// The shortest lock lease a worker accepts: three heartbeats.
 pub const MIN_QUEUE_LOCK_LEASE_SECONDS: u32 = 90;
 
@@ -642,9 +647,12 @@ pub struct Worker {
     pub deliver: WorkerDeliver,
     /// On SIGTERM or SIGINT the worker stops taking new work and waits this
     /// many seconds for the deliveries it has in flight. Whatever is still
-    /// running then is stopped, and its rows are handed back to the queue
-    /// without counting an attempt. Keep it below the stop timeout of the
-    /// process manager (Docker: `stop_grace_period`, default 10 s).
+    /// running then is stopped: rows that had not reached a receiver go back
+    /// to the queue without counting an attempt, the rest keep their lock
+    /// until the lease runs out. Keep it below the stop timeout of the
+    /// process manager (Docker: `stop_grace_period`, default 10 s), which is
+    /// why the default is 8: the worker then finishes its shutdown before
+    /// Docker would kill it, even with no stop timeout configured.
     pub shutdown_grace_seconds: u32,
 }
 
@@ -657,7 +665,7 @@ impl Default for Worker {
             servers: Vec::new(),
             exclude_servers: Vec::new(),
             deliver: WorkerDeliver::All,
-            shutdown_grace_seconds: 25,
+            shutdown_grace_seconds: DEFAULT_SHUTDOWN_GRACE_SECONDS,
         }
     }
 }
@@ -1511,6 +1519,10 @@ mod tests {
         assert_eq!(config.worker.threads, 2);
         assert!(config.worker.servers.is_empty());
         assert_eq!(config.worker.deliver, WorkerDeliver::All);
+        // Below Docker's default stop timeout of 10 s, so the worker is not
+        // killed mid-shutdown when no stop_grace_period is configured.
+        assert_eq!(config.worker.shutdown_grace_seconds, 8);
+        assert!(config.worker.shutdown_grace_seconds < 10);
 
         assert_eq!(config.main_db.host, "localhost");
         assert_eq!(config.main_db.port, 3306);
