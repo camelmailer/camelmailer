@@ -227,7 +227,7 @@ lifecycle_webhooks:
 # complaint feedback loops (JMRP, Yahoo CFL). Each source is off until its
 # credentials are present. Secrets come from the environment variables named
 # below or from files; never write them into this file.
-# See docs/deliverability-feedback.md.
+# See docs/provider-feedback.md.
 deliverability_feedback:
   fetch_interval_seconds: 21600      # 0 turns the scheduled fetch off
   snapshot_retention_days: 400

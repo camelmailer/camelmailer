@@ -432,7 +432,7 @@ impl Default for Retention {
 /// and switched on only by its credentials; a source without them is
 /// disabled, never an error. Secrets are never written into this file: they
 /// come from environment variables or from files (Docker or systemd secrets)
-/// named here. See `docs/deliverability-feedback.md`.
+/// named here. See `docs/provider-feedback.md`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeliverabilityFeedback {

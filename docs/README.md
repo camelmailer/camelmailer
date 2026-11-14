@@ -41,7 +41,6 @@ send your first message in about five minutes, then read
 | [Sending domains](domains.md) | Adding a domain, DKIM (per-domain key with installation fallback), SPF, and DNS verification |
 | [DMARC monitoring](dmarc.md) | Domain health checks and DMARC aggregate report ingestion |
 | [Deliverability and IP pools](deliverability.md) | IP pools, the stream then server then default resolution order, and warmup guidance |
-| [Provider feedback](deliverability-feedback.md) | Google Postmaster Tools, Microsoft SNDS and the JMRP / Yahoo CFL feedback loops: setup, verdicts, and the privacy of complaint reports |
 
 ## Receiving and integrating
 

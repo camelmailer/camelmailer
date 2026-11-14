@@ -563,7 +563,7 @@ Events, payload and signature are described in
 Google Postmaster Tools, Microsoft SNDS and the complaint feedback loops.
 Every source is off until its credentials are present; secrets come from the
 environment or from files, never from this file. Setup per source:
-[Provider feedback](deliverability-feedback.md).
+[Provider feedback](provider-feedback.md).
 
 ```yaml
 deliverability_feedback:

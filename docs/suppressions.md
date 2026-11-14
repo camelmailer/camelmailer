@@ -137,7 +137,7 @@ it. From there:
   and retried with backoff, so a complaint is not lost to a blip.
 - Every abuse report is counted for the provider that sent it
   (`microsoft` for JMRP, `yahoo` for CFL, `google`, `other`) and shown on
-  the [Provider feedback](deliverability-feedback.md) page.
+  the [Provider feedback](provider-feedback.md) page.
 - With `deliverability_feedback.fbl.suppress_complainants: true` a complaint
   about transactional mail also suppresses the recipient for the stream of
   the complained-about message. Off by default.
