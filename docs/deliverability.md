@@ -66,6 +66,42 @@ IP. When no pool resolves to an address, `source_ip` is `None` and the
 worker sends from the host's default outbound address (the operating
 system picks the source IP as it would for any outbound connection).
 
+### Several worker hosts sharing a pool
+
+With `worker.host_aware_pools: true` each worker only uses the pool
+addresses its own host holds, so workers on several hosts can share one pool
+and all send at the same time, each from its own IP.
+
+```yaml
+worker:
+  host_aware_pools: true
+  source_addresses: []            # empty: find them by binding each address
+  foreign_pool_delay_seconds: 30
+```
+
+- **Which addresses are local.** Without a list the worker tries to bind each
+  pool address and rechecks every 30 seconds, so an address that moves to
+  this host (a floating IP taken over after a failure) is picked up without a
+  restart. List the addresses in `source_addresses` (or
+  `WORKER_SOURCE_ADDRESSES`) on a host where an address is configured on the
+  interface but routed somewhere else.
+- **Which one is used.** Among the local addresses, the lowest `priority`
+  number wins. Ties go by a stable hash of the recipient domain, so one
+  receiving domain keeps seeing the same IP from a host, which helps
+  reputation and greylisting.
+- **A pool with no address here.** Outgoing mail records its pool when it is
+  queued, and the worker does not dequeue mail of pools its host holds no
+  address of. Mail queued before that (or after a pool change) is handed
+  back without counting an attempt and looked at again after
+  `foreign_pool_delay_seconds`. The worker logs each such pool once.
+- **No pool at all.** The host's default address, as before. On several hosts
+  that means several different source addresses, each of which needs SPF and
+  reverse DNS; put every server on a pool before running more than one host.
+
+Without the option every worker uses the pool's first address, exactly as
+described above. Mail whose pool no running host holds an address of waits
+in the queue without counting attempts, so watch the queue age.
+
 ## Why isolation matters
 
 Mailbox providers score reputation per sending IP. A marketing blast that

@@ -231,6 +231,10 @@ pub struct PgQueue {
     stale_lock_days: i32,
     filter: QueueFilter,
     turns: Arc<Turns>,
+    /// The IP pools this worker's host holds an address of. `None` serves
+    /// every row; `Some` skips outgoing rows of any other pool. Shared by the
+    /// clones of one queue and refreshed by the worker.
+    source_pools: Arc<std::sync::RwLock<Option<Vec<i64>>>>,
 }
 
 impl PgQueue {
@@ -240,7 +244,35 @@ impl PgQueue {
             stale_lock_days: DEFAULT_STALE_LOCK_DAYS,
             filter: QueueFilter::default(),
             turns: Arc::default(),
+            source_pools: Arc::default(),
         }
+    }
+
+    /// Serve only rows whose IP pool is one of `pools` (or that have none);
+    /// `None` serves every row. Applies to every clone of this queue.
+    pub fn set_source_pools(&self, pools: Option<Vec<i64>>) {
+        *self.source_pools.write().expect("source pools lock") = pools;
+    }
+
+    fn source_pools_param(&self) -> Option<Vec<i64>> {
+        self.source_pools.read().expect("source pools lock").clone()
+    }
+
+    /// Hand a row back without counting an attempt, ready again after
+    /// `seconds`. For a row this worker cannot send (its pool has no address
+    /// on this host): another worker takes it meanwhile.
+    pub async fn defer(&self, id: i64, seconds: i64) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE queued_messages
+             SET locked_by = NULL, locked_at = NULL,
+                 retry_after = now() + make_interval(secs => $2::bigint)
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Serve only the part of the queue the filter names.
@@ -259,6 +291,7 @@ impl PgQueue {
             stale_lock_days: stale_lock_days.max(1),
             filter: QueueFilter::default(),
             turns: Arc::default(),
+            source_pools: Arc::default(),
         }
     }
 
@@ -320,6 +353,8 @@ impl PgQueue {
                AND ($2::bigint[] IS NULL OR q.server_id = ANY($2))
                AND NOT (q.server_id = ANY($3))
                AND ($4::boolean IS NULL OR q.bulk = $4)
+               AND ($5::bigint[] IS NULL OR q.source_pool_id IS NULL
+                    OR q.source_pool_id = ANY($5))
              GROUP BY q.server_id
              ORDER BY in_flight, oldest
              LIMIT 1000",
@@ -328,6 +363,7 @@ impl PgQueue {
         .bind(self.filter.servers_param())
         .bind(self.filter.exclude_param())
         .bind(self.filter.bulk_param())
+        .bind(self.source_pools_param())
         .fetch_all(&self.pool)
         .await?;
         let candidates = rows
@@ -349,6 +385,8 @@ impl PgQueue {
                             OR locked_at < now() - make_interval(days => $3::int))
                        AND (retry_after IS NULL OR retry_after <= now())
                        AND ($4::boolean IS NULL OR bulk = $4)
+                       AND ($5::bigint[] IS NULL OR source_pool_id IS NULL
+                            OR source_pool_id = ANY($5))
                      ORDER BY bulk, id
                      LIMIT 1
                      FOR UPDATE SKIP LOCKED
@@ -359,6 +397,7 @@ impl PgQueue {
             .bind(server_id)
             .bind(self.stale_lock_days)
             .bind(self.filter.bulk_param())
+            .bind(self.source_pools_param())
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = row {

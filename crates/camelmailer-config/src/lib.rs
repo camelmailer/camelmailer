@@ -611,6 +611,20 @@ pub struct Worker {
     /// Which mail this worker delivers: `all`, `transactional` or `bulk`
     /// (broadcast streams and campaigns).
     pub deliver: WorkerDeliver,
+    /// Choose the source address among the pool addresses this host holds,
+    /// so workers on several hosts can share a pool, each sending from its
+    /// own addresses. Off: every worker uses the pool's first address, as
+    /// before.
+    pub host_aware_pools: bool,
+    /// With `host_aware_pools`: the addresses this host may send from. Empty
+    /// finds them by trying to bind each pool address, rechecked every 30 s.
+    /// List them where an address is configured on the interface but routed
+    /// to another host.
+    pub source_addresses: Vec<String>,
+    /// With `host_aware_pools`: how long a message whose pool has no address
+    /// on this host is left for the other hosts before this worker looks at
+    /// it again. No attempt is counted.
+    pub foreign_pool_delay_seconds: u32,
 }
 
 impl Default for Worker {
@@ -622,6 +636,9 @@ impl Default for Worker {
             servers: Vec::new(),
             exclude_servers: Vec::new(),
             deliver: WorkerDeliver::All,
+            host_aware_pools: false,
+            source_addresses: Vec::new(),
+            foreign_pool_delay_seconds: 30,
         }
     }
 }
@@ -669,6 +686,20 @@ impl Worker {
         if let Some(value) = var("WORKER_EXCLUDE_SERVERS") {
             worker.exclude_servers = list(value);
         }
+        if let Some(value) = var("WORKER_HOST_AWARE_POOLS") {
+            worker.host_aware_pools = match value.trim() {
+                "true" | "1" => true,
+                "false" | "0" | "" => false,
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "WORKER_HOST_AWARE_POOLS must be true or false (got {other:?})"
+                    )))
+                }
+            };
+        }
+        if let Some(value) = var("WORKER_SOURCE_ADDRESSES") {
+            worker.source_addresses = list(value);
+        }
         if let Some(value) = var("WORKER_DELIVER") {
             worker.deliver = match value.trim() {
                 "all" => WorkerDeliver::All,
@@ -686,6 +717,13 @@ impl Worker {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        for address in &self.source_addresses {
+            if address.parse::<std::net::IpAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "worker.source_addresses takes IP addresses (got {address:?})"
+                )));
+            }
+        }
         if self.threads == 0 {
             return Err(ConfigError::Invalid(
                 "worker.threads must be at least 1".into(),
@@ -2218,5 +2256,25 @@ smtp_server:
         assert!(Worker::default().with_overrides(bad).is_err());
         let zero = |name: &str| (name == "WORKER_THREADS").then(|| "0".to_string());
         assert!(Worker::default().with_overrides(zero).is_err());
+    }
+
+    #[test]
+    fn host_aware_pool_settings_come_from_the_environment() {
+        let env = |name: &str| match name {
+            "WORKER_HOST_AWARE_POOLS" => Some("true".to_string()),
+            "WORKER_SOURCE_ADDRESSES" => Some("203.0.113.5, 2001:db8::5".to_string()),
+            _ => None,
+        };
+        let worker = Worker::default().with_overrides(env).unwrap();
+        assert!(worker.host_aware_pools);
+        assert_eq!(worker.source_addresses, vec!["203.0.113.5", "2001:db8::5"]);
+        assert_eq!(worker.foreign_pool_delay_seconds, 30);
+        assert!(!Worker::default().host_aware_pools);
+
+        let bad_flag = |name: &str| (name == "WORKER_HOST_AWARE_POOLS").then(|| "yes".to_string());
+        assert!(Worker::default().with_overrides(bad_flag).is_err());
+        let bad_address =
+            |name: &str| (name == "WORKER_SOURCE_ADDRESSES").then(|| "out1.example".to_string());
+        assert!(Worker::default().with_overrides(bad_address).is_err());
     }
 }

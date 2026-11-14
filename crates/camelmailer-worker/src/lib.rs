@@ -15,4 +15,4 @@ pub mod worker;
 pub use sender::SmtpSender;
 pub use signer::Signer;
 pub use smtp_client::SendOutcome;
-pub use worker::{ProcessOutcome, WebhookOutcome, Worker};
+pub use worker::{choose_source_address, ProcessOutcome, WebhookOutcome, Worker};

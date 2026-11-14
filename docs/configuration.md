@@ -304,7 +304,15 @@ worker:
   servers: []             # only these servers (organization/server); empty = all
   exclude_servers: []     # never these servers
   deliver: all            # all | transactional | bulk
+  host_aware_pools: false # send only from pool addresses this host holds
+  source_addresses: []    # with host_aware_pools: this host's addresses (empty = discover)
+  foreign_pool_delay_seconds: 30
 ```
+
+`host_aware_pools` lets workers on several hosts share an IP pool, each
+sending from its own addresses; see
+[Deliverability](deliverability.md#several-worker-hosts-sharing-a-pool).
+`WORKER_HOST_AWARE_POOLS` and `WORKER_SOURCE_ADDRESSES` override the file.
 
 The queue is fair without any of this. A worker takes turns between the
 servers that have mail waiting, so one server's 10,000 queued campaign mails

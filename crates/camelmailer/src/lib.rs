@@ -419,12 +419,18 @@ pub async fn worker() -> std::io::Result<()> {
         servers = ?settings.servers,
         exclude_servers = ?settings.exclude_servers,
         deliver = ?settings.deliver,
+        host_aware_pools = settings.host_aware_pools,
+        source_addresses = ?settings.source_addresses,
         "worker delivery scope"
     );
-    Arc::new(Worker::new(&config, store).with_delivery(filter, settings.threads))
-        .run()
-        .await
-        .map_err(std::io::Error::other)
+    Arc::new(
+        Worker::new(&config, store)
+            .with_delivery(filter, settings.threads)
+            .with_source_selection(&settings),
+    )
+    .run()
+    .await
+    .map_err(std::io::Error::other)
 }
 
 /// The part of the queue this worker serves, from `worker.servers`,
