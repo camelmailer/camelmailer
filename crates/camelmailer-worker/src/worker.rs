@@ -22,7 +22,7 @@ use camelmailer_db::{
     PgLifecycleQueue, PgMessageSink, PgQueue, PgStore, PgWebhookQueue, QueueFilter, StoredMessage,
 };
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -67,15 +67,47 @@ pub fn choose_source_address<'a>(
     Some(tied[index])
 }
 
+/// The IP addresses configured on this host's network interfaces.
+///
+/// Read from the interface list rather than by trying to bind each address:
+/// with `net.ipv4.ip_nonlocal_bind=1` (common with keepalived and floating
+/// IPs) or `IP_FREEBIND` every bind succeeds, so a bind probe would call every
+/// pool address local.
+#[cfg(unix)]
+fn interface_addresses() -> std::io::Result<HashSet<IpAddr>> {
+    let addresses = nix::ifaddrs::getifaddrs().map_err(std::io::Error::from)?;
+    Ok(addresses
+        .filter_map(|interface| interface.address)
+        .filter_map(|address| {
+            if let Some(v4) = address.as_sockaddr_in() {
+                Some(IpAddr::V4(v4.ip()))
+            } else {
+                address.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
+            }
+        })
+        .collect())
+}
+
+/// Without an interface list on this platform, nothing counts as local:
+/// list the addresses in `worker.source_addresses` instead.
+#[cfg(not(unix))]
+fn interface_addresses() -> std::io::Result<HashSet<IpAddr>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no interface list on this platform; set worker.source_addresses",
+    ))
+}
+
 /// Which pool addresses this host may send from (`worker.host_aware_pools`).
 struct SourceSelection {
-    /// `worker.source_addresses`; `None` finds them by binding.
+    /// `worker.source_addresses`; `None` takes the interface addresses.
     explicit: Option<HashSet<IpAddr>>,
-    /// Bind results by address, with when they were taken.
-    probed: Mutex<HashMap<IpAddr, (bool, Instant)>>,
+    /// The interface addresses, with when they were read.
+    discovered: Mutex<Option<(Arc<HashSet<IpAddr>>, Instant)>>,
     /// When the queue's pool filter was last refreshed.
     pools_refreshed: Mutex<Option<Instant>>,
-    /// Pools already reported as having no address here (logged once).
+    /// Pools reported as having no address here. Cleared for a pool once the
+    /// host holds one of its addresses again, so a later loss is logged too.
     reported: Mutex<HashSet<camelmailer_core::Id>>,
     foreign_pool_delay_seconds: i64,
 }
@@ -91,31 +123,45 @@ impl SourceSelection {
         });
         Self {
             explicit,
-            probed: Mutex::default(),
+            discovered: Mutex::default(),
             pools_refreshed: Mutex::default(),
             reported: Mutex::default(),
             foreign_pool_delay_seconds: i64::from(settings.foreign_pool_delay_seconds.max(1)),
         }
     }
 
-    /// Whether this host can send from `address`: listed in
-    /// `worker.source_addresses`, or (without a list) bindable here.
-    fn is_local(&self, address: &str) -> bool {
-        let Ok(ip) = address.trim().parse::<IpAddr>() else {
-            return false;
-        };
-        if let Some(explicit) = &self.explicit {
-            return explicit.contains(&ip);
-        }
-        let mut probed = self.probed.lock().expect("probe lock");
-        if let Some((local, at)) = probed.get(&ip) {
+    /// The interface addresses, re-read at most every 30 s. The lock is not
+    /// held while the list is read.
+    fn discovered(&self) -> Arc<HashSet<IpAddr>> {
+        if let Some((addresses, at)) = &*self.discovered.lock().expect("address lock") {
             if at.elapsed() < LOCAL_ADDRESS_TTL {
-                return *local;
+                return Arc::clone(addresses);
             }
         }
-        let local = std::net::UdpSocket::bind(std::net::SocketAddr::new(ip, 0)).is_ok();
-        probed.insert(ip, (local, Instant::now()));
-        local
+        let addresses = Arc::new(interface_addresses().unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not read the interface addresses");
+            HashSet::new()
+        }));
+        *self.discovered.lock().expect("address lock") =
+            Some((Arc::clone(&addresses), Instant::now()));
+        addresses
+    }
+
+    /// A check for "this host can send from that address": listed in
+    /// `worker.source_addresses`, or (without a list) configured on one of
+    /// this host's interfaces. Take it once per batch of lookups.
+    fn local_check(&self) -> impl Fn(&str) -> bool + '_ {
+        let discovered = self.explicit.is_none().then(|| self.discovered());
+        move |address: &str| {
+            let Ok(ip) = address.trim().parse::<IpAddr>() else {
+                return false;
+            };
+            match (&self.explicit, &discovered) {
+                (Some(explicit), _) => explicit.contains(&ip),
+                (None, Some(discovered)) => discovered.contains(&ip),
+                (None, None) => false,
+            }
+        }
     }
 
     /// Log once per pool that this host holds none of its addresses.
@@ -126,6 +172,62 @@ impl SourceSelection {
                 "this host holds no address of IP pool; leaving its mail to the hosts that do"
             );
         }
+    }
+
+    /// Forget the reports of pools this host holds an address of again.
+    fn clear_reports(&self, local_pools: &[i64]) {
+        self.reported
+            .lock()
+            .expect("report lock")
+            .retain(|pool| !local_pools.contains(&(*pool as i64)));
+    }
+}
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+
+    #[test]
+    fn the_loopback_address_is_an_interface_address() {
+        let addresses = interface_addresses().unwrap();
+        assert!(
+            addresses.contains(&IpAddr::from([127, 0, 0, 1])),
+            "{addresses:?}"
+        );
+    }
+
+    /// A bind probe calls an address local when the bind succeeds, which it
+    /// always does for the unspecified address (and, with
+    /// `ip_nonlocal_bind`, for every address). The interface list does not.
+    #[test]
+    fn a_bindable_address_that_is_on_no_interface_is_not_local() {
+        assert!(std::net::UdpSocket::bind("0.0.0.0:0").is_ok());
+        let selection = SourceSelection::new(&camelmailer_config::Worker::default());
+        let is_local = selection.local_check();
+        assert!(!is_local("0.0.0.0"));
+        assert!(!is_local("192.0.2.1"));
+        assert!(is_local("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_listed_address_replaces_the_interface_list() {
+        let settings = camelmailer_config::Worker {
+            source_addresses: vec!["198.51.100.7".into()],
+            ..Default::default()
+        };
+        let selection = SourceSelection::new(&settings);
+        let is_local = selection.local_check();
+        assert!(is_local("198.51.100.7"));
+        assert!(!is_local("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_pool_is_reported_again_after_the_host_held_it_in_between() {
+        let selection = SourceSelection::new(&camelmailer_config::Worker::default());
+        selection.report_foreign(7);
+        assert!(selection.reported.lock().unwrap().contains(&7));
+        selection.clear_reports(&[7]);
+        assert!(!selection.reported.lock().unwrap().contains(&7));
     }
 }
 
@@ -211,6 +313,10 @@ pub enum ProcessOutcome {
     /// (`worker.host_aware_pools`). It went back to the queue without an
     /// attempt, for a host that holds one.
     ForeignPool,
+    /// The message's IP pool could not be read (`worker.host_aware_pools`).
+    /// It went back to the queue without an attempt and is retried after
+    /// `worker.foreign_pool_delay_seconds`.
+    PoolUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,16 +473,24 @@ impl Worker {
             }
             *refreshed = Some(Instant::now());
         }
-        let rows: Vec<(i64, String)> = sqlx::query_as("SELECT ip_pool_id, ipv4 FROM ip_addresses")
-            .fetch_all(self.store.pool())
-            .await?;
-        let mut pools: Vec<i64> = rows
-            .into_iter()
-            .filter(|(_, ipv4)| selection.is_local(ipv4))
-            .map(|(pool, _)| pool)
-            .collect();
+        // Through the storage traits: every pool, then its addresses. Pools
+        // are few; this runs at most every 30 s per process.
+        let store_error = |e: camelmailer_core::StoreError| sqlx::Error::Protocol(e.to_string());
+        let is_local = selection.local_check();
+        let mut pools: Vec<i64> = Vec::new();
+        for pool in camelmailer_core::AdminStore::list_ip_pools(&self.store)
+            .await
+            .map_err(store_error)?
+        {
+            let addresses = camelmailer_core::AdminStore::list_ip_addresses(&self.store, pool.id)
+                .await
+                .map_err(store_error)?;
+            if addresses.iter().any(|address| is_local(&address.ipv4)) {
+                pools.push(pool.id as i64);
+            }
+        }
         pools.sort_unstable();
-        pools.dedup();
+        selection.clear_reports(&pools);
         self.queue.set_source_pools(Some(pools));
         Ok(())
     }
@@ -521,26 +635,51 @@ impl Worker {
             // Host-aware: only the pool addresses this host holds. A pool
             // with none here goes back to the queue for a host that has one;
             // no pool at all keeps the OS default address.
-            let addresses = camelmailer_core::ServerStore::source_addresses_for(
+            let addresses = match camelmailer_core::ServerStore::source_addresses_for(
                 &self.store,
                 message.server_id,
                 message.stream_id,
             )
             .await
-            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+            {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    // The row is locked: hand it back without an attempt
+                    // instead of leaving it locked until the stale-lock
+                    // reclaim. Sending from an address the pool may not
+                    // hold would be worse than a short wait.
+                    tracing::warn!(
+                        message_id = message.id,
+                        %error,
+                        "could not read the IP pool; handing the message back"
+                    );
+                    self.queue
+                        .defer(queued.id, selection.foreign_pool_delay_seconds, None)
+                        .await?;
+                    return Ok(ProcessOutcome::PoolUnavailable);
+                }
+            };
             if addresses.is_empty() {
                 None
             } else {
-                let local: Vec<&camelmailer_core::IpAddress> = addresses
-                    .iter()
-                    .filter(|a| selection.is_local(&a.ipv4))
-                    .collect();
+                let is_local = selection.local_check();
+                let local: Vec<&camelmailer_core::IpAddress> =
+                    addresses.iter().filter(|a| is_local(&a.ipv4)).collect();
                 match choose_source_address(&local, &queued.domain) {
                     Some(address) => address.ipv4.parse().ok(),
                     None => {
-                        selection.report_foreign(addresses[0].ip_pool_id);
+                        let pool_id = addresses[0].ip_pool_id;
+                        selection.report_foreign(pool_id);
+                        // Record the pool as resolved now, so the queue
+                        // filter of the hosts without an address of it skips
+                        // the row from here on (rows queued before the
+                        // column, or after the pool changed).
                         self.queue
-                            .defer(queued.id, selection.foreign_pool_delay_seconds)
+                            .defer(
+                                queued.id,
+                                selection.foreign_pool_delay_seconds,
+                                Some(pool_id as i64),
+                            )
                             .await?;
                         return Ok(ProcessOutcome::ForeignPool);
                     }

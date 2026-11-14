@@ -18,18 +18,24 @@ integration tests) is green.
 ### Added
 
 - **Host-aware IP pools.** With `worker.host_aware_pools: true` a worker
-  sends only from the pool addresses its host holds (found by binding, or
-  listed in `worker.source_addresses`), so workers on several hosts can share
+  sends only from the pool addresses its host holds (the addresses on its
+  network interfaces, or those listed in `worker.source_addresses`), so workers on several hosts can share
   a pool and send at the same time, each from its own IP. Ties in priority
   are spread by a stable hash of the recipient domain. Mail whose pool has no
   address on the host is skipped at dequeue, or handed back without an
-  attempt and retried after `worker.foreign_pool_delay_seconds`. Off by
-  default; without it every worker uses the pool's first address as before.
+  attempt, with its pool recorded, and retried after
+  `worker.foreign_pool_delay_seconds` (env
+  `WORKER_FOREIGN_POOL_DELAY_SECONDS`). Mail whose recorded pool is stale (the
+  pool was deleted, or the server or stream moved) is taken by any worker and
+  re-resolved. Off by default; without it every worker uses the pool's first
+  address as before.
 - `ServerStore::source_addresses_for` returns every address of the pool a
   message sends from.
 - Outgoing queue rows record the IP pool they send from
   (`queued_messages.source_pool_id`, migration `0050`).
-- `ProcessOutcome::ForeignPool` for a message handed back to another host.
+- `ProcessOutcome::ForeignPool` for a message handed back to another host,
+  `ProcessOutcome::PoolUnavailable` for one handed back because its pool
+  could not be read.
 
 ## [0.13.1] - 2026-11-05
 

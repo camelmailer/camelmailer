@@ -223,6 +223,27 @@ fn turn_order(
     candidates.into_iter().map(|c| c.server_id).collect()
 }
 
+/// The host-aware pool filter of the ready queries, against `queued_messages
+/// q` with the pools this host holds an address of in `$5` (NULL: no filter).
+/// A row passes when it has no pool, when its pool is one of `$5`, or when the
+/// pool recorded at enqueue is no longer the pool of its server or of any of
+/// the server's streams (the pool was deleted or the server/stream moved to
+/// another one). Such a stale row is taken by any worker, which resolves the
+/// current pool and either sends or hands the row back with the current pool
+/// recorded ([`PgQueue::defer`]), so no row waits on a pool nobody uses.
+macro_rules! source_pool_filter {
+    () => {
+        r#"($5::bigint[] IS NULL OR q.source_pool_id IS NULL
+                    OR q.source_pool_id = ANY($5)
+                    OR (NOT EXISTS (SELECT 1 FROM servers s
+                                    WHERE s.id = q.server_id
+                                      AND s.ip_pool_id = q.source_pool_id)
+                        AND NOT EXISTS (SELECT 1 FROM message_streams ms
+                                        WHERE ms.server_id = q.server_id
+                                          AND ms.ip_pool_id = q.source_pool_id)))"#
+    };
+}
+
 #[derive(Clone)]
 pub struct PgQueue {
     pool: PgPool,
@@ -259,17 +280,28 @@ impl PgQueue {
     }
 
     /// Hand a row back without counting an attempt, ready again after
-    /// `seconds`. For a row this worker cannot send (its pool has no address
-    /// on this host): another worker takes it meanwhile.
-    pub async fn defer(&self, id: i64, seconds: i64) -> Result<(), sqlx::Error> {
+    /// `seconds`. For a row this worker cannot send now (its pool has no
+    /// address on this host, or the pool could not be read): another worker
+    /// takes it meanwhile. `source_pool_id`, when given, is the pool the row
+    /// sends from as resolved now; it replaces the one recorded at enqueue,
+    /// so the queue filter of every host-aware worker sees the current pool
+    /// and the workers without an address of it stop picking the row up.
+    pub async fn defer(
+        &self,
+        id: i64,
+        seconds: i64,
+        source_pool_id: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE queued_messages
              SET locked_by = NULL, locked_at = NULL,
-                 retry_after = now() + make_interval(secs => $2::bigint)
+                 retry_after = now() + make_interval(secs => $2::bigint),
+                 source_pool_id = COALESCE($3, source_pool_id)
              WHERE id = $1",
         )
         .bind(id)
         .bind(seconds)
+        .bind(source_pool_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -338,8 +370,8 @@ impl PgQueue {
     /// server that still has one. A row another worker locked in between is
     /// skipped, not waited for.
     pub async fn dequeue(&self, worker_id: &str) -> Result<Option<QueuedMessageRow>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT q.server_id, min(q.id) AS oldest, coalesce(max(f.n), 0) AS in_flight
+        let rows = sqlx::query(concat!(
+            r#"SELECT q.server_id, min(q.id) AS oldest, coalesce(max(f.n), 0) AS in_flight
              FROM queued_messages q
              LEFT JOIN (
                  SELECT server_id, count(*) AS n FROM queued_messages
@@ -353,12 +385,13 @@ impl PgQueue {
                AND ($2::bigint[] IS NULL OR q.server_id = ANY($2))
                AND NOT (q.server_id = ANY($3))
                AND ($4::boolean IS NULL OR q.bulk = $4)
-               AND ($5::bigint[] IS NULL OR q.source_pool_id IS NULL
-                    OR q.source_pool_id = ANY($5))
+               AND "#,
+            source_pool_filter!(),
+            r#"
              GROUP BY q.server_id
              ORDER BY in_flight, oldest
-             LIMIT 1000",
-        )
+             LIMIT 1000"#
+        ))
         .bind(self.stale_lock_days)
         .bind(self.filter.servers_param())
         .bind(self.filter.exclude_param())
@@ -376,23 +409,24 @@ impl PgQueue {
             .collect();
 
         for server_id in turn_order(candidates, |id| self.turns.last_served(id)) {
-            let row = sqlx::query(
-                "UPDATE queued_messages SET locked_by = $1, locked_at = now()
+            let row = sqlx::query(concat!(
+                r#"UPDATE queued_messages SET locked_by = $1, locked_at = now()
                  WHERE id = (
-                     SELECT id FROM queued_messages
+                     SELECT id FROM queued_messages q
                      WHERE server_id = $2
                        AND (locked_by IS NULL
                             OR locked_at < now() - make_interval(days => $3::int))
                        AND (retry_after IS NULL OR retry_after <= now())
                        AND ($4::boolean IS NULL OR bulk = $4)
-                       AND ($5::bigint[] IS NULL OR source_pool_id IS NULL
-                            OR source_pool_id = ANY($5))
+                       AND "#,
+                source_pool_filter!(),
+                r#"
                      ORDER BY bulk, id
                      LIMIT 1
                      FOR UPDATE SKIP LOCKED
                  )
-                 RETURNING *",
-            )
+                 RETURNING *"#
+            ))
             .bind(worker_id)
             .bind(server_id)
             .bind(self.stale_lock_days)
