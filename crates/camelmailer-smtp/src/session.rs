@@ -144,6 +144,9 @@ pub struct Session {
     input_mode: InputMode,
     trace_id: String,
     ip_address: Option<String>,
+    /// The socket peer's address on a `proxy_protocol` connection, used when
+    /// the PROXY header says `UNKNOWN` (see [`Session::set_peer_ip`]).
+    peer_ip: Option<String>,
     /// The reverse-DNS hostname of the client, resolved by the server layer
     /// before DATA. Falls back to the IP address.
     resolved_hostname: Option<String>,
@@ -199,6 +202,7 @@ impl Session {
             input_mode: InputMode::Command,
             trace_id: camelmailer_core::token::generate_trace_id(),
             ip_address,
+            peer_ip: None,
             resolved_hostname: None,
             received_spf: None,
             helo_name: None,
@@ -275,6 +279,14 @@ impl Session {
     /// Mark the transport as TLS-protected (after a completed handshake).
     pub fn set_tls(&mut self, tls: bool) {
         self.tls = tls;
+    }
+
+    /// The socket peer's address, for a session that starts in
+    /// [`State::Preauth`] (`proxy_protocol`). A `PROXY UNKNOWN` header (a
+    /// load balancer health check) then falls back to it, as the PROXY spec
+    /// requires. Without it, `UNKNOWN` is refused.
+    pub fn set_peer_ip(&mut self, ip: String) {
+        self.peer_ip = Some(ip);
     }
 
     pub fn set_resolved_hostname(&mut self, hostname: String) {
@@ -398,10 +410,16 @@ impl Session {
     }
 
     fn proxy(&mut self, data: &str) -> Reply {
-        // PROXY inet-protocol client-ip proxy-ip client-port proxy-port
-        let parts: Vec<&str> = data.split(' ').collect();
-        if parts.len() == 6 && parts[0] == "PROXY" && parts.iter().all(|p| !p.is_empty()) {
-            self.ip_address = Some(parts[2].to_string());
+        // PROXY inet-protocol client-ip proxy-ip client-port proxy-port. The
+        // addresses must be literals of the announced family: the client IP
+        // feeds IP credentials, SPF and the Received header.
+        let client = match crate::proxy::parse_v1(data) {
+            Ok(crate::proxy::ProxyHeader::Inet { client }) => Some(client.to_string()),
+            Ok(crate::proxy::ProxyHeader::Unknown) => self.peer_ip.clone(),
+            Err(_) => None,
+        };
+        if let Some(client) = client {
+            self.ip_address = Some(client);
             self.state = State::Welcome;
             return Reply::Line(self.banner());
         }

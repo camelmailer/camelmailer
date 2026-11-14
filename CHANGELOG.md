@@ -15,6 +15,16 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Changed
+
+- A panic while processing one queued message, webhook request or lifecycle
+  event no longer takes a worker loop down. The row goes back with one
+  attempt counted and waits its backoff, but at least the lock lease, so a
+  message that trips a bug cannot cycle through the workers. A worker loop or
+  the lock heartbeat that ends on its own still stops the whole worker with
+  an error, so the process manager restarts it. Before, a loop that ended
+  disappeared silently and the worker ran on with fewer delivery loops.
+
 ### Added
 
 - **Delivery leases in seconds, with a heartbeat.** New
@@ -43,16 +53,22 @@ integration tests) is green.
   `worker.threads` messages and one webhook locked until the one-day stale
   window ran out. The compose file now runs the worker with `init: true` and
   `stop_grace_period: 30s`.
-
-### Changed
-
-- A panic while processing one queued message, webhook request or lifecycle
-  event no longer takes a worker loop down. The row goes back with one
-  attempt counted and waits its backoff, but at least the lock lease, so a
-  message that trips a bug cannot cycle through the workers. A worker loop or
-  the lock heartbeat that ends on its own still stops the whole worker with
-  an error, so the process manager restarts it. Before, a loop that ended
-  disappeared silently and the worker ran on with fewer delivery loops.
+- **PROXY protocol on implicit TLS (port 465).** With
+  `smtp_server.proxy_protocol: true` an `smtps` listener ran the TLS
+  handshake first and then expected the PROXY line inside the encrypted
+  stream, so every connection through a load balancer failed. The server now
+  reads the PROXY v1 line from the raw socket before the handshake and sends
+  the banner over TLS afterwards. A connection without a valid header is
+  closed.
+- **PROXY header validation, on every listener.** The client and proxy
+  fields must be IP literals of the announced family and the ports numbers;
+  before, any six words were accepted and a garbage client "address" reached
+  the Received header while SPF and IP credentials silently skipped it.
+  `PROXY UNKNOWN` (balancer health checks) is now accepted with the socket's
+  address instead of being refused. The plain `smtp` listener now applies the
+  same 107-byte cap and 10-second timeout to the header as `smtps`; it used
+  to buffer an unterminated first line without limit and wait forever.
+  Refused headers are logged as a rate-limited warning.
 
 ## [0.13.1] - 2026-11-05
 

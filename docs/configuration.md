@@ -120,6 +120,38 @@ a modification time moves, so an ACME renewal reaches a running server
 without a restart. A file caught mid-write keeps the previous certificate in
 service and is retried on the next handshake.
 
+#### Behind a TCP load balancer (`proxy_protocol`)
+
+With `proxy_protocol: true` every listener expects a PROXY protocol v1 line
+(`PROXY TCP4 <client> <proxy> <client-port> <proxy-port>`) as the first thing
+on each connection, and takes the client IP from it. Inbound SPF and IP-based
+relay credentials then see the real client instead of the load balancer.
+Without it, every client looks like the balancer's address.
+
+On `smtp` listeners the line comes before the banner. On `smtps` listeners
+the balancer sends it in the clear in front of the client's TLS handshake;
+the server reads exactly that line from the raw socket, then starts TLS and
+sends the banner over the encrypted stream.
+
+Both listener types read the header the same way: at most 107 bytes (the v1
+limit), within 10 seconds of the connection opening. The addresses must be
+literals of the announced family (`TCP4` IPv4, `TCP6` IPv6) and the ports
+numbers. `PROXY UNKNOWN`, which balancers send for their own health checks,
+is accepted and the connection keeps the socket's address. Only v1 (the text
+form) is understood; a balancer sending v2 is refused.
+
+A connection without a valid header is closed, on every listener: an `smtp`
+listener answers `502 Proxy Error` first, an `smtps` listener closes without
+a word because the client expects TLS. So do not expose a `proxy_protocol`
+listener to clients that bypass the balancer: they cannot connect, and
+nothing lets them claim another address. Refusals are logged as a warning at
+most once a minute (with the number suppressed since), every one at debug
+level: a balancer without `send-proxy`, or with `send-proxy-v2`, shows up
+there.
+
+The switch applies to all listeners of the process. To serve some clients
+directly, run a second `smtp-server` without it.
+
 #### Turning TLS on for an installation that already authenticates
 
 AUTH is advertised, and accepted, only on a TLS-protected session. An
