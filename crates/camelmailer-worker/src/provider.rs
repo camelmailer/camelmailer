@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use camelmailer_core::ProviderGroup;
+use camelmailer_core::{ProviderGroup, ProviderGroups};
 
 /// The most preferred MX host of a domain, if it has one.
 pub type MxLookup =
@@ -24,6 +24,7 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const CACHE_LIMIT: usize = 20_000;
 
 pub struct ProviderClassifier {
+    groups: ProviderGroups,
     lookup: MxLookup,
     cache: Mutex<HashMap<String, (ProviderGroup, Instant)>>,
 }
@@ -38,18 +39,49 @@ impl ProviderClassifier {
     /// A classifier that asks `lookup` for MX hosts (tests).
     pub fn with_lookup(lookup: MxLookup) -> Self {
         Self {
+            groups: ProviderGroups::defaults(),
             lookup,
             cache: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Classify with `groups` instead of the built-in groups.
+    pub fn with_groups(mut self, groups: ProviderGroups) -> Self {
+        self.groups = groups;
+        self.cache.lock().unwrap().clear();
+        self
+    }
+
+    /// The groups of the `provider_groups` config, merged into the
+    /// built-in ones.
+    pub fn groups_from_config(
+        config: &[camelmailer_config::ProviderGroupConfig],
+    ) -> ProviderGroups {
+        let rules: Vec<camelmailer_core::ProviderGroupRule> = config
+            .iter()
+            .filter_map(|group| {
+                Some(camelmailer_core::ProviderGroupRule {
+                    name: ProviderGroup::parse(&group.name)?,
+                    domains: group.domains.clone(),
+                    mx_patterns: group.mx_patterns.clone(),
+                })
+            })
+            .collect();
+        ProviderGroups::with_rules(&rules)
+    }
+
+    /// The groups this classifier uses.
+    pub fn groups(&self) -> &ProviderGroups {
+        &self.groups
+    }
+
     /// The provider group of a recipient domain.
     pub async fn classify(&self, domain: &str) -> ProviderGroup {
-        if let Some(group) = ProviderGroup::from_recipient_domain(domain) {
+        if let Some(group) = self.groups.from_recipient_domain(domain) {
             return group;
         }
         let key = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        if let Some((group, at)) = self.cache.lock().unwrap().get(&key).copied() {
+        if let Some((group, at)) = self.cache.lock().unwrap().get(&key).cloned() {
             if at.elapsed() < CACHE_TTL {
                 return group;
             }
@@ -57,16 +89,16 @@ impl ProviderClassifier {
         match tokio::time::timeout(LOOKUP_TIMEOUT, (self.lookup)(key.clone())).await {
             Ok(answer) => {
                 let group = answer
-                    .map(|host| ProviderGroup::from_mx_host(&host))
-                    .unwrap_or(ProviderGroup::Other);
+                    .map(|host| self.groups.from_mx_host(&host))
+                    .unwrap_or_else(ProviderGroup::other);
                 let mut cache = self.cache.lock().unwrap();
                 if cache.len() >= CACHE_LIMIT {
                     cache.clear();
                 }
-                cache.insert(key, (group, Instant::now()));
+                cache.insert(key, (group.clone(), Instant::now()));
                 group
             }
-            Err(_) => ProviderGroup::Other,
+            Err(_) => ProviderGroup::other(),
         }
     }
 }
@@ -110,7 +142,7 @@ mod tests {
         }));
         assert_eq!(
             classifier.classify("gmail.com").await,
-            ProviderGroup::Google
+            ProviderGroup::google()
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -119,20 +151,20 @@ mod tests {
         );
         assert_eq!(
             classifier.classify("Acme.Example").await,
-            ProviderGroup::Microsoft
+            ProviderGroup::microsoft()
         );
         assert_eq!(
             classifier.classify("acme.example").await,
-            ProviderGroup::Microsoft
+            ProviderGroup::microsoft()
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cached");
         assert_eq!(
             classifier.classify("shop.example").await,
-            ProviderGroup::Google
+            ProviderGroup::google()
         );
         assert_eq!(
             classifier.classify("none.example").await,
-            ProviderGroup::Other
+            ProviderGroup::other()
         );
     }
 
@@ -146,7 +178,7 @@ mod tests {
         }));
         assert_eq!(
             classifier.classify("slow.example").await,
-            ProviderGroup::Other
+            ProviderGroup::other()
         );
         assert!(classifier.cache.lock().unwrap().is_empty());
     }

@@ -17,7 +17,7 @@ fn sqlx_error(error: sqlx::Error) -> StoreError {
 }
 
 fn provider_of(value: &str) -> ProviderGroup {
-    ProviderGroup::parse(value).unwrap_or(ProviderGroup::Other)
+    ProviderGroup::parse(value).unwrap_or_else(ProviderGroup::other)
 }
 
 #[async_trait]

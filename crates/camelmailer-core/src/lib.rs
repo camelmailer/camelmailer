@@ -40,7 +40,7 @@ pub use auth_store::AuthStore;
 pub use bounce::BounceCategory;
 pub use delivery_stats::{
     is_policy_block, DeliveryKind, DeliveryStatsStore, IpComplaint, IpDeliveryRecord,
-    IpDeliveryStat, ProviderGroup, DEFAULT_SOURCE,
+    IpDeliveryStat, ProviderGroup, ProviderGroupRule, ProviderGroups, DEFAULT_SOURCE,
 };
 pub use dmarc::{
     DmarcFilter, DmarcRecordRow, DmarcReport, DmarcSourceStat, DmarcSummary, NewDmarcRecord,

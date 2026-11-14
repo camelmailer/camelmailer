@@ -7862,7 +7862,7 @@ async fn delivery_counters_add_up_and_complaints_reach_the_sending_address() {
         day,
         source_ip: "203.0.113.5".into(),
         ip_address_id: Some(3),
-        provider: ProviderGroup::Microsoft,
+        provider: ProviderGroup::microsoft(),
         kind,
         policy_block,
         server_id: 1,
@@ -7885,14 +7885,14 @@ async fn delivery_counters_add_up_and_complaints_reach_the_sending_address() {
         .await
         .unwrap();
     let mut google = record(DeliveryKind::Sent, 5, false);
-    google.provider = ProviderGroup::Google;
+    google.provider = ProviderGroup::google();
     store.record_ip_delivery(&google).await.unwrap();
 
     let at = chrono::DateTime::parse_from_rfc3339("2026-11-15T08:00:00Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
     let credited = store.record_ip_complaint(2, at).await.unwrap().unwrap();
-    assert_eq!(credited.provider, ProviderGroup::Microsoft);
+    assert_eq!(credited.provider, ProviderGroup::microsoft());
     assert_eq!(credited.ip_address_id, Some(3));
     assert!(store.record_ip_complaint(3, at).await.unwrap().is_none());
 
@@ -7903,7 +7903,7 @@ async fn delivery_counters_add_up_and_complaints_reach_the_sending_address() {
     assert_eq!(stats.len(), 3);
     let ms = stats
         .iter()
-        .find(|s| s.provider == ProviderGroup::Microsoft && s.day == day)
+        .find(|s| s.provider == ProviderGroup::microsoft() && s.day == day)
         .unwrap();
     assert_eq!(
         (ms.sent, ms.deferred, ms.bounced, ms.policy_blocks),
