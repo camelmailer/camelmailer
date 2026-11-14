@@ -179,7 +179,10 @@ Each worker checks every address it may send from, at start and every
 values of every pool address, and the IPv4 and IPv6 address its host sends
 from for servers without a pool. An address passes when it has a PTR record
 and one of the PTR names resolves back to it (forward-confirmed reverse
-DNS). Failures are logged as warnings, shown under **Admin → IP pools →
+DNS). The lookups go to the public resolvers of `dns.check_resolvers`
+(default 1.1.1.1 and 9.9.9.9), never the host's own resolver, and a PTR
+name without a dot or under `.local`, `.localdomain`, `.internal`, `.lan` or
+`.home.arpa` does not count. Failures are logged as warnings, shown under **Admin → IP pools →
 Reverse DNS of the source addresses**, and listed by
 `GET /api/v2/admin/source_addresses`. With
 `smtp_client.skip_family_without_reverse_dns: true`, a `dual_stack` or

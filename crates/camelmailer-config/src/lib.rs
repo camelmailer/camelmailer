@@ -1450,6 +1450,42 @@ pub struct Dns {
     pub custom_return_path_prefix: String,
     pub timeout: u32,
     pub resolv_conf_path: String,
+    /// The public DNS resolvers every DNS check asks (domain verification,
+    /// the domain health check, the infrastructure DNS checks and the
+    /// workers' reverse-DNS check): IP addresses, optionally with a port
+    /// (`9.9.9.9`, `9.9.9.9:53`, `[2620:fe::fe]:53`). The checks never use
+    /// the host's or container's resolver, which can answer from local
+    /// configuration (the host name, `/etc/hosts`, a split-horizon zone)
+    /// instead of what the rest of the internet sees. Delivery and inbound
+    /// SPF keep using the system resolver.
+    pub check_resolvers: Vec<String>,
+}
+
+/// The public resolvers `dns.check_resolvers` defaults to: Cloudflare and
+/// Quad9.
+pub const DEFAULT_CHECK_RESOLVERS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
+
+impl Dns {
+    /// `dns.check_resolvers` as socket addresses (port 53 unless given).
+    /// Entries that do not parse are left out; `Config::validate` refuses
+    /// them at start.
+    pub fn check_resolver_addresses(&self) -> Vec<std::net::SocketAddr> {
+        self.check_resolvers
+            .iter()
+            .filter_map(|entry| parse_resolver(entry))
+            .collect()
+    }
+}
+
+fn parse_resolver(entry: &str) -> Option<std::net::SocketAddr> {
+    let entry = entry.trim();
+    if let Ok(address) = entry.parse::<std::net::SocketAddr>() {
+        return Some(address);
+    }
+    entry
+        .parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| std::net::SocketAddr::new(ip, 53))
 }
 
 impl Default for Dns {
@@ -1472,6 +1508,10 @@ impl Default for Dns {
             custom_return_path_prefix: "psrp".into(),
             timeout: 5,
             resolv_conf_path: "/etc/resolv.conf".into(),
+            check_resolvers: DEFAULT_CHECK_RESOLVERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -2140,6 +2180,18 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.worker.validate()?;
+        if self.dns.check_resolvers.is_empty() {
+            return Err(ConfigError::Invalid(
+                "dns.check_resolvers needs at least one resolver address".into(),
+            ));
+        }
+        for entry in &self.dns.check_resolvers {
+            if parse_resolver(entry).is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "dns.check_resolvers takes IP addresses, optionally with a port (got {entry:?})"
+                )));
+            }
+        }
         self.warmup.validate()?;
         for group in &self.provider_groups {
             let valid = !group.name.is_empty()
@@ -3331,6 +3383,36 @@ mod provider_group_tests {
             "provider_groups:\n  - name: Seznam\n    domains: [seznam.cz]\n",
             "provider_groups:\n  - name: other\n    domains: [x.cz]\n",
             "provider_groups:\n  - name: empty\n",
+        ] {
+            assert!(Config::from_yaml(bad).unwrap().validate().is_err(), "{bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod check_resolver_tests {
+    use super::*;
+
+    #[test]
+    fn check_resolvers_default_to_public_ones_and_are_validated() {
+        let config = Config::default();
+        assert_eq!(
+            config.dns.check_resolver_addresses(),
+            vec![
+                "1.1.1.1:53".parse::<std::net::SocketAddr>().unwrap(),
+                "9.9.9.9:53".parse().unwrap()
+            ]
+        );
+        let config = Config::from_yaml(
+            "dns:\n  check_resolvers: [\"192.0.2.53\", \"192.0.2.54:5353\", \"[2001:db8::53]:53\", \"2001:db8::54\"]\n",
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.dns.check_resolver_addresses().len(), 4);
+        assert_eq!(config.dns.check_resolver_addresses()[1].port(), 5353);
+        for bad in [
+            "dns:\n  check_resolvers: []\n",
+            "dns:\n  check_resolvers: [resolver.example]\n",
         ] {
             assert!(Config::from_yaml(bad).unwrap().validate().is_err(), "{bad}");
         }

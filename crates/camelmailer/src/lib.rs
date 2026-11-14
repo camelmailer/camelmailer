@@ -336,8 +336,9 @@ pub async fn build_state(
     // The domain health check evaluates a sending domain's SPF against this
     // installation's sending addresses, which needs TXT, A/AAAA and MX rather
     // than the TXT-only verification resolver.
-    let spf_resolver: Arc<dyn camelmailer_core::SpfResolver> =
-        Arc::new(camelmailer_api::dns::HickorySpfResolver::new());
+    let spf_resolver: Arc<dyn camelmailer_core::SpfResolver> = Arc::new(
+        camelmailer_api::dns::HickorySpfResolver::new(&config.dns.check_resolver_addresses()),
+    );
 
     if postgres_enabled(config) {
         // One Postgres store, shared as the admin store, the tenant-scoped

@@ -48,7 +48,7 @@ pub use dmarc::{
     DmarcFilter, DmarcRecordRow, DmarcReport, DmarcSourceStat, DmarcSummary, NewDmarcRecord,
     NewDmarcReport, DMARC_REPORTS_ENDPOINT,
 };
-pub use dns::{is_valid_helo_hostname, DnsError, DnsResolver, StaticDnsResolver};
+pub use dns::{is_valid_helo_hostname, ptr_name_problem, DnsError, DnsResolver, StaticDnsResolver};
 pub use feedback::{
     FeedbackSnapshot, FeedbackSourceStatus, FeedbackStore, NewFeedbackSnapshot, NewPlacementTest,
     PlacementFilter, PlacementResult, PlacementRound, PlacementTest, ProviderSignal, Verdict,

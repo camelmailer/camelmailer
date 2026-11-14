@@ -196,3 +196,57 @@ mod helo_hostname_tests {
         }
     }
 }
+
+/// Why a PTR name cannot be a sending address's public reverse-DNS name, if
+/// it cannot: a name without a dot (a bare host name such as `camelmailer`)
+/// or one under a local-only suffix (`.local`, `.localdomain`, `.internal`,
+/// `.lan`, `.home.arpa`). Such names come from a host's or container's own
+/// resolver (its host name, `/etc/hosts`, mDNS), never from the public
+/// reverse zone receivers look at.
+pub fn ptr_name_problem(name: &str) -> Option<&'static str> {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() {
+        return Some("the PTR name is empty");
+    }
+    if !name.contains('.') {
+        return Some("a name without a dot is a local host name, not a public PTR");
+    }
+    const LOCAL: [&str; 5] = ["local", "localdomain", "internal", "lan", "home.arpa"];
+    for suffix in LOCAL {
+        if name == suffix || name.ends_with(&format!(".{suffix}")) {
+            return Some("a local-only name (.local, .localdomain, .internal, .lan, .home.arpa) is not a public PTR");
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod ptr_name_tests {
+    use super::ptr_name_problem;
+
+    #[test]
+    fn local_and_single_label_ptr_names_are_refused() {
+        for name in [
+            "camelmailer",
+            "camelmailer.local",
+            "box.localdomain",
+            "db.internal",
+            "router.lan",
+            "nas.home.arpa",
+            "LOCALHOST",
+            "",
+            "camelmailer.local.",
+        ] {
+            assert!(ptr_name_problem(name).is_some(), "{name}");
+        }
+        for name in [
+            "mx.camelmailer.com",
+            "out1.mail.revenexx.com.",
+            "static.89.167.233.167.clients.your-server.de",
+            "localhost.example.com",
+            "internal.example.com",
+        ] {
+            assert_eq!(ptr_name_problem(name), None, "{name}");
+        }
+    }
+}
