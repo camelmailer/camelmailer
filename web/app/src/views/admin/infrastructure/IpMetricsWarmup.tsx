@@ -33,7 +33,7 @@ import {
   formatRate,
   lastBrake,
   MODE_LABELS,
-  PROVIDER_LABELS,
+  providerLabel,
   rateLevel,
   selectorValue,
   STATUS_LABELS,
@@ -143,7 +143,7 @@ const metricColumns = (thresholds: Record<string, number>): DataTableColumn<Addr
     accessorFn: (r) => r.providers.length,
     cell: ({ row }) => (
       <span className="text-xs text-muted-foreground">
-        {row.original.providers.map((p) => `${PROVIDER_LABELS[p.provider]} ${p.sent}`).join(" · ") || "—"}
+        {row.original.providers.map((p) => `${providerLabel(p.provider)} ${p.sent}`).join(" · ") || "—"}
       </span>
     ),
   },
@@ -153,7 +153,7 @@ function ProviderRow({ state }: { state: WarmupProviderState }) {
   const percent = usedPercent(state)
   return (
     <tr className="border-t align-top">
-      <td className="py-2 pr-3 font-medium">{PROVIDER_LABELS[state.provider]}</td>
+      <td className="py-2 pr-3 font-medium">{providerLabel(state.provider)}</td>
       <td className="py-2 pr-3">
         {state.status ? <StatusPill status={STATUS_LABELS[state.status]} tone={STATUS_TONE[state.status]} /> : "—"}
       </td>
@@ -264,7 +264,7 @@ function AddressCard({ address, onChanged }: { address: WarmupAddress; onChanged
             Mode <span className="font-medium text-foreground">{MODE_LABELS[address.mode]}</span>{" "}
             ({address.mode_source === "address" ? "set on this address" : address.mode_source === "pool" ? "from the pool" : "default"})
             {address.profile &&
-              ` · ${address.profile.start} per day, ×${address.profile.growth}, warm at ${address.profile.cap.toLocaleString()}`}
+              ` · ×${address.profile.growth} per healthy day, allowance and cap per provider below`}
             {address.active && address.eta_days !== null && ` · about ${etaText({ eta_days: address.eta_days, status: null })} until warm`}
           </p>
         </div>
@@ -306,7 +306,7 @@ function AddressCard({ address, onChanged }: { address: WarmupAddress; onChanged
         {brake && (
           <Alert variant="destructive">
             <AlertTitle>
-              Last brake: {PROVIDER_LABELS[brake.provider]}, {relativeTime(brake.at)}
+              Last brake: {providerLabel(brake.provider)}, {relativeTime(brake.at)}
             </AlertTitle>
             <AlertDescription>{brake.reason}</AlertDescription>
           </Alert>
@@ -319,7 +319,7 @@ function AddressCard({ address, onChanged }: { address: WarmupAddress; onChanged
                 <li key={i} className="flex gap-2">
                   <span className="w-28 shrink-0 text-muted-foreground">{relativeTime(entry.created_at)}</span>
                   <span className="w-16 shrink-0 font-medium">{entry.decision}</span>
-                  <span className="w-20 shrink-0">{entry.provider ? PROVIDER_LABELS[entry.provider] : ""}</span>
+                  <span className="w-20 shrink-0">{entry.provider ? providerLabel(entry.provider) : ""}</span>
                   <span className="text-muted-foreground">{entry.reason}</span>
                 </li>
               ))}
@@ -453,6 +453,20 @@ export default function IpMetricsWarmup() {
             <Alert variant="destructive">
               <AlertTitle>The warm-up state could not be loaded</AlertTitle>
               <AlertDescription>{String(warmup.error)}</AlertDescription>
+            </Alert>
+          )}
+          {warmup.data && warmup.data.storage_incidents.length > 0 && (
+            <Alert>
+              <AlertTitle>Warm-up storage outages</AlertTitle>
+              <AlertDescription>
+                <ul className="flex flex-col gap-1 text-xs">
+                  {warmup.data.storage_incidents.slice(0, 5).map((entry, i) => (
+                    <li key={i}>
+                      {relativeTime(entry.created_at)}: {entry.reason}
+                    </li>
+                  ))}
+                </ul>
+              </AlertDescription>
             </Alert>
           )}
           {warmup.data && <PoolModes addresses={warmup.data.addresses} onChanged={refresh} />}

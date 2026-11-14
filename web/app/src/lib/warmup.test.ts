@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   etaText,
+  providerLabel,
   formatRate,
   lastBrake,
   rateLevel,
@@ -43,6 +44,12 @@ const provider = {
 }
 
 describe("warm-up helpers", () => {
+  it("labels built-in and configured provider groups", () => {
+    expect(providerLabel("united_internet")).toBe("United Internet")
+    expect(providerLabel("t_online")).toBe("T-Online")
+    expect(providerLabel("seznam_cz")).toBe("seznam cz")
+  })
+
   it("formats rates and levels", () => {
     expect(formatRate(null)).toBe("—")
     expect(formatRate(0.0512)).toBe("5.12 %")

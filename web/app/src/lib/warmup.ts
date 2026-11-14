@@ -7,7 +7,9 @@ import { api } from "@/lib/api"
 
 // ------------------------------------------------------------------ types
 
-export type Provider = "microsoft" | "google" | "yahoo" | "other"
+/** A provider group name: built in microsoft, google, yahoo, apple,
+ * united_internet, t_online and other; more can be configured. */
+export type Provider = string
 
 export type MetricTotals = {
   sent: number
@@ -44,12 +46,17 @@ export type IpMetrics = {
 
 export type WarmupMode = "off" | "slow" | "normal" | "fast" | "custom"
 export type WarmupStatus = "not_started" | "ramping" | "holding" | "slowed" | "paused" | "warm"
-export type WarmupProfile = { start: number; growth: number; cap: number }
+export type WarmupProfile = {
+  start: number
+  growth: number
+  cap: number
+  groups?: Record<string, { start: number; cap: number }>
+}
 
 export type WarmupLogEntry = {
   ip_address_id: number
   provider: Provider | null
-  decision: "advance" | "hold" | "slow" | "brake" | "warm" | "mode"
+  decision: "advance" | "hold" | "slow" | "brake" | "warm" | "mode" | "storage"
   reason: string
   allowance_before: number | null
   allowance_after: number | null
@@ -89,6 +96,8 @@ export type WarmupAddress = {
 export type Warmup = {
   profiles: Record<"slow" | "normal" | "fast", WarmupProfile>
   thresholds: Record<string, number>
+  provider_groups: Provider[]
+  storage_incidents: WarmupLogEntry[]
   addresses: WarmupAddress[]
 }
 
@@ -112,11 +121,19 @@ export const warmupApi = {
 
 // ---------------------------------------------------------------- helpers
 
-export const PROVIDER_LABELS: Record<Provider, string> = {
+const PROVIDER_LABELS: Record<string, string> = {
   microsoft: "Microsoft",
   google: "Google",
   yahoo: "Yahoo",
+  apple: "Apple",
+  united_internet: "United Internet",
+  t_online: "T-Online",
   other: "Others",
+}
+
+/** The display name of a provider group; configured groups show their name. */
+export function providerLabel(provider: Provider): string {
+  return PROVIDER_LABELS[provider] ?? provider.replace(/_/g, " ")
 }
 
 export const MODE_LABELS: Record<WarmupMode, string> = {
