@@ -207,6 +207,8 @@ pub(crate) struct MemoryStoreInner {
     pub(crate) ip_addresses: HashMap<Id, IpAddress>,
     /// Latest reverse-DNS check per source address.
     pub(crate) source_address_checks: HashMap<String, SourceAddressCheck>,
+    /// The cluster topology, by (instance id, role).
+    pub(crate) cluster_nodes: HashMap<(String, String), ClusterNode>,
     pub(crate) webhooks: HashMap<Id, Webhook>,
     /// Verified single sender addresses (per-address From authorization).
     pub(crate) sender_addresses: HashMap<Id, SenderAddress>,

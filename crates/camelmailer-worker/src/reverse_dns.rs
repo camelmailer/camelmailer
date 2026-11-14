@@ -303,6 +303,21 @@ pub fn host_addresses() -> (Option<IpAddr>, Option<IpAddr>) {
     )
 }
 
+/// The host addresses to check and to judge the host's families by:
+/// `cluster.public_addresses` where it lists an address of a family (the
+/// first one listed), the detected address otherwise. A process inside a
+/// Docker network detects its private bridge address (`172.18.0.5`), which
+/// no receiver ever sees; the configured public address is the one whose
+/// reverse DNS matters.
+pub fn effective_host_addresses(
+    public: &[IpAddr],
+    detected: (Option<IpAddr>, Option<IpAddr>),
+) -> (Option<IpAddr>, Option<IpAddr>) {
+    let v4 = public.iter().copied().find(IpAddr::is_ipv4);
+    let v6 = public.iter().copied().find(IpAddr::is_ipv6);
+    (v4.or(detected.0), v6.or(detected.1))
+}
+
 /// The latest results, shared between the periodic check and the sender.
 #[derive(Debug, Default)]
 pub struct ReverseDnsState {
@@ -561,9 +576,13 @@ pub fn spawn(
     };
     let state = ReverseDnsState::global();
     let checked_by = host_name();
+    let public = config.cluster.public_ips();
+    if !public.is_empty() {
+        tracing::info!(addresses = ?public, "reverse-DNS check uses cluster.public_addresses as this host's addresses");
+    }
     Some(tokio::spawn(async move {
         loop {
-            let (host_ipv4, host_ipv6) = host_addresses();
+            let (host_ipv4, host_ipv6) = effective_host_addresses(&public, host_addresses());
             run_once(
                 &resolver,
                 store.as_ref(),
@@ -767,6 +786,40 @@ mod tests {
         assert_eq!(stored[1].status, "mismatch");
         assert_eq!(stored[1].family, "ipv4");
         assert_eq!(stored[1].origin, "pool");
+    }
+
+    #[test]
+    fn configured_public_addresses_replace_the_detected_ones_per_family() {
+        let detected = (Some(ip("172.18.0.5")), Some(ip("fd00::5")));
+        assert_eq!(effective_host_addresses(&[], detected), detected);
+        assert_eq!(
+            effective_host_addresses(&[ip("167.233.167.89")], detected),
+            (Some(ip("167.233.167.89")), Some(ip("fd00::5"))),
+            "a family not listed is still detected"
+        );
+        assert_eq!(
+            effective_host_addresses(
+                &[ip("2a01:4f8:1c18:aa2d::1"), ip("167.233.167.89")],
+                (Some(ip("172.18.0.5")), None)
+            ),
+            (
+                Some(ip("167.233.167.89")),
+                Some(ip("2a01:4f8:1c18:aa2d::1"))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_check_reports_the_public_address_instead_of_the_docker_one() {
+        let store = camelmailer_core::MemoryStore::new();
+        let state = ReverseDnsState::new();
+        let (v4, v6) =
+            effective_host_addresses(&[ip("203.0.113.10")], (Some(ip("172.18.0.5")), None));
+        let checks = run_once(&table(), &store, &state, v4, v6, "worker-1").await;
+        let addresses: Vec<String> = checks.iter().map(|c| c.address.to_string()).collect();
+        assert_eq!(addresses, vec!["203.0.113.10"]);
+        let stored = store.list_source_address_checks().await.unwrap();
+        assert!(stored.iter().all(|c| c.address != "172.18.0.5"));
     }
 
     #[test]

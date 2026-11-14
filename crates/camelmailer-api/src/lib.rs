@@ -5,6 +5,7 @@ mod app_mailer;
 pub mod auth_api;
 pub mod billing;
 pub mod captcha;
+mod cluster_api;
 pub mod cors;
 pub mod dns;
 mod memberships;

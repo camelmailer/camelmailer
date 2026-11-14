@@ -389,6 +389,7 @@ dependencies = [
  "camelmailer-db",
  "camelmailer-smtp",
  "camelmailer-worker",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -3035,6 +3035,87 @@ paths:
                             detail: { type: string }
                             checked_by: { type: string }
                             checked_at: { type: string, format: date-time }
+  /api/v2/admin/cluster:
+    get:
+      tags: [Instance]
+      summary: Cluster topology
+      description: >-
+        Every registered web, SMTP and worker process with its role, version and heartbeat
+        (`status` is `live`, `stale` once not heard from for `cluster.node_stale_seconds`, or
+        `stopped` after a graceful shutdown), the queue rows each worker holds (by its lock id),
+        locks held under an id no registered worker has, the load balancer address and inbound
+        host name from `cluster`, and the IP pools with their addresses. `mixed_versions` is true
+        when live processes report different versions. Global administrators only.
+      security: [{ AdminApiKey: [] }, { SessionToken: [] }]
+      responses:
+        "200":
+          description: The topology
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  time: { type: number }
+                  data:
+                    type: object
+                    properties:
+                      cluster:
+                        type: object
+                        properties:
+                          load_balancer_address: { type: string, nullable: true }
+                          inbound_hostname: { type: string, nullable: true }
+                          heartbeat_interval_seconds: { type: integer }
+                          node_stale_seconds: { type: integer }
+                      nodes:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            instance_id: { type: string }
+                            role: { type: string, enum: [web, smtp, worker] }
+                            node_name: { type: string }
+                            version: { type: string }
+                            status: { type: string, enum: [live, stale, stopped] }
+                            started_at: { type: string, format: date-time }
+                            last_seen_at: { type: string, format: date-time }
+                            seconds_since_seen: { type: integer }
+                            stopped_at: { type: string, format: date-time, nullable: true }
+                            details: { type: object }
+                            leases:
+                              type: object
+                              nullable: true
+                              description: Workers only.
+                              properties:
+                                queued_messages: { type: integer }
+                                webhook_requests: { type: integer }
+                                lifecycle_events: { type: integer }
+                                oldest_lock_at: { type: string, format: date-time, nullable: true }
+                                oldest_lock_age_seconds: { type: integer, nullable: true }
+                      unregistered_leases:
+                        type: array
+                        items: { type: object }
+                      versions: { type: array, items: { type: string } }
+                      mixed_versions: { type: boolean }
+                      ip_pools:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: integer }
+                            name: { type: string }
+                            default: { type: boolean }
+                            address_family: { type: string, nullable: true }
+                            addresses:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  id: { type: integer }
+                                  ipv4: { type: string }
+                                  ipv6: { type: string, nullable: true }
+                                  hostname: { type: string }
+                                  priority: { type: integer }
   /api/v2/admin/admin_api_keys:
     get:
       tags: [Instance]

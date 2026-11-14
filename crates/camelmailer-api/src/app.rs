@@ -1965,6 +1965,7 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
             "/source_addresses",
             get(resources::source_addresses_index),
         )
+        .route("/cluster", get(crate::cluster_api::cluster_show))
         .route(
             "/ip_pools/{pool_id}/ip_addresses",
             get(resources::ip_addresses_index).post(resources::ip_addresses_create),
