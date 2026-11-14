@@ -53,7 +53,11 @@ clipboard, ready for a ticket to the DNS or hosting team. What is checked:
 - the EHLO name the worker uses from the address equals its PTR name;
 - SPF of the return-path domain and of every verified sending domain covers
   every sending address, with the exact `ip4:`/`ip6:` mechanisms to add;
-- MX of receiving domains, the return-path and the tracking host names.
+- every verified sending domain publishes the DKIM key the worker signs with
+  (the exact `v=DKIM1; k=rsa; p=…` record when it does not) and one DMARC
+  record (`p=none` is a warning, with the record to move to `p=quarantine`);
+- domains with an inbound route and the return-path domain have their MX on
+  the installation (a wrong MX fails); the tracking host name resolves.
 
 Results are cached for a minute; *Refresh* looks everything up again.
 
@@ -73,11 +77,13 @@ It only reads DNS.
 **Metrics**: per sending address and per pool, over 1 to 90 days: accepted,
 deferred and bounced attempts, policy refusals and complaints, the deferral,
 bounce and policy-block rates, and the complaint rate; broken down by
-receiving provider (Microsoft, Google, Yahoo, others) and by day.
+receiving provider group (built in: Microsoft, Google, Yahoo, Apple, United
+Internet, T-Online, others; more via `provider_groups`) and by day.
 
 **Warm-up** is off by default. Per address the page shows the mode and where
 it comes from (the address itself, its pool, or the default), and per provider
-the daily allowance, today's use, the status (not started, ramping, holding,
+the daily allowance (each provider group has its own), today's use, the
+status (not started, ramping, holding,
 slowed, paused, warm), the last decision and the last brake with their
 reasons, the progress towards the cap and an estimate of the healthy days
 until warm. The mode can be changed per address or per pool at any time

@@ -55,8 +55,8 @@ outside Camelmailer and works the same as for any other application: point
 
 | Process | More than once? | Notes |
 |---|---|---|
-| `web-server` | Yes | Stateless. Sessions and everything else live in PostgreSQL. |
-| `smtp-server` | Yes | Behind a TCP load balancer with `smtp_server.proxy_protocol: true`. Each process accepts and queues independently. |
+| `web-server` | Yes | Stateless. Sessions and everything else live in PostgreSQL. Drains on SIGTERM. |
+| `smtp-server` | Yes | Behind a TCP load balancer with `smtp_server.proxy_protocol: true`. Each process accepts and queues independently, and drains on SIGTERM. |
 | `worker` | Yes | Shares the queue through row locks (`SKIP LOCKED`), leases and heartbeats. Housekeeping, retention, the reverse-DNS check and the nightly warm-up evaluation are safe to run on every worker: each step is idempotent or decided by the first worker to save it. |
 | `initialize` | Once per deploy | Runs the database migrations. Run it once, before the new version starts anywhere; do not run two at the same time. |
 | PostgreSQL | One primary | Use your database's own HA. Camelmailer needs one writable primary. |
@@ -91,6 +91,24 @@ smtp_server:
 
 Health checks: a TCP check on port 25 is enough. The balancer should take a
 node out when the check fails, and put it back when it passes again.
+
+### Stopping a web or SMTP node
+
+On SIGTERM or SIGINT the SMTP server stops accepting connections. A session in
+the middle of a transaction finishes it; once its message is accepted or
+refused it gets `421 4.3.2 <smtp_hostname> Service shutting down, closing
+transmission channel` and is closed. After `smtp_server.shutdown_grace_seconds`
+(30) every session still open gets the same reply. A message is queued before
+its `250` is written, so nothing a client saw accepted is lost. The web server
+stops accepting connections and lets running requests finish within
+`web_server.shutdown_grace_seconds` (30). Both mark their node `stopped` in the
+registry.
+
+Take the node out of the load balancer first, so no new connections arrive
+while it drains, and keep the process manager's stop timeout above the grace
+period (the compose file sets `stop_grace_period: 40s` for web and smtp;
+systemd's default of 90 s is enough; plain Docker kills after 10 s unless told
+otherwise).
 
 See [Configuration](configuration.md#behind-a-tcp-load-balancer-proxy_protocol)
 for the details of the header handling.
@@ -209,6 +227,10 @@ IP) without any DNS change.
 The **DNS checks** of the infrastructure dashboard (and
 `GET /api/v2/admin/dns_checks`) look up every one of these records and show,
 per address and per host name, what was found and the exact record to set.
+They check each domain by its role: a domain with an inbound route must have
+its MX pointing at the installation, and every verified sending domain needs
+SPF covering every sending address, the DKIM record of the key the worker
+signs with, and a DMARC record (`p=none` is a warning).
 The **add server / add IP wizard** lists the records a new address needs and
 re-checks them until they are all in place. Both only read DNS; they never
 change it.
@@ -251,7 +273,10 @@ change it.
   newer schema expecting it to remove anything; it removes nothing.
 - **Warm-up**: set every address and pool to `off` (or `inherit` with the pool
   `off`). The worker stops consulting warm-up within a minute and sends as
-  before.
+  before. While warm-up is on and its storage cannot be read, only addresses
+  known to be warm send; mail from not-yet-warm addresses waits without an
+  attempt until the storage answers (see
+  [Deliverability](deliverability.md#where-the-volume-goes)).
 
 ## See also
 
