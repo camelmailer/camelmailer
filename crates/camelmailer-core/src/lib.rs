@@ -8,6 +8,7 @@ pub mod admin_store;
 pub mod auth;
 pub mod auth_store;
 pub mod bounce;
+pub mod delivery_stats;
 pub mod dmarc;
 pub mod dns;
 pub mod feedback;
@@ -27,6 +28,7 @@ pub mod store;
 pub mod template;
 pub mod testing;
 pub mod token;
+pub mod warmup;
 
 pub use admin_store::{
     AdminStore, NewCredential, NewIpAddress, NewOrganization, NewRoute, NewSenderAddress,
@@ -38,6 +40,10 @@ pub use auth::{
 };
 pub use auth_store::AuthStore;
 pub use bounce::BounceCategory;
+pub use delivery_stats::{
+    is_policy_block, DeliveryKind, DeliveryStatsStore, IpComplaint, IpDeliveryRecord,
+    IpDeliveryStat, ProviderGroup, ProviderGroupRule, ProviderGroups, DEFAULT_SOURCE,
+};
 pub use dmarc::{
     DmarcFilter, DmarcRecordRow, DmarcReport, DmarcSourceStat, DmarcSummary, NewDmarcRecord,
     NewDmarcReport, DMARC_REPORTS_ENDPOINT,
@@ -77,4 +83,9 @@ pub use spf::{
 pub use store::{MemoryStore, Store};
 pub use template::{
     render as render_template, render_in_layout, wrapper_has_raw_content, RenderError,
+};
+pub use warmup::{
+    GroupLimits, Ramp, SignalVerdict, WarmupAddress, WarmupDecision, WarmupLogEntry, WarmupMode,
+    WarmupProfile, WarmupProfiles, WarmupSignal, WarmupState, WarmupStatus, WarmupStore,
+    WarmupThresholds,
 };

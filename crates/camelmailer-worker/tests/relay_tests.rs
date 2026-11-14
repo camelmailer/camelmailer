@@ -175,6 +175,7 @@ fn params(port: u16, security: ConnectionSecurity, auth: Option<SmtpAuth>) -> Se
         auth,
         source: Default::default(),
         connection_attempt_delay: Duration::ZERO,
+        data_gate: Default::default(),
     }
 }
 

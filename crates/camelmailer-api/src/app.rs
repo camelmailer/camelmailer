@@ -72,6 +72,16 @@ pub struct ApiState {
     /// Provider feedback snapshots (Postmaster Tools, SNDS, feedback loops).
     /// `None` reports every source as off.
     pub feedback_store: Option<Arc<dyn camelmailer_core::FeedbackStore>>,
+    /// Delivery counters per sending address and provider (IP metrics,
+    /// warm-up). `None` answers the IP metrics with no data.
+    pub delivery_stats: Option<Arc<dyn camelmailer_core::DeliveryStatsStore>>,
+    /// Adaptive warm-up settings and state. `None` answers the warm-up
+    /// endpoints with 503.
+    pub warmup_store: Option<Arc<dyn camelmailer_core::WarmupStore>>,
+    /// Lookups for the infrastructure DNS checks; `None` uses hickory.
+    pub dns_check_resolver: Option<Arc<dyn crate::dns_checks::DnsCheckResolver>>,
+    /// The last full DNS check run, reused for a minute.
+    pub dns_checks_cache: Arc<crate::dns_checks::DnsChecksCache>,
 }
 
 impl ApiState {
@@ -103,7 +113,11 @@ impl ApiState {
             installation_signing_key_pem: None,
             org_sso_store: None,
             feedback_store: None,
+            delivery_stats: None,
+            warmup_store: None,
             spf_resolver: None,
+            dns_check_resolver: None,
+            dns_checks_cache: Arc::default(),
         })
     }
 
@@ -127,7 +141,11 @@ impl ApiState {
             installation_signing_key_pem: None,
             org_sso_store: None,
             feedback_store: None,
+            delivery_stats: None,
+            warmup_store: None,
             spf_resolver: None,
+            dns_check_resolver: None,
+            dns_checks_cache: Arc::default(),
         })
     }
 
@@ -296,7 +314,11 @@ impl ApiState {
             installation_signing_key_pem,
             org_sso_store: None,
             feedback_store: None,
+            delivery_stats: None,
+            warmup_store: None,
             spf_resolver: None,
+            dns_check_resolver: None,
+            dns_checks_cache: Arc::default(),
         })
     }
 
@@ -315,6 +337,17 @@ impl ApiState {
     /// sending domain's policy rather than compare its text. Same shape as
     /// [`ApiState::with_org_sso_store`]: the state is immutable behind an
     /// `Arc`, so this returns a fresh one.
+    /// Use `resolver` for the infrastructure DNS checks (tests).
+    pub fn with_dns_check_resolver(
+        self: Arc<Self>,
+        resolver: Arc<dyn crate::dns_checks::DnsCheckResolver>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.dns_check_resolver = Some(resolver);
+        state.dns_checks_cache = Arc::default();
+        Arc::new(state)
+    }
+
     pub fn with_spf_resolver(
         self: Arc<Self>,
         spf_resolver: Arc<dyn camelmailer_core::SpfResolver>,
@@ -344,6 +377,28 @@ impl ApiState {
     ) -> Arc<Self> {
         let mut state = (*self).clone();
         state.feedback_store = Some(feedback_store);
+        Arc::new(state)
+    }
+
+    /// Attach the delivery counters (IP metrics). Same shape as
+    /// [`ApiState::with_org_sso_store`].
+    pub fn with_delivery_stats(
+        self: Arc<Self>,
+        delivery_stats: Arc<dyn camelmailer_core::DeliveryStatsStore>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.delivery_stats = Some(delivery_stats);
+        Arc::new(state)
+    }
+
+    /// Attach the warm-up store. Same shape as
+    /// [`ApiState::with_org_sso_store`].
+    pub fn with_warmup_store(
+        self: Arc<Self>,
+        warmup_store: Arc<dyn camelmailer_core::WarmupStore>,
+    ) -> Arc<Self> {
+        let mut state = (*self).clone();
+        state.warmup_store = Some(warmup_store);
         Arc::new(state)
     }
 
@@ -1990,6 +2045,23 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/source_addresses",
             get(resources::source_addresses_index),
+        )
+        .route("/ip_metrics", get(crate::ip_metrics::ip_metrics_index))
+        .route("/ip_warmup", get(crate::ip_warmup::ip_warmup_index))
+        .route("/ip_warmup/log", get(crate::ip_warmup::ip_warmup_log))
+        .route(
+            "/ip_warmup/addresses/{id}",
+            axum::routing::patch(crate::ip_warmup::ip_warmup_address_update),
+        )
+        .route(
+            "/ip_warmup/pools/{id}",
+            axum::routing::patch(crate::ip_warmup::ip_warmup_pool_update),
+        )
+        .route("/cluster", get(crate::cluster_api::cluster_show))
+        .route("/dns_checks", get(crate::dns_checks::dns_checks_index))
+        .route(
+            "/dns_checks/candidate",
+            get(crate::dns_checks::dns_checks_candidate),
         )
         .route(
             "/deliverability/feedback",
