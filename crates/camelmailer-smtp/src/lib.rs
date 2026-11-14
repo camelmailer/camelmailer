@@ -1,5 +1,6 @@
 //! Camelmailer SMTP server — the Rust port of `app/lib/smtp_server/`.
 
+pub mod proxy;
 pub mod server;
 pub mod session;
 pub mod spf_resolver;

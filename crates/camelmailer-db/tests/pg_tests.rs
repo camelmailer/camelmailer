@@ -2670,6 +2670,319 @@ async fn dequeue_reclaims_stale_locks_but_not_fresh_ones() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_in_seconds_reclaims_a_dead_workers_row_after_the_lease() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let queue = camelmailer_db::PgQueue::with_stale_lock_seconds(pool.clone(), 300);
+
+    let expired = queue.enqueue(1001, f.server.id, "a.example").await.unwrap();
+    let within = queue.enqueue(1002, f.server.id, "b.example").await.unwrap();
+    sqlx::query(
+        "UPDATE queued_messages SET locked_by = 'dead', locked_at = now() - interval '301 seconds' \
+         WHERE id = $1",
+    )
+    .bind(expired)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE queued_messages SET locked_by = 'alive', locked_at = now() - interval '200 seconds' \
+         WHERE id = $1",
+    )
+    .bind(within)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let reclaimed = queue
+        .dequeue("reaper")
+        .await
+        .unwrap()
+        .expect("expired lease");
+    assert_eq!(reclaimed.id, expired);
+    assert!(queue.dequeue("reaper").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_below_ninety_seconds_is_raised_to_ninety() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    // A lease of 1 s would take rows from workers whose heartbeat is late.
+    let queue = camelmailer_db::PgQueue::with_stale_lock_seconds(pool.clone(), 1);
+    let id = queue.enqueue(1001, f.server.id, "a.example").await.unwrap();
+    sqlx::query(
+        "UPDATE queued_messages SET locked_by = 'slow', locked_at = now() - interval '60 seconds' \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(queue.dequeue("reaper").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_heartbeat_keeps_a_live_workers_rows_and_only_its_own() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let queue = camelmailer_db::PgQueue::with_stale_lock_seconds(pool.clone(), 300);
+
+    let mine = queue.enqueue(1001, f.server.id, "a.example").await.unwrap();
+    let theirs = queue.enqueue(1002, f.server.id, "b.example").await.unwrap();
+    let locked = queue.dequeue("worker-a").await.unwrap().unwrap();
+    assert_eq!(locked.id, mine);
+    sqlx::query(
+        "UPDATE queued_messages SET locked_by = 'worker-b', locked_at = now() WHERE id = $1",
+    )
+    .bind(theirs)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Both locks are old enough to be taken over.
+    sqlx::query("UPDATE queued_messages SET locked_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // worker-a refreshes its row; naming a row it does not hold does nothing.
+    assert_eq!(
+        queue.heartbeat("worker-a", &[mine, theirs]).await.unwrap(),
+        vec![mine]
+    );
+    assert!(queue.heartbeat("worker-a", &[]).await.unwrap().is_empty());
+
+    // Only worker-b's row, which nobody refreshed, can be taken over.
+    let reclaimed = queue
+        .dequeue("reaper")
+        .await
+        .unwrap()
+        .expect("unrefreshed row");
+    assert_eq!(reclaimed.id, theirs);
+    assert!(queue.dequeue("reaper").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn releasing_hands_rows_back_without_an_attempt() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let queue = camelmailer_db::PgQueue::with_stale_lock_seconds(pool.clone(), 300);
+
+    let first = queue.enqueue(1001, f.server.id, "a.example").await.unwrap();
+    let second = queue.enqueue(1002, f.server.id, "b.example").await.unwrap();
+    let kept = queue.enqueue(1003, f.server.id, "c.example").await.unwrap();
+    assert_eq!(queue.dequeue("stopping").await.unwrap().unwrap().id, first);
+    assert_eq!(queue.dequeue("other").await.unwrap().unwrap().id, second);
+    assert_eq!(queue.dequeue("stopping").await.unwrap().unwrap().id, kept);
+
+    // Only the named row of the stopping worker goes back: not the other
+    // worker's row, and not a row of its own it did not name (one whose
+    // delivery failed half way keeps its lock for the lease).
+    assert_eq!(
+        queue.release("stopping", &[first, second]).await.unwrap(),
+        1
+    );
+    assert_eq!(queue.release("stopping", &[]).await.unwrap(), 0);
+    let kept_by: Option<String> =
+        sqlx::query_scalar("SELECT locked_by FROM queued_messages WHERE id = $1")
+            .bind(kept)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept_by.as_deref(), Some("stopping"));
+
+    let row = sqlx::query(
+        "SELECT locked_by, locked_at, attempts, retry_after FROM queued_messages WHERE id = $1",
+    )
+    .bind(first)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.get::<Option<String>, _>("locked_by").is_none());
+    assert!(row
+        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("locked_at")
+        .is_none());
+    assert_eq!(row.get::<i32, _>("attempts"), 0);
+    assert!(row
+        .get::<Option<chrono::DateTime<chrono::Utc>>, _>("retry_after")
+        .is_none());
+    // Ready for the next worker at once; the other worker's row stays held.
+    assert_eq!(queue.dequeue("next").await.unwrap().unwrap().id, first);
+    assert!(queue.dequeue("next").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_and_lifecycle_queues_have_the_same_lease_heartbeat_and_release() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+
+    let webhook = f
+        .store
+        .create_webhook(camelmailer_core::NewWebhook::all(
+            f.server.id,
+            "hook",
+            "https://hooks.example.test/x",
+            false,
+        ))
+        .await
+        .unwrap();
+    let webhooks = camelmailer_db::PgWebhookQueue::with_stale_lock_seconds(pool.clone(), 300);
+    let headers = std::collections::BTreeMap::new();
+    let request = webhooks
+        .enqueue(
+            f.server.id,
+            webhook.id,
+            "u-1",
+            "MessageSent",
+            "https://hooks.example.test/x",
+            "{}",
+            false,
+            &headers,
+        )
+        .await
+        .unwrap();
+    assert_eq!(webhooks.dequeue("w").await.unwrap().unwrap().id, request);
+    sqlx::query("UPDATE webhook_requests SET locked_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        webhooks.heartbeat("w", &[request]).await.unwrap(),
+        vec![request]
+    );
+    assert!(webhooks.dequeue("reaper").await.unwrap().is_none());
+    sqlx::query("UPDATE webhook_requests SET locked_at = now() - interval '301 seconds'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        webhooks.dequeue("reaper").await.unwrap().unwrap().id,
+        request
+    );
+    assert_eq!(webhooks.release("reaper", &[request]).await.unwrap(), 1);
+    let attempts: i32 = sqlx::query_scalar("SELECT attempts FROM webhook_requests WHERE id = $1")
+        .bind(request)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 0);
+    assert_eq!(webhooks.dequeue("next").await.unwrap().unwrap().id, request);
+
+    let lifecycle = camelmailer_db::PgLifecycleQueue::with_stale_lock_seconds(pool.clone(), 300);
+    let event: i64 = sqlx::query_scalar(
+        "INSERT INTO lifecycle_events (uuid, event, payload) VALUES ('e-1', 'test', '{}') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(lifecycle.dequeue("w").await.unwrap().unwrap().id, event);
+    sqlx::query("UPDATE lifecycle_events SET locked_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        lifecycle.heartbeat("w", &[event]).await.unwrap(),
+        vec![event]
+    );
+    assert!(lifecycle.dequeue("reaper").await.unwrap().is_none());
+    assert_eq!(lifecycle.release("w", &[event]).await.unwrap(), 1);
+    assert_eq!(lifecycle.dequeue("next").await.unwrap().unwrap().id, event);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_that_panicked_comes_back_with_an_attempt_and_no_sooner_than_the_lease() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let queue = camelmailer_db::PgQueue::with_stale_lock_seconds(pool.clone(), 600);
+
+    let id = queue.enqueue(1001, f.server.id, "a.example").await.unwrap();
+    let theirs = queue.enqueue(1002, f.server.id, "b.example").await.unwrap();
+    assert_eq!(queue.dequeue("w").await.unwrap().unwrap().id, id);
+    assert_eq!(queue.dequeue("other").await.unwrap().unwrap().id, theirs);
+
+    // A row this worker does not hold is left alone.
+    assert_eq!(queue.defer_panicked("w", &[id, theirs]).await.unwrap(), 1);
+    assert!(queue.defer_panicked("w", &[]).await.unwrap() == 0);
+
+    let (locked_by, attempts, wait): (Option<String>, i32, f64) = sqlx::query_as(
+        "SELECT locked_by, attempts, extract(epoch FROM retry_after - now())::float8
+         FROM queued_messages WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(locked_by.is_none());
+    assert_eq!(attempts, 1);
+    // Backoff for attempt 0 is one minute; the lease of ten minutes wins.
+    assert!((590.0..=600.0).contains(&wait), "waits the lease: {wait}");
+    assert!(queue.dequeue("next").await.unwrap().is_none());
+
+    // Once the backoff outgrows the lease, the backoff wins (2^10 minutes).
+    sqlx::query("UPDATE queued_messages SET attempts = 12, locked_by = 'w', locked_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(queue.defer_panicked("w", &[id]).await.unwrap(), 1);
+    let wait: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM retry_after - now())::float8 FROM queued_messages WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        (61_400.0..=61_440.0).contains(&wait),
+        "waits the backoff: {wait}"
+    );
+
+    let webhook = f
+        .store
+        .create_webhook(camelmailer_core::NewWebhook::all(
+            f.server.id,
+            "hook",
+            "https://hooks.example.test/x",
+            false,
+        ))
+        .await
+        .unwrap();
+    let webhooks = camelmailer_db::PgWebhookQueue::with_stale_lock_seconds(pool.clone(), 600);
+    let request = webhooks
+        .enqueue(
+            f.server.id,
+            webhook.id,
+            "u-1",
+            "MessageSent",
+            "https://hooks.example.test/x",
+            "{}",
+            false,
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(webhooks.dequeue("w").await.unwrap().unwrap().id, request);
+    assert_eq!(webhooks.defer_panicked("w", &[request]).await.unwrap(), 1);
+    assert!(webhooks.dequeue("next").await.unwrap().is_none());
+
+    let lifecycle = camelmailer_db::PgLifecycleQueue::with_stale_lock_seconds(pool.clone(), 600);
+    let event: i64 = sqlx::query_scalar(
+        "INSERT INTO lifecycle_events (uuid, event, payload) VALUES ('e-1', 'test', '{}') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(lifecycle.dequeue("w").await.unwrap().unwrap().id, event);
+    assert_eq!(lifecycle.defer_panicked("w", &[event]).await.unwrap(), 1);
+    assert!(lifecycle.dequeue("next").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn templates_crud_and_scoping() {
     use camelmailer_core::{NewTemplate, ServerStore};
 

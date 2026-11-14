@@ -20,6 +20,100 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
+/// How long a `proxy_protocol` connection may take to send its PROXY header,
+/// on every listener. A load balancer sends it right after connecting.
+const PROXY_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Why no PROXY header line came off the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyReadFailure {
+    /// The peer closed the connection first.
+    Closed,
+    /// No `\n` within [`crate::proxy::V1_MAX_LENGTH`] bytes.
+    TooLong,
+    /// Nothing complete within [`PROXY_HEADER_TIMEOUT`].
+    TimedOut,
+}
+
+impl std::fmt::Display for ProxyReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "closed before a PROXY header",
+            Self::TooLong => "PROXY header longer than 107 bytes",
+            Self::TimedOut => "no PROXY header within the timeout",
+        })
+    }
+}
+
+/// Read a PROXY protocol v1 header from the raw socket, one byte at a time
+/// so not a single byte that follows it is consumed: on an `smtps` listener
+/// that is the client's TLS handshake. At most 107 bytes, so a byte-wise read
+/// costs nothing worth buffering for (a `peek` loop would spin on a header
+/// that arrives in pieces).
+///
+/// Returns the line without its `\n` (a trailing `\r` is kept, as the
+/// session expects).
+async fn read_proxy_header<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    timeout: std::time::Duration,
+) -> std::io::Result<Result<String, ProxyReadFailure>> {
+    let read = async {
+        let mut line = Vec::with_capacity(crate::proxy::V1_MAX_LENGTH);
+        loop {
+            let mut byte = [0u8; 1];
+            if stream.read(&mut byte).await? == 0 {
+                return Ok(Err(ProxyReadFailure::Closed));
+            }
+            if byte[0] == b'\n' {
+                return Ok(Ok(String::from_utf8_lossy(&line).into_owned()));
+            }
+            line.push(byte[0]);
+            if line.len() >= crate::proxy::V1_MAX_LENGTH {
+                return Ok(Err(ProxyReadFailure::TooLong));
+            }
+        }
+    };
+    match tokio::time::timeout(timeout, read).await {
+        Ok(result) => result,
+        Err(_) => Ok(Err(ProxyReadFailure::TimedOut)),
+    }
+}
+
+/// Log a refused PROXY header. Every refusal goes to debug; a warning goes
+/// out at most once a minute per process, with the count since the last one,
+/// because a refusal almost always means a misconfigured balancer (no
+/// `send-proxy`, or PROXY v2) and then every connection fails the same way.
+fn report_proxy_refusal(peer: SocketAddr, mode: SmtpListenerMode, reason: &dyn std::fmt::Display) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_WARNING: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    const INTERVAL_SECONDS: u64 = 60;
+
+    tracing::debug!(%peer, ?mode, %reason, "PROXY header refused, connection closed");
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARNING.load(Ordering::Relaxed);
+    if (last == 0 || now.saturating_sub(last) >= INTERVAL_SECONDS)
+        && LAST_WARNING
+            .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let suppressed = SUPPRESSED.swap(0, Ordering::Relaxed);
+        tracing::warn!(
+            %peer,
+            ?mode,
+            %reason,
+            suppressed_since_last_warning = suppressed,
+            "proxy_protocol is on but a connection sent no valid PROXY v1 header; \
+             check that the load balancer sends PROXY protocol v1 (send-proxy, not v2)"
+        );
+    } else {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A line-oriented reader/writer over any stream, kept upgradeable: unlike
 /// a `BufReader` split, the inner stream can be taken back out for the TLS
 /// handshake after STARTTLS.
@@ -206,6 +300,9 @@ pub struct SmtpServer {
     /// and what tests using `serve`/`serve_listeners` get); `run` wires the
     /// production hickory resolver in.
     spf_resolver: Option<Arc<dyn camelmailer_core::SpfResolver>>,
+    /// How long a `proxy_protocol` connection may take to send its PROXY
+    /// header ([`PROXY_HEADER_TIMEOUT`]; tests shorten it).
+    proxy_header_timeout: std::time::Duration,
 }
 
 impl SmtpServer {
@@ -219,7 +316,16 @@ impl SmtpServer {
             store,
             sink,
             spf_resolver: None,
+            proxy_header_timeout: PROXY_HEADER_TIMEOUT,
         }
+    }
+
+    /// Override how long a `proxy_protocol` connection may take to send its
+    /// PROXY header. For tests; production keeps [`PROXY_HEADER_TIMEOUT`].
+    #[doc(hidden)]
+    pub fn with_proxy_header_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.proxy_header_timeout = timeout;
+        self
     }
 
     /// Enable inbound SPF evaluation with the given resolver. Purely
@@ -334,7 +440,7 @@ impl SmtpServer {
 
     async fn handle_connection(
         &self,
-        stream: TcpStream,
+        mut stream: TcpStream,
         peer: SocketAddr,
         tls_acceptor: Option<Arc<TlsReloader>>,
         mode: SmtpListenerMode,
@@ -342,12 +448,12 @@ impl SmtpServer {
         let session_config = SessionConfig::from(&self.config);
         // With proxy_protocol enabled the client IP comes from the PROXY
         // line, not the socket peer.
-        let ip_address = if self.config.smtp_server.proxy_protocol {
+        let proxy_protocol = self.config.smtp_server.proxy_protocol;
+        let ip_address = if proxy_protocol {
             None
         } else {
             Some(peer.ip().to_string())
         };
-        let send_banner = ip_address.is_some();
 
         let mut session = Session::new(
             session_config,
@@ -355,6 +461,8 @@ impl SmtpServer {
             self.sink.clone(),
             ip_address,
         );
+        // `PROXY UNKNOWN` (a balancer health check) falls back to this.
+        session.set_peer_ip(peer.ip().to_string());
 
         // Context for the (optional) inbound SPF check, evaluated just before
         // DATA once MAIL FROM and the client IP are known.
@@ -362,6 +470,43 @@ impl SmtpServer {
             resolver: resolver.clone(),
             receiver: self.config.camelmailer.smtp_hostname.clone(),
         });
+
+        // proxy_protocol: the PROXY line is the first thing on the socket on
+        // every listener, read with the same length cap and timeout. On smtps
+        // it comes in the clear in front of the client's TLS handshake, so
+        // it is read byte by byte from the raw socket and the handshake bytes
+        // that follow stay untouched.
+        let mut proxy_reply = None;
+        if proxy_protocol {
+            let header = match read_proxy_header(&mut stream, self.proxy_header_timeout).await? {
+                Ok(header) => header,
+                Err(failure) => {
+                    report_proxy_refusal(peer, mode, &failure);
+                    if mode == SmtpListenerMode::Smtp && failure == ProxyReadFailure::TooLong {
+                        // Same answer as for any other invalid line in plain text.
+                        stream.write_all(b"502 Proxy Error\r\n").await.ok();
+                    }
+                    return Ok(());
+                }
+            };
+            let reply = session.handle(&header);
+            if session.finished() {
+                if let Err(reason) = crate::proxy::parse_v1(header.trim_end_matches('\r')) {
+                    report_proxy_refusal(peer, mode, &reason);
+                } else {
+                    // `UNKNOWN` without a peer address; unreachable here.
+                    report_proxy_refusal(peer, mode, &"PROXY UNKNOWN without a peer address");
+                }
+                if mode == SmtpListenerMode::Smtp {
+                    // Plain text can carry the session's 502; a TLS client
+                    // cannot read it, so smtps just closes.
+                    stream.write_all(b"502 Proxy Error\r\n").await.ok();
+                }
+                return Ok(());
+            }
+            // The banner. On smtps it is held back and sent over TLS below.
+            proxy_reply = Some(reply);
+        }
 
         if mode == SmtpListenerMode::Smtps {
             // Implicit TLS: handshake before the first SMTP byte, then run
@@ -376,17 +521,16 @@ impl SmtpServer {
             let tls_stream = tls_acceptor.acceptor().await.accept(stream).await?;
             session.set_tls(true);
             let mut lines = LineStream::new(tls_stream);
-            if send_banner {
-                lines.write_line(&session.banner()).await?;
-            }
+            lines.write_line(&session.banner()).await?;
             drive_session(&mut session, &mut lines, spf.as_ref()).await?;
             lines.stream.shutdown().await.ok();
             return Ok(());
         }
 
         let mut lines = LineStream::new(stream);
-        if send_banner {
-            lines.write_line(&session.banner()).await?;
+        match proxy_reply {
+            Some(reply) => lines.write_reply(&reply).await?,
+            None => lines.write_line(&session.banner()).await?,
         }
 
         // Plaintext phase: run until the connection ends or STARTTLS asks
@@ -490,5 +634,65 @@ async fn drive_session<S: AsyncRead + AsyncWrite + Unpin>(
         if session.finished() {
             return Ok(false);
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_header_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn reads_exactly_the_header_line_and_nothing_after_it() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"PROXY TCP4 203.0.113.7 10.0.70.5 1 465\r\n\x16\x03\x01rest")
+            .await
+            .unwrap();
+        let header = read_proxy_header(&mut server, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            header,
+            Ok("PROXY TCP4 203.0.113.7 10.0.70.5 1 465\r".to_string())
+        );
+        // The TLS ClientHello bytes are still on the stream.
+        let mut rest = [0u8; 7];
+        server.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"\x16\x03\x01rest");
+    }
+
+    #[tokio::test]
+    async fn stops_at_the_v1_length_cap() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(&[b'A'; 2000]).await.unwrap();
+        let header = read_proxy_header(&mut server, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(header, Err(ProxyReadFailure::TooLong));
+        // 106 bytes plus the line end is the longest header that fits.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let mut longest = vec![b'A'; crate::proxy::V1_MAX_LENGTH - 1];
+        longest.push(b'\n');
+        client.write_all(&longest).await.unwrap();
+        let header = read_proxy_header(&mut server, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(header.is_ok());
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_the_timeout_and_on_close() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client.write_all(b"PROXY TCP4 ").await.unwrap();
+        let header = read_proxy_header(&mut server, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(header, Err(ProxyReadFailure::TimedOut));
+        drop(client);
+        let header = read_proxy_header(&mut server, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(header, Err(ProxyReadFailure::Closed));
     }
 }

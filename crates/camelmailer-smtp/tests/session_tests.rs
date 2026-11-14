@@ -100,6 +100,35 @@ fn proxy_returns_an_error_when_the_header_is_invalid() {
     assert!(setup.session.finished());
 }
 
+#[test]
+fn proxy_refuses_a_client_field_that_is_not_an_ip() {
+    let mut setup = TestSetup::with_ip(None);
+    let reply = setup
+        .session
+        .handle("PROXY TCP4 evil.example 2.2.2.2 1111 2222");
+    assert_eq!(line(&reply), "502 Proxy Error");
+    assert!(setup.session.finished());
+    assert_eq!(setup.session.ip_address(), None);
+}
+
+#[test]
+fn proxy_unknown_falls_back_to_the_peer_address() {
+    let mut setup = TestSetup::with_ip(None);
+    setup.session.set_peer_ip("192.0.2.10".into());
+    let reply = setup.session.handle("PROXY UNKNOWN\r");
+    assert!(line(&reply).starts_with("220 "));
+    assert_eq!(setup.session.state(), State::Welcome);
+    assert_eq!(setup.session.ip_address(), Some("192.0.2.10"));
+}
+
+#[test]
+fn proxy_unknown_without_a_peer_address_is_refused() {
+    let mut setup = TestSetup::with_ip(None);
+    let reply = setup.session.handle("PROXY UNKNOWN");
+    assert_eq!(line(&reply), "502 Proxy Error");
+    assert!(setup.session.finished());
+}
+
 // ----------------------------------------------------------------- helo_spec
 
 #[test]
