@@ -365,6 +365,8 @@ pub struct Worker {
     worker_id: String,
     /// Delivery loops of this process (`worker.threads`).
     threads: u32,
+    /// `smtp_client.helo_from_ip_address`.
+    helo_from_ip_address: bool,
     /// Host-aware source selection; `None` uses each pool's first address.
     source_selection: Option<SourceSelection>,
 }
@@ -440,6 +442,7 @@ impl Worker {
             return_path_domain,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
             threads: config.worker.threads.max(1),
+            helo_from_ip_address: config.smtp_client.helo_from_ip_address,
             source_selection: config
                 .worker
                 .host_aware_pools
@@ -631,80 +634,90 @@ impl Worker {
         // Source-address selection: send from the message stream's IP pool if
         // it sets one, else the server's pool. A stream without a pool
         // resolves to the server pool exactly as before.
-        let source_ip = if let Some(selection) = &self.source_selection {
-            // Host-aware: only the pool addresses this host holds. A pool
-            // with none here goes back to the queue for a host that has one;
-            // no pool at all keeps the OS default address.
-            let addresses = match camelmailer_core::ServerStore::source_addresses_for(
-                &self.store,
-                message.server_id,
-                message.stream_id,
-            )
-            .await
-            {
-                Ok(addresses) => addresses,
-                Err(error) => {
-                    // The row is locked: hand it back without an attempt
-                    // instead of leaving it locked until the stale-lock
-                    // reclaim. Sending from an address the pool may not
-                    // hold would be worse than a short wait.
-                    tracing::warn!(
-                        message_id = message.id,
-                        %error,
-                        "could not read the IP pool; handing the message back"
-                    );
-                    self.queue
-                        .defer(queued.id, selection.foreign_pool_delay_seconds, None)
-                        .await?;
-                    return Ok(ProcessOutcome::PoolUnavailable);
-                }
-            };
-            if addresses.is_empty() {
-                None
-            } else {
-                let is_local = selection.local_check();
-                let local: Vec<&camelmailer_core::IpAddress> =
-                    addresses.iter().filter(|a| is_local(&a.ipv4)).collect();
-                match choose_source_address(&local, &queued.domain) {
-                    Some(address) => address.ipv4.parse().ok(),
-                    None => {
-                        let pool_id = addresses[0].ip_pool_id;
-                        selection.report_foreign(pool_id);
-                        // Record the pool as resolved now, so the queue
-                        // filter of the hosts without an address of it skips
-                        // the row from here on (rows queued before the
-                        // column, or after the pool changed).
+        let source: Option<camelmailer_core::IpAddress> =
+            if let Some(selection) = &self.source_selection {
+                // Host-aware: only the pool addresses this host holds. A pool
+                // with none here goes back to the queue for a host that has one;
+                // no pool at all keeps the OS default address.
+                let addresses = match camelmailer_core::ServerStore::source_addresses_for(
+                    &self.store,
+                    message.server_id,
+                    message.stream_id,
+                )
+                .await
+                {
+                    Ok(addresses) => addresses,
+                    Err(error) => {
+                        // The row is locked: hand it back without an attempt
+                        // instead of leaving it locked until the stale-lock
+                        // reclaim. Sending from an address the pool may not
+                        // hold would be worse than a short wait.
+                        tracing::warn!(
+                            message_id = message.id,
+                            %error,
+                            "could not read the IP pool; handing the message back"
+                        );
                         self.queue
-                            .defer(
-                                queued.id,
-                                selection.foreign_pool_delay_seconds,
-                                Some(pool_id as i64),
-                            )
+                            .defer(queued.id, selection.foreign_pool_delay_seconds, None)
                             .await?;
-                        return Ok(ProcessOutcome::ForeignPool);
+                        return Ok(ProcessOutcome::PoolUnavailable);
+                    }
+                };
+                if addresses.is_empty() {
+                    None
+                } else {
+                    let is_local = selection.local_check();
+                    let local: Vec<&camelmailer_core::IpAddress> =
+                        addresses.iter().filter(|a| is_local(&a.ipv4)).collect();
+                    match choose_source_address(&local, &queued.domain) {
+                        Some(address) => Some(address.clone()),
+                        None => {
+                            let pool_id = addresses[0].ip_pool_id;
+                            selection.report_foreign(pool_id);
+                            // Record the pool as resolved now, so the queue
+                            // filter of the hosts without an address of it skips
+                            // the row from here on (rows queued before the
+                            // column, or after the pool changed).
+                            self.queue
+                                .defer(
+                                    queued.id,
+                                    selection.foreign_pool_delay_seconds,
+                                    Some(pool_id as i64),
+                                )
+                                .await?;
+                            return Ok(ProcessOutcome::ForeignPool);
+                        }
                     }
                 }
-            }
-        } else {
-            camelmailer_core::ServerStore::source_ip_for(
-                &self.store,
-                message.server_id,
-                message.stream_id,
-            )
-            .await
-            .ok()
-            .flatten()
-            .and_then(|ip| ip.parse().ok())
-        };
+            } else {
+                // The pool's first address (lowest priority number, then id).
+                camelmailer_core::ServerStore::source_addresses_for(
+                    &self.store,
+                    message.server_id,
+                    message.stream_id,
+                )
+                .await
+                .ok()
+                .and_then(|addresses| addresses.into_iter().next())
+            };
+        let source_ip: Option<IpAddr> = source.as_ref().and_then(|a| a.ipv4.parse().ok());
+        // EHLO with the bound address's own name when asked to and it has
+        // one; otherwise the installation's name.
+        let helo_hostname = source
+            .as_ref()
+            .filter(|_| self.helo_from_ip_address && source_ip.is_some())
+            .map(|a| a.hostname.trim())
+            .filter(|name| !name.is_empty());
 
         let outcome = self
             .sender
-            .send(
+            .send_with_helo(
                 &queued.domain,
                 &return_path,
                 &message.rcpt_to,
                 &raw_message,
                 source_ip,
+                helo_hostname,
             )
             .await;
 

@@ -4265,3 +4265,55 @@ async fn a_host_aware_worker_still_delivers_past_a_dead_first_address_to_a_slow_
         .iter()
         .any(|line| line == "RCPT TO:<user@dest.example>"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ehlo_uses_the_pool_addresses_hostname_when_asked_to() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    // pool_with names 127.0.0.1 "host-127.0.0.1.example".
+    pool_with(&s, &[("127.0.0.1", 1)]).await;
+
+    for (opt_in, expected) in [
+        (false, "EHLO postal.example.com"),
+        (true, "EHLO host-127.0.0.1.example"),
+    ] {
+        let smtp = mock_smtp("250 Accepted").await;
+        s.sink
+            .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+            .await
+            .unwrap();
+        let mut config = worker_config(smtp.port);
+        config.smtp_client.helo_from_ip_address = opt_in;
+        let worker = Worker::new(&config, s.store.clone());
+        let outcome = worker.process_next().await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, ProcessOutcome::Delivered { .. }),
+            "{outcome:?}"
+        );
+        let seen = smtp.received.lock().unwrap().clone();
+        assert_eq!(seen.first().map(String::as_str), Some(expected), "{seen:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ehlo_falls_back_without_a_pool_address() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    s.sink
+        .insert_message(&outgoing_message(s.server.id, "user@dest.example"))
+        .await
+        .unwrap();
+    let mut config = worker_config(smtp.port);
+    config.smtp_client.helo_from_ip_address = true;
+    config.dns.helo_hostname = Some("out.example.net".into());
+    let worker = Worker::new(&config, s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+    let seen = smtp.received.lock().unwrap().clone();
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("EHLO out.example.net")
+    );
+}

@@ -362,7 +362,14 @@ smtp_client:
   open_timeout: 30    # seconds for the TCP connection, per remote address
   read_timeout: 300   # seconds for the greeting, a TLS handshake and each reply
   data_timeout: 600   # seconds to send the body and get the reply to its final dot
+  helo_from_ip_address: false   # EHLO with the bound pool address's hostname
 ```
+
+`helo_from_ip_address` greets with the `hostname` of the IP-pool address a
+delivery leaves from, so EHLO, that address's PTR and its A record all name
+the same host when a pool holds several IPs. Without a pool address, or with
+an empty `hostname`, the worker falls back to `dns.helo_hostname`. Off by
+default, so upgrading never changes an installation's EHLO.
 
 The defaults follow RFC 5321 4.5.3.2. Keep `read_timeout` at minutes, not
 seconds: receivers such as Hornetsecurity hold the greeting back on purpose

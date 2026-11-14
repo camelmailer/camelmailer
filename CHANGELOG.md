@@ -17,6 +17,11 @@ integration tests) is green.
 
 ### Added
 
+- **EHLO from the pool address.** With `smtp_client.helo_from_ip_address:
+  true` the worker greets with the `hostname` of the IP-pool address a
+  delivery is bound to, so EHLO, PTR and A record agree per IP. Falls back to
+  `dns.helo_hostname` (else `smtp_hostname`). Off by default.
+
 - **Host-aware IP pools.** With `worker.host_aware_pools: true` a worker
   sends only from the pool addresses its host holds (the addresses on its
   network interfaces, or those listed in `worker.source_addresses`), so workers on several hosts can share

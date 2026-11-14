@@ -261,7 +261,7 @@ dashboard does not by itself guarantee inbox placement.
 | Broadcast opt-in gate and one-click unsubscribe handling | Enforced |
 | SPF / DMARC record publication and alignment | Your DNS; Camelmailer checks and monitors |
 | Reverse DNS (PTR) for each pool IP | Your network provider; not verified by the product |
-| EHLO / HELO hostname | A single installation-level config value, not the per-address `hostname` field |
+| EHLO / HELO hostname | The installation-level `dns.helo_hostname` (else `smtp_hostname`); with `smtp_client.helo_from_ip_address: true`, the `hostname` of the pool address the delivery is bound to |
 | IPv6 source sending | The `ipv6` field is stored but source binding uses the `ipv4` value |
 | Pool `default` flag | A label in the admin UI; source resolution reads a server's or stream's assigned pool, so assign a pool explicitly for it to take effect |
 | IP warmup pacing | Operational; you control volume ramp, the product does not throttle |
