@@ -346,6 +346,67 @@ services:
 Any number of workers, scoped or not, work on the same queue safely; a
 message is handed to exactly one of them.
 
+#### Locks, heartbeats and shutdown
+
+A worker locks the row it works on. While the delivery runs it refreshes
+that lock every 30 seconds, so a slow receiver never makes another worker
+take the row over. A row whose lock has not been refreshed for the lease is
+treated as abandoned by a worker that died, and the next worker takes it.
+
+```yaml
+camelmailer:
+  queued_message_lock_stale_seconds: 300   # lease; unset = queued_message_lock_stale_days
+worker:
+  shutdown_grace_seconds: 8                # default; keep it below the stop timeout
+```
+
+The lease defaults to `queued_message_lock_stale_days` (one day). Set
+`queued_message_lock_stale_seconds` to get mail held by a crashed worker or a
+lost host moving again within minutes; values below 90 are raised to 90. The
+same lease applies to the webhook queue and the lifecycle outbox.
+
+**Recommended: a lease of about 300 seconds.** The one-day default is kept
+only so an upgrade changes nothing. With it, a delivery stopped while talking
+to the receiver (a restart, a deploy, a reboot) waits a whole day before it is
+tried again. Five minutes is long enough to cover a worker that misses a few
+heartbeats under load (they run every 30 seconds) and short enough that such
+a delivery moves again soon after the worker comes back. Shorter leases add
+no duplicate sends while the worker can reach the database, because the
+heartbeat keeps a live worker's rows; they only make a stalled worker lose
+its rows sooner.
+
+On SIGTERM or SIGINT the worker stops taking new work and gives the
+deliveries in flight `shutdown_grace_seconds` to finish. Whatever is still
+running then is stopped:
+
+- A row stopped before it reached a receiver (still loading or signing) goes
+  back to the queue without counting an attempt, and the next worker takes it
+  straight away.
+- A row stopped while talking to the receiver keeps its lock until the lease
+  runs out, as after a crash. The receiver may already have accepted it, so it
+  is not sent again early. With the default lease of one day that delivery
+  waits a day; set `queued_message_lock_stale_seconds` to shorten it.
+- A row whose processing failed half way (for example the database was gone
+  after the receiver's `250`) also keeps its lock for the lease.
+
+The process manager's stop timeout must stay above the grace period, or the
+worker is killed before it has finished. The default of 8 seconds is below
+Docker's default stop timeout of 10 seconds; the compose file sets
+`stop_grace_period: 30s`, which leaves room to raise the grace period to about
+25 seconds for slow receivers.
+
+A panic while processing one row does not stop the worker. The row goes back
+to the queue with one attempt counted and waits its backoff, but never less
+than the lease, so a message that trips a bug cannot cycle through the
+workers.
+
+Delivery stays at-least-once: a worker that dies between the receiver's
+`250` and recording it leaves a message that is sent again once its lease
+runs out. A short lease makes that no more likely while the worker can reach
+the database, because a live worker keeps its locks fresh. If it cannot reach
+the database for a whole lease, another worker may take its rows over; the
+worker logs a warning naming them when its heartbeat comes back.
+
 ### `smtp_client:` outgoing connections
 
 ```yaml

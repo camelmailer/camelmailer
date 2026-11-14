@@ -15,6 +15,45 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Delivery leases in seconds, with a heartbeat.** New
+  `camelmailer.queued_message_lock_stale_seconds` replaces the lease in days
+  when set (minimum 90). A worker refreshes the locks of the rows it works on
+  every 30 seconds, so a live worker never loses a row however long a
+  delivery takes, and only the rows of a worker that died are taken over.
+  Applies to the delivery queue, the webhook queue and the lifecycle outbox.
+  Unset, the one-day lease stays; about 300 seconds is recommended, so a
+  delivery stopped mid-conversation by a restart moves again within minutes
+  rather than a day (`docs/configuration.md`).
+- **Graceful worker shutdown.** On SIGTERM or SIGINT the worker stops taking
+  new work, waits `worker.shutdown_grace_seconds` (default 8, below Docker's
+  default stop timeout of 10 s) for what is in flight, and then stops the
+  rest. Rows that had not reached a receiver go back to the queue without
+  counting an attempt; a delivery stopped while talking to the receiver, and
+  a row whose processing failed half way, keep their lock for the lease as
+  after a crash, so nothing a receiver may already have accepted is sent
+  again early.
+
+### Fixed
+
+- **A restarted worker no longer strands its deliveries for a day.** The
+  worker installed no signal handler, so in a container without an init it
+  ignored SIGTERM and was killed after the stop timeout, leaving up to
+  `worker.threads` messages and one webhook locked until the one-day stale
+  window ran out. The compose file now runs the worker with `init: true` and
+  `stop_grace_period: 30s`.
+
+### Changed
+
+- A panic while processing one queued message, webhook request or lifecycle
+  event no longer takes a worker loop down. The row goes back with one
+  attempt counted and waits its backoff, but at least the lock lease, so a
+  message that trips a bug cannot cycle through the workers. A worker loop or
+  the lock heartbeat that ends on its own still stops the whole worker with
+  an error, so the process manager restarts it. Before, a loop that ended
+  disappeared silently and the worker ran on with fewer delivery loops.
+
 ## [0.13.1] - 2026-11-05
 
 ### Fixed
