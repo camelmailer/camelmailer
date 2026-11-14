@@ -20,7 +20,7 @@ pool carries:
 |---|---|
 | `ipv4` | The IPv4 source address. Required and validated as a real IPv4. |
 | `ipv6` | An optional IPv6 address. Stored for reference. |
-| `hostname` | The EHLO / reverse-DNS name you intend the address to present. |
+| `hostname` | The EHLO / reverse-DNS name you intend the address to present. Must be a fully qualified host name; used as the EHLO name with `smtp_client.helo_from_ip_address`. |
 | `priority` | Selection order within the pool. A lower number wins; the default is `100`. |
 
 Pools and their addresses are installation-wide configuration (the
@@ -244,8 +244,13 @@ and they check the EHLO name your server presents. Set the reverse DNS for
 each pool address at your network provider, and set the installation's
 EHLO identity to a name that matches (`camelmailer.smtp_hostname`, or an
 explicit `smtp_server` HELO override; see [Configuration](configuration.md)).
-The `hostname` field on a pool address records the name you intend an IP to
-present, which keeps your operational intent next to the address.
+With several pool addresses, each with its own PTR, turn on
+`smtp_client.helo_from_ip_address`: the worker then greets with the
+`hostname` of the address a delivery is bound to, so EHLO, PTR and A record
+agree per IP. Without it the `hostname` field only records the name you
+intend an IP to present. The API accepts only a fully qualified host name
+there (no IP literal, no trailing dot); a stored name that is not one is
+skipped with a warning and the worker greets with `dns.helo_hostname`.
 
 ## What Camelmailer enforces versus operational best practice
 

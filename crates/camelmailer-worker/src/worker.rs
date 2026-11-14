@@ -98,6 +98,28 @@ fn interface_addresses() -> std::io::Result<HashSet<IpAddr>> {
     ))
 }
 
+/// The EHLO name of a pool address (`smtp_client.helo_from_ip_address`):
+/// its `hostname` when that is a fully qualified host name, else `None`, and
+/// the worker greets with `dns.helo_hostname`. The API only stores valid
+/// names; this guards rows written before that check or around the API, so a
+/// CR, LF or space never reaches the SMTP command line.
+fn pool_helo_hostname(address: &camelmailer_core::IpAddress) -> Option<&str> {
+    let name = address.hostname.as_str();
+    if name.is_empty() {
+        return None;
+    }
+    if camelmailer_core::is_valid_helo_hostname(name) {
+        return Some(name);
+    }
+    tracing::warn!(
+        ip_address_id = address.id,
+        hostname = ?name,
+        "pool address hostname is not a fully qualified host name; \
+         greeting with dns.helo_hostname instead"
+    );
+    None
+}
+
 /// Which pool addresses this host may send from (`worker.host_aware_pools`).
 struct SourceSelection {
     /// `worker.source_addresses`; `None` takes the interface addresses.
@@ -706,8 +728,7 @@ impl Worker {
         let helo_hostname = source
             .as_ref()
             .filter(|_| self.helo_from_ip_address && source_ip.is_some())
-            .map(|a| a.hostname.trim())
-            .filter(|name| !name.is_empty());
+            .and_then(pool_helo_hostname);
 
         let outcome = self
             .sender

@@ -908,6 +908,32 @@ async fn ip_pools_and_nested_addresses() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
+    // The hostname can become the EHLO name: anything that is not a fully
+    // qualified host name (CR/LF injection, spaces, IP literals, a bare
+    // label, a trailing dot) is rejected and nothing is stored.
+    for hostname in [
+        "out1.example.com\r\nRSET",
+        "out1.example.com\n",
+        "out1 example.com",
+        "203.0.113.5",
+        "localhost",
+        "out1.example.com.",
+    ] {
+        let (status, body) = request(
+            &app,
+            "POST",
+            &format!("/api/v2/admin/ip_pools/{pool_id}/ip_addresses"),
+            Some(GLOBAL_KEY),
+            Some(json!({ "ipv4": "192.0.2.11", "hostname": hostname })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{hostname:?}: {body}"
+        );
+    }
+
     let (status, body) = request(
         &app,
         "POST",
