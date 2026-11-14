@@ -7,6 +7,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { PlayIcon } from "lucide-react"
 import { toast } from "sonner"
 import { PageHeader } from "@/components/shared"
+import { InfrastructureNav } from "./infrastructure/InfrastructureNav"
 import { Page } from "@/components/page"
 import { StatusPill } from "@/components/status-pill"
 import { Badge } from "@/components/ui/badge"
@@ -351,10 +352,13 @@ export default function ProviderFeedback() {
     <Page
       variant="scroll"
       header={
-        <PageHeader
-          title="Provider feedback"
-          description="What Gmail, Outlook.com and Yahoo report about the mail this installation sends: spam and complaint rates, filter results, and complaints from the feedback loops. Each source is fetched once its credentials are configured."
-        />
+        <>
+          <PageHeader
+            title="Provider feedback"
+            description="What Gmail, Outlook.com and Yahoo report about the mail this installation sends: spam and complaint rates, filter results, and complaints from the feedback loops. Each source is fetched once its credentials are configured."
+          />
+          <InfrastructureNav />
+        </>
       }
     >
       <div className="flex flex-col gap-6">

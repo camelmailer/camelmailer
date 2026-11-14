@@ -54,6 +54,11 @@ services:
   web:
     <<: *app
     command: web-server
+    # On SIGTERM the web server stops accepting connections and gives
+    # requests in flight web_server.shutdown_grace_seconds (default 30 s).
+    # The stop timeout stays above it.
+    init: true
+    stop_grace_period: 40s
     ports:
       - "${WEB_PORT:-5000}:5000"
     healthcheck:
@@ -68,6 +73,12 @@ services:
   smtp:
     <<: *app
     command: smtp-server
+    # On SIGTERM the SMTP server stops accepting connections, lets open
+    # transactions finish for smtp_server.shutdown_grace_seconds (default
+    # 30 s) and closes the remaining sessions with 421. The stop timeout
+    # stays above it.
+    init: true
+    stop_grace_period: 40s
     ports:
       - "${SMTP_PORT:-25}:25"
       # Submission port — served once the config file lists it under

@@ -276,6 +276,45 @@ A pool result disappears once the address leaves every pool, and any result
 not refreshed for seven days is removed. Failures are also logged by each
 worker as a warning at every check.
 
+When a worker runs inside a Docker network it sees only its bridge address
+(`172.18.0.5`), which reports `not_public`. List the host's public addresses
+in `cluster.public_addresses` (see [Configuration](configuration.md)) and the
+check uses those instead.
+
+## Cluster topology and DNS checks
+
+`GET /api/v2/admin/cluster` lists every registered web, SMTP and worker
+process with its node name, role, version, status (`live`, `stale`,
+`stopped`) and the queue rows each worker holds, plus the load balancer
+address, the inbound host name and the IP pools.
+
+`GET /api/v2/admin/dns_checks` checks the records the installation depends
+on and names each expected record exactly:
+
+| Check (`kind`) | Subject | Expected |
+|---|---|---|
+| `a` | `cluster.inbound_hostname` | A/AAAA on `cluster.load_balancer_address`, or on the public addresses of the live SMTP nodes without one |
+| `ptr` | every sending address | a PTR record carrying the name the worker greets with |
+| `fcrdns` | every sending address | the PTR name resolves back to the address |
+| `ehlo` | every sending address | the EHLO name (the pool address's `hostname` with `smtp_client.helo_from_ip_address`, else `dns.helo_hostname`) equals the PTR name |
+| `spf` | the return-path domain, every verified sending domain | every sending address passes; the instruction is the full TXT record with the missing `ip4:`/`ip6:` mechanisms |
+| `dkim` | every verified sending domain | the TXT record at `<dns.dkim_identifier>._domainkey.<domain>` carries the public key the worker signs with (the domain's own key, else the installation key); fail when missing or different |
+| `dmarc` | every verified sending domain | a single `v=DMARC1` record at `_dmarc.<domain>`; fail when missing, warning at `p=none` (the instruction raises it to `p=quarantine`) |
+| `mx` | the return-path domain, every domain with an inbound route | MX on the inbound host name or `dns.mx_records`, or on a host that resolves to the inbound addresses; fail otherwise |
+| `resolves` | `dns.track_domain` | resolves |
+
+Every check carries `found`, `expected` and `instructions` such as
+`set A out1.mail.example.com → 203.0.113.10, TTL 300` or
+`set PTR 203.0.113.10 → out1.mail.example.com (at the provider of the address)`;
+the top-level `instructions` lists each record to set once. Each lookup is
+limited to five seconds, eight subjects are checked at a time, at most 100
+tenant domains are included (`truncated_domains` counts the rest), and the
+result is reused for a minute unless `?refresh=1` is given.
+
+`GET /api/v2/admin/dns_checks/candidate?ipv4=…&ipv6=…&hostname=…` runs the
+checks a planned address must pass before it goes into a pool and answers
+`ready: true` once they all do. Both endpoints only read DNS.
+
 ## What this view does not do
 
 - It reports counters, and it raises no alert of its own. Nothing here

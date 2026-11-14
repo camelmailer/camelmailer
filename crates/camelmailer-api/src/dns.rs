@@ -218,3 +218,74 @@ impl camelmailer_core::SpfResolver for MemoizingSpfResolver<'_> {
         value
     }
 }
+
+/// The production [`crate::dns_checks::DnsCheckResolver`] for the
+/// infrastructure dashboard's DNS checks: one resolver, reused for a whole
+/// check run, with every lookup bounded by [`DNS_CHECK_TIMEOUT`] so a dead
+/// name server cannot hold the request.
+pub struct HickoryDnsCheckResolver {
+    spf: HickorySpfResolver,
+}
+
+/// How long one lookup of the DNS checks may take.
+pub const DNS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl HickoryDnsCheckResolver {
+    pub fn new() -> Self {
+        Self {
+            spf: HickorySpfResolver::new(),
+        }
+    }
+}
+
+impl Default for HickoryDnsCheckResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+async fn bounded<T>(
+    lookup: impl std::future::Future<Output = Result<T, DnsError>>,
+) -> Result<T, DnsError> {
+    tokio::time::timeout(DNS_CHECK_TIMEOUT, lookup)
+        .await
+        .unwrap_or_else(|_| Err(DnsError::Lookup("timed out".into())))
+}
+
+#[async_trait]
+impl crate::dns_checks::DnsCheckResolver for HickoryDnsCheckResolver {
+    async fn txt(&self, name: &str) -> Result<Vec<String>, DnsError> {
+        use camelmailer_core::SpfResolver;
+        bounded(self.spf.txt(name)).await
+    }
+
+    async fn ip_addresses(&self, name: &str) -> Result<Vec<std::net::IpAddr>, DnsError> {
+        use camelmailer_core::SpfResolver;
+        bounded(self.spf.ip_addresses(name)).await
+    }
+
+    async fn mx_hosts(&self, name: &str) -> Result<Vec<String>, DnsError> {
+        use camelmailer_core::SpfResolver;
+        bounded(self.spf.mx_hosts(name)).await
+    }
+
+    async fn ptr(&self, address: std::net::IpAddr) -> Result<Vec<String>, DnsError> {
+        use hickory_resolver::proto::rr::Name;
+        bounded(async {
+            match self.spf.resolver.reverse_lookup(Name::from(address)).await {
+                Ok(lookup) => Ok(lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|record| match &record.data {
+                        RData::PTR(name) => {
+                            Some(name.0.to_utf8().trim_end_matches('.').to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect()),
+                Err(error) => empty_on_no_records(error, Vec::new()),
+            }
+        })
+        .await
+    }
+}

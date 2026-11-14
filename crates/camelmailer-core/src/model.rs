@@ -267,6 +267,47 @@ pub struct SourceAddressCheck {
     pub checked_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// What one process reports about itself in the cluster topology
+/// (`cluster_nodes`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NodeRegistration {
+    /// Unique per process; for a worker its queue lock id (`locked_by`).
+    pub instance_id: String,
+    /// `web`, `smtp` or `worker`.
+    pub role: String,
+    /// `cluster.node_name`, else the host name.
+    pub node_name: String,
+    pub version: String,
+    /// Role-specific facts (public addresses, threads, listeners, ...).
+    pub details: serde_json::Value,
+}
+
+/// One registered process as stored, with its heartbeat times.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ClusterNode {
+    pub instance_id: String,
+    pub role: String,
+    pub node_name: String,
+    pub version: String,
+    pub details: serde_json::Value,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    /// Set by a graceful shutdown.
+    pub stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The queue rows one worker holds right now, by queue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct NodeLeases {
+    /// The worker's lock id (`locked_by`).
+    pub locked_by: String,
+    pub queued_messages: i64,
+    pub webhook_requests: i64,
+    pub lifecycle_events: i64,
+    /// When the oldest of those locks was taken or last refreshed.
+    pub oldest_lock_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// The webhook event names Camelmailer can fire (the worker for delivery,
 /// bounce and complaint events, the tracking endpoints for opens and
 /// clicks). The only valid values for [`Webhook::events`]; API validation
