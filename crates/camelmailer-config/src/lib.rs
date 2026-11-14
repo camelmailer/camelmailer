@@ -408,6 +408,12 @@ pub struct Retention {
     pub auth_event_days: u32,
     /// The per-server API request log. Installation-wide; default 30.
     pub api_request_days: u32,
+    /// Raw ARF feedback reports (complaints from JMRP, CFL and other
+    /// feedback loops). They contain the complaining recipient's address,
+    /// so their content is removed after this many days; the complaint, its
+    /// suppression and the provider counts stay. Installation-wide; default
+    /// 30, `0` keeps them as long as the message content.
+    pub feedback_report_days: u32,
     /// Rows deleted per statement, so a large backlog never holds one long
     /// transaction or lock.
     pub batch_size: u32,
@@ -422,6 +428,7 @@ impl Default for Retention {
             dmarc_report_days: 0,
             auth_event_days: 0,
             api_request_days: 30,
+            feedback_report_days: 30,
             batch_size: 1000,
         }
     }
@@ -620,14 +627,23 @@ pub struct Seed {
 /// Complaint feedback loops (Microsoft JMRP, Yahoo CFL and any other ARF
 /// feedback loop). Reports reach the installation as inbound mail to a
 /// route address; they are recognised by their ARF envelope (RFC 5965).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FeedbackLoops {
     /// Also suppress the complainant when the complaint is about
     /// transactional mail (a message without a broadcast unsubscribe token),
-    /// for the message's stream. Off by default: broadcast complaints are
-    /// always suppressed for their stream, transactional mail keeps flowing.
+    /// for the message's stream. On by default; each mail server can choose
+    /// otherwise in its settings. Broadcast complaints are always suppressed
+    /// for their stream.
     pub suppress_complainants: bool,
+}
+
+impl Default for FeedbackLoops {
+    fn default() -> Self {
+        Self {
+            suppress_complainants: true,
+        }
+    }
 }
 
 /// Installation lifecycle webhooks: organization created/deleted, user
@@ -2698,7 +2714,8 @@ smtp_server:
         assert_eq!(feedback.fetch_interval_seconds, 21_600);
         assert!(feedback.postmaster_tools.domains.is_empty());
         assert!(feedback.snds.data_url_file.is_none());
-        assert!(!feedback.fbl.suppress_complainants);
+        assert!(feedback.fbl.suppress_complainants, "on by default");
+        assert_eq!(config.retention.feedback_report_days, 30);
         assert_eq!(
             feedback.postmaster_tools.api_base_url,
             "https://gmailpostmastertools.googleapis.com"
@@ -2707,7 +2724,7 @@ smtp_server:
         let config = Config::from_yaml(
             "deliverability_feedback:\n  postmaster_tools:\n    domains: [example.com]\n    \
              client_id: id\n    refresh_token_file: /run/secrets/t\n  snds:\n    \
-             data_url_file: /run/secrets/snds\n  fbl:\n    suppress_complainants: true\n",
+             data_url_file: /run/secrets/snds\n  fbl:\n    suppress_complainants: false\n",
         )
         .unwrap();
         let feedback = &config.deliverability_feedback;
@@ -2717,7 +2734,7 @@ smtp_server:
             feedback.snds.data_url_file.as_deref(),
             Some("/run/secrets/snds")
         );
-        assert!(feedback.fbl.suppress_complainants);
+        assert!(!feedback.fbl.suppress_complainants);
         assert!(Config::from_yaml("deliverability_feedback:\n  snds:\n    key: x\n").is_err());
 
         let config = Config::from_yaml(

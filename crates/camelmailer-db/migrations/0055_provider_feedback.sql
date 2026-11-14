@@ -6,7 +6,9 @@
 CREATE TABLE feedback_snapshots (
     id BIGSERIAL PRIMARY KEY,
     source TEXT NOT NULL,
-    provider TEXT NOT NULL,
+    -- a provider group name (`google`, `microsoft`, `united_internet`, ...);
+    -- groups are configurable, so only the format is checked
+    provider TEXT NOT NULL CHECK (provider ~ '^[a-z0-9_]+$'),
     subject_kind TEXT NOT NULL CHECK (subject_kind IN ('domain', 'ip', 'provider')),
     subject TEXT NOT NULL,
     data_date DATE NOT NULL,
@@ -31,3 +33,23 @@ CREATE TABLE feedback_sources (
     lease_holder TEXT,
     lease_until TIMESTAMPTZ
 );
+
+-- Per mail server: suppress the complainant of transactional mail on a
+-- feedback-loop complaint. NULL follows the installation default
+-- (`deliverability_feedback.fbl.suppress_complainants`).
+CREATE TABLE server_feedback_settings (
+    server_id BIGINT PRIMARY KEY REFERENCES servers (id) ON DELETE CASCADE,
+    suppress_complainants BOOLEAN
+);
+
+-- The inbound messages that were ARF feedback reports. They hold recipient
+-- data, so their raw content is removed after
+-- `retention.feedback_report_days`; the counts above stay.
+CREATE TABLE feedback_reports (
+    server_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (server_id, message_id)
+);
+
+CREATE INDEX idx_feedback_reports_received_at ON feedback_reports (received_at);

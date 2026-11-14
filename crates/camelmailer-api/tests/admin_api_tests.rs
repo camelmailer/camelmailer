@@ -1299,6 +1299,83 @@ async fn placement_rounds_are_requested_on_demand_once_per_interval() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn a_server_chooses_whether_complainants_are_suppressed() {
+    let store = Arc::new(MemoryStore::new());
+    let state = ApiState::new(store.clone(), Some(GLOBAL_KEY.to_string()))
+        .with_feedback_store(store.clone());
+    let app = build_router(state);
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Acme", "permalink": "acme" })),
+    )
+    .await;
+    request(
+        &app,
+        "POST",
+        "/api/v2/admin/organizations/acme/servers",
+        Some(GLOBAL_KEY),
+        Some(json!({ "name": "Mail", "permalink": "mail" })),
+    )
+    .await;
+    let path = "/api/v2/admin/organizations/acme/servers/mail/complaint_settings";
+
+    let (status, body) = request(&app, "GET", path, Some(GLOBAL_KEY), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let settings = &body["data"]["complaint_settings"];
+    assert_eq!(settings["suppress_complainants"], Value::Null);
+    assert_eq!(settings["installation_default"], true);
+    assert_eq!(settings["effective"], true);
+
+    let (status, body) = request(
+        &app,
+        "PATCH",
+        path,
+        Some(GLOBAL_KEY),
+        Some(json!({ "suppress_complainants": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["complaint_settings"]["effective"], false);
+    let (_, body) = request(&app, "GET", path, Some(GLOBAL_KEY), None).await;
+    assert_eq!(
+        body["data"]["complaint_settings"]["suppress_complainants"],
+        false
+    );
+
+    let (status, _) = request(
+        &app,
+        "PATCH",
+        path,
+        Some(GLOBAL_KEY),
+        Some(json!({ "suppress_complainants": "yes" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, body) = request(
+        &app,
+        "PATCH",
+        path,
+        Some(GLOBAL_KEY),
+        Some(json!({ "suppress_complainants": null })),
+    )
+    .await;
+    assert_eq!(body["data"]["complaint_settings"]["effective"], true);
+
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/v2/admin/organizations/acme/servers/nope/complaint_settings",
+        Some(GLOBAL_KEY),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // ------------------------------------------------ P0: server config + keys
 
 #[tokio::test]

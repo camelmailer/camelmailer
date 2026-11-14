@@ -211,6 +211,7 @@ retention:
   dmarc_report_days: 0       # received DMARC aggregate reports
   auth_event_days: 0         # authentication audit log
   api_request_days: 30       # per-server API request log
+  feedback_report_days: 30   # raw ARF complaint reports (they hold the recipient's address)
   batch_size: 1000           # rows per delete statement
 
 # Installation lifecycle webhooks: organization.created,
@@ -239,7 +240,7 @@ deliverability_feedback:
   snds: {}
     # data_url_file: /run/secrets/snds_data_url                  # CAMELMAILER_SNDS_DATA_URL
   fbl:
-    suppress_complainants: false     # also suppress complainants of transactional mail
+    suppress_complainants: true      # also for transactional mail; each server can opt out
   # Seed inbox placement tests: one message per sending IP to each seed,
   # looked up read-only over IMAP. They only measure; nothing is opened,
   # clicked, answered or moved. Off while seeds is empty.

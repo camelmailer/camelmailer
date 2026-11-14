@@ -319,6 +319,7 @@ retention:
   dmarc_report_days: 0
   auth_event_days: 0
   api_request_days: 30
+  feedback_report_days: 30   # raw ARF complaint reports (recipient data)
   batch_size: 1000
 ```
 
@@ -578,7 +579,7 @@ deliverability_feedback:
   snds:
     # data_url_file: /run/secrets/snds_data_url                   # or CAMELMAILER_SNDS_DATA_URL
   fbl:
-    suppress_complainants: false      # also suppress complainants of transactional mail
+    suppress_complainants: true       # also for transactional mail; servers can opt out
   placement:                          # seed inbox placement tests; off without seeds
     server: ""                        # organization/server that sends the tests
     from_address: ""                  # on a verified domain of that server

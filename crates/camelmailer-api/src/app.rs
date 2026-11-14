@@ -569,7 +569,11 @@ fn required_role(rest: &[&str], method: &axum::http::Method) -> camelmailer_core
         Some(&"sso") => Role::Admin,
         Some(&"servers") => match rest.get(2) {
             // server lifecycle (create/update/delete/suspend/ip_pool)
-            None | Some(&"suspend") | Some(&"unsuspend") | Some(&"ip_pool") => {
+            None
+            | Some(&"suspend")
+            | Some(&"unsuspend")
+            | Some(&"ip_pool")
+            | Some(&"complaint_settings") => {
                 if read {
                     Role::Viewer
                 } else {
@@ -1762,6 +1766,11 @@ pub fn build_router(state: Arc<ApiState>) -> Router {
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/ip_pool",
             axum::routing::post(servers_set_ip_pool),
+        )
+        .route(
+            "/organizations/{permalink}/servers/{server_permalink}/complaint_settings",
+            get(crate::deliverability::complaint_settings_show)
+                .patch(crate::deliverability::complaint_settings_update),
         )
         .route(
             "/organizations/{permalink}/servers/{server_permalink}/stats",

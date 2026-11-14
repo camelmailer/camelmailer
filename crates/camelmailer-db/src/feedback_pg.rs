@@ -458,4 +458,53 @@ impl FeedbackStore for PgStore {
             .map_err(sqlx_error)?;
         Ok(rows.iter().map(test_from_row).collect())
     }
+
+    async fn server_complaint_suppression(
+        &self,
+        server_id: camelmailer_core::Id,
+    ) -> Result<Option<bool>, StoreError> {
+        let value: Option<Option<bool>> = sqlx::query_scalar(
+            "SELECT suppress_complainants FROM server_feedback_settings WHERE server_id = $1",
+        )
+        .bind(server_id as i64)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(value.flatten())
+    }
+
+    async fn set_server_complaint_suppression(
+        &self,
+        server_id: camelmailer_core::Id,
+        suppress: Option<bool>,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO server_feedback_settings (server_id, suppress_complainants)
+             VALUES ($1, $2)
+             ON CONFLICT (server_id) DO UPDATE SET suppress_complainants = EXCLUDED.suppress_complainants",
+        )
+        .bind(server_id as i64)
+        .bind(suppress)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(())
+    }
+
+    async fn record_feedback_report(
+        &self,
+        server_id: camelmailer_core::Id,
+        message_id: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO feedback_reports (server_id, message_id) VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(server_id as i64)
+        .bind(message_id)
+        .execute(self.pool())
+        .await
+        .map_err(sqlx_error)?;
+        Ok(())
+    }
 }

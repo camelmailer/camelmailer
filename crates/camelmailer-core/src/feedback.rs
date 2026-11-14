@@ -346,6 +346,30 @@ pub trait FeedbackStore: Send + Sync {
 
     /// The newest tests, newest first.
     async fn list_placement_tests(&self, limit: i64) -> Result<Vec<PlacementTest>, StoreError>;
+
+    // -- complaint handling per mail server
+
+    /// Whether `server_id` suppresses complainants of transactional mail;
+    /// `None` follows the installation default.
+    async fn server_complaint_suppression(
+        &self,
+        server_id: crate::model::Id,
+    ) -> Result<Option<bool>, StoreError>;
+
+    /// Set (or with `None` clear) the server's own choice.
+    async fn set_server_complaint_suppression(
+        &self,
+        server_id: crate::model::Id,
+        suppress: Option<bool>,
+    ) -> Result<(), StoreError>;
+
+    /// Remember that an inbound message was an ARF report, so retention can
+    /// remove its raw content after `retention.feedback_report_days`.
+    async fn record_feedback_report(
+        &self,
+        server_id: crate::model::Id,
+        message_id: i64,
+    ) -> Result<(), StoreError>;
 }
 
 // ------------------------------------------------------------- helpers
@@ -412,6 +436,9 @@ pub struct MemoryFeedback {
     /// Tests with their next lookup time and claim.
     tests: Vec<(PlacementTest, DateTime<Utc>, Option<DateTime<Utc>>)>,
     next_id: i64,
+    server_settings: std::collections::HashMap<crate::model::Id, bool>,
+    /// (server, message, received at)
+    reports: Vec<(crate::model::Id, i64, DateTime<Utc>)>,
 }
 
 impl MemoryFeedback {
@@ -785,6 +812,53 @@ impl FeedbackStore for MemoryStore {
         tests.truncate(limit.max(0) as usize);
         Ok(tests)
     }
+
+    async fn server_complaint_suppression(
+        &self,
+        server_id: crate::model::Id,
+    ) -> Result<Option<bool>, StoreError> {
+        Ok(self
+            .inner
+            .read()
+            .unwrap()
+            .feedback
+            .server_settings
+            .get(&server_id)
+            .copied())
+    }
+
+    async fn set_server_complaint_suppression(
+        &self,
+        server_id: crate::model::Id,
+        suppress: Option<bool>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        match suppress {
+            Some(value) => {
+                inner.feedback.server_settings.insert(server_id, value);
+            }
+            None => {
+                inner.feedback.server_settings.remove(&server_id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_feedback_report(
+        &self,
+        server_id: crate::model::Id,
+        message_id: i64,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let reports = &mut inner.feedback.reports;
+        if !reports
+            .iter()
+            .any(|(s, m, _)| *s == server_id && *m == message_id)
+        {
+            reports.push((server_id, message_id, Utc::now()));
+        }
+        Ok(())
+    }
 }
 
 /// The snapshot a final placement result leaves: inbox is ok, spam bad,
@@ -1066,6 +1140,28 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_server_choice_overrides_the_default_until_cleared() {
+        let store = MemoryStore::new();
+        assert_eq!(store.server_complaint_suppression(7).await.unwrap(), None);
+        store
+            .set_server_complaint_suppression(7, Some(false))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.server_complaint_suppression(7).await.unwrap(),
+            Some(false)
+        );
+        store
+            .set_server_complaint_suppression(7, None)
+            .await
+            .unwrap();
+        assert_eq!(store.server_complaint_suppression(7).await.unwrap(), None);
+        store.record_feedback_report(7, 42).await.unwrap();
+        store.record_feedback_report(7, 42).await.unwrap();
+        assert_eq!(store.inner.read().unwrap().feedback.reports.len(), 1);
     }
 
     #[tokio::test]
