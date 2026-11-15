@@ -717,8 +717,13 @@ mod memory_tests {
             .unwrap();
         assert_eq!(complaint_day.complaints, 1);
 
+        // Sources are stamped with the wall clock when recorded, so prune them
+        // with a cutoff after "now" rather than the fixed complaint time.
         let removed = store
-            .prune_delivery_stats(NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(), at)
+            .prune_delivery_stats(
+                NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(),
+                Utc::now() + chrono::Duration::days(1),
+            )
             .await
             .unwrap();
         assert_eq!(removed, 2 + 3, "two old counters and every source");
