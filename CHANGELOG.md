@@ -15,6 +15,8 @@ integration tests) is green.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-15
+
 ### Added
 
 - **Optional error reporting to Sentry** or any Sentry-compatible tracker.
@@ -1625,7 +1627,8 @@ ground-up Rust rewrite of [Postal](https://github.com/postalserver/postal)
 - **Postal compatibility** — existing `postal.yml` config files load
   unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
 
-[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/camelmailer/camelmailer/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/camelmailer/camelmailer/compare/v0.15.1...v0.16.0
 [0.15.1]: https://github.com/camelmailer/camelmailer/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/camelmailer/camelmailer/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/camelmailer/camelmailer/compare/v0.13.1...v0.14.0
