@@ -18,6 +18,9 @@ x-app: &app
   environment:
     DATABASE_URL: postgres://camelmailer:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/camelmailer
     RUST_LOG: ${RUST_LOG:-info}
+    # Optional error reporting to Sentry or a compatible tracker; empty = off.
+    # See docs/configuration.md, "Error reporting".
+    SENTRY_DSN: ${SENTRY_DSN:-}
     # To use a config file (DKIM signing key, DNS names, TLS, relays …),
     # place camelmailer.yml next to this file, then uncomment:
     # CAMELMAILER_CONFIG_FILE_PATH: /config/camelmailer.yml

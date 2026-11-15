@@ -12,6 +12,8 @@ deployments need only environment variables.
 | `DATABASE_URL` | PostgreSQL URL — **takes precedence** over the `postgres:` group |
 | `PORT` / `BIND_ADDRESS` | Web-server listen overrides (used by the Docker image) |
 | `RUST_LOG` | Log filter (`info`, `debug`, `camelmailer_worker=debug,info`, …) |
+| `SENTRY_DSN` | Optional error reporting to Sentry or a Sentry-compatible tracker; empty means off (see [Error reporting](#error-reporting-optional)) |
+| `SENTRY_ENVIRONMENT` / `SENTRY_SAMPLE_RATE` | Environment name (default `production`) and share of errors sent (`0` to `1`, default `1`) |
 
 A full annotated example lives at
 [`config/camelmailer.example.yml`](../config/camelmailer.example.yml).
@@ -754,6 +756,47 @@ verifier `503 CaptchaUnavailable`. `GET /api/v2/auth/features` publishes
 the provider and the endpoint, never the secret. Any service with the same
 siteverify contract works.
 
+### Error reporting (optional)
+
+The `web-server`, `smtp-server` and `worker` roles can report errors to
+Sentry or any tracker that speaks the Sentry protocol. Reporting is off
+until a DSN is set: without one, no client is started and the process
+opens no connection for it.
+
+```bash
+SENTRY_DSN=https://<public key>@errors.example.com/<project id>
+SENTRY_ENVIRONMENT=production   # optional, default production
+SENTRY_SAMPLE_RATE=1            # optional, share of errors sent, 0 to 1
+```
+
+`logging.sentry_dsn` in the config file works as well (it is the key
+Postal used); `SENTRY_DSN` takes precedence. An invalid DSN or sample rate
+logs a warning at startup and leaves reporting off; the role starts
+normally.
+
+What is sent:
+
+- panics, with a backtrace;
+- every `ERROR` log line, with the `WARN` lines before it as breadcrumbs;
+- the error a role exits with.
+
+Each event carries the release (`camelmailer@<version>`), the environment
+and a `role` tag. Performance tracing is not enabled.
+
+What is not sent: a mail platform logs recipients, senders and
+credentials, so every event is scrubbed before it leaves the process.
+Fields named like mail content, addresses or secrets (`rcpt_to`, `from`,
+`subject`, `body`, `password`, `token`, `api_key`, …) are replaced with
+`[redacted]`; e-mail addresses, credentials in URLs and bearer tokens in
+any remaining text are masked. Message bodies, recipient lists and
+credentials are never part of an event. User and request data is not
+collected (`send_default_pii` is off). The one-shot commands
+(`initialize`, `make-user`, `make-admin-api-key`) never report.
+
+The feature is compiled in by default (cargo feature `sentry` of the
+`camelmailer` crate). A build without it:
+`cargo build --release -p camelmailer --no-default-features`.
+
 ## Production checklist
 
 - [ ] `POSTGRES_PASSWORD` strong; database backed up (it holds config *and* mail)
@@ -764,6 +807,7 @@ siteverify contract works.
 - [ ] Reverse proxy (TLS) in front of port 5000; `/health` as the LB probe
 - [ ] Port 25 egress open (many clouds block it — or use `smtp_relays`)
 - [ ] `RUST_LOG=info`, logs shipped somewhere
+- [ ] Optional: `SENTRY_DSN` set, if errors should reach a tracker
 - [ ] Admin API keys are database-backed (`make-admin-api-key`), the global
       `admin_api_key` is unset
 

@@ -15,6 +15,21 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Optional error reporting to Sentry** or any Sentry-compatible tracker.
+  Off until `SENTRY_DSN` (or `logging.sentry_dsn`) is set; without a DSN no
+  client starts and nothing leaves the process. The `web-server`,
+  `smtp-server` and `worker` roles then report panics, `ERROR` log lines
+  (with the preceding `WARN` lines as breadcrumbs) and the error a role
+  exits with, tagged with the release, `SENTRY_ENVIRONMENT` and the role.
+  Events are scrubbed before they are sent: fields named like mail content,
+  addresses or secrets are replaced, and e-mail addresses, URL credentials
+  and bearer tokens in text are masked; user and request data is never
+  collected. `SENTRY_SAMPLE_RATE` sets the share of errors sent. The cargo
+  feature `sentry` is on by default; `--no-default-features` builds without
+  it. See docs/configuration.md, "Error reporting".
+
 ## [0.15.1] - 2026-11-14
 
 ### Fixed
