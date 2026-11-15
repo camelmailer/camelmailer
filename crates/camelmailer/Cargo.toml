@@ -43,6 +43,14 @@ assets = [
     ["../../config/camelmailer.example.yml", "etc/camelmailer/camelmailer.yml", "640"],
 ]
 
+[features]
+default = ["sentry"]
+# Error reporting to Sentry or a Sentry-compatible tracker (see
+# docs/configuration.md). Compiled in by default and inert until a DSN is set:
+# without `SENTRY_DSN` no client is created and nothing leaves the process.
+# `--no-default-features` builds a binary without the dependency at all.
+sentry = ["dep:sentry", "dep:regex", "dep:rustls"]
+
 [dependencies]
 axum = { workspace = true }
 camelmailer-api = { workspace = true }
@@ -55,3 +63,10 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+regex = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+sentry = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Captures events in memory instead of sending them (error_reporting tests).
+sentry = { workspace = true, features = ["test"] }

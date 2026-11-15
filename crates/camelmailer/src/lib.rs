@@ -34,6 +34,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 pub mod cluster;
+#[cfg(feature = "sentry")]
+pub mod error_reporting;
 
 pub use camelmailer_api;
 pub use camelmailer_config;
@@ -81,14 +83,30 @@ pub fn main() -> ExitCode {
 /// The CLI entry point with extensions: parses `std::env::args()` and runs
 /// the requested role.
 pub fn main_with(extensions: Extensions) -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
 
     let args: Vec<String> = std::env::args().collect();
+
+    // Decided before logging is set up: the Sentry layers are only installed
+    // when there is a DSN, and the client must exist before the runtime
+    // threads start. `_error_reporting` flushes pending events on drop.
+    #[cfg(feature = "sentry")]
+    let reporting = error_reporting::Plan::for_role(args.get(1).map(String::as_str));
+
+    let logs = tracing_subscriber::fmt::layer().with_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    let registry = tracing_subscriber::registry().with(logs);
+    #[cfg(feature = "sentry")]
+    let registry = registry.with(reporting.layers());
+    registry.init();
+
+    #[cfg(feature = "sentry")]
+    let _error_reporting = reporting.start();
+
     match args.get(1).map(String::as_str) {
         Some("web-server") => run_async(web_server_with(extensions)),
         Some("smtp-server") => run_async(smtp_server()),
@@ -113,6 +131,8 @@ fn run_async(future: impl std::future::Future<Output = std::io::Result<()>>) -> 
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
+            #[cfg(feature = "sentry")]
+            error_reporting::capture_fatal(&error);
             ExitCode::FAILURE
         }
     }
