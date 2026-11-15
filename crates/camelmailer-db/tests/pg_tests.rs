@@ -7970,8 +7970,13 @@ async fn delivery_counters_add_up_and_complaints_reach_the_sending_address() {
     );
     assert_eq!(stats.iter().map(|s| s.complaints).sum::<i64>(), 1);
 
+    // Sources carry the database clock of their insert, so prune them with a
+    // cutoff after "now" rather than the fixed complaint time.
     let removed = store
-        .prune_delivery_stats(chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(), at)
+        .prune_delivery_stats(
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(),
+            chrono::Utc::now() + chrono::Duration::days(1),
+        )
         .await
         .unwrap();
     assert_eq!(removed, 2 + 3);
