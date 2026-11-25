@@ -31,7 +31,7 @@ zip = { workspace = true }
 # Interface addresses for host-aware IP pools (getifaddrs). Already in the
 # tree through zip; this only turns on its `net` module.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["net"] }
+nix = { version = "0.32", default-features = false, features = ["net"] }
 
 [dev-dependencies]
 axum = { workspace = true }
