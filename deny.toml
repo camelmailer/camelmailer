@@ -20,6 +20,10 @@ ignore = [
     # unsafe-libyaml (unmaintained) via serde_yaml. Replacing serde_yaml
     # changes public config types, planned as its own change.
     { id = "RUSTSEC-2024-0449", reason = "serde_yaml replacement planned separately" },
+    # chrono (unmaintained, no vulnerability). Used by every crate and by
+    # sqlx 0.8 for timestamp columns. Moving to jiff or time is its own change
+    # and needs sqlx support; clears when chrono is gone from the tree.
+    { id = "RUSTSEC-2026-0543", reason = "chrono used by sqlx 0.8 and all crates, migration planned separately" },
 ]
 
 [licenses]
